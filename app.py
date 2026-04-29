@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import time
 import uuid as uuid_mod
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
@@ -59,6 +61,16 @@ MAX_TITLE_CHARS = 80
 MAX_LISTED_SESSIONS = 100
 TOOL_RESULT_PREVIEW = 200
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
+# bay before using user input as a filename.
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _safe_id(value: str) -> str:
+    if not _ID_RE.match(value or ""):
+        raise HTTPException(400, "bad id")
+    return value
 
 # Tools that are safe enough to auto-approve without showing a permission card.
 # TodoWrite is pure bookkeeping; the user sees the todos panel either way.
@@ -248,6 +260,78 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
+# ─── Active run tracking ──────────────────────────────────────────────────────
+
+
+class ActiveRun:
+    """One in-flight SDK conversation turn.
+
+    Decouples the SDK task from the originating HTTP request: the task runs
+    to completion regardless of whether the browser disconnects. Buffers
+    every emitted event so a reconnecting browser gets a replay-then-tail.
+    """
+
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.events: list[dict] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = False
+        self.session_id: Optional[str] = None
+        self.task: Optional[asyncio.Task] = None
+        self.finished_at: Optional[float] = None
+        self.session_allowlist: set[tuple[str, str]] = set()
+
+    def emit(self, event: dict) -> None:
+        self.events.append(event)
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            sid = event.get("session_id")
+            if sid:
+                self.session_id = sid
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        for e in self.events:
+            q.put_nowait(e)
+        if self.done:
+            q.put_nowait({"type": "_done"})
+        else:
+            self.subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self.subscribers.discard(q)
+
+    def finish(self) -> None:
+        self.done = True
+        self.finished_at = time.time()
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait({"type": "_done"})
+            except asyncio.QueueFull:
+                pass
+        self.subscribers.clear()
+
+
+ACTIVE_RUNS: dict[str, ActiveRun] = {}
+RUN_RETENTION_SECONDS = 300  # keep finished runs around so a slow reconnect can still replay
+
+
+def _gc_runs() -> None:
+    """Evict completed runs older than retention so the dict doesn't grow."""
+    now = time.time()
+    stale = [
+        rid for rid, r in ACTIVE_RUNS.items()
+        if r.done and r.finished_at and (now - r.finished_at) > RUN_RETENTION_SECONDS
+    ]
+    for rid in stale:
+        ACTIVE_RUNS.pop(rid, None)
+
+
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
 
 
@@ -268,9 +352,20 @@ async def api_sessions(user: dict = Depends(auth.require_user)):
 
 @app.get("/api/sessions/{sid}")
 async def api_session(sid: str, user: dict = Depends(auth.require_user)):
+    sid = _safe_id(sid)
     if not (SESSIONS_DIR / f"{sid}.jsonl").exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     return {"id": sid, "messages": session_transcript(sid)}
+
+
+@app.delete("/api/sessions/{sid}")
+async def api_delete_session(sid: str, user: dict = Depends(auth.require_user)):
+    sid = _safe_id(sid)
+    path = SESSIONS_DIR / f"{sid}.jsonl"
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    path.unlink()
+    return {"ok": True}
 
 
 @app.post("/api/permission/{request_id}")
@@ -292,41 +387,79 @@ async def api_permission(
     return {"ok": True}
 
 
+def _stream_run_response(run: ActiveRun) -> StreamingResponse:
+    """Subscribe to an ActiveRun and stream its events as SSE.
+
+    Closing the request just unsubscribes — the SDK task keeps running so
+    a reload or new tab can rejoin via /api/chat/stream/{run_id}.
+    """
+    async def stream() -> AsyncIterator[bytes]:
+        q = run.subscribe()
+        try:
+            while True:
+                evt = await q.get()
+                if evt.get("type") == "_done":
+                    yield b"event: done\ndata: {}\n\n"
+                    break
+                yield f"data: {json.dumps(evt)}\n\n".encode()
+        finally:
+            run.unsubscribe(q)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/chat")
 async def api_chat(
     message: str = Form(...),
     session_id: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
-    """Stream Claude's responses as Server-Sent Events.
+    """Start a new SDK turn and stream its events as SSE.
 
     Permission requests are emitted as `permission_request` events; the
     browser POSTs the decision to /api/permission/{id} which unblocks the
     can_use_tool callback below.
+
+    The SDK driver task is detached from the request — see ActiveRun.
+    Browser reload reconnects via /api/chat/stream/{run_id}; explicit stop
+    happens via /api/chat/stop/{run_id}.
     """
+    _gc_runs()
     sid_in = session_id or None
-    # Per-run "allow this session" rules: {(tool, signature)}.
-    session_allowlist: set[tuple[str, str]] = set()
+    run_id = str(uuid_mod.uuid4())
+    run = ActiveRun(run_id)
+    ACTIVE_RUNS[run_id] = run
+    # First two events: run_id (so a reload can reconnect) and the user's
+    # prompt (so a resumed transcript shows what was asked — the SDK only
+    # echoes assistant content and tool results back).
+    run.emit({"type": "run_started", "run_id": run_id})
+    run.emit({"type": "user_prompt", "text": message})
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context):
         if tool_name in SAFE_TOOLS:
             return PermissionResultAllow()
         sig = _tool_signature(tool_name, tool_input)
-        if (tool_name, sig) in session_allowlist:
+        if (tool_name, sig) in run.session_allowlist:
             return PermissionResultAllow()
 
         request_id = str(uuid_mod.uuid4())
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         PENDING[request_id] = fut
         try:
-            payload = {
+            run.emit({
                 "type": "permission_request",
                 "id": request_id,
                 "tool": tool_name,
                 "input": tool_input,
                 "signature": sig,
-            }
-            await events.put(("data", payload))
+            })
             decision = await fut
         finally:
             PENDING.pop(request_id, None)
@@ -335,12 +468,9 @@ async def api_chat(
         if d == "allow":
             return PermissionResultAllow()
         if d == "allow_session":
-            session_allowlist.add((tool_name, sig))
+            run.session_allowlist.add((tool_name, sig))
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied permission via web UI.")
-
-    # Outgoing event queue. SSE stream drains it; can_use_tool puts on it.
-    events: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
 
     options = ClaudeAgentOptions(
         cwd=str(CWD),
@@ -353,40 +483,64 @@ async def api_chat(
     )
 
     async def driver():
-        """Run the SDK client to completion, push results onto the queue."""
         try:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(message)
                 async for msg in client.receive_response():
                     for evt in _sdk_message_to_events(msg):
-                        await events.put(("data", evt))
-        except Exception as e:
-            await events.put(("data", {"type": "error", "message": str(e)}))
-        finally:
-            await events.put(("done", None))
-
-    task = asyncio.create_task(driver())
-
-    async def stream() -> AsyncIterator[bytes]:
-        try:
-            while True:
-                kind, payload = await events.get()
-                if kind == "done":
-                    yield b"event: done\ndata: {}\n\n"
-                    break
-                yield f"data: {json.dumps(payload)}\n\n".encode()
+                        run.emit(evt)
         except asyncio.CancelledError:
-            task.cancel()
+            # Explicit /api/chat/stop or process shutdown — surface as a
+            # tidy "stopped" rather than the raw transport error that the
+            # SDK would otherwise raise on broken pipes.
+            run.emit({"type": "stopped"})
             raise
+        except Exception as e:
+            run.emit({"type": "error", "message": str(e)})
+        finally:
+            run.finish()
 
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    run.task = asyncio.create_task(driver())
+    return _stream_run_response(run)
+
+
+@app.get("/api/chat/active")
+async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_user)):
+    """Used by the browser on page load to decide whether to resume."""
+    if not run_id:
+        return {"active": False}
+    _safe_id(run_id)
+    run = ACTIVE_RUNS.get(run_id)
+    if run is None:
+        return {"active": False}
+    return {
+        "active": not run.done,
+        "run_id": run.run_id,
+        "session_id": run.session_id,
+        "buffered_events": len(run.events),
+    }
+
+
+@app.get("/api/chat/stream/{run_id}")
+async def api_chat_stream(run_id: str, user: dict = Depends(auth.require_user)):
+    """Reconnect to an in-flight or recently-finished run."""
+    _safe_id(run_id)
+    run = ACTIVE_RUNS.get(run_id)
+    if run is None:
+        raise HTTPException(404, "no such run")
+    return _stream_run_response(run)
+
+
+@app.post("/api/chat/stop/{run_id}")
+async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
+    """Cancel the SDK task. Idempotent."""
+    _safe_id(run_id)
+    run = ACTIVE_RUNS.get(run_id)
+    if run is None or run.done:
+        return {"ok": False}
+    if run.task and not run.task.done():
+        run.task.cancel()
+    return {"ok": True}
 
 
 def _sdk_message_to_events(msg) -> list[dict]:

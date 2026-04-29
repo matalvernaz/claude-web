@@ -5,10 +5,21 @@
   const form = document.getElementById("chat-form");
   const promptEl = document.getElementById("prompt");
   const sendBtn = document.getElementById("send");
+  const stopBtn = document.getElementById("stop");
   const statusEl = document.getElementById("status");
   const announcer = document.getElementById("status-announcer");
   const newChatBtn = document.getElementById("new-chat");
   const sessionList = document.getElementById("session-list");
+  const headerCostEl = document.getElementById("header-cost");
+
+  // AbortController for the in-flight chat stream — used by Stop and to
+  // abandon a resume attempt. The SDK task lives server-side independently
+  // of the fetch; stopping for real goes through POST /api/chat/stop.
+  let currentAbort = null;
+  // Run-id of the in-flight turn. Persisted to sessionStorage so a reload
+  // can rejoin via /api/chat/stream/{run_id}.
+  let currentRunId = null;
+  const RUN_KEY = "claude-web.active-run";
 
   // Quietly tell NVDA / VoiceOver something interesting happened. The
   // visible "Thinking…" text in #status is also live, but this region is
@@ -16,9 +27,11 @@
   // permission needed) rather than every chunk.
   function announce(text) {
     if (!announcer) return;
+    // NVDA needs a real gap between clearing and re-filling, otherwise the
+    // mutation gets coalesced and nothing speaks. 10ms wasn't enough; 120ms
+    // is reliable in NVDA + Chrome/Firefox without feeling laggy.
     announcer.textContent = "";
-    // Force a tick so the live-region change actually fires.
-    setTimeout(() => { announcer.textContent = text; }, 10);
+    setTimeout(() => { announcer.textContent = text; }, 120);
   }
 
   // Format unix timestamp as a short human-friendly relative/absolute string.
@@ -44,14 +57,37 @@
   const params = new URLSearchParams(location.search);
   let sessionId = params.get("session") || "";
 
-  if (sessionId) {
-    loadSession(sessionId).catch((err) => setStatus("Could not load session: " + err.message));
-    markActive(sessionId);
-  }
-
   // Always refresh the sidebar from /api/sessions on load — the server-rendered
   // list can be stale if the HTML was cached or another tab created sessions.
   refreshSessions();
+  refreshHeaderCost();
+
+  // Boot order: if there's an in-flight run to resume, that wins; otherwise
+  // load the session history from the URL. Doing both would race on
+  // transcript.innerHTML and produce flicker/duplicates.
+  (async () => {
+    const resumed = await tryResume();
+    if (resumed) return;
+    if (sessionId) {
+      try {
+        await loadSession(sessionId);
+      } catch (err) {
+        setStatus("Could not load session: " + err.message);
+      }
+      markActive(sessionId);
+    }
+  })();
+
+  async function refreshHeaderCost() {
+    if (!headerCostEl) return;
+    try {
+      const r = await fetch("/api/usage");
+      if (!r.ok) return;
+      const data = await r.json();
+      const cost = (data.today && data.today.cost_usd) || 0;
+      headerCostEl.textContent = "$" + cost.toFixed(4);
+    } catch { /* ignore */ }
+  }
 
   // Sidebar collapse state — persist across reloads. Default: open on wide
   // screens, closed on narrow ones.
@@ -95,7 +131,7 @@
       if (m.role === "user" || m.role === "assistant") {
         appendMessage(m.role, m.text);
       } else if (m.role === "tool_use") {
-        insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""));
+        insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
       } else if (m.role === "tool_result") {
         insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
       }
@@ -109,10 +145,18 @@
   }
 
   function renderMarkdown(text) {
-    if (window.marked && typeof window.marked.parse === "function") {
-      return window.marked.parse(text || "");
+    // Assistant output is untrusted — it routinely echoes web pages, file
+    // contents, and tool output. marked passes raw HTML through, so an
+    // unsanitized .innerHTML is an XSS vector. Fail closed if either lib
+    // is missing rather than render unescaped HTML.
+    if (
+      window.marked &&
+      typeof window.marked.parse === "function" &&
+      window.DOMPurify &&
+      typeof window.DOMPurify.sanitize === "function"
+    ) {
+      return window.DOMPurify.sanitize(window.marked.parse(text || ""));
     }
-    // Fallback: textContent if marked failed to load.
     const div = document.createElement("div");
     div.textContent = text || "";
     return div.innerHTML;
@@ -121,23 +165,47 @@
   function appendMessage(role, text) {
     const el = document.createElement("article");
     el.className = "msg " + role;
-    // Heading per message so NVDA's H key cycles through them.
+    // Heading + actions row. The H3 keeps NVDA's H-key cycling working.
+    const header = document.createElement("div");
+    header.className = "msg-header";
     const r = document.createElement("h3");
     r.className = "role";
     r.textContent = role === "user" ? "You" : role === "assistant" ? "Claude" : role;
+    header.appendChild(r);
     const b = document.createElement("div");
     b.className = "body";
     if (role === "assistant") {
       b.innerHTML = renderMarkdown(text);
       b.dataset.raw = text || "";
+      header.appendChild(makeCopyButton(b));
     } else {
       b.textContent = text;
     }
-    el.appendChild(r);
+    el.appendChild(header);
     el.appendChild(b);
     transcript.appendChild(el);
     transcript.scrollTop = transcript.scrollHeight;
     return b;
+  }
+
+  function makeCopyButton(bodyEl) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "msg-copy";
+    btn.textContent = "Copy";
+    btn.setAttribute("aria-label", "Copy reply to clipboard");
+    btn.addEventListener("click", async () => {
+      const raw = bodyEl.dataset.raw || bodyEl.textContent || "";
+      try {
+        await navigator.clipboard.writeText(raw);
+        btn.textContent = "Copied";
+        announce("Copied reply.");
+        setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+      } catch {
+        announce("Could not copy.");
+      }
+    });
+    return btn;
   }
 
   function setStatus(text) {
@@ -200,61 +268,129 @@
     promptEl.focus();
   });
 
+  function setStreaming(on) {
+    sendBtn.hidden = on;
+    sendBtn.disabled = on;
+    stopBtn.hidden = !on;
+  }
+
+  stopBtn.addEventListener("click", async () => {
+    // Tell the server to cancel the SDK task. The fetch will then end on
+    // its own when the run finishes; abort is fallback insurance.
+    if (currentRunId) {
+      try {
+        await fetch(`/api/chat/stop/${encodeURIComponent(currentRunId)}`, { method: "POST" });
+      } catch { /* fall through to abort */ }
+    }
+    if (currentAbort) currentAbort.abort();
+  });
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     if (sendBtn.disabled) return;  // belt-and-braces against double-submit
     const text = promptEl.value.trim();
     if (!text) return;
-    appendMessage("user", text);
+    // Server echoes the prompt back as a user_prompt event; that's the
+    // single source of truth for rendering it in the transcript.
     promptEl.value = "";
-    sendBtn.disabled = true;
+    setStreaming(true);
+    currentAbort = new AbortController();
     startGerunds();
     announce("Sent. Claude is responding.");
-
-    // Mutable holder so handleSSEEvent can lazy-create a new assistant
-    // article each time text follows a tool call — keeps DOM order matching
-    // chronological order.
-    const ctx = { currentAssistantBody: null };
 
     try {
       const fd = new FormData();
       fd.append("message", text);
       if (sessionId) fd.append("session_id", sessionId);
-
-      const r = await fetch("/api/chat", { method: "POST", body: fd });
+      const r = await fetch("/api/chat", { method: "POST", body: fd, signal: currentAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
-
-      const reader = r.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        // Parse SSE: events separated by \n\n
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const evt = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          handleSSEEvent(evt, ctx);
-        }
-      }
-      stopGerunds();
-      const summary = summariseResult(ctx.lastResult);
-      setStatus(summary);
-      announce(summary);
-      // refresh session list (titles may have updated)
-      refreshSessions();
+      await drainStream(r);
     } catch (err) {
-      stopGerunds();
-      setStatus("Error: " + err.message);
-      announce("Error: " + err.message);
+      handleStreamError(err);
     } finally {
-      sendBtn.disabled = false;
+      currentAbort = null;
+      currentRunId = null;
+      sessionStorage.removeItem(RUN_KEY);
+      setStreaming(false);
       promptEl.focus();
     }
   });
+
+  async function drainStream(response) {
+    // Mutable holder so handleSSEEvent can lazy-create a new assistant
+    // article each time text follows a tool call — keeps DOM order matching
+    // chronological order.
+    const ctx = { currentAssistantBody: null };
+    const reader = response.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const evt = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        handleSSEEvent(evt, ctx);
+      }
+    }
+    stopGerunds();
+    const summary = summariseResult(ctx.lastResult);
+    setStatus(summary);
+    announce(summary);
+    refreshSessions();
+    refreshHeaderCost();
+  }
+
+  function handleStreamError(err) {
+    stopGerunds();
+    if (err.name === "AbortError") {
+      setStatus("Stopped.");
+      announce("Stopped.");
+    } else {
+      setStatus("Error: " + err.message);
+      announce("Error: " + err.message);
+    }
+  }
+
+  async function tryResume() {
+    const savedRunId = sessionStorage.getItem(RUN_KEY);
+    if (!savedRunId) return false;
+    let info;
+    try {
+      const r = await fetch(`/api/chat/active?run_id=${encodeURIComponent(savedRunId)}`);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      info = await r.json();
+    } catch {
+      sessionStorage.removeItem(RUN_KEY);
+      return false;
+    }
+    if (!info.active && !info.buffered_events) {
+      sessionStorage.removeItem(RUN_KEY);
+      return false;
+    }
+    currentRunId = savedRunId;
+    setStreaming(true);
+    currentAbort = new AbortController();
+    startGerunds();
+    announce("Reconnecting to previous response.");
+    transcript.innerHTML = "";
+    try {
+      const r = await fetch(`/api/chat/stream/${encodeURIComponent(savedRunId)}`, { signal: currentAbort.signal });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      await drainStream(r);
+    } catch (err) {
+      handleStreamError(err);
+    } finally {
+      currentAbort = null;
+      currentRunId = null;
+      sessionStorage.removeItem(RUN_KEY);
+      setStreaming(false);
+      promptEl.focus();
+    }
+    return true;
+  }
 
   function handleSSEEvent(evt, ctx) {
     const lines = evt.split("\n");
@@ -266,7 +402,21 @@
     let obj;
     try { obj = JSON.parse(dataLine); } catch { return; }
 
-    if (obj.type === "system" && obj.subtype === "init") {
+    if (obj.type === "run_started") {
+      // Save the run-id so a reload can rejoin via /api/chat/stream/{id}.
+      if (obj.run_id) {
+        currentRunId = obj.run_id;
+        sessionStorage.setItem(RUN_KEY, obj.run_id);
+      }
+    } else if (obj.type === "user_prompt") {
+      // Single source of truth for "the user's message in the transcript":
+      // the server echoes the prompt as an event so both live and resumed
+      // streams render it the same way.
+      appendMessage("user", obj.text || "");
+    } else if (obj.type === "stopped") {
+      setStatus("Stopped.");
+      announce("Stopped.");
+    } else if (obj.type === "system" && obj.subtype === "init") {
       // first chunk has session_id — record it for resume
       if (obj.session_id && !sessionId) {
         sessionId = obj.session_id;
@@ -289,7 +439,7 @@
           // Subsequent text blocks should land in a new assistant article
           // *after* this tool call, not into the one above it.
           ctx.currentAssistantBody = null;
-          insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}));
+          insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
         }
       }
     } else if (obj.type === "user" && Array.isArray(obj.message?.content)) {
@@ -526,9 +676,10 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
-  function insertToolMessage(text) {
+  function insertToolMessage(text, toolName) {
     // Group consecutive tool messages under a collapsible <details> so the
-    // dance doesn't drown out Claude's actual response.
+    // dance doesn't drown out Claude's actual response. The summary lists
+    // distinct tool names so you can tell what's inside without expanding.
     let group = transcript.lastElementChild;
     if (!group || !group.classList || !group.classList.contains("tool-group")) {
       group = document.createElement("details");
@@ -542,8 +693,18 @@
     el.className = "tool-line";
     el.textContent = text;
     group.appendChild(el);
+    if (toolName) {
+      const seen = (group.dataset.tools || "").split(",").filter(Boolean);
+      if (!seen.includes(toolName)) {
+        seen.push(toolName);
+        group.dataset.tools = seen.join(",");
+      }
+    }
     const count = group.querySelectorAll(".tool-line").length;
-    group.querySelector("summary").textContent = `Tools (${count})`;
+    const tools = (group.dataset.tools || "").split(",").filter(Boolean);
+    group.querySelector("summary").textContent = tools.length
+      ? `Tools: ${tools.join(", ")} (${count})`
+      : `Tools (${count})`;
     transcript.scrollTop = transcript.scrollHeight;
   }
 
@@ -581,9 +742,51 @@
         a.appendChild(title);
         a.appendChild(time);
         li.appendChild(a);
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "session-delete";
+        del.textContent = "×";
+        del.setAttribute("aria-label", `Delete session: ${s.title}`);
+        del.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          deleteSession(s.id, s.title, li);
+        });
+        li.appendChild(del);
         sessionList.appendChild(li);
       }
       markActive(sessionId);
+      filterSessions();
     } catch { /* ignore */ }
   }
+
+  async function deleteSession(id, title, li) {
+    if (!confirm(`Delete session "${title}"?`)) return;
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      li.remove();
+      announce("Session deleted.");
+      if (sessionId === id) {
+        sessionId = "";
+        transcript.innerHTML = "";
+        updateTodosPanel([]);
+        history.replaceState({}, "", location.pathname);
+        setStatus("Session deleted.");
+      }
+    } catch (err) {
+      setStatus("Delete failed: " + err.message);
+      announce("Delete failed.");
+    }
+  }
+
+  const sessionSearchEl = document.getElementById("session-search");
+  function filterSessions() {
+    const q = (sessionSearchEl?.value || "").toLowerCase();
+    sessionList.querySelectorAll("li").forEach((li) => {
+      const t = (li.querySelector(".session-title")?.textContent || "").toLowerCase();
+      li.hidden = q.length > 0 && !t.includes(q);
+    });
+  }
+  sessionSearchEl?.addEventListener("input", filterSessions);
 })();

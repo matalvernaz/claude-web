@@ -17,6 +17,7 @@
     <h1>Claude — homelab</h1>
     <div class="header-actions">
       <button type="button" id="toggle-sessions" aria-controls="sessions-panel" aria-expanded="true">Sessions</button>
+      <span id="header-cost" class="header-cost" aria-label="Today's spend so far" title="Today so far">$0.0000</span>
       <button type="button" id="show-usage" aria-haspopup="dialog">Usage</button>
       <button type="button" id="new-chat" aria-label="Start a new chat">New chat</button>
       {% if user and user.sub != 'anonymous' %}
@@ -29,6 +30,7 @@
   <div class="layout">
     <nav id="sessions-panel" aria-labelledby="sessions-heading">
       <h2 id="sessions-heading">Sessions</h2>
+      <input type="search" id="session-search" placeholder="Filter…" aria-label="Filter sessions" autocomplete="off">
       <ul id="session-list">
         {% for s in sessions %}
           <li>
@@ -52,7 +54,7 @@
         <div id="transcript"></div>
       </section>
 
-      <output id="status-announcer" class="sr-only" aria-live="polite"></output>
+      <div id="status-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
       <dialog id="usage-dialog" aria-labelledby="usage-title">
         <h2 id="usage-title">Usage</h2>
@@ -69,6 +71,7 @@
           <textarea id="prompt" name="message" rows="3" required placeholder="Ask Claude…"></textarea>
           <div class="row">
             <button type="submit" id="send">Send</button>
+            <button type="button" id="stop" hidden>Stop</button>
             <span id="status" aria-hidden="true"></span>
           </div>
         </form>
@@ -77,6 +80,7 @@
   </div>
 
   <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
+  <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
   <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>
 </body>
 </html>

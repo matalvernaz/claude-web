@@ -46,7 +46,29 @@ nav#sessions-panel h2 {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: #888;
-  margin: 0 0 0.25rem 0;
+  margin: 0;
+}
+.msg-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+.msg-copy {
+  background: transparent;
+  color: #888;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+.msg-copy:hover, .msg-copy:focus {
+  color: var(--accent);
+  border-color: var(--accent);
+  outline: none;
 }
 header {
   display: flex;
@@ -56,9 +78,17 @@ header {
   border-bottom: 1px solid var(--border);
 }
 h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
-.header-actions { display: flex; gap: 0.5rem; }
+.header-actions { display: flex; gap: 0.5rem; align-items: center; }
 .header-actions button { background: transparent; color: var(--fg); border: 1px solid var(--border); }
 .header-actions button:hover, .header-actions button:focus { border-color: var(--accent); outline: none; }
+.header-cost {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  color: #aaa;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+}
 .layout {
   display: grid;
   grid-template-columns: 16rem 1fr;
@@ -101,6 +131,39 @@ body.sidebar-collapsed nav#sessions-panel { display: none; }
 }
 #session-list li a:hover, #session-list li a:focus { background: #333; outline: 2px solid var(--accent); }
 #session-list li.active a { background: #2c4060; }
+#session-list li {
+  display: flex;
+  align-items: stretch;
+  gap: 0.25rem;
+}
+#session-list li a { flex: 1; min-width: 0; }
+.session-delete {
+  background: transparent;
+  color: #888;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 0 0.4rem;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.session-delete:hover, .session-delete:focus {
+  color: #d96868;
+  border-color: var(--border);
+  outline: none;
+}
+#session-search {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  font: inherit;
+  font-size: 0.85rem;
+  margin: 0 0 0.5rem 0;
+}
+#session-search:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
 main {
   display: flex;
   flex-direction: column;
@@ -298,6 +361,8 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+#stop { background: #d96868; color: #fff; }
+#stop:hover, #stop:focus { background: #c45555; outline: none; }
 #status { color: #aaa; font-size: 0.9rem; }
 @media (max-width: 720px) {
   .layout { grid-template-columns: 1fr; }
