@@ -234,7 +234,12 @@ main {
   margin: 0.15rem 0;
   font-size: 0.95rem;
 }
-#todos-list li.completed { color: #888; text-decoration: line-through; }
+#todos-list .task-status {
+  font-weight: 600;
+  margin-right: 0.15rem;
+}
+#todos-list li.completed { color: #888; }
+#todos-list li.completed .task-label { text-decoration: line-through; }
 #todos-list li.in_progress { color: var(--user); font-weight: 600; }
 #todos-list li.pending { color: var(--fg); }
 

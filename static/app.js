@@ -193,6 +193,7 @@
   newChatBtn.addEventListener("click", () => {
     sessionId = "";
     transcript.innerHTML = "";
+    updateTodosPanel([]);
     history.replaceState({}, "", location.pathname);
     markActive("");
     setStatus("");
@@ -416,6 +417,12 @@
   const todosPanel = document.getElementById("todos-panel");
   const todosList = document.getElementById("todos-list");
 
+  const STATUS_LABELS = {
+    pending: "To do",
+    in_progress: "In progress",
+    completed: "Done",
+  };
+
   function updateTodosPanel(todos) {
     if (!todos.length) {
       todosPanel.hidden = true;
@@ -429,7 +436,18 @@
       const status = t.status || "pending";
       li.className = status;
       const label = status === "in_progress" && t.activeForm ? t.activeForm : (t.content || "");
-      li.textContent = label;
+      // Status conveyed in real text (not just CSS) so NVDA reads "Done:
+      // Foo" / "In progress: Bar" / "To do: Baz" instead of the same flat
+      // string for every item.
+      const statusEl = document.createElement("span");
+      statusEl.className = "task-status";
+      statusEl.textContent = STATUS_LABELS[status] || status;
+      const sep = document.createTextNode(": ");
+      const labelEl = document.createElement("span");
+      labelEl.className = "task-label";
+      labelEl.textContent = label;
+      li.append(statusEl, sep, labelEl);
+      if (status === "in_progress") li.setAttribute("aria-current", "step");
       todosList.appendChild(li);
     }
   }
