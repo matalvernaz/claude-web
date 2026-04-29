@@ -217,44 +217,72 @@
   // Verbatim list mined from the Claude Code 2.1.123 binary so the web UI
   // matches the CLI's TTY animation. Refresh on next major version bump.
   const GERUNDS = [
-    'Accomplishing', 'Actioning', 'Actualizing', 'Architecting', 'Baking', 'Beaming', 'Befuddling', 'Billowing',
-    'Blanching', 'Bloviating', 'Boogieing', 'Boondoggling', 'Booping', 'Bootstrapping', 'Brewing', 'Bunning',
-    'Burrowing', 'Calculating', 'Canoodling', 'Caramelizing', 'Cascading', 'Catapulting', 'Cerebrating', 'Channeling',
-    'Channelling', 'Choreographing', 'Churning', 'Clauding', 'Coalescing', 'Cogitating', 'Combobulating', 'Composing',
-    'Computing', 'Concocting', 'Considering', 'Contemplating', 'Cooking', 'Crafting', 'Creating', 'Crunching',
-    'Crystallizing', 'Cultivating', 'Deciphering', 'Deliberating', 'Determining', 'Discombobulating', 'Doing', 'Doodling',
-    'Drizzling', 'Ebbing', 'Effecting', 'Elucidating', 'Embellishing', 'Enchanting', 'Envisioning', 'Evaporating',
-    'Fermenting', 'Finagling', 'Flibbertigibbeting', 'Flowing', 'Flummoxing', 'Fluttering', 'Forging', 'Forming',
-    'Frolicking', 'Frosting', 'Gallivanting', 'Galloping', 'Garnishing', 'Generating', 'Gesticulating', 'Germinating',
-    'Gitifying', 'Grooving', 'Gusting', 'Harmonizing', 'Hashing', 'Hatching', 'Herding', 'Honking',
-    'Hullaballooing', 'Hyperspacing', 'Ideating', 'Imagining', 'Improvising', 'Incubating', 'Inferring', 'Infusing',
-    'Ionizing', 'Jitterbugging', 'Julienning', 'Kneading', 'Leavening', 'Levitating', 'Lollygagging', 'Manifesting',
+    'Accomplishing', 'Actioning', 'Actualizing', 'Architecting', 'Baking', 'Beaming', "Beboppin'", 'Befuddling',
+    'Billowing', 'Blanching', 'Bloviating', 'Boogieing', 'Boondoggling', 'Booping', 'Bootstrapping', 'Brewing',
+    'Bunning', 'Burrowing', 'Calculating', 'Canoodling', 'Caramelizing', 'Cascading', 'Catapulting', 'Cerebrating',
+    'Channeling', 'Channelling', 'Choreographing', 'Churning', 'Clauding', 'Coalescing', 'Cogitating', 'Combobulating',
+    'Composing', 'Computing', 'Concocting', 'Considering', 'Contemplating', 'Cooking', 'Crafting', 'Creating',
+    'Crunching', 'Crystallizing', 'Cultivating', 'Deciphering', 'Deliberating', 'Determining', 'Dilly-dallying',
+    'Discombobulating', 'Doing', 'Doodling', 'Drizzling', 'Ebbing', 'Effecting', 'Elucidating', 'Embellishing',
+    'Enchanting', 'Envisioning', 'Evaporating', 'Fermenting', 'Fiddle-faddling', 'Finagling', 'Flambéing',
+    'Flibbertigibbeting', 'Flowing', 'Flummoxing', 'Fluttering', 'Forging', 'Forming', 'Frolicking', 'Frosting',
+    'Gallivanting', 'Galloping', 'Garnishing', 'Generating', 'Gesticulating', 'Germinating', 'Gitifying',
+    'Grooving', 'Gusting', 'Harmonizing', 'Hashing', 'Hatching', 'Herding', 'Honking', 'Hullaballooing',
+    'Hyperspacing', 'Ideating', 'Imagining', 'Improvising', 'Incubating', 'Inferring', 'Infusing', 'Ionizing',
+    'Jitterbugging', 'Julienning', 'Kneading', 'Leavening', 'Levitating', 'Lollygagging', 'Manifesting',
     'Marinating', 'Meandering', 'Metamorphosing', 'Misting', 'Moonwalking', 'Moseying', 'Mulling', 'Mustering',
     'Musing', 'Nebulizing', 'Nesting', 'Newspapering', 'Noodling', 'Nucleating', 'Orbiting', 'Orchestrating',
-    'Osmosing', 'Perambulating', 'Percolating', 'Perusing', 'Philosophising', 'Photosynthesizing', 'Pollinating', 'Pondering',
-    'Pontificating', 'Pouncing', 'Precipitating', 'Prestidigitating', 'Processing', 'Proofing', 'Propagating', 'Puttering',
-    'Puzzling', 'Quantumizing', 'Razzmatazzing', 'Recombobulating', 'Reticulating', 'Roosting', 'Ruminating', 'Scampering',
-    'Schlepping', 'Scurrying', 'Seasoning', 'Shenaniganing', 'Shimmying', 'Simmering', 'Skedaddling', 'Sketching',
-    'Slithering', 'Smooshing', 'Spelunking', 'Spinning', 'Sprouting', 'Stewing', 'Sublimating', 'Swirling',
-    'Swooping', 'Symbioting', 'Synthesizing', 'Tempering', 'Thinking', 'Thundering', 'Tinkering', 'Tomfoolering',
-    'Transfiguring', 'Transmuting', 'Twisting', 'Undulating', 'Unfurling', 'Unravelling', 'Vibing', 'Waddling',
-    'Wandering', 'Warping', 'Whatchamacalliting', 'Whirlpooling', 'Whirring', 'Whisking', 'Wibbling', 'Working',
-    'Wrangling', 'Zesting', 'Zigzagging',
+    'Osmosing', 'Perambulating', 'Percolating', 'Perusing', 'Philosophising', 'Photosynthesizing', 'Pollinating',
+    'Pondering', 'Pontificating', 'Pouncing', 'Precipitating', 'Prestidigitating', 'Processing', 'Proofing',
+    'Propagating', 'Puttering', 'Puzzling', 'Quantumizing', 'Razzle-dazzling', 'Razzmatazzing', 'Recombobulating',
+    'Reticulating', 'Roosting', 'Ruminating', 'Sautéing', 'Scampering', 'Schlepping', 'Scurrying', 'Seasoning',
+    'Shenaniganing', 'Shimmying', 'Simmering', 'Skedaddling', 'Sketching', 'Slithering', 'Smooshing',
+    'Sock-hopping', 'Spelunking', 'Spinning', 'Sprouting', 'Stewing', 'Sublimating', 'Swirling', 'Swooping',
+    'Symbioting', 'Synthesizing', 'Tempering', 'Thinking', 'Thundering', 'Tinkering', 'Tomfoolering',
+    'Topsy-turvying', 'Transfiguring', 'Transmuting', 'Twisting', 'Undulating', 'Unfurling', 'Unravelling',
+    'Vibing', 'Waddling', 'Wandering', 'Warping', 'Whatchamacalliting', 'Whirlpooling', 'Whirring', 'Whisking',
+    'Wibbling', 'Working', 'Wrangling', 'Zesting', 'Zigzagging',
   ];
   let gerundTimer = null;
+  let gerundSpeakTimer = null;
+  let currentGerund = "Working";
+  let lastVisibleActivityAt = 0;
+  // Visual cycle stays fast (3.5s) so the gerund actually feels alive when
+  // it does appear. Speech is paced wider (~12s) so NVDA isn't cut off
+  // mid-word. Sighted users already have streaming text + tool lines as
+  // "still working" feedback; we only show the gerund when the rest of
+  // the UI has been quiet for IDLE_MS.
+  const GERUND_VISUAL_MS = 3500;
+  const GERUND_SPEAK_MS = 12000;
+  const GERUND_IDLE_MS = 3000;
+
+  function markVisibleActivity() {
+    lastVisibleActivityAt = Date.now();
+    setStatus("");
+  }
+
   function startGerunds() {
     let last = -1;
-    function tick() {
+    lastVisibleActivityAt = 0;  // start from "idle" so the gerund shows right away
+    function visualTick() {
+      const idleMs = Date.now() - lastVisibleActivityAt;
+      if (idleMs < GERUND_IDLE_MS) return;  // sighted users have other feedback
       let i;
       do { i = Math.floor(Math.random() * GERUNDS.length); } while (i === last);
       last = i;
-      setStatus("✻ " + GERUNDS[i] + "…");
+      currentGerund = GERUNDS[i];
+      setStatus("✻ " + currentGerund + "…");
     }
-    tick();
-    gerundTimer = setInterval(tick, 3500);
+    visualTick();
+    gerundTimer = setInterval(visualTick, GERUND_VISUAL_MS);
+    // Speech keeps firing regardless of visual activity — for NVDA users,
+    // streaming text isn't auto-spoken, so the gerund heartbeat is still
+    // their only "still working" cue.
+    gerundSpeakTimer = setInterval(() => announce(currentGerund + "…"), GERUND_SPEAK_MS);
   }
   function stopGerunds() {
     if (gerundTimer) { clearInterval(gerundTimer); gerundTimer = null; }
+    if (gerundSpeakTimer) { clearInterval(gerundSpeakTimer); gerundSpeakTimer = null; }
     setStatus("");
   }
 
@@ -435,11 +463,13 @@
           ctx.currentAssistantBody.dataset.raw = raw;
           ctx.currentAssistantBody.innerHTML = renderMarkdown(raw);
           transcript.scrollTop = transcript.scrollHeight;
+          markVisibleActivity();
         } else if (blk.type === "tool_use") {
           // Subsequent text blocks should land in a new assistant article
           // *after* this tool call, not into the one above it.
           ctx.currentAssistantBody = null;
           insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
+          markVisibleActivity();
         }
       }
     } else if (obj.type === "user" && Array.isArray(obj.message?.content)) {
@@ -450,6 +480,7 @@
           const txt = typeof blk.content === "string" ? blk.content : JSON.stringify(blk.content);
           const prefix = blk.is_error ? "✗ " : "← ";
           insertToolMessage(prefix + truncate(txt, 200));
+          markVisibleActivity();
         }
       }
     } else if (obj.type === "permission_request") {
