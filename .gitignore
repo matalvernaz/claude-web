@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+*.log
+
+# Local state when running from source
+.claude-web/
+workspace/
+claude-home/
+claude-web-state/

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude — homelab</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+</head>
+<body>
+  <div class="skip-links">
+    <a class="skip" href="#sessions-heading">Skip to sessions</a>
+    <a class="skip" href="#transcript-heading">Skip to messages</a>
+    <a class="skip" href="#prompt">Skip to prompt</a>
+  </div>
+
+  <header>
+    <h1>Claude — homelab</h1>
+    <div class="header-actions">
+      <button type="button" id="toggle-sessions" aria-controls="sessions-panel" aria-expanded="true">Sessions</button>
+      <button type="button" id="show-usage" aria-haspopup="dialog">Usage</button>
+      <button type="button" id="new-chat" aria-label="Start a new chat">New chat</button>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge" aria-label="Signed in as {{ user.email or user.name or user.sub }}">{{ user.email or user.name or user.sub }}</span>
+        <a href="/auth/logout">Sign out</a>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav id="sessions-panel" aria-labelledby="sessions-heading">
+      <h2 id="sessions-heading">Sessions</h2>
+      <ul id="session-list">
+        {% for s in sessions %}
+          <li>
+            <a href="?session={{ s.id }}" data-session="{{ s.id }}" data-mtime="{{ s.mtime }}">
+              <span class="session-title">{{ s.title }}</span>
+              <time class="session-time" datetime="{{ s.mtime }}"></time>
+            </a>
+          </li>
+        {% endfor %}
+      </ul>
+    </nav>
+
+    <main>
+      <section id="todos-panel" aria-labelledby="todos-heading" hidden>
+        <h2 id="todos-heading">Tasks</h2>
+        <ol id="todos-list"></ol>
+      </section>
+
+      <section aria-labelledby="transcript-heading" class="transcript-region">
+        <h2 id="transcript-heading" class="sr-only">Conversation</h2>
+        <div id="transcript"></div>
+      </section>
+
+      <output id="status-announcer" class="sr-only" aria-live="polite"></output>
+
+      <dialog id="usage-dialog" aria-labelledby="usage-title">
+        <h2 id="usage-title">Usage</h2>
+        <div id="usage-body">Loading…</div>
+        <form method="dialog">
+          <button type="submit">Close</button>
+        </form>
+      </dialog>
+
+      <section aria-labelledby="prompt-heading">
+        <h2 id="prompt-heading" class="sr-only">Send a message</h2>
+        <form id="chat-form" autocomplete="off">
+          <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline)</span></label>
+          <textarea id="prompt" name="message" rows="3" required placeholder="Ask Claude…"></textarea>
+          <div class="row">
+            <button type="submit" id="send">Send</button>
+            <span id="status" aria-hidden="true"></span>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
+  <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>
+</body>
+</html>
