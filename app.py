@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import datetime
 import json
 import logging
 import os
@@ -42,7 +43,7 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -378,8 +379,142 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
                             "new_string": inp.get("new_string"),
                             "content": inp.get("content"),
                         }
+                    elif name == "Bash":
+                        # The export wants the un-truncated command, not the
+                        # 200-char summary. The live UI ignores this field
+                        # for Bash so the extra payload is export-only cost.
+                        entry["input"] = {"command": inp.get("command")}
                     msgs.append(entry)
     return msgs
+
+
+# Cap on Write content + arbitrary tool input dumps in the markdown export.
+# Tool *results* are already truncated by session_transcript to
+# TOOL_RESULT_PREVIEW, so they don't need a second cap.
+EXPORT_INPUT_MAX_CHARS = 4000
+
+
+def _truncate_for_export(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… (truncated {len(text) - limit} more chars)"
+
+
+def _md_summary(text: str, limit: int = 60) -> str:
+    """Tool-call summary safe for a <details><summary> line."""
+    flat = text.replace("\n", " ").strip()
+    if len(flat) > limit:
+        flat = flat[:limit] + "…"
+    # < and ` would break either the summary's HTML or its inline-code render.
+    return flat.replace("<", "&lt;").replace("`", "ʼ")
+
+
+def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]:
+    """Render a session jsonl as a self-contained markdown document.
+
+    Produces a single string with a small frontmatter-y header followed by
+    alternating "## You" / "## Claude" sections. Tool calls and results are
+    folded into <details> blocks so the document is readable in a fresh
+    GitHub issue / forum post but the dance doesn't drown out the text.
+    """
+    path = _find_session_path(session_id, project_key)
+    if path is None:
+        return None
+
+    title = session_title_from(path) or session_id[:8]
+    # Reverse the sanitised dir name back to a real path when we still have
+    # the project configured; otherwise fall back to the sanitised key so
+    # the export at least carries *something* identifying.
+    parent_key = path.parent.name
+    project_path = str(PROJECT_KEYS[parent_key]) if parent_key in PROJECT_KEYS else parent_key
+    try:
+        started = datetime.datetime.fromtimestamp(path.stat().st_ctime).isoformat(timespec="seconds")
+    except OSError:
+        started = "?"
+
+    out: list[str] = [
+        f"# {title}",
+        "",
+        f"- **Session:** `{session_id}`",
+        f"- **Project:** `{project_path}`",
+        f"- **Started:** {started}",
+        "",
+        "---",
+        "",
+    ]
+
+    for m in session_transcript(session_id, project_key):
+        role = m.get("role")
+        if role == "user":
+            out.append("## You")
+            out.append("")
+            text = m.get("text", "")
+            if text:
+                out.append(text)
+                out.append("")
+            count = m.get("image_count") or 0
+            if count:
+                out.append(f"_({count} image{'s' if count != 1 else ''} attached)_")
+                out.append("")
+        elif role == "assistant":
+            out.append("## Claude")
+            out.append("")
+            out.append(m.get("text", ""))
+            out.append("")
+        elif role == "tool_use":
+            name = m.get("name", "?")
+            inp = m.get("input") or {}
+            summary = m.get("summary", "")
+            heading = f"🔧 {name}"
+            if summary:
+                heading += f" — `{_md_summary(summary)}`"
+            out.append("<details>")
+            out.append(f"<summary>{heading}</summary>")
+            out.append("")
+            if name in ("Edit", "Write") and isinstance(inp, dict):
+                file_path = inp.get("file_path") or ""
+                if file_path:
+                    out.append(f"`{file_path}`")
+                    out.append("")
+                if name == "Edit":
+                    old_s = inp.get("old_string") or ""
+                    new_s = inp.get("new_string") or ""
+                    out.append("```diff")
+                    for ln in old_s.split("\n"):
+                        out.append(f"- {ln}")
+                    for ln in new_s.split("\n"):
+                        out.append(f"+ {ln}")
+                    out.append("```")
+                else:  # Write
+                    content = inp.get("content") or ""
+                    out.append("```")
+                    out.append(_truncate_for_export(content, EXPORT_INPUT_MAX_CHARS))
+                    out.append("```")
+            elif name == "Bash" and isinstance(inp, dict) and inp.get("command"):
+                out.append("```sh")
+                out.append(_truncate_for_export(str(inp["command"]), EXPORT_INPUT_MAX_CHARS))
+                out.append("```")
+            # No `elif summary:` body — for Read/Grep/WebFetch/etc the path
+            # or pattern already lives in the <summary> line, so a duplicate
+            # body just adds noise.
+            out.append("")
+            out.append("</details>")
+            out.append("")
+        elif role == "tool_result":
+            text = m.get("text", "")
+            if not text:
+                continue
+            mark = "❌" if m.get("is_error") else "↩️"
+            out.append("<details>")
+            out.append(f"<summary>{mark} Result</summary>")
+            out.append("")
+            out.append("```")
+            out.append(text)
+            out.append("```")
+            out.append("")
+            out.append("</details>")
+            out.append("")
+    return "\n".join(out)
 
 
 # ─── Permission registry ──────────────────────────────────────────────────────
@@ -645,6 +780,31 @@ async def api_session(
         "project": project_key,
         "messages": session_transcript(sid, project_key),
     }
+
+
+@app.get("/api/sessions/{sid}/export.md")
+async def api_session_export(
+    sid: str,
+    project: str = "",
+    user: dict = Depends(auth.require_user),
+):
+    """Return a markdown rendering of the session for copy/paste or download.
+
+    Same Content-Disposition either way: a fetch() call gets the body and
+    can copy to clipboard, while a direct browser navigation downloads it.
+    """
+    sid = _safe_id(sid)
+    md = session_to_markdown(sid, project)
+    if md is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(
+        content=md,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="claude-session-{sid[:12]}.md"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.delete("/api/sessions/{sid}")
@@ -1377,7 +1537,6 @@ def _log_usage(msg) -> None:
 
 def _today_window() -> tuple[int, int]:
     """Unix [start, end) of today in local time."""
-    import datetime
     now = datetime.datetime.now()
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(start.timestamp()), int((start + datetime.timedelta(days=1)).timestamp())

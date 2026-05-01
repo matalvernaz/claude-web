@@ -63,6 +63,7 @@
                 {% if multi_project %}<span class="session-project">{{ s.project_path.split('/')[-1] or s.project_path }}</span>{% endif %}
               </span>
             </a>
+            <a class="session-export" href="/api/sessions/{{ s.id }}/export.md?project={{ s.project }}" title="Copy as Markdown" aria-label="Copy session as Markdown: {{ s.title }}">↗</a>
           </li>
         {% endfor %}
       </ul>

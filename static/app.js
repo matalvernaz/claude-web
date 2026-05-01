@@ -1288,6 +1288,18 @@
       }
       a.appendChild(meta);
       li.appendChild(a);
+      const exp = document.createElement("button");
+      exp.type = "button";
+      exp.className = "session-export";
+      exp.textContent = "↗";
+      exp.title = "Copy as Markdown";
+      exp.setAttribute("aria-label", `Copy session as Markdown: ${s.title}`);
+      exp.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        exportSession(s.id, s.project || "", s.title);
+      });
+      li.appendChild(exp);
       const del = document.createElement("button");
       del.type = "button";
       del.className = "session-delete";
@@ -1302,6 +1314,43 @@
       sessionList.appendChild(li);
     }
     markActive(sessionId);
+  }
+
+  async function exportSession(id, project, title) {
+    const url = new URL(`/api/sessions/${encodeURIComponent(id)}/export.md`, location.origin);
+    if (project) url.searchParams.set("project", project);
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const md = await r.text();
+      // Clipboard requires a secure context. Behind Cloudflare/HTTPS that's
+      // fine; on plain http://localhost it's also allowed by browsers, but
+      // an http://lan-ip deployment will fail — fall back to a download in
+      // that case so the export still works.
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(md);
+        announce(`Copied "${title}" as Markdown.`);
+        setStatus(`Copied "${truncate(title, 40)}" to clipboard.`);
+        return;
+      }
+      throw new Error("clipboard unavailable");
+    } catch (err) {
+      // Fallback: trigger a real download via a data URL so the user still
+      // gets the markdown out even when clipboard write is blocked.
+      try {
+        const a = document.createElement("a");
+        a.href = url.toString();
+        a.download = `claude-session-${id.slice(0, 12)}.md`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        announce("Downloading session as Markdown.");
+        setStatus("Downloaded.");
+      } catch (err2) {
+        setStatus("Export failed: " + (err.message || err2.message));
+        announce("Export failed.");
+      }
+    }
   }
 
   async function refreshSessions() {

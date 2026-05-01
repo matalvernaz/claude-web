@@ -137,7 +137,7 @@ body.sidebar-collapsed nav#sessions-panel { display: none; }
   gap: 0.25rem;
 }
 #session-list li a { flex: 1; min-width: 0; }
-.session-delete {
+.session-delete, .session-export {
   background: transparent;
   color: #888;
   border: 1px solid transparent;
@@ -146,9 +146,17 @@ body.sidebar-collapsed nav#sessions-panel { display: none; }
   font-size: 1rem;
   line-height: 1;
   cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
 }
 .session-delete:hover, .session-delete:focus {
   color: #d96868;
+  border-color: var(--border);
+  outline: none;
+}
+.session-export:hover, .session-export:focus {
+  color: var(--accent);
   border-color: var(--border);
   outline: none;
 }
