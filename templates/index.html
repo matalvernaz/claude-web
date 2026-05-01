@@ -21,7 +21,7 @@
         <span class="sr-only">Model</span>
         <select id="model-select" aria-label="Model">
           {% for m in models %}
-            <option value="{{ m.id }}">{{ m.label }}</option>
+            <option value="{{ m.key }}">{{ m.label }}</option>
           {% endfor %}
         </select>
       </label>

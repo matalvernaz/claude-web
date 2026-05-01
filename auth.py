@@ -29,6 +29,10 @@ from starlette.middleware.sessions import SessionMiddleware
 
 AUTH_MODE = os.getenv("AUTH_MODE", "oidc").strip().lower()
 
+# Default 24h. The signed cookie carries this max-age and Starlette refuses
+# expired payloads, so a stale cookie can't be replayed past the limit.
+SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE_SECONDS", "86400"))
+
 
 def _split_csv(value: str) -> set[str]:
     return {item.strip() for item in value.split(",") if item.strip()}
@@ -36,6 +40,19 @@ def _split_csv(value: str) -> set[str]:
 
 ALLOWED_EMAILS = _split_csv(os.getenv("OIDC_ALLOWED_EMAILS", ""))
 ALLOWED_GROUPS = _split_csv(os.getenv("OIDC_ALLOWED_GROUPS", ""))
+
+
+def safe_next(value: Optional[str]) -> str:
+    r"""Constrain a post-login redirect to a same-origin path.
+
+    `startswith("/")` alone admits `//evil.com` and `/\evil.com`, which
+    browsers parse as protocol-relative or backslash-host URLs.
+    """
+    if not value or not value.startswith("/"):
+        return "/"
+    if value.startswith("//") or value.startswith("/\\"):
+        return "/"
+    return value
 
 
 _oauth: Optional[OAuth] = None
@@ -65,6 +82,7 @@ def configure(app) -> None:
         secret_key=secret,
         same_site="lax",
         https_only=os.getenv("SESSION_COOKIE_INSECURE", "").lower() != "true",
+        max_age=SESSION_MAX_AGE,
     )
 
     global _oauth
@@ -112,9 +130,12 @@ def require_user(request: Request) -> dict:
         next_url = request.url.path
         if request.url.query:
             next_url += "?" + request.url.query
+        # Re-validate to be safe and percent-encode so an `&next=...` smuggled
+        # into the original query can't redefine the login redirect target.
+        encoded = urlencode({"next": safe_next(next_url)})
         raise HTTPException(
             status_code=302,
-            headers={"location": f"/auth/login?next={next_url}"},
+            headers={"location": f"/auth/login?{encoded}"},
         )
     raise HTTPException(status_code=401, detail="authentication required")
 
@@ -126,7 +147,7 @@ def install_routes(app) -> None:
 
     @app.get("/auth/login")
     async def login(request: Request, next: str = "/"):
-        request.session["post_login_next"] = next if next.startswith("/") else "/"
+        request.session["post_login_next"] = safe_next(next)
         redirect_uri = os.getenv("OIDC_REDIRECT_URI") or str(request.url_for("auth_callback"))
         return await _oauth.oidc.authorize_redirect(request, redirect_uri)
 
@@ -157,7 +178,7 @@ def install_routes(app) -> None:
         if id_token := token.get("id_token"):
             request.session["id_token"] = id_token
 
-        next_url = request.session.pop("post_login_next", "/")
+        next_url = safe_next(request.session.pop("post_login_next", "/"))
         return RedirectResponse(url=next_url, status_code=302)
 
     @app.get("/auth/logout")

@@ -95,6 +95,15 @@ USAGE_DIR.mkdir(parents=True, exist_ok=True)
 USAGE_LOG = USAGE_DIR / "usage.jsonl"
 RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
 
+# Pending permission requests deny themselves after this if the browser never
+# answers (closed tab, lost network). Without this the SDK turn pins forever.
+PERMISSION_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_WEB_PERMISSION_TIMEOUT", "900"))
+
+# Cap how many synth-message turns can chain off background tool notifications
+# before we stop and wait for the human. Prevents a notification-emitting tool
+# from looping the driver against the API forever.
+MAX_CONSECUTIVE_AUTO_FIRES = int(os.getenv("CLAUDE_WEB_MAX_AUTO_FIRES", "3"))
+
 MAX_TITLE_CHARS = 80
 MAX_LISTED_SESSIONS = 100
 MAX_SEARCH_RESULTS = 50
@@ -105,17 +114,20 @@ MAX_IMAGES_PER_TURN = 10
 ALLOWED_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 STATIC_DIR = Path(__file__).parent / "static"
 
-# Models exposed in the UI dropdown. Empty model id ("" → "Default") just
-# omits `model=` so the SDK uses whatever the CLI defaults to. The 1M-context
-# Opus variant isn't a separate model id — it's the `context-1m-2025-08-07`
-# beta flag — so we don't expose it as a picker option.
+# Models exposed in the UI dropdown. The form sends `key`; the server maps
+# that to (`model`, `betas`). Opus 4.7's 1M-context variant is exposed as a
+# separate option because it's enabled via a beta flag rather than a distinct
+# model id. The empty key ("" → "Default") omits `model=` so the SDK uses
+# whatever the CLI defaults to.
 KNOWN_MODELS = [
-    {"id": "", "label": "Default"},
-    {"id": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000},
-    {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000},
-    {"id": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000},
+    {"key": "", "model": "", "label": "Default", "betas": []},
+    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": []},
+    {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
+     "context": 1000000, "betas": ["context-1m-2025-08-07"]},
+    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": []},
+    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": []},
 ]
-ALLOWED_MODEL_IDS = {m["id"] for m in KNOWN_MODELS}
+MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
 
 # Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
 # bay before using user input as a filename.
@@ -373,8 +385,10 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
 # ─── Permission registry ──────────────────────────────────────────────────────
 
 
-# request_id → asyncio.Future[dict] (resolved by /api/permission)
-PENDING: dict[str, asyncio.Future] = {}
+# request_id → {"future": Future[dict], "owner_sub": str}.
+# owner_sub gates which logged-in user is allowed to resolve the request, so
+# in a multi-user deployment one user can't approve another user's tool call.
+PENDING: dict[str, dict] = {}
 
 
 def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
@@ -403,8 +417,9 @@ class ActiveRun:
     reconnecting browser replay-then-tail.
     """
 
-    def __init__(self, run_id: str):
+    def __init__(self, run_id: str, owner_sub: Optional[str] = None):
         self.run_id = run_id
+        self.owner_sub = owner_sub
         self.events: list[dict] = []
         self.subscribers: set[asyncio.Queue] = set()
         self.done = False
@@ -417,7 +432,10 @@ class ActiveRun:
         self.user_input_queue: asyncio.Queue = asyncio.Queue()
         self.pending_notifications: list[dict] = []
         self.notification_grace_started_at: Optional[float] = None
-        self.busy_in_turn: bool = False
+        # Tool notifications that arrive between turns auto-fire a synth user
+        # message. If the synth's tool calls emit more notifications we'd
+        # auto-fire forever; this counter caps the chain.
+        self.consecutive_auto_fires: int = 0
         self.last_activity: float = time.time()
 
     def emit(self, event: dict) -> None:
@@ -426,11 +444,9 @@ class ActiveRun:
             sid = event.get("session_id")
             if sid:
                 self.session_id = sid
+        # Subscriber queues are unbounded, so put_nowait can't fail here.
         for q in list(self.subscribers):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
+            q.put_nowait(event)
 
     def subscribe(self, start_index: int = 0) -> asyncio.Queue:
         """Subscribe to events from `start_index` onward.
@@ -456,10 +472,7 @@ class ActiveRun:
         self.done = True
         self.finished_at = time.time()
         for q in list(self.subscribers):
-            try:
-                q.put_nowait({"type": "_done"})
-            except asyncio.QueueFull:
-                pass
+            q.put_nowait({"type": "_done"})
         self.subscribers.clear()
 
 
@@ -493,6 +506,19 @@ def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
     if run is None or run.done or (run.task and run.task.done()):
         return None
     return run
+
+
+def _require_owner(run: ActiveRun, user: dict) -> None:
+    """Reject cross-user access in multi-user deployments.
+
+    Run ids are random UUIDs so this is mostly belt-and-braces, but
+    OIDC_ALLOWED_EMAILS advertises shared use and the cost of a check is
+    nothing. Runs created before owner tracking existed (owner_sub is None)
+    are allowed through.
+    """
+    owner = run.owner_sub
+    if owner and owner != user.get("sub"):
+        raise HTTPException(403, "not your run")
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -611,12 +637,9 @@ async def api_session(
     path = _find_session_path(sid, project)
     if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    # Recover the project_key from whichever configured project owns this dir.
-    project_key = ""
-    for p in PROJECTS:
-        if path.parent == _sessions_dir(p):
-            project_key = _sanitize_project_key(p)
-            break
+    # path lives at <CLAUDE_HOME>/projects/<sanitized-cwd>/<sid>.jsonl, so the
+    # parent dir's name *is* the project key — no need to walk PROJECTS.
+    project_key = path.parent.name
     return {
         "id": sid,
         "project": project_key,
@@ -720,9 +743,15 @@ async def api_permission(
 
     Accepts decision in {"allow", "allow_session", "deny"}.
     """
-    fut = PENDING.get(request_id)
-    if fut is None or fut.done():
+    entry = PENDING.get(request_id)
+    if entry is None:
         raise HTTPException(404, "no such pending request")
+    fut: asyncio.Future = entry["future"]
+    if fut.done():
+        raise HTTPException(404, "no such pending request")
+    owner = entry.get("owner_sub")
+    if owner and owner != user.get("sub"):
+        raise HTTPException(403, "not your permission request")
     if decision not in {"allow", "allow_session", "deny"}:
         raise HTTPException(400, "bad decision")
     fut.set_result({"decision": decision})
@@ -864,29 +893,34 @@ async def api_chat(
     _gc_runs()
 
     cwd = _resolve_project(project)
-    if model and model not in ALLOWED_MODEL_IDS:
+    if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, "unknown model")
+    selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
 
     image_blocks, _image_meta = await _read_uploaded_images(images)
 
     # Reuse an existing long-lived run for this session if we can.
     existing = _existing_run_for_session(session_id) if session_id else None
     if existing is not None:
+        _require_owner(existing, user)
         # Subscribe BEFORE we emit the new user_prompt so the new subscriber
         # only sees events from this turn forward, not the entire prior
         # history that the browser already rendered.
         start_index = len(existing.events)
         existing.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
         # Pending notifications get superseded by explicit user input — the
-        # user is now driving, no need to auto-fire.
+        # user is now driving, no need to auto-fire. Reset the chain counter
+        # so the user gets a fresh budget if their reply itself triggers
+        # background work later.
         existing.pending_notifications.clear()
         existing.notification_grace_started_at = None
+        existing.consecutive_auto_fires = 0
         await existing.user_input_queue.put({"text": message, "image_blocks": image_blocks})
         return _stream_run_response(existing, start_index=start_index)
 
     sid_in = session_id or None
     run_id = str(uuid_mod.uuid4())
-    run = ActiveRun(run_id)
+    run = ActiveRun(run_id, owner_sub=user.get("sub"))
     run.project_key = _sanitize_project_key(cwd)
     ACTIVE_RUNS[run_id] = run
     # First two events: run_id (so a reload can reconnect) and the user's
@@ -904,7 +938,7 @@ async def api_chat(
 
         request_id = str(uuid_mod.uuid4())
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        PENDING[request_id] = fut
+        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
         try:
             run.emit({
                 "type": "permission_request",
@@ -912,8 +946,23 @@ async def api_chat(
                 "tool": tool_name,
                 "input": tool_input,
                 "signature": sig,
+                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
             })
-            decision = await fut
+            try:
+                decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                run.emit({
+                    "type": "permission_timeout",
+                    "id": request_id,
+                    "tool": tool_name,
+                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                })
+                return PermissionResultDeny(
+                    message=(
+                        f"Permission request timed out after "
+                        f"{PERMISSION_TIMEOUT_SECONDS}s with no user response."
+                    ),
+                )
         finally:
             PENDING.pop(request_id, None)
 
@@ -947,13 +996,16 @@ async def api_chat(
         skills="all",
         include_partial_messages=False,
         stderr=_capture_stderr,
-        # Always enable the 1M-context beta when we're on Opus. Long debugging
-        # sessions blow past the 200k default, and the CLI surfaces the
-        # rejection as a cryptic "Error in input stream".
-        betas=["context-1m-2025-08-07"],
     )
-    if model:
-        options_kwargs["model"] = model
+    sdk_model = selected_model.get("model") or ""
+    if sdk_model:
+        options_kwargs["model"] = sdk_model
+    sdk_betas = list(selected_model.get("betas") or [])
+    if sdk_betas:
+        # The CLI surfaces an unsupported beta as "Error in input stream", so
+        # only set this when the picked variant actually wants it (currently
+        # only Opus 4.7's 1M-context option).
+        options_kwargs["betas"] = sdk_betas
     options = ClaudeAgentOptions(**options_kwargs)
 
     async def _query_iter_for(text: str, blocks: list[dict]):
@@ -983,35 +1035,53 @@ async def api_chat(
         """After ResultMessage, decide whether to send another turn or exit.
 
         - Queued user input (immediate) → return it.
-        - Pending task notifications + AUTO_FIRE_GRACE_MS settle → auto-fire.
+        - Pending task notifications + AUTO_FIRE_GRACE_MS settle → auto-fire,
+          unless the auto-fire chain has already hit MAX_CONSECUTIVE_AUTO_FIRES
+          (then we drop the notifications and wait for the human).
         - Neither for SESSION_IDLE_TIMEOUT_MS → return None (driver exits,
           subprocess closes, monitors die).
         """
-        # Auto-fire path: short timeout, then synth message
-        if run.pending_notifications and run.notification_grace_started_at:
+        cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
+
+        def _drain_pending_for_auto_fire() -> dict:
+            events = run.pending_notifications[:]
+            run.pending_notifications = []
+            run.notification_grace_started_at = None
+            run.consecutive_auto_fires += 1
+            synth = _compose_auto_fire_message(events)
+            run.emit({"type": "auto_fire", "events": events})
+            return {"kind": "auto_fire", "synth": synth}
+
+        def _drop_pending_capped() -> None:
+            dropped = run.pending_notifications[:]
+            run.pending_notifications = []
+            run.notification_grace_started_at = None
+            run.emit({
+                "type": "auto_fire_capped",
+                "events": dropped,
+                "limit": MAX_CONSECUTIVE_AUTO_FIRES,
+            })
+
+        # Auto-fire path: short timeout, then synth message.
+        if run.pending_notifications and run.notification_grace_started_at and not cap_reached:
             grace_remaining = AUTO_FIRE_GRACE_MS / 1000 - (time.time() - run.notification_grace_started_at)
             if grace_remaining <= 0:
-                events = run.pending_notifications[:]
-                run.pending_notifications = []
-                run.notification_grace_started_at = None
-                synth = _compose_auto_fire_message(events)
-                run.emit({"type": "auto_fire", "events": events})
-                return {"kind": "auto_fire", "synth": synth}
+                return _drain_pending_for_auto_fire()
             timeout = grace_remaining
         else:
+            if cap_reached and run.pending_notifications:
+                _drop_pending_capped()
             timeout = SESSION_IDLE_TIMEOUT_MS / 1000
 
         try:
             item = await asyncio.wait_for(run.user_input_queue.get(), timeout=timeout)
+            run.consecutive_auto_fires = 0
             return {"kind": "user", "item": item}
         except asyncio.TimeoutError:
+            if run.pending_notifications and not cap_reached:
+                return _drain_pending_for_auto_fire()
             if run.pending_notifications:
-                events = run.pending_notifications[:]
-                run.pending_notifications = []
-                run.notification_grace_started_at = None
-                synth = _compose_auto_fire_message(events)
-                run.emit({"type": "auto_fire", "events": events})
-                return {"kind": "auto_fire", "synth": synth}
+                _drop_pending_capped()
             return None
 
     async def driver():
@@ -1019,7 +1089,6 @@ async def api_chat(
             async with ClaudeSDKClient(options=options) as client:
                 # Initial user message — already enqueued for transcript;
                 # send into the SDK now.
-                run.busy_in_turn = True
                 await _send_user_message(client, message, image_blocks)
 
                 async for msg in client.receive_messages():
@@ -1047,11 +1116,9 @@ async def api_chat(
                         run.notification_grace_started_at = time.time()
 
                     if isinstance(msg, ResultMessage):
-                        run.busy_in_turn = False
                         next_action = await _wait_for_next_action(client)
                         if next_action is None:
                             break
-                        run.busy_in_turn = True
                         if next_action["kind"] == "user":
                             item = next_action["item"]
                             await _send_user_message(client, item.get("text") or "", item.get("image_blocks") or [])
@@ -1101,10 +1168,12 @@ async def api_chat_send(
     run = ACTIVE_RUNS.get(run_id)
     if run is None or run.done:
         raise HTTPException(404, "no such run")
+    _require_owner(run, user)
     image_blocks, _meta = await _read_uploaded_images(images)
     run.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
+    run.consecutive_auto_fires = 0
     await run.user_input_queue.put({"text": message, "image_blocks": image_blocks})
     return JSONResponse({"ok": True}, status_code=202)
 
@@ -1117,6 +1186,10 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
     _safe_id(run_id)
     run = ACTIVE_RUNS.get(run_id)
     if run is None:
+        return {"active": False}
+    # Don't leak existence/state of someone else's run; report inactive so the
+    # browser falls back to a fresh session.
+    if run.owner_sub and run.owner_sub != user.get("sub"):
         return {"active": False}
     return {
         "active": not run.done,
@@ -1134,16 +1207,20 @@ async def api_chat_stream(run_id: str, user: dict = Depends(auth.require_user)):
     run = ACTIVE_RUNS.get(run_id)
     if run is None:
         raise HTTPException(404, "no such run")
+    _require_owner(run, user)
     return _stream_run_response(run)
 
 
 @app.post("/api/chat/stop/{run_id}")
 async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
-    """Cancel the SDK task. Idempotent."""
+    """Cancel the SDK task. Idempotent for runs already finished."""
     _safe_id(run_id)
     run = ACTIVE_RUNS.get(run_id)
-    if run is None or run.done:
-        return {"ok": False}
+    if run is None:
+        raise HTTPException(404, "no such run")
+    _require_owner(run, user)
+    if run.done:
+        return {"ok": True, "already_done": True}
     if run.task and not run.task.done():
         run.task.cancel()
     return {"ok": True}
@@ -1272,7 +1349,7 @@ def _sdk_message_to_events(msg) -> list[dict]:
 
 def _save_rate_limit(rli: dict) -> None:
     try:
-        RATE_LIMIT_CACHE.write_text(json.dumps({"info": rli, "captured_at": int(_time())}))
+        RATE_LIMIT_CACHE.write_text(json.dumps({"info": rli, "captured_at": int(time.time())}))
     except Exception:
         pass
 
@@ -1281,7 +1358,7 @@ def _log_usage(msg) -> None:
     """Append one row per completed turn to usage.jsonl."""
     usage = getattr(msg, "usage", None) or {}
     row = {
-        "ts": int(_time()),
+        "ts": int(time.time()),
         "session_id": msg.session_id,
         "duration_ms": msg.duration_ms,
         "total_cost_usd": msg.total_cost_usd,
@@ -1296,11 +1373,6 @@ def _log_usage(msg) -> None:
             f.write(json.dumps(row) + "\n")
     except Exception:
         pass
-
-
-def _time() -> float:
-    import time
-    return time.time()
 
 
 def _today_window() -> tuple[int, int]:

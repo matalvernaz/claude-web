@@ -45,8 +45,12 @@
   const queueArea = document.getElementById("queue-area");
 
   // Per-model context windows for the meter; null = unknown / hide bar.
+  // Keyed on the picker value (which is the variant key, not the raw SDK
+  // model id) so "claude-opus-4-7-1m" resolves to the 1M window even though
+  // the underlying model id is plain "claude-opus-4-7".
   const MODEL_CONTEXT = {
     "claude-opus-4-7": 200000,
+    "claude-opus-4-7-1m": 1000000,
     "claude-sonnet-4-6": 1000000,
     "claude-haiku-4-5": 200000,
   };
@@ -249,6 +253,19 @@
     window.marked.setOptions({ gfm: true, breaks: true });
   }
 
+  // Force every assistant-rendered <a href> to open in a new tab with a
+  // hardened rel attribute. Without this an assistant link click replaces
+  // the chat view (losing in-flight state) and the new tab can read
+  // window.opener via the legacy rel-less default.
+  if (window.DOMPurify && typeof window.DOMPurify.addHook === "function") {
+    window.DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+      if (node.tagName === "A" && node.getAttribute("href")) {
+        node.setAttribute("target", "_blank");
+        node.setAttribute("rel", "noopener noreferrer");
+      }
+    });
+  }
+
   function renderMarkdown(text) {
     // Assistant output is untrusted — it routinely echoes web pages, file
     // contents, and tool output. marked passes raw HTML through, so an
@@ -394,6 +411,10 @@
 
   newChatBtn.addEventListener("click", () => {
     sessionId = "";
+    // Clear the URL-pinned project so the picker takes over again. Without
+    // this, a chat opened from a session URL stayed glued to that project
+    // even after the user picked a different one and clicked New chat.
+    sessionProject = "";
     transcript.innerHTML = "";
     updateTodosPanel([]);
     history.replaceState({}, "", location.pathname);
@@ -1058,10 +1079,10 @@
       const reset = rl.resetsAt ? new Date(rl.resetsAt * 1000) : null;
       const resetText = reset ? `${reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (${humanIn(reset)})` : "—";
       html += `<div class="summary">
-        <strong>Rate limit (${escape(rl.rateLimitType || "")})</strong><br>
-        <span>Status: ${escape(rl.status || "—")}</span>
+        <strong>Rate limit (${htmlEscape(rl.rateLimitType || "")})</strong><br>
+        <span>Status: ${htmlEscape(rl.status || "—")}</span>
         <span>Resets: ${resetText}</span>
-        ${rl.overageStatus ? `<span>Overage: ${escape(rl.overageStatus)}</span>` : ""}
+        ${rl.overageStatus ? `<span>Overage: ${htmlEscape(rl.overageStatus)}</span>` : ""}
       </div>`;
     } else {
       html += `<div class="summary"><em>No rate-limit info captured yet — send one message and reopen.</em></div>`;
@@ -1078,7 +1099,7 @@
     if (t.sessions && t.sessions.length) {
       html += `<table><thead><tr><th>Session</th><th>Turns</th><th>Cost</th></tr></thead><tbody>`;
       for (const s of t.sessions) {
-        html += `<tr><td>${escape(s.title)}</td><td>${s.turns}</td><td>${cost(s.cost_usd)}</td></tr>`;
+        html += `<tr><td>${htmlEscape(s.title)}</td><td>${s.turns}</td><td>${cost(s.cost_usd)}</td></tr>`;
       }
       html += `</tbody></table>`;
     } else {
@@ -1097,7 +1118,7 @@
     return Math.floor(diff / 3600) + "h " + Math.floor((diff % 3600) / 60) + "m";
   }
 
-  function escape(s) {
+  function htmlEscape(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
