@@ -708,6 +708,25 @@
     } else if (obj.type === "stopped") {
       setStatus("Stopped.");
       announce("Stopped.");
+    } else if (obj.type === "restarted_during_run") {
+      // The server was restarted while a previous turn was running. The
+      // SDK subprocess is gone, but the conversation jsonl on disk and our
+      // session_id are intact — sending a new message will resume cleanly.
+      ctx.currentAssistantBody = null;
+      const article = document.createElement("article");
+      article.className = "msg info";
+      const role = document.createElement("h3");
+      role.className = "role";
+      role.textContent = "Server restarted";
+      const body = document.createElement("p");
+      body.className = "info-body";
+      body.textContent = obj.message || "Server restarted mid-turn.";
+      article.appendChild(role);
+      article.appendChild(body);
+      transcript.appendChild(article);
+      transcript.scrollTop = transcript.scrollHeight;
+      announce("Server restarted while the previous turn was running.");
+      setStatus("Server restarted mid-turn — send a new message to continue.");
     } else if (obj.type === "system" && obj.subtype === "init") {
       // first chunk has session_id — record it for resume
       if (obj.session_id && !sessionId) {

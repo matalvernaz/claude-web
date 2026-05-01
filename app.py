@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import traceback
 import uuid as uuid_mod
@@ -95,6 +96,13 @@ USAGE_DIR = Path(os.getenv("CLAUDE_WEB_STATE_DIR", str(Path.home() / ".claude-we
 USAGE_DIR.mkdir(parents=True, exist_ok=True)
 USAGE_LOG = USAGE_DIR / "usage.jsonl"
 RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
+STATE_DB_PATH = USAGE_DIR / "state.db"
+
+# How long persisted runs (events + metadata) survive before being purged.
+# Default 24h; tune via CLAUDE_WEB_PERSIST_RETENTION. The matching in-memory
+# retention (RUN_RETENTION_SECONDS) is set to the same value so the GC pass
+# and the sqlite purge stay aligned.
+PERSIST_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_PERSIST_RETENTION", "86400"))
 
 # Pending permission requests deny themselves after this if the browser never
 # answers (closed tab, lost network). Without this the SDK turn pins forever.
@@ -537,7 +545,172 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
-# ─── Active run tracking ──────────────────────────────────────────────────────
+# ─── State persistence (sqlite-backed run + event store) ─────────────────────
+#
+# Goal: a `systemctl restart claude-web` doesn't lose the user's transcript.
+# We persist run metadata + every emitted event row so a reload's tryResume
+# path keeps working: the browser's run_id still resolves to a (now-finished)
+# ActiveRun whose events SSE replays. The next user message hits a fresh
+# /api/chat with `resume=session_id`, which the SDK uses to pick the
+# conversation back up from the underlying jsonl file. We don't try to
+# reattach to the killed CLI subprocess — anything in-flight at restart time
+# (a partial tool call, a queued auto-fire) is gone, but the conversation
+# itself is intact.
+
+
+_STATE_DB: Optional[sqlite3.Connection] = None
+
+
+def _state_db() -> sqlite3.Connection:
+    """Lazy-open + initialise the sqlite connection. WAL + autocommit."""
+    global _STATE_DB
+    if _STATE_DB is None:
+        conn = sqlite3.connect(str(STATE_DB_PATH), check_same_thread=False, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            owner_sub TEXT,
+            session_id TEXT,
+            project_key TEXT,
+            created_at REAL NOT NULL,
+            finished_at REAL,
+            last_activity REAL NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_finished ON runs(finished_at)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS events (
+            run_id TEXT NOT NULL,
+            idx INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY(run_id, idx)
+        )""")
+        _STATE_DB = conn
+    return _STATE_DB
+
+
+def _persist_run_meta(run: "ActiveRun") -> None:
+    """Upsert the runs row. COALESCE preserves session_id/project_key once set
+    so a later emit() that doesn't carry them can't blank them out."""
+    try:
+        _state_db().execute(
+            """
+            INSERT INTO runs(run_id, owner_sub, session_id, project_key,
+                             created_at, finished_at, last_activity)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                session_id=COALESCE(excluded.session_id, runs.session_id),
+                project_key=COALESCE(excluded.project_key, runs.project_key),
+                finished_at=excluded.finished_at,
+                last_activity=excluded.last_activity
+            """,
+            (
+                run.run_id, run.owner_sub, run.session_id, run.project_key,
+                run.created_at, run.finished_at, run.last_activity,
+            ),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("persist_run_meta failed: %s", e)
+
+
+def _persist_event(run_id: str, idx: int, event: dict) -> None:
+    try:
+        payload = json.dumps(event)
+    except (TypeError, ValueError):
+        return
+    try:
+        _state_db().execute(
+            "INSERT OR REPLACE INTO events(run_id, idx, payload) VALUES(?, ?, ?)",
+            (run_id, idx, payload),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("persist_event failed: %s", e)
+
+
+def _purge_old_persisted(now: float) -> None:
+    cutoff = now - PERSIST_RETENTION_SECONDS
+    try:
+        db = _state_db()
+        db.execute(
+            "DELETE FROM events WHERE run_id IN ("
+            " SELECT run_id FROM runs WHERE COALESCE(finished_at, last_activity) < ?"
+            ")",
+            (cutoff,),
+        )
+        db.execute(
+            "DELETE FROM runs WHERE COALESCE(finished_at, last_activity) < ?",
+            (cutoff,),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("purge_old_persisted failed: %s", e)
+
+
+def _restore_persisted_runs() -> None:
+    """At boot, hydrate ACTIVE_RUNS from sqlite as already-finished entries.
+
+    Each restored run is marked done so the in-memory state is consistent
+    with "the live SDK turn is gone". Runs that died mid-flight (finished_at
+    NULL on disk) get a synthetic `restarted_during_run` event appended so
+    the user knows what happened, and the synth is itself persisted so the
+    next restart sees a clean already-finished row.
+    """
+    now = time.time()
+    _purge_old_persisted(now)
+    try:
+        rows = _state_db().execute(
+            "SELECT run_id, owner_sub, session_id, project_key, created_at,"
+            " finished_at, last_activity FROM runs ORDER BY created_at"
+        ).fetchall()
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("restore_persisted_runs read failed: %s", e)
+        return
+
+    log = logging.getLogger("claude-web")
+    restored = 0
+    interrupted = 0
+    for run_id, owner_sub, session_id, project_key, created_at, finished_at, last_activity in rows:
+        run = ActiveRun(run_id, owner_sub=owner_sub)
+        run.created_at = created_at or now
+        run.last_activity = last_activity or now
+        run.session_id = session_id
+        run.project_key = project_key
+        try:
+            evt_rows = _state_db().execute(
+                "SELECT payload FROM events WHERE run_id = ? ORDER BY idx", (run_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            evt_rows = []
+        for (payload,) in evt_rows:
+            try:
+                run.events.append(json.loads(payload))
+            except (TypeError, ValueError):
+                continue
+        was_killed = finished_at is None
+        if was_killed:
+            synth = {
+                "type": "restarted_during_run",
+                "message": (
+                    "Server restarted while this turn was running. The "
+                    "conversation is intact — send a new message and Claude "
+                    "will pick up from here."
+                ),
+                "ts": now,
+            }
+            run.events.append(synth)
+            _persist_event(run_id, len(run.events) - 1, synth)
+            interrupted += 1
+        run.done = True
+        run.finished_at = finished_at or now
+        ACTIVE_RUNS[run_id] = run
+        if was_killed:
+            _persist_run_meta(run)
+        restored += 1
+
+    if restored:
+        log.info("Restored %d run(s) from %s (%d interrupted)",
+                 restored, STATE_DB_PATH, interrupted)
+
+
+# ─── Active run tracking ─────────────────────────────────────────────────────
 
 
 class ActiveRun:
@@ -561,6 +734,8 @@ class ActiveRun:
         self.session_id: Optional[str] = None
         self.project_key: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
+        now = time.time()
+        self.created_at: float = now
         self.finished_at: Optional[float] = None
         self.session_allowlist: set[tuple[str, str]] = set()
         # Long-lived conversation state.
@@ -571,17 +746,28 @@ class ActiveRun:
         # message. If the synth's tool calls emit more notifications we'd
         # auto-fire forever; this counter caps the chain.
         self.consecutive_auto_fires: int = 0
-        self.last_activity: float = time.time()
+        self.last_activity: float = now
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
+        idx = len(self.events) - 1
+        meta_changed = False
         if event.get("type") == "system" and event.get("subtype") == "init":
             sid = event.get("session_id")
-            if sid:
+            if sid and self.session_id != sid:
                 self.session_id = sid
+                meta_changed = True
+        if event.get("type") == "run_started":
+            meta_changed = True
+        self.last_activity = time.time()
         # Subscriber queues are unbounded, so put_nowait can't fail here.
         for q in list(self.subscribers):
             q.put_nowait(event)
+        # Persist after fan-out so a slow disk write never blocks the live
+        # browser update. Failures are logged and swallowed.
+        _persist_event(self.run_id, idx, event)
+        if meta_changed:
+            _persist_run_meta(self)
 
     def subscribe(self, start_index: int = 0) -> asyncio.Queue:
         """Subscribe to events from `start_index` onward.
@@ -606,16 +792,24 @@ class ActiveRun:
     def finish(self) -> None:
         self.done = True
         self.finished_at = time.time()
+        self.last_activity = self.finished_at
         for q in list(self.subscribers):
             q.put_nowait({"type": "_done"})
         self.subscribers.clear()
+        _persist_run_meta(self)
 
 
 ACTIVE_RUNS: dict[str, ActiveRun] = {}
 ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
-RUN_RETENTION_SECONDS = 300  # keep finished runs around so a slow reconnect can still replay
+# Match PERSIST_RETENTION_SECONDS so a finished run that's still on disk is
+# also still in memory — saves a "load on demand from sqlite" code path.
+RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
 AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
 SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
+
+# Hydrate from sqlite at module load so uvicorn's first request already sees
+# whatever state survived the last restart.
+_restore_persisted_runs()
 
 
 def _gc_runs() -> None:

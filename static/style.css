@@ -678,7 +678,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   outline: none;
 }
 
-/* ─── Error block in transcript ───────────────────────────────────────── */
+/* ─── Error / info block in transcript ────────────────────────────────── */
 .msg.error {
   border: 1px solid #d96868;
   background: rgba(217, 104, 104, 0.08);
@@ -687,6 +687,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   max-width: none;
 }
 .msg.error .role { color: #d96868; }
+.msg.info {
+  border: 1px solid #d8a657;
+  background: rgba(216, 166, 87, 0.08);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  max-width: none;
+}
+.msg.info .role { color: #d8a657; }
+.info-body { margin: 0.4rem 0 0; line-height: 1.4; }
 .error-body {
   margin: 0.4rem 0 0;
   font-family: ui-monospace, SFMono-Regular, monospace;
