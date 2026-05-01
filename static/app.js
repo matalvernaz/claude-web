@@ -11,6 +11,17 @@
   const newChatBtn = document.getElementById("new-chat");
   const sessionList = document.getElementById("session-list");
   const headerCostEl = document.getElementById("header-cost");
+  const modelSelect = document.getElementById("model-select");
+  const projectSelect = document.getElementById("project-select");
+  const imageInput = document.getElementById("image-input");
+  const attachmentsEl = document.getElementById("attachments");
+  const slashMenu = document.getElementById("slash-menu");
+  const contextMeter = document.getElementById("context-meter");
+  const contextText = document.getElementById("context-text");
+  const contextFill = document.getElementById("context-fill");
+  const searchModeEl = document.getElementById("search-mode");
+  const searchModeLabel = document.getElementById("search-mode-label");
+  const searchClearBtn = document.getElementById("search-clear");
 
   // AbortController for the in-flight chat stream — used by Stop and to
   // abandon a resume attempt. The SDK task lives server-side independently
@@ -20,6 +31,27 @@
   // can rejoin via /api/chat/stream/{run_id}.
   let currentRunId = null;
   const RUN_KEY = "claude-web.active-run";
+  const MODEL_KEY = "claude-web.model";
+  const PROJECT_KEY = "claude-web.project";
+
+  // Pending image attachments for the next send. Each entry is {file, dataUrl}.
+  let pendingImages = [];
+
+  // Outgoing message queue. While a turn is streaming, pressing Send pushes
+  // here instead of starting a new request; drainStream flushes the queue
+  // when the current turn finishes. Entries: {text, images}.
+  const messageQueue = [];
+  let isStreaming = false;
+  const queueArea = document.getElementById("queue-area");
+
+  // Per-model context windows for the meter; null = unknown / hide bar.
+  const MODEL_CONTEXT = {
+    "claude-opus-4-7": 200000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-haiku-4-5": 200000,
+  };
+  let lastSeenModel = null;
+  let lastInputTokens = null;
 
   // Quietly tell NVDA / VoiceOver something interesting happened. The
   // visible "Thinking…" text in #status is also live, but this region is
@@ -56,6 +88,37 @@
 
   const params = new URLSearchParams(location.search);
   let sessionId = params.get("session") || "";
+  let sessionProject = params.get("project") || "";
+
+  // Restore model + project from localStorage so the picks persist across reloads.
+  if (modelSelect) {
+    const savedModel = localStorage.getItem(MODEL_KEY);
+    if (savedModel !== null && [...modelSelect.options].some((o) => o.value === savedModel)) {
+      modelSelect.value = savedModel;
+    }
+    modelSelect.addEventListener("change", () => {
+      localStorage.setItem(MODEL_KEY, modelSelect.value);
+      lastSeenModel = modelSelect.value || lastSeenModel;
+      renderContextMeter();
+    });
+  }
+  if (projectSelect) {
+    const savedProject = localStorage.getItem(PROJECT_KEY);
+    if (savedProject !== null && [...projectSelect.options].some((o) => o.value === savedProject)) {
+      projectSelect.value = savedProject;
+    }
+    if (sessionProject && [...projectSelect.options].some((o) => o.value === sessionProject)) {
+      projectSelect.value = sessionProject;
+    }
+    projectSelect.addEventListener("change", () => {
+      localStorage.setItem(PROJECT_KEY, projectSelect.value);
+    });
+  }
+
+  function currentProject() {
+    if (sessionProject) return sessionProject;
+    return projectSelect ? projectSelect.value : "";
+  }
 
   // Always refresh the sidebar from /api/sessions on load — the server-rendered
   // list can be stale if the HTML was cached or another tab created sessions.
@@ -70,12 +133,13 @@
     if (resumed) return;
     if (sessionId) {
       try {
-        await loadSession(sessionId);
+        await loadSession(sessionId, sessionProject);
       } catch (err) {
         setStatus("Could not load session: " + err.message);
       }
       markActive(sessionId);
     }
+    renderContextMeter();
   })();
 
   async function refreshHeaderCost() {
@@ -107,10 +171,34 @@
 
   // Enter to send, Shift+Enter for newline. Skip when the Send button is
   // disabled so we don't fire a second /api/chat over a still-streaming one.
+  // When the slash menu is open, Up/Down/Enter/Tab navigate it.
   promptEl.addEventListener("keydown", (e) => {
+    if (slashMenu && !slashMenu.hidden && slashItems.length) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        slashActive = (slashActive + 1) % slashItems.length;
+        updateSlashHighlight();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        slashActive = (slashActive - 1 + slashItems.length) % slashItems.length;
+        updateSlashHighlight();
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        acceptSlash(slashActive);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        hideSlashMenu();
+        return;
+      }
+    }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      if (sendBtn.disabled) return;
       form.requestSubmit();
     }
   });
@@ -122,21 +210,38 @@
     if (link) link.parentElement.classList.add("active");
   }
 
-  async function loadSession(id) {
-    const r = await fetch(`/api/sessions/${id}`);
+  async function loadSession(id, project) {
+    const url = new URL(`/api/sessions/${id}`, location.origin);
+    if (project) url.searchParams.set("project", project);
+    const r = await fetch(url);
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
+    sessionProject = data.project || sessionProject || "";
     transcript.innerHTML = "";
     for (const m of data.messages) {
-      if (m.role === "user" || m.role === "assistant") {
-        appendMessage(m.role, m.text);
+      if (m.role === "user") {
+        const body = appendMessage("user", m.text || "");
+        if (m.image_count) appendImagePlaceholder(body, m.image_count);
+      } else if (m.role === "assistant") {
+        appendMessage("assistant", m.text);
       } else if (m.role === "tool_use") {
-        insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
+        if ((m.name === "Edit" || m.name === "Write") && m.input) {
+          insertDiffMessage(m.name, m.input);
+        } else {
+          insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
+        }
       } else if (m.role === "tool_result") {
         insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
       }
     }
     transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  function appendImagePlaceholder(bodyEl, count) {
+    const note = document.createElement("div");
+    note.className = "image-placeholder";
+    note.textContent = `📎 ${count} image${count === 1 ? "" : "s"} attached`;
+    bodyEl.parentElement.appendChild(note);
   }
 
   // marked is loaded globally from /static/marked.min.js
@@ -298,14 +403,60 @@
   });
 
   function setStreaming(on) {
-    sendBtn.hidden = on;
-    sendBtn.disabled = on;
+    // "on" means: a turn is currently in progress (between submit/auto-fire
+    // and the next ResultMessage). The SSE may stay open across multiple
+    // turns; this state toggles back and forth as result/auto_fire events
+    // arrive.
+    isStreaming = on;
+    sendBtn.hidden = false;
+    sendBtn.disabled = false;
+    sendBtn.textContent = on ? "Queue" : "Send";
     stopBtn.hidden = !on;
+  }
+
+  function renderQueue() {
+    if (!queueArea) return;
+    queueArea.innerHTML = "";
+    if (!messageQueue.length) {
+      queueArea.hidden = true;
+      return;
+    }
+    queueArea.hidden = false;
+    const heading = document.createElement("span");
+    heading.className = "queue-heading";
+    heading.textContent = `${messageQueue.length} queued`;
+    queueArea.appendChild(heading);
+    messageQueue.forEach((entry, idx) => {
+      const chip = document.createElement("span");
+      chip.className = "queue-chip";
+      const label = document.createElement("span");
+      label.className = "queue-text";
+      const previewText = entry.text || (entry.images.length ? `[${entry.images.length} image${entry.images.length === 1 ? "" : "s"}]` : "(empty)");
+      label.textContent = previewText.length > 60 ? previewText.slice(0, 60) + "…" : previewText;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "queue-cancel";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `Cancel queued message: ${previewText}`);
+      del.addEventListener("click", () => {
+        messageQueue.splice(idx, 1);
+        renderQueue();
+        announce("Queued message cancelled.");
+      });
+      chip.appendChild(label);
+      chip.appendChild(del);
+      queueArea.appendChild(chip);
+    });
   }
 
   stopBtn.addEventListener("click", async () => {
     // Tell the server to cancel the SDK task. The fetch will then end on
-    // its own when the run finishes; abort is fallback insurance.
+    // its own when the run finishes; abort is fallback insurance. Also
+    // empty the outgoing queue — Stop means stop, not "stop just this one".
+    if (messageQueue.length) {
+      messageQueue.length = 0;
+      renderQueue();
+    }
     if (currentRunId) {
       try {
         await fetch(`/api/chat/stop/${encodeURIComponent(currentRunId)}`, { method: "POST" });
@@ -316,21 +467,99 @@
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (sendBtn.disabled) return;  // belt-and-braces against double-submit
+    if (slashMenu && !slashMenu.hidden) {
+      // Tab/Enter through the slash menu went to the form for some reason —
+      // ignore. The menu's own keyboard handler will accept the suggestion.
+      return;
+    }
     const text = promptEl.value.trim();
-    if (!text) return;
-    // Server echoes the prompt back as a user_prompt event; that's the
-    // single source of truth for rendering it in the transcript.
+    if (!text && pendingImages.length === 0) return;
+    // Intercept client-side slash commands BEFORE we treat the input as a
+    // user message to the model. Everything else (e.g. skills like
+    // /security-review) flows through as text — the model recognises the
+    // syntax even though the SDK doesn't.
+    if (text.startsWith("/") && pendingImages.length === 0) {
+      const handled = await handleClientSlashCommand(text);
+      if (handled) {
+        promptEl.value = "";
+        return;
+      }
+    }
+    const entry = { text, images: pendingImages.slice() };
     promptEl.value = "";
+    clearAttachments();
+    if (isStreaming) {
+      // Currently mid-turn — queue this for when the current run finishes.
+      messageQueue.push(entry);
+      renderQueue();
+      announce(`Queued. ${messageQueue.length} message${messageQueue.length === 1 ? "" : "s"} pending.`);
+      promptEl.focus();
+      return;
+    }
+    if (currentRunId) {
+      // SSE is still open from a previous turn (long-lived run) — send into
+      // it instead of opening a second stream.
+      await sendInExistingRun(entry);
+      return;
+    }
+    await sendOne(entry);
+    await drainQueue();
+  });
+
+  async function sendInExistingRun(entry) {
+    if (!currentRunId) {
+      await sendOne(entry);
+      return;
+    }
+    setStreaming(true);
+    startGerunds();
+    announce("Sent. Claude is responding.");
+    try {
+      const fd = new FormData();
+      fd.append("message", entry.text || "");
+      for (const img of entry.images) {
+        fd.append("images", img.file, img.file.name);
+      }
+      const r = await fetch(`/api/chat/send/${encodeURIComponent(currentRunId)}`, { method: "POST", body: fd });
+      if (r.status === 404) {
+        // Run died on the server — fall back to opening a fresh one.
+        currentRunId = null;
+        sessionStorage.removeItem(RUN_KEY);
+        await sendOne(entry);
+        return;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      // The existing SSE stream will deliver the new turn's events; nothing
+      // else to do here. setStreaming(false) happens on the next result.
+    } catch (err) {
+      handleStreamError(err);
+      setStreaming(false);
+    }
+  }
+
+  function drainQueueIfPossible() {
+    if (!messageQueue.length || !currentRunId || isStreaming) return;
+    const entry = messageQueue.shift();
+    renderQueue();
+    announce("Sending next queued message.");
+    sendInExistingRun(entry).catch((err) => handleStreamError(err));
+  }
+
+  async function sendOne(entry) {
     setStreaming(true);
     currentAbort = new AbortController();
     startGerunds();
     announce("Sent. Claude is responding.");
-
     try {
       const fd = new FormData();
-      fd.append("message", text);
+      fd.append("message", entry.text || "");
       if (sessionId) fd.append("session_id", sessionId);
+      const project = currentProject();
+      if (project) fd.append("project", project);
+      if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+      for (const img of entry.images) {
+        fd.append("images", img.file, img.file.name);
+      }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: currentAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
       await drainStream(r);
@@ -343,7 +572,16 @@
       setStreaming(false);
       promptEl.focus();
     }
-  });
+  }
+
+  async function drainQueue() {
+    while (messageQueue.length) {
+      const next = messageQueue.shift();
+      renderQueue();
+      announce("Sending next queued message.");
+      await sendOne(next);
+    }
+  }
 
   async function drainStream(response) {
     // Mutable holder so handleSSEEvent can lazy-create a new assistant
@@ -399,6 +637,7 @@
       sessionStorage.removeItem(RUN_KEY);
       return false;
     }
+    if (info.project) sessionProject = info.project;
     currentRunId = savedRunId;
     setStreaming(true);
     currentAbort = new AbortController();
@@ -437,11 +676,14 @@
         currentRunId = obj.run_id;
         sessionStorage.setItem(RUN_KEY, obj.run_id);
       }
+      if (obj.project) sessionProject = obj.project;
+      if (obj.model) lastSeenModel = obj.model;
     } else if (obj.type === "user_prompt") {
       // Single source of truth for "the user's message in the transcript":
       // the server echoes the prompt as an event so both live and resumed
       // streams render it the same way.
-      appendMessage("user", obj.text || "");
+      const body = appendMessage("user", obj.text || "");
+      if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
     } else if (obj.type === "stopped") {
       setStatus("Stopped.");
       announce("Stopped.");
@@ -451,8 +693,10 @@
         sessionId = obj.session_id;
         const url = new URL(location.href);
         url.searchParams.set("session", sessionId);
+        if (sessionProject) url.searchParams.set("project", sessionProject);
         history.replaceState({}, "", url.toString());
       }
+      if (obj.model) lastSeenModel = obj.model;
     } else if (obj.type === "assistant" && obj.message) {
       const blocks = obj.message.content || [];
       for (const blk of blocks) {
@@ -469,7 +713,11 @@
           // Subsequent text blocks should land in a new assistant article
           // *after* this tool call, not into the one above it.
           ctx.currentAssistantBody = null;
-          insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
+          if (blk.name === "Edit" || blk.name === "Write") {
+            insertDiffMessage(blk.name, blk.input || {});
+          } else {
+            insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
+          }
           markVisibleActivity();
         }
       }
@@ -490,11 +738,147 @@
       renderPermissionCard(obj);
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
+    } else if (obj.type === "task_started") {
+      renderTaskEvent("started", obj);
+    } else if (obj.type === "task_progress") {
+      renderTaskEvent("progress", obj);
+    } else if (obj.type === "task_notification") {
+      renderTaskEvent("notification", obj);
+    } else if (obj.type === "auto_fire") {
+      // Server is auto-firing a follow-up turn driven by a buffered
+      // task notification. Flip the spinner back on.
+      setStreaming(true);
+      startGerunds();
+      announce("Auto-responding to background events.");
     } else if (obj.type === "result") {
       ctx.lastResult = obj;
-      if (obj.is_error) setStatus("Error: " + (obj.result || obj.subtype));
+      if (typeof obj.input_tokens === "number") {
+        lastInputTokens = obj.input_tokens;
+        renderContextMeter();
+      }
+      // Treat each result as the end of THIS turn even if the SSE stays
+      // open for an auto-fire chain. Spinner stops; user can send a new
+      // message; if an auto_fire event arrives next we'll flip it back.
+      stopGerunds();
+      const summary = summariseResult(obj);
+      setStatus(summary);
+      announce(summary);
+      refreshSessions();
+      refreshHeaderCost();
+      setStreaming(false);
+      // Drain any client-side queued messages — the user submitted them
+      // mid-turn and we promised we'd flush after the turn ends.
+      drainQueueIfPossible();
+      if (obj.is_error) {
+        const lines = [obj.result || obj.subtype || "Error"];
+        if (Array.isArray(obj.errors) && obj.errors.length) {
+          lines.push("--- errors ---", ...obj.errors.map((x) => typeof x === "string" ? x : JSON.stringify(x, null, 2)));
+        }
+        // Last-resort: dump the whole result envelope so we have every clue
+        // the SDK gave us. If two passes of debugging still leave us blind,
+        // the raw fields (subtype, stop_reason, model_usage, etc.) usually
+        // pinpoint it.
+        const dump = { ...obj };
+        delete dump.type;
+        lines.push("--- raw result ---", JSON.stringify(dump, null, 2));
+        const detail = lines.join("\n");
+        setStatus("Error: " + (obj.result || obj.subtype || "see transcript"));
+        renderErrorBlock(detail);
+        announce("Error: " + (obj.result || ""));
+      }
     } else if (obj.type === "error") {
-      setStatus("Error: " + (obj.message || obj.stderr || obj.exit_code));
+      const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : (obj.message || obj.exit_code || "Error");
+      setStatus("Error: " + (obj.message || obj.exit_code || "see transcript"));
+      renderErrorBlock(String(detail));
+      announce("Error: " + (obj.message || ""));
+    }
+  }
+
+  function renderTaskEvent(kind, obj) {
+    // Group all events for the same task_id under one collapsible block so
+    // a chatty Monitor doesn't flood the transcript. The block updates in
+    // place as later events arrive.
+    const id = obj.task_id || "?";
+    const blockId = `task-${id}`;
+    let block = document.getElementById(blockId);
+    if (!block) {
+      block = document.createElement("details");
+      block.id = blockId;
+      block.className = "task-block";
+      block.open = true;
+      const summary = document.createElement("summary");
+      summary.className = "task-summary";
+      summary.textContent = "▶ " + (obj.description || "task " + id);
+      block.appendChild(summary);
+      const log = document.createElement("div");
+      log.className = "task-log";
+      block.appendChild(log);
+      transcript.appendChild(block);
+    }
+    const summary = block.querySelector("summary");
+    const log = block.querySelector(".task-log");
+
+    // Update summary with latest description + status.
+    if (kind === "started") {
+      summary.textContent = "▶ " + (obj.description || "task " + id);
+    } else if (kind === "notification") {
+      const status = obj.status || "done";
+      const icon = status === "success" ? "✓" : status === "error" ? "✗" : "●";
+      summary.textContent = `${icon} ${obj.description || obj.summary || "task " + id} (${status})`;
+      block.classList.add("task-" + status);
+    }
+
+    // Append log line.
+    const line = document.createElement("div");
+    line.className = "task-line task-line-" + kind;
+    if (kind === "progress") {
+      line.textContent = (obj.last_tool_name ? `[${obj.last_tool_name}] ` : "") + (obj.description || "");
+    } else if (kind === "notification") {
+      line.textContent = (obj.summary || "(no summary)");
+    } else {
+      line.textContent = obj.description || "started";
+    }
+    log.appendChild(line);
+    transcript.scrollTop = transcript.scrollHeight;
+    markVisibleActivity();
+    if (kind === "notification") {
+      announce(`Background task ${id}: ${obj.status || "done"}`);
+    }
+  }
+
+  function renderErrorBlock(detail) {
+    const article = document.createElement("article");
+    article.className = "msg error";
+    const role = document.createElement("h3");
+    role.className = "role";
+    role.textContent = "Error";
+    const body = document.createElement("pre");
+    body.className = "error-body";
+    body.textContent = detail;
+    article.appendChild(role);
+    article.appendChild(body);
+    transcript.appendChild(article);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  function renderContextMeter() {
+    if (!contextMeter) return;
+    const model = (modelSelect && modelSelect.value) || lastSeenModel;
+    const max = model && MODEL_CONTEXT[model];
+    if (!lastInputTokens) {
+      contextMeter.hidden = true;
+      return;
+    }
+    contextMeter.hidden = false;
+    const pretty = (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+    if (max) {
+      const pct = Math.min(100, Math.round((lastInputTokens / max) * 100));
+      contextText.textContent = `${pretty(lastInputTokens)} / ${pretty(max)} (${pct}%)`;
+      contextFill.style.width = pct + "%";
+      contextFill.style.background = pct > 85 ? "#d96868" : pct > 70 ? "#d8a657" : "var(--accent)";
+    } else {
+      contextText.textContent = pretty(lastInputTokens);
+      contextFill.style.width = "0%";
     }
   }
 
@@ -611,6 +995,15 @@
       todosList.innerHTML = "";
       return;
     }
+    // Hide the panel once everything is done. The TodoWrite tool calls are
+    // still visible as chips in the transcript for anyone who wants to scroll
+    // back, so we lose nothing by collapsing the live panel.
+    const allDone = todos.every((t) => (t.status || "pending") === "completed");
+    if (allDone) {
+      todosPanel.hidden = true;
+      todosList.innerHTML = "";
+      return;
+    }
     todosPanel.hidden = false;
     todosList.innerHTML = "";
     for (const t of todos) {
@@ -708,6 +1101,88 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
+  function insertDiffMessage(toolName, input) {
+    // Edit/Write get a real diff block instead of the one-line tool chip,
+    // so reviewing what Claude wrote doesn't require expanding tool output.
+    const path = input.file_path || input.path || "";
+    const wrap = document.createElement("article");
+    wrap.className = "msg diff";
+    const header = document.createElement("div");
+    header.className = "diff-header";
+    header.textContent = (toolName === "Edit" ? "✎ Edit " : "✎ Write ") + path;
+    wrap.appendChild(header);
+
+    const pre = document.createElement("pre");
+    pre.className = "diff-body";
+    if (toolName === "Edit") {
+      const oldS = input.old_string || "";
+      const newS = input.new_string || "";
+      pre.appendChild(diffLines(oldS, newS));
+    } else {
+      // Write: just preview the new content (no "old" side).
+      const content = input.content || "";
+      const max = 4000;
+      const preview = content.length > max ? content.slice(0, max) + "\n… (" + (content.length - max) + " more chars)" : content;
+      preview.split("\n").forEach((line) => {
+        const span = document.createElement("span");
+        span.className = "diff-add";
+        span.textContent = "+ " + line;
+        pre.appendChild(span);
+        pre.appendChild(document.createTextNode("\n"));
+      });
+    }
+    wrap.appendChild(pre);
+    transcript.appendChild(wrap);
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  // Tiny, dependency-free LCS-based line diff. Output is a fragment of
+  // line spans (.diff-add / .diff-del / .diff-ctx) interleaved with newlines.
+  function diffLines(a, b) {
+    const A = (a || "").split("\n");
+    const B = (b || "").split("\n");
+    // LCS via dynamic programming. Cap inputs so a multi-megabyte string can't
+    // freeze the tab — Edits are usually small but Write payloads can be huge.
+    const cap = 400;
+    const At = A.length > cap ? A.slice(0, cap) : A;
+    const Bt = B.length > cap ? B.slice(0, cap) : B;
+    const m = At.length, n = Bt.length;
+    const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
+    for (let i = m - 1; i >= 0; i--) {
+      for (let j = n - 1; j >= 0; j--) {
+        if (At[i] === Bt[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
+        else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    const frag = document.createDocumentFragment();
+    let i = 0, j = 0;
+    function pushLine(cls, prefix, text) {
+      const span = document.createElement("span");
+      span.className = cls;
+      span.textContent = prefix + text;
+      frag.appendChild(span);
+      frag.appendChild(document.createTextNode("\n"));
+    }
+    while (i < m && j < n) {
+      if (At[i] === Bt[j]) {
+        pushLine("diff-ctx", "  ", At[i]);
+        i++; j++;
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        pushLine("diff-del", "- ", At[i]);
+        i++;
+      } else {
+        pushLine("diff-add", "+ ", Bt[j]);
+        j++;
+      }
+    }
+    while (i < m) { pushLine("diff-del", "- ", At[i++]); }
+    while (j < n) { pushLine("diff-add", "+ ", Bt[j++]); }
+    if (A.length > cap || B.length > cap) {
+      pushLine("diff-ctx", "  ", `… diff truncated at ${cap} lines`);
+    }
+    return frag;
+  }
+
   function insertToolMessage(text, toolName) {
     // Group consecutive tool messages under a collapsible <details> so the
     // dance doesn't drown out Claude's actual response. The summary lists
@@ -752,55 +1227,85 @@
     return s.length > n ? s.slice(0, n) + "…" : s;
   }
 
+  function renderSessionList(list, opts) {
+    opts = opts || {};
+    sessionList.innerHTML = "";
+    for (const s of list) {
+      const li = document.createElement("li");
+      li.dataset.project = s.project || "";
+      const a = document.createElement("a");
+      const url = new URL(location.origin + "/");
+      url.searchParams.set("session", s.id);
+      if (s.project) url.searchParams.set("project", s.project);
+      a.href = url.pathname + url.search;
+      a.dataset.session = s.id;
+      a.dataset.project = s.project || "";
+      a.dataset.mtime = s.mtime;
+      const title = document.createElement("span");
+      title.className = "session-title";
+      title.textContent = s.title;
+      a.appendChild(title);
+      if (opts.snippet && s.snippet) {
+        const snip = document.createElement("span");
+        snip.className = "session-snippet";
+        snip.textContent = s.snippet;
+        a.appendChild(snip);
+      }
+      const meta = document.createElement("span");
+      meta.className = "session-meta";
+      const time = document.createElement("time");
+      time.className = "session-time";
+      time.setAttribute("datetime", s.mtime);
+      time.textContent = formatTime(s.mtime);
+      meta.appendChild(time);
+      if (s.project_path || s.project) {
+        const proj = document.createElement("span");
+        proj.className = "session-project";
+        const path = s.project_path || (s.project || "").replace(/-/g, "/");
+        proj.textContent = path.split("/").filter(Boolean).pop() || path;
+        meta.appendChild(proj);
+      }
+      a.appendChild(meta);
+      li.appendChild(a);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "session-delete";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `Delete session: ${s.title}`);
+      del.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        deleteSession(s.id, s.project || "", s.title, li);
+      });
+      li.appendChild(del);
+      sessionList.appendChild(li);
+    }
+    markActive(sessionId);
+  }
+
   async function refreshSessions() {
+    if (searchActive) return;
     try {
       const r = await fetch("/api/sessions");
       if (!r.ok) return;
       const list = await r.json();
-      sessionList.innerHTML = "";
-      for (const s of list) {
-        const li = document.createElement("li");
-        const a = document.createElement("a");
-        a.href = `?session=${s.id}`;
-        a.dataset.session = s.id;
-        a.dataset.mtime = s.mtime;
-        const title = document.createElement("span");
-        title.className = "session-title";
-        title.textContent = s.title;
-        const time = document.createElement("time");
-        time.className = "session-time";
-        time.setAttribute("datetime", s.mtime);
-        time.textContent = formatTime(s.mtime);
-        a.appendChild(title);
-        a.appendChild(time);
-        li.appendChild(a);
-        const del = document.createElement("button");
-        del.type = "button";
-        del.className = "session-delete";
-        del.textContent = "×";
-        del.setAttribute("aria-label", `Delete session: ${s.title}`);
-        del.addEventListener("click", (ev) => {
-          ev.preventDefault();
-          ev.stopPropagation();
-          deleteSession(s.id, s.title, li);
-        });
-        li.appendChild(del);
-        sessionList.appendChild(li);
-      }
-      markActive(sessionId);
+      renderSessionList(list);
       filterSessions();
     } catch { /* ignore */ }
   }
 
-  async function deleteSession(id, title, li) {
+  async function deleteSession(id, project, title, li) {
     if (!confirm(`Delete session "${title}"?`)) return;
     try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const url = new URL(`/api/sessions/${encodeURIComponent(id)}`, location.origin);
+      if (project) url.searchParams.set("project", project);
+      const r = await fetch(url, { method: "DELETE" });
       if (!r.ok) throw new Error("HTTP " + r.status);
       li.remove();
       announce("Session deleted.");
       if (sessionId === id) {
         sessionId = "";
+        sessionProject = "";
         transcript.innerHTML = "";
         updateTodosPanel([]);
         history.replaceState({}, "", location.pathname);
@@ -812,7 +1317,13 @@
     }
   }
 
+  // ─── Sidebar search: short queries filter titles locally; longer ones
+  //     hit /api/sessions/search to grep across every session transcript.
   const sessionSearchEl = document.getElementById("session-search");
+  let searchActive = false;
+  let searchTimer = null;
+  let searchToken = 0;
+
   function filterSessions() {
     const q = (sessionSearchEl?.value || "").toLowerCase();
     sessionList.querySelectorAll("li").forEach((li) => {
@@ -820,5 +1331,348 @@
       li.hidden = q.length > 0 && !t.includes(q);
     });
   }
-  sessionSearchEl?.addEventListener("input", filterSessions);
+
+  async function runTranscriptSearch(q) {
+    const myToken = ++searchToken;
+    searchActive = true;
+    if (searchModeEl) {
+      searchModeEl.hidden = false;
+      searchModeLabel.textContent = "Searching transcripts…";
+    }
+    try {
+      const r = await fetch(`/api/sessions/search?q=${encodeURIComponent(q)}`);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      if (myToken !== searchToken) return;  // a newer query already fired
+      renderSessionList(data.hits || [], { snippet: true });
+      if (searchModeLabel) {
+        const n = (data.hits || []).length;
+        searchModeLabel.textContent = `${n} match${n === 1 ? "" : "es"} for "${q}"`;
+      }
+    } catch (err) {
+      if (myToken !== searchToken) return;
+      if (searchModeLabel) searchModeLabel.textContent = "Search failed: " + err.message;
+    }
+  }
+
+  function clearSearch() {
+    if (sessionSearchEl) sessionSearchEl.value = "";
+    if (searchModeEl) searchModeEl.hidden = true;
+    searchActive = false;
+    searchToken++;
+    refreshSessions();
+  }
+
+  sessionSearchEl?.addEventListener("input", () => {
+    const q = (sessionSearchEl.value || "").trim();
+    if (searchTimer) clearTimeout(searchTimer);
+    if (q.length < 2) {
+      // Short query: revert to local title filter on the standard list.
+      if (searchActive) {
+        searchActive = false;
+        if (searchModeEl) searchModeEl.hidden = true;
+        refreshSessions();
+      } else {
+        filterSessions();
+      }
+      return;
+    }
+    // Two or more characters: debounce, then run a transcript search.
+    searchTimer = setTimeout(() => runTranscriptSearch(q), 250);
+  });
+
+  searchClearBtn?.addEventListener("click", clearSearch);
+
+  // ─── Image attachments ──────────────────────────────────────────────────
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+  const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  const MAX_IMAGES = 10;
+
+  function clearAttachments() {
+    pendingImages = [];
+    if (attachmentsEl) {
+      attachmentsEl.innerHTML = "";
+      attachmentsEl.hidden = true;
+    }
+  }
+
+  function renderAttachments() {
+    if (!attachmentsEl) return;
+    attachmentsEl.innerHTML = "";
+    if (!pendingImages.length) {
+      attachmentsEl.hidden = true;
+      return;
+    }
+    attachmentsEl.hidden = false;
+    pendingImages.forEach((entry, idx) => {
+      const wrap = document.createElement("div");
+      wrap.className = "attachment";
+      const img = document.createElement("img");
+      img.src = entry.dataUrl;
+      img.alt = entry.file.name || "attached image";
+      const meta = document.createElement("div");
+      meta.className = "attachment-meta";
+      meta.textContent = `${entry.file.name} (${Math.round(entry.file.size / 1024)} KB)`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "attachment-delete";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `Remove attachment ${entry.file.name}`);
+      del.addEventListener("click", () => {
+        pendingImages.splice(idx, 1);
+        renderAttachments();
+      });
+      wrap.appendChild(img);
+      wrap.appendChild(meta);
+      wrap.appendChild(del);
+      attachmentsEl.appendChild(wrap);
+    });
+  }
+
+  function readAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error || new Error("read failed"));
+      reader.onload = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function addImageFile(file) {
+    if (!file) return;
+    if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+      setStatus(`Skipped ${file.name || "image"}: unsupported type`);
+      announce("Image type not allowed.");
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      setStatus(`Skipped ${file.name}: larger than 10 MB`);
+      announce("Image too large.");
+      return;
+    }
+    if (pendingImages.length >= MAX_IMAGES) {
+      setStatus(`At most ${MAX_IMAGES} images per message`);
+      return;
+    }
+    try {
+      const dataUrl = await readAsDataURL(file);
+      pendingImages.push({ file, dataUrl });
+      renderAttachments();
+      announce(`Attached ${file.name}.`);
+    } catch (err) {
+      setStatus("Could not read image: " + err.message);
+    }
+  }
+
+  imageInput?.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const f of files) await addImageFile(f);
+    imageInput.value = "";  // allow picking the same file again later
+  });
+
+  promptEl.addEventListener("paste", async (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    let consumed = false;
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) {
+          consumed = true;
+          await addImageFile(file);
+        }
+      }
+    }
+    if (consumed) e.preventDefault();
+  });
+
+  // Drop zone covers the whole prompt region so the user doesn't have to
+  // aim. Visual feedback via a class on the <main>.
+  const dropTarget = document.querySelector(".prompt-region") || document.body;
+  ["dragenter", "dragover"].forEach((ev) => {
+    dropTarget.addEventListener(ev, (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+      e.preventDefault();
+      dropTarget.classList.add("dragging");
+    });
+  });
+  ["dragleave", "drop"].forEach((ev) => {
+    dropTarget.addEventListener(ev, () => dropTarget.classList.remove("dragging"));
+  });
+  dropTarget.addEventListener("drop", async (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    for (const f of e.dataTransfer.files) {
+      if (f.type.startsWith("image/")) await addImageFile(f);
+    }
+  });
+
+  // ─── Client-side slash commands ─────────────────────────────────────────
+  // These are commands that map to UI actions or harness behaviour. The
+  // CLI's stream-json mode doesn't intercept slash commands, so anything not
+  // listed here falls through to the model as text (which still works for
+  // skills like /security-review).
+  const CLIENT_SLASH_COMMANDS = {
+    clear: { description: "Start a new chat (alias: /new)", run: () => newChatBtn.click() },
+    new: { description: "Start a new chat", run: () => newChatBtn.click() },
+    cost: { description: "Open the usage dialog", run: () => document.getElementById("show-usage").click() },
+    usage: { description: "Open the usage dialog", run: () => document.getElementById("show-usage").click() },
+    stop: { description: "Stop the current turn", run: () => { if (!stopBtn.hidden) stopBtn.click(); } },
+    help: { description: "Show what slash commands work in claude-web", run: () => showSlashHelp() },
+    model: { description: "Switch model: /model <id> (e.g. /model claude-sonnet-4-6)", run: (arg) => switchModel(arg) },
+  };
+
+  function showSlashHelp() {
+    const supported = Object.entries(CLIENT_SLASH_COMMANDS)
+      .map(([name, def]) => `/${name} — ${def.description}`)
+      .join("\n");
+    const lines = [
+      "Slash commands handled by claude-web:",
+      supported,
+      "",
+      "Anything else (e.g. /security-review, /init, /loop, /skill <name>) is",
+      "sent to Claude as text. The model recognises the convention and runs",
+      "the corresponding skill — but it's the model doing it, not the harness.",
+    ];
+    renderErrorBlock(lines.join("\n"));
+    transcript.lastElementChild.classList.remove("error");
+    transcript.lastElementChild.classList.add("info");
+  }
+
+  function switchModel(arg) {
+    if (!modelSelect) {
+      announce("Model picker is not enabled in this UI.");
+      return;
+    }
+    const target = (arg || "").trim();
+    const opt = [...modelSelect.options].find((o) => o.value === target || o.text.toLowerCase() === target.toLowerCase());
+    if (!opt) {
+      const valid = [...modelSelect.options].map((o) => o.value || "(default)").join(", ");
+      renderErrorBlock(`Unknown model "${target}". Try one of: ${valid}`);
+      return;
+    }
+    modelSelect.value = opt.value;
+    modelSelect.dispatchEvent(new Event("change"));
+    announce(`Model set to ${opt.text}.`);
+  }
+
+  async function handleClientSlashCommand(text) {
+    // Parse "/word [arg ...]". Returns true if we handled it locally.
+    const m = /^\/([a-zA-Z0-9_-]+)(?:\s+(.*))?$/.exec(text.trim());
+    if (!m) return false;
+    const name = m[1].toLowerCase();
+    const arg = m[2] || "";
+    const def = CLIENT_SLASH_COMMANDS[name];
+    if (!def) return false;
+    try {
+      await def.run(arg);
+    } catch (err) {
+      renderErrorBlock(`/${name} failed: ${err.message || err}`);
+    }
+    return true;
+  }
+
+  // ─── Slash command autocomplete ─────────────────────────────────────────
+  let allCommands = [];
+  let slashItems = [];
+  let slashActive = -1;
+
+  fetch("/api/commands").then((r) => r.ok ? r.json() : null).then((data) => {
+    const fromServer = (data && Array.isArray(data.commands)) ? data.commands : [];
+    // Prepend client-side commands (the ones that actually do something
+    // mapped to UI actions). Mark them "client" so users can tell them
+    // apart from text-only / model-handled ones.
+    const clientEntries = Object.entries(CLIENT_SLASH_COMMANDS).map(([name, def]) => ({
+      name,
+      description: def.description,
+      kind: "client",
+    }));
+    const seen = new Set(clientEntries.map((c) => c.name));
+    // Re-tag server-side built-ins as "text" so the menu is honest about
+    // them: in the SDK's stream-json mode they reach the model as plain
+    // text, not as harness-invoked commands.
+    const tagged = fromServer
+      .filter((c) => !seen.has(c.name))
+      .map((c) => ({ ...c, kind: c.kind === "builtin" ? "text" : c.kind }));
+    allCommands = [...clientEntries, ...tagged];
+  }).catch(() => { /* non-fatal; menu just stays empty */ });
+
+  function hideSlashMenu() {
+    if (!slashMenu) return;
+    slashMenu.hidden = true;
+    slashMenu.innerHTML = "";
+    slashItems = [];
+    slashActive = -1;
+  }
+
+  function showSlashMenu(matches) {
+    if (!slashMenu) return;
+    slashMenu.innerHTML = "";
+    slashItems = matches;
+    slashActive = matches.length ? 0 : -1;
+    matches.forEach((cmd, i) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "slash-item";
+      row.dataset.index = String(i);
+      row.setAttribute("role", "option");
+      row.innerHTML = "";
+      const name = document.createElement("span");
+      name.className = "slash-name";
+      name.textContent = "/" + cmd.name;
+      const kind = document.createElement("span");
+      kind.className = "slash-kind";
+      kind.textContent = cmd.kind;
+      const desc = document.createElement("span");
+      desc.className = "slash-desc";
+      desc.textContent = cmd.description || "";
+      row.appendChild(name);
+      row.appendChild(kind);
+      if (desc.textContent) row.appendChild(desc);
+      row.addEventListener("mousedown", (ev) => {
+        ev.preventDefault();  // keep textarea focus
+        acceptSlash(i);
+      });
+      slashMenu.appendChild(row);
+    });
+    slashMenu.hidden = matches.length === 0;
+    updateSlashHighlight();
+  }
+
+  function updateSlashHighlight() {
+    if (!slashMenu) return;
+    [...slashMenu.children].forEach((el, i) => {
+      el.classList.toggle("active", i === slashActive);
+    });
+  }
+
+  function acceptSlash(index) {
+    if (index < 0 || index >= slashItems.length) return;
+    const cmd = slashItems[index];
+    promptEl.value = "/" + cmd.name + " ";
+    hideSlashMenu();
+    promptEl.focus();
+    // Place cursor at end.
+    promptEl.selectionStart = promptEl.selectionEnd = promptEl.value.length;
+  }
+
+  function maybeUpdateSlashMenu() {
+    if (!slashMenu) return;
+    const v = promptEl.value;
+    // Only suggest while the textarea matches /^\/[a-z0-9_-]*$/ — once the
+    // user types past the command name we get out of the way.
+    const m = /^\/([a-zA-Z0-9_-]*)$/.exec(v);
+    if (!m) {
+      hideSlashMenu();
+      return;
+    }
+    const q = m[1].toLowerCase();
+    const matches = allCommands
+      .filter((c) => c.name.toLowerCase().startsWith(q))
+      .slice(0, 8);
+    if (!matches.length) hideSlashMenu();
+    else showSlashMenu(matches);
+  }
+
+  promptEl.addEventListener("input", maybeUpdateSlashMenu);
+  promptEl.addEventListener("blur", () => setTimeout(hideSlashMenu, 150));
 })();

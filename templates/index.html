@@ -17,6 +17,24 @@
     <h1>Claude — homelab</h1>
     <div class="header-actions">
       <button type="button" id="toggle-sessions" aria-controls="sessions-panel" aria-expanded="true">Sessions</button>
+      <label class="header-select" for="model-select">
+        <span class="sr-only">Model</span>
+        <select id="model-select" aria-label="Model">
+          {% for m in models %}
+            <option value="{{ m.id }}">{{ m.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% if multi_project %}
+        <label class="header-select" for="project-select">
+          <span class="sr-only">Project</span>
+          <select id="project-select" aria-label="Project">
+            {% for p in projects %}
+              <option value="{{ p.key }}" data-path="{{ p.path }}" {% if p.key == default_project %}selected{% endif %}>{{ p.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      {% endif %}
       <span id="header-cost" class="header-cost" aria-label="Today's spend so far" title="Today so far">$0.0000</span>
       <button type="button" id="show-usage" aria-haspopup="dialog">Usage</button>
       <button type="button" id="new-chat" aria-label="Start a new chat">New chat</button>
@@ -30,13 +48,20 @@
   <div class="layout">
     <nav id="sessions-panel" aria-labelledby="sessions-heading">
       <h2 id="sessions-heading">Sessions</h2>
-      <input type="search" id="session-search" placeholder="Filter…" aria-label="Filter sessions" autocomplete="off">
+      <input type="search" id="session-search" placeholder="Filter or search…" aria-label="Filter or search sessions" autocomplete="off">
+      <div id="search-mode" class="search-mode" hidden>
+        <span id="search-mode-label">Searching transcripts…</span>
+        <button type="button" id="search-clear" class="search-clear">Clear</button>
+      </div>
       <ul id="session-list">
         {% for s in sessions %}
-          <li>
-            <a href="?session={{ s.id }}" data-session="{{ s.id }}" data-mtime="{{ s.mtime }}">
+          <li data-project="{{ s.project }}">
+            <a href="?session={{ s.id }}&project={{ s.project }}" data-session="{{ s.id }}" data-project="{{ s.project }}" data-mtime="{{ s.mtime }}">
               <span class="session-title">{{ s.title }}</span>
-              <time class="session-time" datetime="{{ s.mtime }}"></time>
+              <span class="session-meta">
+                <time class="session-time" datetime="{{ s.mtime }}"></time>
+                {% if multi_project %}<span class="session-project">{{ s.project_path.split('/')[-1] or s.project_path }}</span>{% endif %}
+              </span>
             </a>
           </li>
         {% endfor %}
@@ -44,14 +69,14 @@
     </nav>
 
     <main>
-      <section id="todos-panel" aria-labelledby="todos-heading" hidden>
-        <h2 id="todos-heading">Tasks</h2>
-        <ol id="todos-list"></ol>
-      </section>
-
       <section aria-labelledby="transcript-heading" class="transcript-region">
         <h2 id="transcript-heading" class="sr-only">Conversation</h2>
         <div id="transcript"></div>
+      </section>
+
+      <section id="todos-panel" aria-labelledby="todos-heading" hidden>
+        <h2 id="todos-heading">Tasks</h2>
+        <ol id="todos-list"></ol>
       </section>
 
       <div id="status-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -64,16 +89,30 @@
         </form>
       </dialog>
 
-      <section aria-labelledby="prompt-heading">
+      <section aria-labelledby="prompt-heading" class="prompt-region">
         <h2 id="prompt-heading" class="sr-only">Send a message</h2>
+        <div id="context-meter" class="context-meter" hidden>
+          <span class="context-label">Context</span>
+          <span id="context-text" class="context-text">—</span>
+          <span class="context-bar" aria-hidden="true"><span id="context-fill" class="context-fill"></span></span>
+        </div>
         <form id="chat-form" autocomplete="off">
-          <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline)</span></label>
-          <textarea id="prompt" name="message" rows="3" required placeholder="Ask Claude…"></textarea>
+          <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline, paste or drop images)</span></label>
+          <div class="prompt-wrap">
+            <textarea id="prompt" name="message" rows="3" placeholder="Ask Claude…"></textarea>
+            <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
+          </div>
+          <div id="attachments" class="attachments" hidden aria-label="Attached images"></div>
           <div class="row">
             <button type="submit" id="send">Send</button>
             <button type="button" id="stop" hidden>Stop</button>
+            <label class="image-btn" for="image-input" aria-label="Attach images">
+              <span aria-hidden="true">📎</span> Image
+              <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+            </label>
             <span id="status" aria-hidden="true"></span>
           </div>
+          <div id="queue-area" class="queue-area" hidden aria-label="Queued messages"></div>
         </form>
       </section>
     </main>

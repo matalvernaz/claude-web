@@ -11,10 +11,13 @@ Configuration is via environment variables -- see README.md and
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import os
 import re
 import time
+import traceback
 import uuid as uuid_mod
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
@@ -27,6 +30,9 @@ from claude_agent_sdk import (
     PermissionResultDeny,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
     UserMessage,
 )
 from claude_agent_sdk.types import (
@@ -35,7 +41,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -48,9 +54,41 @@ def _sanitize_project_key(cwd: Path) -> str:
     return str(cwd.resolve()).replace("/", "-")
 
 
-CWD = Path(os.getenv("CLAUDE_PROJECT_DIR", str(Path.home()))).resolve()
 CLAUDE_HOME = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).resolve()
-SESSIONS_DIR = CLAUDE_HOME / "projects" / _sanitize_project_key(CWD)
+
+
+def _configured_projects() -> list[Path]:
+    """Allowed working directories for sessions.
+
+    Set CLAUDE_WEB_PROJECT_DIRS=/a,/b,/c to enable the project picker.
+    Falls back to the legacy single-CWD behaviour when only CLAUDE_PROJECT_DIR
+    (or neither) is set.
+    """
+    raw = os.getenv("CLAUDE_WEB_PROJECT_DIRS")
+    if raw:
+        return [Path(p.strip()).resolve() for p in raw.split(",") if p.strip()]
+    fallback = os.getenv("CLAUDE_PROJECT_DIR", str(Path.home()))
+    return [Path(fallback).resolve()]
+
+
+PROJECTS: list[Path] = _configured_projects()
+DEFAULT_CWD: Path = PROJECTS[0]
+PROJECT_KEYS: dict[str, Path] = {_sanitize_project_key(p): p for p in PROJECTS}
+
+
+def _resolve_project(key: str) -> Path:
+    """Map a project key (sanitised path) to its real path, rejecting unknown ones."""
+    if not key:
+        return DEFAULT_CWD
+    cwd = PROJECT_KEYS.get(key)
+    if cwd is None:
+        raise HTTPException(400, "unknown project")
+    return cwd
+
+
+def _sessions_dir(cwd: Path) -> Path:
+    return CLAUDE_HOME / "projects" / _sanitize_project_key(cwd)
+
 
 USAGE_DIR = Path(os.getenv("CLAUDE_WEB_STATE_DIR", str(Path.home() / ".claude-web"))).resolve()
 USAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,8 +97,25 @@ RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
 
 MAX_TITLE_CHARS = 80
 MAX_LISTED_SESSIONS = 100
+MAX_SEARCH_RESULTS = 50
+SEARCH_SNIPPET_CHARS = 160
 TOOL_RESULT_PREVIEW = 200
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGES_PER_TURN = 10
+ALLOWED_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Models exposed in the UI dropdown. Empty model id ("" → "Default") just
+# omits `model=` so the SDK uses whatever the CLI defaults to. The 1M-context
+# Opus variant isn't a separate model id — it's the `context-1m-2025-08-07`
+# beta flag — so we don't expose it as a picker option.
+KNOWN_MODELS = [
+    {"id": "", "label": "Default"},
+    {"id": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000},
+    {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000},
+    {"id": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000},
+]
+ALLOWED_MODEL_IDS = {m["id"] for m in KNOWN_MODELS}
 
 # Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
 # bay before using user input as a filename.
@@ -136,8 +191,7 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
         return
 
 
-def session_title(session_id: str) -> Optional[str]:
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+def session_title_from(path: Path) -> Optional[str]:
     for obj in _iter_jsonl(path):
         if obj.get("type") != "user" or obj.get("isMeta"):
             continue
@@ -148,22 +202,52 @@ def session_title(session_id: str) -> Optional[str]:
     return None
 
 
+def session_title(session_id: str, cwd: Optional[Path] = None) -> Optional[str]:
+    """Look up a session's first user line.
+
+    If `cwd` is given, only the matching project's dir is consulted; otherwise
+    every configured project is searched.
+    """
+    candidates = [cwd] if cwd is not None else PROJECTS
+    for project in candidates:
+        path = _sessions_dir(project) / f"{session_id}.jsonl"
+        if path.exists():
+            return session_title_from(path)
+    return None
+
+
 def list_sessions() -> list[dict]:
-    if not SESSIONS_DIR.exists():
-        return []
-    files = sorted(
-        SESSIONS_DIR.glob("*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:MAX_LISTED_SESSIONS]
-    return [
-        {
-            "id": p.stem,
-            "title": session_title(p.stem) or p.stem[:8],
-            "mtime": int(p.stat().st_mtime),
-        }
-        for p in files
-    ]
+    """All sessions across every configured project, newest first."""
+    rows: list[dict] = []
+    for project in PROJECTS:
+        d = _sessions_dir(project)
+        if not d.exists():
+            continue
+        key = _sanitize_project_key(project)
+        for p in d.glob("*.jsonl"):
+            try:
+                mtime = p.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            rows.append({
+                "id": p.stem,
+                "project": key,
+                "project_path": str(project),
+                "mtime": int(mtime),
+                "_path": p,
+            })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    rows = rows[:MAX_LISTED_SESSIONS]
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "project": r["project"],
+            "project_path": r["project_path"],
+            "title": session_title_from(r["_path"]) or r["id"][:8],
+            "mtime": r["mtime"],
+        })
+    return out
 
 
 def _summarise_tool_input(name: str, inp: dict) -> str:
@@ -177,15 +261,32 @@ def _summarise_tool_input(name: str, inp: dict) -> str:
     return json.dumps(inp)[:200]
 
 
-def session_transcript(session_id: str) -> list[dict]:
+def _find_session_path(session_id: str, project_key: str = "") -> Optional[Path]:
+    """Locate a session file in the configured projects."""
+    if project_key:
+        cwd = _resolve_project(project_key)
+        path = _sessions_dir(cwd) / f"{session_id}.jsonl"
+        return path if path.exists() else None
+    for project in PROJECTS:
+        path = _sessions_dir(project) / f"{session_id}.jsonl"
+        if path.exists():
+            return path
+    return None
+
+
+def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
     """Return ordered messages for replay, including tool dance.
 
     Roles: "user", "assistant", "tool_use" (Claude→world), "tool_result"
-    (world→Claude). Frontend renders tool_use/tool_result as single-line
-    chips so reloaded sessions match the live view.
+    (world→Claude), "tool_use_full" (Edit/Write so the frontend can render a
+    diff). Frontend renders tool_use/tool_result as single-line chips so
+    reloaded sessions match the live view.
     """
+    path = _find_session_path(session_id, project_key)
+    if path is None:
+        return []
     msgs: list[dict] = []
-    for obj in _iter_jsonl(SESSIONS_DIR / f"{session_id}.jsonl"):
+    for obj in _iter_jsonl(path):
         kind = obj.get("type")
         message = obj.get("message")
         if kind == "user" and not obj.get("isMeta"):
@@ -200,14 +301,22 @@ def session_transcript(session_id: str) -> list[dict]:
                 if _is_user_visible(content):
                     msgs.append({"role": "user", "text": content})
             elif isinstance(content, list):
+                # Collect text + count of attachments so the resumed turn
+                # shows the same shape (text + N images) it did live.
+                text_parts: list[str] = []
+                image_count = 0
+                tool_results: list[dict] = []
                 for blk in content:
                     if not isinstance(blk, dict):
                         continue
-                    if blk.get("type") == "text":
-                        text = blk.get("text", "")
-                        if text and _is_user_visible(text):
-                            msgs.append({"role": "user", "text": text})
-                    elif blk.get("type") == "tool_result":
+                    btype = blk.get("type")
+                    if btype == "text":
+                        t = blk.get("text", "")
+                        if t and _is_user_visible(t):
+                            text_parts.append(t)
+                    elif btype == "image":
+                        image_count += 1
+                    elif btype == "tool_result":
                         c = blk.get("content")
                         if isinstance(c, list):
                             c = "".join(
@@ -215,11 +324,18 @@ def session_transcript(session_id: str) -> list[dict]:
                                 for b in c
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
-                        msgs.append({
+                        tool_results.append({
                             "role": "tool_result",
                             "text": str(c or "")[:TOOL_RESULT_PREVIEW],
                             "is_error": bool(blk.get("is_error")),
                         })
+                if text_parts or image_count:
+                    msgs.append({
+                        "role": "user",
+                        "text": "\n".join(text_parts),
+                        "image_count": image_count,
+                    })
+                msgs.extend(tool_results)
         elif kind == "assistant":
             if not isinstance(message, dict):
                 continue
@@ -234,11 +350,23 @@ def session_transcript(session_id: str) -> list[dict]:
                     if text:
                         msgs.append({"role": "assistant", "text": text})
                 elif blk.get("type") == "tool_use":
-                    msgs.append({
+                    name = blk.get("name", "?")
+                    inp = blk.get("input", {}) or {}
+                    entry = {
                         "role": "tool_use",
-                        "name": blk.get("name", "?"),
-                        "summary": _summarise_tool_input(blk.get("name", ""), blk.get("input", {}) or {}),
-                    })
+                        "name": name,
+                        "summary": _summarise_tool_input(name, inp),
+                    }
+                    if name in ("Edit", "Write"):
+                        # Pass enough input through for the frontend to render
+                        # a diff on session reload (live view already gets it).
+                        entry["input"] = {
+                            "file_path": inp.get("file_path") or inp.get("path"),
+                            "old_string": inp.get("old_string"),
+                            "new_string": inp.get("new_string"),
+                            "content": inp.get("content"),
+                        }
+                    msgs.append(entry)
     return msgs
 
 
@@ -264,11 +392,15 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
 
 
 class ActiveRun:
-    """One in-flight SDK conversation turn.
+    """One long-lived conversation backed by a single ClaudeSDKClient.
 
-    Decouples the SDK task from the originating HTTP request: the task runs
-    to completion regardless of whether the browser disconnects. Buffers
-    every emitted event so a reconnecting browser gets a replay-then-tail.
+    Originally per-turn; widened so the bundled CLI subprocess survives
+    across user messages and Monitor / TaskNotification events keep flowing
+    in between turns. The driver loop reads receive_messages() forever,
+    auto-firing follow-up turns when background tools emit notifications.
+
+    Subscribers (HTTP SSE streams) come and go. Buffered events let a
+    reconnecting browser replay-then-tail.
     """
 
     def __init__(self, run_id: str):
@@ -277,9 +409,16 @@ class ActiveRun:
         self.subscribers: set[asyncio.Queue] = set()
         self.done = False
         self.session_id: Optional[str] = None
+        self.project_key: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
         self.finished_at: Optional[float] = None
         self.session_allowlist: set[tuple[str, str]] = set()
+        # Long-lived conversation state.
+        self.user_input_queue: asyncio.Queue = asyncio.Queue()
+        self.pending_notifications: list[dict] = []
+        self.notification_grace_started_at: Optional[float] = None
+        self.busy_in_turn: bool = False
+        self.last_activity: float = time.time()
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
@@ -293,9 +432,16 @@ class ActiveRun:
             except asyncio.QueueFull:
                 pass
 
-    def subscribe(self) -> asyncio.Queue:
+    def subscribe(self, start_index: int = 0) -> asyncio.Queue:
+        """Subscribe to events from `start_index` onward.
+
+        Use 0 for "give me everything from the start" (page reload). Use
+        len(events)-N for "give me only the newest N events" — used when a
+        follow-up POST hits an already-running long-lived run and the
+        browser already has the older events rendered.
+        """
         q: asyncio.Queue = asyncio.Queue()
-        for e in self.events:
+        for e in self.events[start_index:]:
             q.put_nowait(e)
         if self.done:
             q.put_nowait({"type": "_done"})
@@ -318,7 +464,10 @@ class ActiveRun:
 
 
 ACTIVE_RUNS: dict[str, ActiveRun] = {}
+ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
 RUN_RETENTION_SECONDS = 300  # keep finished runs around so a slow reconnect can still replay
+AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
+SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
 
 
 def _gc_runs() -> None:
@@ -329,7 +478,21 @@ def _gc_runs() -> None:
         if r.done and r.finished_at and (now - r.finished_at) > RUN_RETENTION_SECONDS
     ]
     for rid in stale:
-        ACTIVE_RUNS.pop(rid, None)
+        run = ACTIVE_RUNS.pop(rid, None)
+        if run and run.session_id:
+            existing = ACTIVE_RUNS_BY_SESSION.get(run.session_id)
+            if existing is run:
+                ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
+
+
+def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
+    """Return the live ActiveRun owning this client session, if any."""
+    if not session_id:
+        return None
+    run = ACTIVE_RUNS_BY_SESSION.get(session_id)
+    if run is None or run.done or (run.task and run.task.done()):
+        return None
+    return run
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -338,11 +501,32 @@ def _gc_runs() -> None:
 @app.get("/")
 async def index(request: Request, user: dict = Depends(auth.require_user)):
     response = templates.TemplateResponse(
-        request, "index.html", {"sessions": list_sessions(), "user": user}
+        request, "index.html", {
+            "sessions": list_sessions(),
+            "user": user,
+            "projects": [
+                {"key": _sanitize_project_key(p), "path": str(p), "name": p.name or str(p)}
+                for p in PROJECTS
+            ],
+            "default_project": _sanitize_project_key(DEFAULT_CWD),
+            "models": KNOWN_MODELS,
+            "multi_project": len(PROJECTS) > 1,
+        }
     )
     # Don't cache the HTML — sidebar contents are time-sensitive.
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/api/projects")
+async def api_projects(user: dict = Depends(auth.require_user)):
+    return {
+        "projects": [
+            {"key": _sanitize_project_key(p), "path": str(p), "name": p.name or str(p)}
+            for p in PROJECTS
+        ],
+        "default": _sanitize_project_key(DEFAULT_CWD),
+    }
 
 
 @app.get("/api/sessions")
@@ -350,22 +534,180 @@ async def api_sessions(user: dict = Depends(auth.require_user)):
     return list_sessions()
 
 
+@app.get("/api/sessions/search")
+async def api_sessions_search(
+    q: str = "",
+    user: dict = Depends(auth.require_user),
+):
+    """Substring search across every configured project's session transcripts.
+
+    Cheap-and-cheerful: line-by-line, case-insensitive, capped at
+    MAX_SEARCH_RESULTS hits. The frontend always shows titles for matched
+    sessions even when the hit was inside an assistant or tool message.
+    """
+    query = (q or "").strip().lower()
+    if len(query) < 2:
+        return {"query": q, "hits": []}
+
+    hits: list[dict] = []
+    for project in PROJECTS:
+        d = _sessions_dir(project)
+        if not d.exists():
+            continue
+        key = _sanitize_project_key(project)
+        for path in d.glob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            session_hit: Optional[dict] = None
+            for obj in _iter_jsonl(path):
+                kind = obj.get("type")
+                if kind not in ("user", "assistant"):
+                    continue
+                if kind == "user" and obj.get("isMeta"):
+                    continue
+                text = _extract_text(obj.get("message")) or ""
+                if not text:
+                    continue
+                low = text.lower()
+                idx = low.find(query)
+                if idx < 0:
+                    continue
+                start = max(0, idx - 40)
+                end = min(len(text), idx + len(query) + SEARCH_SNIPPET_CHARS - 40)
+                snippet = text[start:end].replace("\n", " ").strip()
+                if start > 0:
+                    snippet = "…" + snippet
+                if end < len(text):
+                    snippet = snippet + "…"
+                session_hit = {
+                    "id": path.stem,
+                    "project": key,
+                    "title": session_title_from(path) or path.stem[:8],
+                    "mtime": int(mtime),
+                    "snippet": snippet,
+                    "role": kind,
+                }
+                break
+            if session_hit:
+                hits.append(session_hit)
+            if len(hits) >= MAX_SEARCH_RESULTS:
+                break
+        if len(hits) >= MAX_SEARCH_RESULTS:
+            break
+
+    hits.sort(key=lambda h: h["mtime"], reverse=True)
+    return {"query": q, "hits": hits}
+
+
 @app.get("/api/sessions/{sid}")
-async def api_session(sid: str, user: dict = Depends(auth.require_user)):
+async def api_session(
+    sid: str,
+    project: str = "",
+    user: dict = Depends(auth.require_user),
+):
     sid = _safe_id(sid)
-    if not (SESSIONS_DIR / f"{sid}.jsonl").exists():
+    path = _find_session_path(sid, project)
+    if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return {"id": sid, "messages": session_transcript(sid)}
+    # Recover the project_key from whichever configured project owns this dir.
+    project_key = ""
+    for p in PROJECTS:
+        if path.parent == _sessions_dir(p):
+            project_key = _sanitize_project_key(p)
+            break
+    return {
+        "id": sid,
+        "project": project_key,
+        "messages": session_transcript(sid, project_key),
+    }
 
 
 @app.delete("/api/sessions/{sid}")
-async def api_delete_session(sid: str, user: dict = Depends(auth.require_user)):
+async def api_delete_session(
+    sid: str,
+    project: str = "",
+    user: dict = Depends(auth.require_user),
+):
     sid = _safe_id(sid)
-    path = SESSIONS_DIR / f"{sid}.jsonl"
-    if not path.exists():
+    path = _find_session_path(sid, project)
+    if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     path.unlink()
     return {"ok": True}
+
+
+@app.get("/api/commands")
+async def api_commands(user: dict = Depends(auth.require_user)):
+    """Slash-command suggestions for the prompt textarea.
+
+    Built-in commands are hardcoded; user skills/commands are scanned from
+    ~/.claude/skills/<name>/SKILL.md and ~/.claude/commands/<name>.md so
+    project-specific helpers show up automatically.
+    """
+    builtins = [
+        {"name": "help", "description": "Get help with using Claude Code", "kind": "builtin"},
+        {"name": "clear", "description": "Clear conversation history", "kind": "builtin"},
+        {"name": "compact", "description": "Compact the conversation", "kind": "builtin"},
+        {"name": "cost", "description": "Show usage and cost so far", "kind": "builtin"},
+        {"name": "memory", "description": "View or edit the auto-memory store", "kind": "builtin"},
+        {"name": "model", "description": "Switch model", "kind": "builtin"},
+        {"name": "agents", "description": "List available subagents", "kind": "builtin"},
+        {"name": "init", "description": "Initialize a CLAUDE.md file", "kind": "builtin"},
+        {"name": "review", "description": "Review a pull request", "kind": "builtin"},
+        {"name": "schedule", "description": "Manage scheduled remote agents", "kind": "builtin"},
+        {"name": "loop", "description": "Run a prompt or skill on a recurring interval", "kind": "builtin"},
+    ]
+
+    def _scan(dir_path: Path, kind: str, name_from_dir: bool) -> list[dict]:
+        out: list[dict] = []
+        if not dir_path.exists():
+            return out
+        try:
+            entries = sorted(dir_path.iterdir())
+        except OSError:
+            return out
+        for entry in entries:
+            if name_from_dir:
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                desc_path = entry / "SKILL.md"
+            else:
+                if entry.suffix != ".md" or not entry.is_file():
+                    continue
+                name = entry.stem
+                desc_path = entry
+            description = ""
+            try:
+                if desc_path.exists():
+                    with desc_path.open() as f:
+                        for _ in range(40):
+                            line = f.readline()
+                            if not line:
+                                break
+                            stripped = line.strip()
+                            if stripped.startswith("description:"):
+                                description = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                                break
+            except OSError:
+                pass
+            out.append({"name": name, "description": description, "kind": kind})
+        return out
+
+    skills = _scan(CLAUDE_HOME / "skills", "skill", name_from_dir=True)
+    user_cmds = _scan(CLAUDE_HOME / "commands", "command", name_from_dir=False)
+
+    # Stable, de-duplicated by name (built-ins win, then skills, then commands).
+    seen = {b["name"] for b in builtins}
+    extras: list[dict] = []
+    for c in skills + user_cmds:
+        if c["name"] in seen:
+            continue
+        seen.add(c["name"])
+        extras.append(c)
+    return {"commands": builtins + extras}
 
 
 @app.post("/api/permission/{request_id}")
@@ -387,17 +729,28 @@ async def api_permission(
     return {"ok": True}
 
 
-def _stream_run_response(run: ActiveRun) -> StreamingResponse:
+def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
     """Subscribe to an ActiveRun and stream its events as SSE.
 
+    `start_index` controls how much history the new subscriber replays —
+    0 for full reconnect, len(events)-N for "only events I'm about to emit".
     Closing the request just unsubscribes — the SDK task keeps running so
     a reload or new tab can rejoin via /api/chat/stream/{run_id}.
     """
     async def stream() -> AsyncIterator[bytes]:
-        q = run.subscribe()
+        q = run.subscribe(start_index=start_index)
         try:
             while True:
-                evt = await q.get()
+                # SSE comment heartbeat: Cloudflare/cloudflared close response
+                # streams after ~100s of byte-level silence, which Firefox
+                # surfaces as "Error in input stream" mid-conversation while
+                # we wait for the user's next prompt. Colon-prefixed lines are
+                # ignored by EventSource/fetch consumers per the SSE spec.
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    yield b": ping\n\n"
+                    continue
                 if evt.get("type") == "_done":
                     yield b"event: done\ndata: {}\n\n"
                     break
@@ -415,32 +768,132 @@ def _stream_run_response(run: ActiveRun) -> StreamingResponse:
     )
 
 
+def _validate_image(upload: UploadFile, data: bytes) -> str:
+    """Return the media type, raising HTTPException if the upload is rejected.
+
+    Trusts the client's content-type hint but cross-checks the magic bytes so
+    a renamed `.png` blob can't sneak past the allowlist.
+    """
+    media_type = (upload.content_type or "").lower()
+    if media_type not in ALLOWED_IMAGE_MEDIA_TYPES:
+        raise HTTPException(400, f"unsupported image type: {media_type!r}")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(400, f"image too large (>{MAX_IMAGE_BYTES} bytes)")
+    sniffed: Optional[str] = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        sniffed = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        sniffed = "image/jpeg"
+    elif data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        sniffed = "image/gif"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        sniffed = "image/webp"
+    if sniffed and sniffed != media_type:
+        raise HTTPException(400, f"image bytes don't match content-type {media_type!r}")
+    return media_type
+
+
+async def _read_uploaded_images(images: list[UploadFile]) -> tuple[list[dict], list[dict]]:
+    """Validate and base64-encode uploaded image files."""
+    if images and len(images) > MAX_IMAGES_PER_TURN:
+        raise HTTPException(400, f"too many images (max {MAX_IMAGES_PER_TURN})")
+    blocks: list[dict] = []
+    meta: list[dict] = []
+    for img in images or []:
+        if not img or not img.filename:
+            continue
+        data = await img.read()
+        if not data:
+            continue
+        media_type = _validate_image(img, data)
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.b64encode(data).decode("ascii"),
+            },
+        })
+        meta.append({"filename": img.filename, "media_type": media_type, "size": len(data)})
+    return blocks, meta
+
+
+def _compose_auto_fire_message(events: list[dict]) -> str:
+    """Render buffered task notifications into a synthetic user message.
+
+    The model sees this and decides what to do — the same as if you had
+    typed it. Keep it terse so it doesn't crowd the agent's context.
+    """
+    lines = ["Background events from your tools (auto-injected):"]
+    for e in events:
+        kind = e.get("kind") or "event"
+        task_id = e.get("task_id") or "?"
+        bits = [f"- [{kind} task={task_id}]"]
+        if e.get("status"):
+            bits.append(f"status={e['status']}")
+        if e.get("summary"):
+            bits.append(str(e["summary"]))
+        if e.get("description"):
+            bits.append(str(e["description"]))
+        if e.get("output_file"):
+            bits.append(f"output_file={e['output_file']}")
+        lines.append(" ".join(bits))
+    lines.append("Please respond as appropriate, or stay quiet if nothing needs doing.")
+    return "\n".join(lines)
+
+
 @app.post("/api/chat")
 async def api_chat(
+    request: Request,
     message: str = Form(...),
     session_id: str = Form(default=""),
+    project: str = Form(default=""),
+    model: str = Form(default=""),
+    images: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
-    """Start a new SDK turn and stream its events as SSE.
+    """Send a user message into a (possibly already-running) conversation.
 
-    Permission requests are emitted as `permission_request` events; the
-    browser POSTs the decision to /api/permission/{id} which unblocks the
-    can_use_tool callback below.
+    If an ActiveRun exists for this session_id, the message is enqueued onto
+    its driver — the bundled CLI subprocess and any in-flight Monitor stay
+    alive across turns. Otherwise we spawn a fresh driver.
 
-    The SDK driver task is detached from the request — see ActiveRun.
-    Browser reload reconnects via /api/chat/stream/{run_id}; explicit stop
-    happens via /api/chat/stop/{run_id}.
+    Permission requests come back as `permission_request` events, resolved
+    via /api/permission/{id}. Reconnect via /api/chat/stream/{run_id}.
     """
     _gc_runs()
+
+    cwd = _resolve_project(project)
+    if model and model not in ALLOWED_MODEL_IDS:
+        raise HTTPException(400, "unknown model")
+
+    image_blocks, _image_meta = await _read_uploaded_images(images)
+
+    # Reuse an existing long-lived run for this session if we can.
+    existing = _existing_run_for_session(session_id) if session_id else None
+    if existing is not None:
+        # Subscribe BEFORE we emit the new user_prompt so the new subscriber
+        # only sees events from this turn forward, not the entire prior
+        # history that the browser already rendered.
+        start_index = len(existing.events)
+        existing.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
+        # Pending notifications get superseded by explicit user input — the
+        # user is now driving, no need to auto-fire.
+        existing.pending_notifications.clear()
+        existing.notification_grace_started_at = None
+        await existing.user_input_queue.put({"text": message, "image_blocks": image_blocks})
+        return _stream_run_response(existing, start_index=start_index)
+
     sid_in = session_id or None
     run_id = str(uuid_mod.uuid4())
     run = ActiveRun(run_id)
+    run.project_key = _sanitize_project_key(cwd)
     ACTIVE_RUNS[run_id] = run
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
     # echoes assistant content and tool results back).
-    run.emit({"type": "run_started", "run_id": run_id})
-    run.emit({"type": "user_prompt", "text": message})
+    run.emit({"type": "run_started", "run_id": run_id, "project": run.project_key, "model": model or None})
+    run.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context):
         if tool_name in SAFE_TOOLS:
@@ -472,23 +925,139 @@ async def api_chat(
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied permission via web UI.")
 
-    options = ClaudeAgentOptions(
-        cwd=str(CWD),
+    # Buffer the CLI subprocess's stderr so we can include it in any error
+    # event we emit. Without this the SDK just surfaces "Error in input
+    # stream" with no clue why (rate limit? OOM? bad arg?).
+    stderr_buf: list[str] = []
+
+    def _capture_stderr(line: str) -> None:
+        if len(stderr_buf) < 200:
+            stderr_buf.append(line)
+
+    options_kwargs: dict[str, Any] = dict(
+        cwd=str(cwd),
         resume=sid_in,
         permission_mode="default",
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
         system_prompt={"type": "preset", "preset": "claude_code"},
+        # Default-None hides every installed skill from the model. "all"
+        # mirrors the host-shell `claude` CLI so /security-review,
+        # /init, /loop, /skill <name>, etc. actually run.
+        skills="all",
         include_partial_messages=False,
+        stderr=_capture_stderr,
+        # Always enable the 1M-context beta when we're on Opus. Long debugging
+        # sessions blow past the 200k default, and the CLI surfaces the
+        # rejection as a cryptic "Error in input stream".
+        betas=["context-1m-2025-08-07"],
     )
+    if model:
+        options_kwargs["model"] = model
+    options = ClaudeAgentOptions(**options_kwargs)
+
+    async def _query_iter_for(text: str, blocks: list[dict]):
+        content: list[dict] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        content.extend(blocks)
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "parent_tool_use_id": None,
+            "session_id": "default",
+        }
+
+    async def _send_user_message(client: ClaudeSDKClient, text: str, blocks: list[dict]) -> None:
+        """Forward one user input into the live SDK client.
+
+        Strings can't carry image blocks, so we only swap to the iterable
+        form when we actually have an image attachment.
+        """
+        if blocks:
+            await client.query(_query_iter_for(text, blocks))
+        else:
+            await client.query(text or "")
+
+    async def _wait_for_next_action(client: ClaudeSDKClient) -> Optional[dict]:
+        """After ResultMessage, decide whether to send another turn or exit.
+
+        - Queued user input (immediate) → return it.
+        - Pending task notifications + AUTO_FIRE_GRACE_MS settle → auto-fire.
+        - Neither for SESSION_IDLE_TIMEOUT_MS → return None (driver exits,
+          subprocess closes, monitors die).
+        """
+        # Auto-fire path: short timeout, then synth message
+        if run.pending_notifications and run.notification_grace_started_at:
+            grace_remaining = AUTO_FIRE_GRACE_MS / 1000 - (time.time() - run.notification_grace_started_at)
+            if grace_remaining <= 0:
+                events = run.pending_notifications[:]
+                run.pending_notifications = []
+                run.notification_grace_started_at = None
+                synth = _compose_auto_fire_message(events)
+                run.emit({"type": "auto_fire", "events": events})
+                return {"kind": "auto_fire", "synth": synth}
+            timeout = grace_remaining
+        else:
+            timeout = SESSION_IDLE_TIMEOUT_MS / 1000
+
+        try:
+            item = await asyncio.wait_for(run.user_input_queue.get(), timeout=timeout)
+            return {"kind": "user", "item": item}
+        except asyncio.TimeoutError:
+            if run.pending_notifications:
+                events = run.pending_notifications[:]
+                run.pending_notifications = []
+                run.notification_grace_started_at = None
+                synth = _compose_auto_fire_message(events)
+                run.emit({"type": "auto_fire", "events": events})
+                return {"kind": "auto_fire", "synth": synth}
+            return None
 
     async def driver():
         try:
             async with ClaudeSDKClient(options=options) as client:
-                await client.query(message)
-                async for msg in client.receive_response():
+                # Initial user message — already enqueued for transcript;
+                # send into the SDK now.
+                run.busy_in_turn = True
+                await _send_user_message(client, message, image_blocks)
+
+                async for msg in client.receive_messages():
+                    run.last_activity = time.time()
                     for evt in _sdk_message_to_events(msg):
                         run.emit(evt)
+
+                    # Index by SDK session id once we know it, so a follow-up
+                    # /api/chat with the same session can find this run.
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        sid = (msg.data or {}).get("session_id")
+                        if sid and run.session_id is None:
+                            run.session_id = sid
+                            ACTIVE_RUNS_BY_SESSION[sid] = run
+
+                    if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
+                        run.pending_notifications.append({
+                            "task_id": msg.task_id,
+                            "kind": type(msg).__name__,
+                            "description": getattr(msg, "description", None),
+                            "summary": getattr(msg, "summary", None),
+                            "status": getattr(msg, "status", None),
+                            "output_file": getattr(msg, "output_file", None),
+                        })
+                        run.notification_grace_started_at = time.time()
+
+                    if isinstance(msg, ResultMessage):
+                        run.busy_in_turn = False
+                        next_action = await _wait_for_next_action(client)
+                        if next_action is None:
+                            break
+                        run.busy_in_turn = True
+                        if next_action["kind"] == "user":
+                            item = next_action["item"]
+                            await _send_user_message(client, item.get("text") or "", item.get("image_blocks") or [])
+                        else:  # auto_fire
+                            await client.query(next_action["synth"])
+
         except asyncio.CancelledError:
             # Explicit /api/chat/stop or process shutdown — surface as a
             # tidy "stopped" rather than the raw transport error that the
@@ -496,12 +1065,48 @@ async def api_chat(
             run.emit({"type": "stopped"})
             raise
         except Exception as e:
-            run.emit({"type": "error", "message": str(e)})
+            tb = traceback.format_exc()
+            tail = "\n".join(stderr_buf[-30:]).strip()
+            logging.getLogger("claude-web").error(
+                "driver error: %s\nstderr:\n%s\ntraceback:\n%s", e, tail, tb,
+            )
+            payload = {"type": "error", "message": f"{type(e).__name__}: {e}"}
+            detail_parts: list[str] = []
+            if tail:
+                detail_parts.append("--- CLI stderr ---\n" + tail)
+            detail_parts.append("--- traceback ---\n" + tb)
+            payload["stderr"] = "\n\n".join(detail_parts)
+            run.emit(payload)
         finally:
             run.finish()
 
     run.task = asyncio.create_task(driver())
     return _stream_run_response(run)
+
+
+@app.post("/api/chat/send/{run_id}")
+async def api_chat_send(
+    run_id: str,
+    message: str = Form(...),
+    images: list[UploadFile] = File(default_factory=list),
+    user: dict = Depends(auth.require_user),
+):
+    """Enqueue a user message into an already-running long-lived run.
+
+    The browser uses this when its SSE subscription is still open from a
+    prior turn — avoids opening a second stream just to deliver the input.
+    Returns 202 Accepted; the existing stream emits the new events.
+    """
+    _safe_id(run_id)
+    run = ACTIVE_RUNS.get(run_id)
+    if run is None or run.done:
+        raise HTTPException(404, "no such run")
+    image_blocks, _meta = await _read_uploaded_images(images)
+    run.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
+    run.pending_notifications.clear()
+    run.notification_grace_started_at = None
+    await run.user_input_queue.put({"text": message, "image_blocks": image_blocks})
+    return JSONResponse({"ok": True}, status_code=202)
 
 
 @app.get("/api/chat/active")
@@ -517,6 +1122,7 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         "active": not run.done,
         "run_id": run.run_id,
         "session_id": run.session_id,
+        "project": run.project_key,
         "buffered_events": len(run.events),
     }
 
@@ -610,18 +1216,49 @@ def _sdk_message_to_events(msg) -> list[dict]:
         if results:
             return [{"type": "user", "message": {"content": results}}]
         return []
+    if isinstance(msg, TaskStartedMessage):
+        return [{
+            "type": "task_started",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "task_type": msg.task_type,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskProgressMessage):
+        return [{
+            "type": "task_progress",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "last_tool_name": msg.last_tool_name,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskNotificationMessage):
+        return [{
+            "type": "task_notification",
+            "task_id": msg.task_id,
+            "status": msg.status,
+            "summary": msg.summary,
+            "output_file": msg.output_file,
+            "tool_use_id": msg.tool_use_id,
+        }]
     if isinstance(msg, ResultMessage):
         _log_usage(msg)
+        usage = msg.usage or {}
         return [{
             "type": "result",
             "is_error": msg.is_error,
             "result": msg.result,
+            "errors": list(msg.errors or []),
             "duration_ms": msg.duration_ms,
             "total_cost_usd": msg.total_cost_usd,
             "session_id": msg.session_id,
             "subtype": msg.subtype,
             "stop_reason": msg.stop_reason,
             "num_turns": msg.num_turns,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
             "permission_denials": [
                 {"tool_name": d.tool_name, "tool_input": d.tool_input}
                 for d in (msg.permission_denials or [])
