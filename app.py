@@ -808,7 +808,8 @@ class ActiveRun:
         # context. Mid-turn user input is sent through it directly so the
         # bundled CLI's "next LLM pause" queue can inject it between tool
         # calls — matching the binary's steerability instead of waiting until
-        # end-of-turn. Lock serializes writes between driver + handlers.
+        # end-of-turn. Lock serializes writes between driver + handlers and
+        # gates the run.client publish so handlers never see a partial state.
         self.client: Optional[Any] = None  # ClaudeSDKClient
         self.client_write_lock: asyncio.Lock = asyncio.Lock()
         # How many mid-turn queries we've already pushed into the CLI but
@@ -816,6 +817,10 @@ class ActiveRun:
         # each ResultMessage and skips its post-turn wait while > 0, since
         # the next turn is already inbound from the CLI.
         self.pending_immediate_queries: int = 0
+        # Set whenever a direct-path injection happens, so a driver blocked
+        # on idle-wait (post-ResultMessage with no queued items) wakes up
+        # instead of timing out while the CLI is mid-stream on the new query.
+        self.injection_event: asyncio.Event = asyncio.Event()
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
@@ -954,13 +959,21 @@ async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> N
     subagent returns) — that's the steerability the binary has by default
     and that we want here. Falls back to the Python-side queue only if the
     driver hasn't fully started yet, so no input is ever silently dropped.
+
+    Both branches run under client_write_lock so the driver's atomic
+    "drain-queue-then-publish-client" setup step can rely on no new queue
+    puts or direct sends happening behind its back.
     """
-    if run.client is not None:
-        async with run.client_write_lock:
+    async with run.client_write_lock:
+        if run.client is not None:
             await _send_to_client(run.client, text, blocks)
-        run.pending_immediate_queries += 1
-    else:
-        await run.user_input_queue.put({"text": text, "image_blocks": blocks})
+            run.pending_immediate_queries += 1
+            # Wake the driver if it's sleeping on _wait_for_next_action's
+            # idle-timeout — otherwise the CLI's response to this injection
+            # streams back into a driver that's about to time out and exit.
+            run.injection_event.set()
+        else:
+            await run.user_input_queue.put({"text": text, "image_blocks": blocks})
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -1590,7 +1603,14 @@ async def api_chat(
         if run.pending_immediate_queries > 0:
             run.pending_immediate_queries -= 1
             run.consecutive_auto_fires = 0
+            if run.pending_immediate_queries == 0:
+                run.injection_event.clear()
             return {"kind": "noop"}
+        # Nothing pending right now. If a mid-turn injection happens during
+        # the wait below, the handler will set injection_event; we want that
+        # to wake the wait so we don't idle-timeout while the CLI is mid-
+        # streaming a response to that injection.
+        run.injection_event.clear()
         cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
 
         def _drain_pending_for_auto_fire() -> dict:
@@ -1623,28 +1643,59 @@ async def api_chat(
                 _drop_pending_capped()
             timeout = SESSION_IDLE_TIMEOUT_MS / 1000
 
+        # Race three things: a queued fallback message, a direct-path
+        # injection (signalled via injection_event), or the timeout.
+        # Whichever fires first wins; we cancel the others before returning.
+        get_task = asyncio.create_task(run.user_input_queue.get())
+        evt_task = asyncio.create_task(run.injection_event.wait())
         try:
-            item = await asyncio.wait_for(run.user_input_queue.get(), timeout=timeout)
+            done, _pending = await asyncio.wait(
+                {get_task, evt_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (get_task, evt_task):
+                if not t.done():
+                    t.cancel()
+        if get_task in done:
+            item = get_task.result()
             run.consecutive_auto_fires = 0
             return {"kind": "user", "item": item}
-        except asyncio.TimeoutError:
-            if run.pending_notifications and not cap_reached:
-                return _drain_pending_for_auto_fire()
-            if run.pending_notifications:
-                _drop_pending_capped()
-            return None
+        if evt_task in done:
+            # Direct-path injection happened during the wait. Re-enter so
+            # the pending_immediate_queries early-return at the top runs.
+            return await _wait_for_next_action(client)
+        # Timeout — neither queue nor event fired.
+        if run.pending_notifications and not cap_reached:
+            return _drain_pending_for_auto_fire()
+        if run.pending_notifications:
+            _drop_pending_capped()
+        return None
 
     async def driver():
         try:
             async with ClaudeSDKClient(options=options) as client:
-                # Publish the live client so request handlers can push
-                # mid-turn input directly through it (binary-style queueing).
-                run.client = client
+                # Atomic startup: hold the write lock so no handler can race
+                # a queue.put or direct query against us. Drain anything that
+                # arrived during the run-creation window before publishing
+                # run.client, so subsequent direct-path messages strictly
+                # come AFTER any already-queued ones.
+                async with run.client_write_lock:
+                    await _send_to_client(client, effective_message, image_blocks)
+                    while not run.user_input_queue.empty():
+                        item = run.user_input_queue.get_nowait()
+                        await _send_to_client(
+                            client, item.get("text") or "", item.get("image_blocks") or [],
+                        )
+                        run.pending_immediate_queries += 1
+                    # Publish under the same lock — handlers waiting on the
+                    # lock will see the published client and use the direct
+                    # path; new arrivals see the same.
+                    run.client = client
+                    if run.pending_immediate_queries > 0:
+                        run.injection_event.set()
                 try:
-                    # Initial user message — already enqueued for transcript;
-                    # send into the SDK now.
-                    await _send_user_message(client, effective_message, image_blocks)
-
                     async for msg in client.receive_messages():
                         run.last_activity = time.time()
                         for evt in _sdk_message_to_events(msg):
