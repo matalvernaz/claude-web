@@ -44,11 +44,12 @@ from claude_agent_sdk.types import (
     ToolUseBlock,
 )
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import auth
+import setup_flow
 
 
 def _sanitize_project_key(cwd: Path) -> str:
@@ -157,6 +158,9 @@ SAFE_TOOLS = set(
 app = FastAPI()
 auth.configure(app)
 auth.install_routes(app)
+# Pull a persisted Anthropic API key (from a previous /setup api-key submission)
+# into the env so the SDK and CLI both see it without a container restart.
+setup_flow.load_api_key_into_env()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -855,6 +859,8 @@ def _require_owner(run: ActiveRun, user: dict) -> None:
 
 @app.get("/")
 async def index(request: Request, user: dict = Depends(auth.require_user)):
+    if not setup_flow.is_configured():
+        return RedirectResponse(url="/setup", status_code=302)
     response = templates.TemplateResponse(
         request, "index.html", {
             "sessions": list_sessions(),
@@ -1241,9 +1247,18 @@ async def api_chat(
     its driver — the bundled CLI subprocess and any in-flight Monitor stay
     alive across turns. Otherwise we spawn a fresh driver.
 
+    Refuses with 503 if Claude Code hasn't been signed in yet, so the
+    frontend can bounce the user to /setup instead of waiting for a 401
+    from Anthropic's API.
+
     Permission requests come back as `permission_request` events, resolved
     via /api/permission/{id}. Reconnect via /api/chat/stream/{run_id}.
     """
+    if not setup_flow.is_configured():
+        return JSONResponse(
+            {"error": "claude_not_configured", "setup_url": "/setup"},
+            status_code=503,
+        )
     _gc_runs()
 
     cwd = _resolve_project(project)
@@ -1788,6 +1803,95 @@ async def api_usage(user: dict = Depends(auth.require_user)):
         },
         "rate_limit": rate_limit,
     }
+
+
+@app.get("/setup")
+async def setup_page(request: Request, user: dict = Depends(auth.require_user)):
+    """Setup screen for the in-container `claude` CLI sign-in.
+
+    Always reachable (even when already configured) so users can re-auth
+    without first signing out. The template adjusts copy based on
+    ``configured``.
+    """
+    response = templates.TemplateResponse(
+        request, "setup.html", {
+            "user": user,
+            "configured": setup_flow.is_configured(),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/setup/status")
+async def api_setup_status(user: dict = Depends(auth.require_user)):
+    flow = setup_flow.current_flow()
+    return {
+        "configured": setup_flow.is_configured(),
+        "flow": flow.to_public() if flow else None,
+    }
+
+
+@app.post("/api/setup/oauth/start")
+async def api_setup_oauth_start(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    variant = body.get("variant", "claudeai")
+    if variant not in ("claudeai", "console"):
+        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    state = await setup_flow.start_oauth(variant)
+    return state.to_public()
+
+
+@app.post("/api/setup/oauth/code")
+async def api_setup_oauth_code(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    if not code:
+        raise HTTPException(400, "code is required")
+    try:
+        state = await setup_flow.submit_code(code)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {
+        "configured": setup_flow.is_configured(),
+        "flow": state.to_public(),
+    }
+
+
+@app.post("/api/setup/oauth/cancel")
+async def api_setup_oauth_cancel(user: dict = Depends(auth.require_user)):
+    await setup_flow.cancel_flow()
+    return {"ok": True}
+
+
+@app.post("/api/setup/apikey")
+async def api_setup_apikey(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(400, "api_key is required")
+    try:
+        setup_flow.save_api_key(api_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"configured": setup_flow.is_configured()}
+
+
+@app.post("/api/setup/signout")
+async def api_setup_signout(user: dict = Depends(auth.require_user)):
+    """Forget all stored Claude credentials. Forward-auth (Keycloak) login
+    is unaffected — this only signs the in-container Claude CLI out."""
+    await setup_flow.sign_out()
+    return {"configured": setup_flow.is_configured()}
 
 
 @app.get("/healthz")

@@ -1,0 +1,106 @@
+/* /setup page — first-run sign-in for the in-container Claude Code CLI. */
+
+main.setup {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 3rem;
+}
+
+.setup-intro,
+.setup-already {
+  margin: 0 0 1.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.setup-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.5rem;
+}
+@media (min-width: 56rem) {
+  .setup-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.setup-card {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+}
+
+.setup-card h2 {
+  margin-top: 0;
+  font-size: 1.15rem;
+}
+
+.setup-card fieldset {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin: 0 0 0.75rem;
+}
+
+.setup-card legend { padding: 0 0.25rem; font-weight: 600; }
+
+.radio-row, .checkbox-row { margin: 0.25rem 0; }
+.radio-row input, .checkbox-row input { margin-right: 0.4rem; }
+
+.setup-card input[type="text"],
+.setup-card input[type="password"] {
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+}
+
+.setup-card input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.setup-card button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.setup-card button:hover:not(:disabled),
+.setup-card button:focus:not(:disabled) {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.setup-card button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.setup-error {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #b44;
+  background: rgba(180, 68, 68, 0.15);
+  color: #ffb4b4;
+  border-radius: 4px;
+}
+
+.setup-signout {
+  margin-top: 1.5rem;
+}
+
+.user-badge {
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}

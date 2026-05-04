@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in to Claude — claude-web</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Sign in to Claude</h1>
+    <div class="header-actions">
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="setup">
+    {% if configured %}
+      <p class="setup-already" role="status">
+        This claude-web instance is already signed in to a Claude account.
+        <a href="/">Continue to the main interface</a> &mdash; or sign in
+        again below to switch accounts.
+      </p>
+    {% else %}
+      <p class="setup-intro">
+        This is the in-container Claude Code's first-run sign-in.
+        Pick whichever flow matches the account you want this instance
+        to use. Until that's done, the chat interface won't open.
+      </p>
+    {% endif %}
+
+    <div class="setup-grid">
+      <section aria-labelledby="oauth-heading" class="setup-card">
+        <h2 id="oauth-heading">Sign in with a Claude account</h2>
+        <p>Best for Claude.ai subscriptions (Pro, Max, Team) and Anthropic Console accounts. Opens claude.com in a new tab so you can sign in there, then asks you to paste a one-time code.</p>
+
+        <form id="oauth-form">
+          <fieldset>
+            <legend>Account type</legend>
+            <p class="radio-row">
+              <input type="radio" id="variant-claudeai" name="variant" value="claudeai" checked>
+              <label for="variant-claudeai">Claude subscription (claude.ai)</label>
+            </p>
+            <p class="radio-row">
+              <input type="radio" id="variant-console" name="variant" value="console">
+              <label for="variant-console">Anthropic Console (API billing)</label>
+            </p>
+          </fieldset>
+          <p>
+            <button type="submit" id="oauth-start">Start sign-in</button>
+          </p>
+        </form>
+
+        <div id="oauth-progress" hidden>
+          <p id="oauth-status" role="status" aria-live="polite"></p>
+
+          <div id="oauth-link-block" hidden>
+            <p>
+              <a id="oauth-url" href="#" target="_blank" rel="noopener noreferrer">Open the Claude sign-in page</a>
+              (opens in a new tab)
+            </p>
+            <p class="hint">
+              After signing in, claude.com will show a one-time code.
+              Copy it and paste it below.
+            </p>
+            <form id="oauth-code-form">
+              <p>
+                <label for="oauth-code">Auth code</label><br>
+                <input type="text" id="oauth-code" name="code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+              </p>
+              <p>
+                <button type="submit" id="oauth-code-submit">Finish sign-in</button>
+                <button type="button" id="oauth-cancel">Cancel</button>
+              </p>
+            </form>
+          </div>
+
+          <p id="oauth-error" class="setup-error" role="alert" hidden></p>
+        </div>
+      </section>
+
+      <section aria-labelledby="apikey-heading" class="setup-card">
+        <h2 id="apikey-heading">Or paste an API key</h2>
+        <p>Best for headless or shared instances where the OAuth flow isn't a fit. The key is stored in <code>$CLAUDE_WEB_STATE_DIR/anthropic_api_key</code> with mode 0600 and loaded into <code>ANTHROPIC_API_KEY</code> for the SDK.</p>
+
+        <form id="apikey-form">
+          <p>
+            <label for="apikey-input">Anthropic API key</label><br>
+            <input type="password" id="apikey-input" name="api_key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+          </p>
+          <p>
+            <label class="checkbox-row">
+              <input type="checkbox" id="apikey-show">
+              Show key
+            </label>
+          </p>
+          <p>
+            <button type="submit" id="apikey-submit">Save key</button>
+          </p>
+        </form>
+
+        <p id="apikey-status" role="status" aria-live="polite"></p>
+        <p id="apikey-error" class="setup-error" role="alert" hidden></p>
+      </section>
+    </div>
+
+    {% if configured %}
+      <section aria-labelledby="signout-heading" class="setup-card setup-signout">
+        <h2 id="signout-heading">Sign Claude out</h2>
+        <p>Forget the in-container Claude credentials (and any saved API key) so the next visitor has to sign in again. Your Keycloak login here is unaffected.</p>
+        <form id="signout-form">
+          <p><button type="submit" id="signout-submit">Sign Claude out</button></p>
+        </form>
+        <p id="signout-status" role="status" aria-live="polite"></p>
+      </section>
+    {% endif %}
+  </main>
+
+  <script src="/static/setup.js?v={{ asset_version('setup.js') }}"></script>
+</body>
+</html>

@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY app.py auth.py ./
+COPY app.py auth.py setup_flow.py ./
 COPY static ./static
 COPY templates ./templates
 

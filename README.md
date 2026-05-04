@@ -22,13 +22,14 @@ mkdir -p workspace claude-home claude-web-state
 docker compose up -d
 ```
 
-Then sign in to your Claude Code account inside the container once (so the credentials persist in the `claude-home` volume):
+Open `https://claude.example.com` (whatever you set `OIDC_REDIRECT_URI` to point at). On first visit you'll be redirected to **`/setup`** — a one-time, in-browser sign-in flow for the in-container Claude Code CLI. Two options there:
 
-```bash
-docker compose exec claude-web claude login
-```
+- **Sign in with a Claude account** — drives `claude auth login` (or `--console` for an Anthropic Console account) as a subprocess. Click the link to claude.com, sign in, copy the one-time code back into the textbox.
+- **Or paste an API key** — for headless / shared instances. The key is persisted to `$CLAUDE_WEB_STATE_DIR/anthropic_api_key` (mode 0600) and loaded into `ANTHROPIC_API_KEY` on startup.
 
-Open `https://claude.example.com` (whatever you set `OIDC_REDIRECT_URI` to point at) and you're in.
+Either way, credentials persist in the `claude-home` (or `claude-web-state`) volume across container restarts. To switch accounts later, the `/setup` page also exposes a "Sign Claude out" button.
+
+If you'd rather sign in from a shell, that still works: `docker compose exec claude-web claude auth login`.
 
 ## Configuration
 
@@ -88,11 +89,12 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 npm install -g @anthropic-ai/claude-code
-claude login
 cp .env.example .env  # edit values
 set -a; source .env; set +a
 uvicorn app:app --host 127.0.0.1 --port 3001
 ```
+
+Then visit `/setup` to sign Claude in via the in-browser flow, or run `claude auth login` from the shell if you prefer.
 
 ## How sessions work
 
