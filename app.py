@@ -804,6 +804,18 @@ class ActiveRun:
         # auto-fire forever; this counter caps the chain.
         self.consecutive_auto_fires: int = 0
         self.last_activity: float = now
+        # The live SDK client, set once the driver has entered its async
+        # context. Mid-turn user input is sent through it directly so the
+        # bundled CLI's "next LLM pause" queue can inject it between tool
+        # calls — matching the binary's steerability instead of waiting until
+        # end-of-turn. Lock serializes writes between driver + handlers.
+        self.client: Optional[Any] = None  # ClaudeSDKClient
+        self.client_write_lock: asyncio.Lock = asyncio.Lock()
+        # How many mid-turn queries we've already pushed into the CLI but
+        # haven't yet seen a ResultMessage for. The driver decrements on
+        # each ResultMessage and skips its post-turn wait while > 0, since
+        # the next turn is already inbound from the CLI.
+        self.pending_immediate_queries: int = 0
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
@@ -906,6 +918,49 @@ def _require_owner(run: ActiveRun, user: dict) -> None:
     owner = run.owner_sub
     if owner and owner != user.get("sub"):
         raise HTTPException(403, "not your run")
+
+
+async def _query_iter_with_blocks(text: str, blocks: list[dict]):
+    """Async iterable that yields a single user message dict.
+
+    Used by _send_to_client when image blocks are attached: client.query()
+    only accepts blocks via the iterable form, not the plain-string form.
+    """
+    content: list[dict] = []
+    if text:
+        content.append({"type": "text", "text": text})
+    content.extend(blocks)
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": None,
+        "session_id": "default",
+    }
+
+
+async def _send_to_client(client, text: str, blocks: list[dict]) -> None:
+    """Forward one user input into a live SDK client."""
+    if blocks:
+        await client.query(_query_iter_with_blocks(text, blocks))
+    else:
+        await client.query(text or "")
+
+
+async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> None:
+    """Push mid-turn user input down to the bundled CLI immediately.
+
+    The bundled binary holds the message in its own concurrent-query queue
+    and injects it at the next LLM pause (between tool calls, after a
+    subagent returns) — that's the steerability the binary has by default
+    and that we want here. Falls back to the Python-side queue only if the
+    driver hasn't fully started yet, so no input is ever silently dropped.
+    """
+    if run.client is not None:
+        async with run.client_write_lock:
+            await _send_to_client(run.client, text, blocks)
+        run.pending_immediate_queries += 1
+    else:
+        await run.user_input_queue.put({"text": text, "image_blocks": blocks})
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -1411,7 +1466,7 @@ async def api_chat(
         existing.pending_notifications.clear()
         existing.notification_grace_started_at = None
         existing.consecutive_auto_fires = 0
-        await existing.user_input_queue.put({"text": effective, "image_blocks": image_blocks})
+        await _inject_user_input(existing, effective, image_blocks)
         return _stream_run_response(existing, start_index=start_index)
 
     sid_in = session_id or None
@@ -1511,39 +1566,31 @@ async def api_chat(
         options_kwargs["betas"] = sdk_betas
     options = ClaudeAgentOptions(**options_kwargs)
 
-    async def _query_iter_for(text: str, blocks: list[dict]):
-        content: list[dict] = []
-        if text:
-            content.append({"type": "text", "text": text})
-        content.extend(blocks)
-        yield {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-            "parent_tool_use_id": None,
-            "session_id": "default",
-        }
-
     async def _send_user_message(client: ClaudeSDKClient, text: str, blocks: list[dict]) -> None:
-        """Forward one user input into the live SDK client.
+        """Forward one user input into the live SDK client (driver path).
 
-        Strings can't carry image blocks, so we only swap to the iterable
-        form when we actually have an image attachment.
+        Acquires the per-run write lock so concurrent mid-turn injections
+        from request handlers don't interleave bytes on the CLI's stdin.
         """
-        if blocks:
-            await client.query(_query_iter_for(text, blocks))
-        else:
-            await client.query(text or "")
+        async with run.client_write_lock:
+            await _send_to_client(client, text, blocks)
 
     async def _wait_for_next_action(client: ClaudeSDKClient) -> Optional[dict]:
         """After ResultMessage, decide whether to send another turn or exit.
 
-        - Queued user input (immediate) → return it.
+        - Mid-turn user query already pushed via _inject_user_input → noop
+          (the next turn is already inbound from the CLI; just keep reading).
+        - Queued user input (fallback, race-window only) → return it.
         - Pending task notifications + AUTO_FIRE_GRACE_MS settle → auto-fire,
           unless the auto-fire chain has already hit MAX_CONSECUTIVE_AUTO_FIRES
           (then we drop the notifications and wait for the human).
         - Neither for SESSION_IDLE_TIMEOUT_MS → return None (driver exits,
           subprocess closes, monitors die).
         """
+        if run.pending_immediate_queries > 0:
+            run.pending_immediate_queries -= 1
+            run.consecutive_auto_fires = 0
+            return {"kind": "noop"}
         cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
 
         def _drain_pending_for_auto_fire() -> dict:
@@ -1590,43 +1637,55 @@ async def api_chat(
     async def driver():
         try:
             async with ClaudeSDKClient(options=options) as client:
-                # Initial user message — already enqueued for transcript;
-                # send into the SDK now.
-                await _send_user_message(client, effective_message, image_blocks)
+                # Publish the live client so request handlers can push
+                # mid-turn input directly through it (binary-style queueing).
+                run.client = client
+                try:
+                    # Initial user message — already enqueued for transcript;
+                    # send into the SDK now.
+                    await _send_user_message(client, effective_message, image_blocks)
 
-                async for msg in client.receive_messages():
-                    run.last_activity = time.time()
-                    for evt in _sdk_message_to_events(msg):
-                        run.emit(evt)
+                    async for msg in client.receive_messages():
+                        run.last_activity = time.time()
+                        for evt in _sdk_message_to_events(msg):
+                            run.emit(evt)
 
-                    # Index by SDK session id once we know it, so a follow-up
-                    # /api/chat with the same session can find this run.
-                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                        sid = (msg.data or {}).get("session_id")
-                        if sid and run.session_id is None:
-                            run.session_id = sid
-                            ACTIVE_RUNS_BY_SESSION[sid] = run
+                        # Index by SDK session id once we know it, so a follow-up
+                        # /api/chat with the same session can find this run.
+                        if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                            sid = (msg.data or {}).get("session_id")
+                            if sid and run.session_id is None:
+                                run.session_id = sid
+                                ACTIVE_RUNS_BY_SESSION[sid] = run
 
-                    if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
-                        run.pending_notifications.append({
-                            "task_id": msg.task_id,
-                            "kind": type(msg).__name__,
-                            "description": getattr(msg, "description", None),
-                            "summary": getattr(msg, "summary", None),
-                            "status": getattr(msg, "status", None),
-                            "output_file": getattr(msg, "output_file", None),
-                        })
-                        run.notification_grace_started_at = time.time()
+                        if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
+                            run.pending_notifications.append({
+                                "task_id": msg.task_id,
+                                "kind": type(msg).__name__,
+                                "description": getattr(msg, "description", None),
+                                "summary": getattr(msg, "summary", None),
+                                "status": getattr(msg, "status", None),
+                                "output_file": getattr(msg, "output_file", None),
+                            })
+                            run.notification_grace_started_at = time.time()
 
-                    if isinstance(msg, ResultMessage):
-                        next_action = await _wait_for_next_action(client)
-                        if next_action is None:
-                            break
-                        if next_action["kind"] == "user":
-                            item = next_action["item"]
-                            await _send_user_message(client, item.get("text") or "", item.get("image_blocks") or [])
-                        else:  # auto_fire
-                            await client.query(next_action["synth"])
+                        if isinstance(msg, ResultMessage):
+                            next_action = await _wait_for_next_action(client)
+                            if next_action is None:
+                                break
+                            if next_action["kind"] == "noop":
+                                # Mid-turn input was already injected via
+                                # _inject_user_input; the next turn is on
+                                # its way from the CLI. Just keep reading.
+                                continue
+                            if next_action["kind"] == "user":
+                                item = next_action["item"]
+                                await _send_user_message(client, item.get("text") or "", item.get("image_blocks") or [])
+                            else:  # auto_fire
+                                async with run.client_write_lock:
+                                    await client.query(next_action["synth"])
+                finally:
+                    run.client = None
 
         except asyncio.CancelledError:
             # Explicit /api/chat/stop or process shutdown — surface as a
@@ -1662,10 +1721,13 @@ async def api_chat_send(
     files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
-    """Enqueue a user message into an already-running long-lived run.
+    """Inject a user message into an already-running long-lived run.
 
     The browser uses this when its SSE subscription is still open from a
     prior turn — avoids opening a second stream just to deliver the input.
+    Goes straight to the bundled CLI's stdin so its concurrent-query queue
+    can inject between tool calls (binary-style steerability), instead of
+    waiting on our own end-of-turn boundary.
     Returns 202 Accepted; the existing stream emits the new events.
     """
     _safe_id(run_id)
@@ -1685,7 +1747,7 @@ async def api_chat_send(
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0
-    await run.user_input_queue.put({"text": effective, "image_blocks": image_blocks})
+    await _inject_user_input(run, effective, image_blocks)
     return JSONResponse({"ok": True}, status_code=202)
 
 
