@@ -408,6 +408,23 @@
     'Wassailing' /*(local)*/, 'Whatchamacalliting', 'Whirlpooling', 'Whirring',
     'Whisking', 'Wibbling', 'Working', 'Wrangling',
     'Yammering' /*(local)*/, 'Yodeling' /*(local)*/, 'Zesting', 'Zigzagging',
+    // Multi-word phrases (local). The bundled CLI binary only ships the
+    // 187 single-word gerunds above; these phrases are inspired by rubber-duck
+    // and yak-shaving sightings in the wild and look fine in "✻ {x}…" form.
+    'Consulting the rubber duck' /*(local phrase)*/,
+    'Asking the rubber duck' /*(local phrase)*/,
+    'Bribing the rubber duck' /*(local phrase)*/,
+    "Pestering Schrödinger's cat" /*(local phrase)*/,
+    'Shaving the yak' /*(local phrase)*/,
+    'Reticulating splines' /*(local phrase)*/,
+    'Untangling the spaghetti' /*(local phrase)*/,
+    'Dusting off the docs' /*(local phrase)*/,
+    'Negotiating with the linter' /*(local phrase)*/,
+    'Counting the rubber ducks' /*(local phrase)*/,
+    'Stalking the bug' /*(local phrase)*/,
+    'Reading the source, Luke' /*(local phrase)*/,
+    'Bargaining with TypeScript' /*(local phrase)*/,
+    'Auditing the cargo cult' /*(local phrase)*/,
   ];
   let gerundTimer = null;
   let gerundSpeakTimer = null;
