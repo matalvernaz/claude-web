@@ -485,6 +485,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   background: #d96868;
   outline: none;
 }
+
+/* File chips: same row layout as image attachments, but no thumbnail. */
+.file-attachments .attachment {
+  width: auto;
+  min-width: 12rem;
+  max-width: 22rem;
+  padding-right: 1.6rem; /* leave room for the delete button */
+}
+.file-attachments .attachment-icon {
+  display: inline-block;
+  margin-right: 0.4rem;
+  font-size: 1rem;
+}
+.file-attachments .attachment-name {
+  font-size: 0.85rem;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .image-btn {
   display: inline-flex;
   align-items: center;

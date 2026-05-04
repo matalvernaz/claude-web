@@ -98,18 +98,23 @@
           <span class="context-bar" aria-hidden="true"><span id="context-fill" class="context-fill"></span></span>
         </div>
         <form id="chat-form" autocomplete="off">
-          <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline, paste or drop images)</span></label>
+          <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline, paste or drop files)</span></label>
           <div class="prompt-wrap">
             <textarea id="prompt" name="message" rows="3" placeholder="Ask Claude…"></textarea>
             <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
           </div>
           <div id="attachments" class="attachments" hidden aria-label="Attached images"></div>
+          <div id="file-attachments" class="attachments file-attachments" hidden aria-label="Attached files"></div>
           <div class="row">
             <button type="submit" id="send">Send</button>
             <button type="button" id="stop" hidden>Stop</button>
             <label class="image-btn" for="image-input" aria-label="Attach images">
               <span aria-hidden="true">📎</span> Image
               <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+            </label>
+            <label class="image-btn" for="file-input" aria-label="Attach files">
+              <span aria-hidden="true">📄</span> File
+              <input type="file" id="file-input" multiple hidden>
             </label>
             <span id="status" aria-hidden="true"></span>
           </div>

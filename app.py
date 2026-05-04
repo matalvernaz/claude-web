@@ -98,12 +98,19 @@ USAGE_DIR.mkdir(parents=True, exist_ok=True)
 USAGE_LOG = USAGE_DIR / "usage.jsonl"
 RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
 STATE_DB_PATH = USAGE_DIR / "state.db"
+UPLOADS_ROOT = USAGE_DIR / "uploads"
+UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 
 # How long persisted runs (events + metadata) survive before being purged.
 # Default 24h; tune via CLAUDE_WEB_PERSIST_RETENTION. The matching in-memory
 # retention (RUN_RETENTION_SECONDS) is set to the same value so the GC pass
 # and the sqlite purge stay aligned.
 PERSIST_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_PERSIST_RETENTION", "86400"))
+
+# Per-run upload directories (uploads/<run_id>/) get GC'd this old. Default
+# 7 days, longer than PERSIST_RETENTION_SECONDS so a user can still grab a
+# file they uploaded yesterday after the conversation has rolled off.
+UPLOAD_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_UPLOAD_RETENTION", str(7 * 86400)))
 
 # Pending permission requests deny themselves after this if the browser never
 # answers (closed tab, lost network). Without this the SDK turn pins forever.
@@ -122,6 +129,11 @@ TOOL_RESULT_PREVIEW = 200
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGES_PER_TURN = 10
 ALLOWED_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+# Generic (non-image) attachments. Saved to disk and referenced by absolute
+# path in a synthetic prefix so Claude's Read/Bash tools can open them — the
+# Anthropic API can't take arbitrary binary blobs as content blocks anyway.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_FILES_PER_TURN = 10
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Models exposed in the UI dropdown. The form sends `key`; the server maps
@@ -648,6 +660,47 @@ def _purge_old_persisted(now: float) -> None:
         logging.getLogger("claude-web").warning("purge_old_persisted failed: %s", e)
 
 
+_LAST_UPLOAD_PURGE = 0.0
+_UPLOAD_PURGE_INTERVAL_SECONDS = 600  # don't rescan the dir on every request
+
+
+def _purge_old_uploads(now: float) -> None:
+    """Drop per-run upload directories older than UPLOAD_RETENTION_SECONDS.
+
+    Wired into _gc_runs (which fires on every /api/chat) but throttled to
+    one scan every ten minutes so a chatty session doesn't statvfs-storm
+    the uploads dir. Names that don't match the run-id regex are ignored.
+    """
+    global _LAST_UPLOAD_PURGE
+    if now - _LAST_UPLOAD_PURGE < _UPLOAD_PURGE_INTERVAL_SECONDS:
+        return
+    _LAST_UPLOAD_PURGE = now
+    cutoff = now - UPLOAD_RETENTION_SECONDS
+    try:
+        entries = list(UPLOADS_ROOT.iterdir())
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        if not _ID_RE.match(entry.name):
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        for child in entry.iterdir():
+            try:
+                child.unlink()
+            except OSError:
+                pass
+        try:
+            entry.rmdir()
+        except OSError:
+            pass
+
+
 def _restore_persisted_runs() -> None:
     """At boot, hydrate ACTIVE_RUNS from sqlite as already-finished entries.
 
@@ -829,6 +882,7 @@ def _gc_runs() -> None:
             existing = ACTIVE_RUNS_BY_SESSION.get(run.session_id)
             if existing is run:
                 ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
+    _purge_old_uploads(now)
 
 
 def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
@@ -1182,6 +1236,71 @@ def _validate_image(upload: UploadFile, data: bytes) -> str:
     return media_type
 
 
+_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_filename(name: str) -> str:
+    """Strip path separators / NULs / non-ASCII so the upload can't escape its
+    per-run directory or trip the OS on weird unicode. Falls back to "upload"
+    if nothing usable is left."""
+    base = os.path.basename(name or "")
+    cleaned = _FILENAME_RE.sub("_", base).strip("._") or "upload"
+    return cleaned[:120]
+
+
+async def _save_uploaded_files(files: list[UploadFile], run_id: str) -> list[dict]:
+    """Persist non-image attachments under uploads/<run_id>/ and return metadata.
+
+    The Anthropic API can't accept arbitrary binary blobs in user content, so
+    instead of inlining we write to disk and let Claude's filesystem tools
+    (Read, Bash) open the path. ``run_id`` namespaces the directory; cleanup
+    happens with the rest of the run's persisted state.
+    """
+    if not files:
+        return []
+    real = [f for f in files if f and f.filename]
+    if not real:
+        return []
+    if len(real) > MAX_FILES_PER_TURN:
+        raise HTTPException(400, f"too many files (max {MAX_FILES_PER_TURN})")
+    target_dir = UPLOADS_ROOT / run_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out: list[dict] = []
+    for f in real:
+        data = await f.read()
+        if not data:
+            continue
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(400, f"file '{f.filename}' too large (>{MAX_UPLOAD_BYTES} bytes)")
+        base = _safe_filename(f.filename)
+        target = target_dir / base
+        # Disambiguate name collisions within the same run.
+        n = 1
+        while target.exists():
+            stem, dot, ext = base.rpartition(".")
+            base2 = f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
+            target = target_dir / base2
+            n += 1
+        target.write_bytes(data)
+        out.append({
+            "filename": target.name,
+            "path": str(target),
+            "size": len(data),
+            "content_type": (f.content_type or "application/octet-stream"),
+        })
+    return out
+
+
+def _file_attachment_prefix(metas: list[dict]) -> str:
+    if not metas:
+        return ""
+    lines = ["[Attached files for this turn — open with the Read tool (or Bash):]"]
+    for m in metas:
+        size_kb = max(1, round(m["size"] / 1024))
+        lines.append(f"- {m['path']} ({size_kb} KB, {m['content_type']})")
+    return "\n".join(lines) + "\n\n"
+
+
 async def _read_uploaded_images(images: list[UploadFile]) -> tuple[list[dict], list[dict]]:
     """Validate and base64-encode uploaded image files."""
     if images and len(images) > MAX_IMAGES_PER_TURN:
@@ -1239,6 +1358,7 @@ async def api_chat(
     project: str = Form(default=""),
     model: str = Form(default=""),
     images: list[UploadFile] = File(default_factory=list),
+    files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -1272,11 +1392,18 @@ async def api_chat(
     existing = _existing_run_for_session(session_id) if session_id else None
     if existing is not None:
         _require_owner(existing, user)
+        file_metas = await _save_uploaded_files(files, existing.run_id)
+        effective = _file_attachment_prefix(file_metas) + message
         # Subscribe BEFORE we emit the new user_prompt so the new subscriber
         # only sees events from this turn forward, not the entire prior
         # history that the browser already rendered.
         start_index = len(existing.events)
-        existing.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
+        existing.emit({
+            "type": "user_prompt",
+            "text": message,
+            "image_count": len(image_blocks),
+            "file_count": len(file_metas),
+        })
         # Pending notifications get superseded by explicit user input — the
         # user is now driving, no need to auto-fire. Reset the chain counter
         # so the user gets a fresh budget if their reply itself triggers
@@ -1284,7 +1411,7 @@ async def api_chat(
         existing.pending_notifications.clear()
         existing.notification_grace_started_at = None
         existing.consecutive_auto_fires = 0
-        await existing.user_input_queue.put({"text": message, "image_blocks": image_blocks})
+        await existing.user_input_queue.put({"text": effective, "image_blocks": image_blocks})
         return _stream_run_response(existing, start_index=start_index)
 
     sid_in = session_id or None
@@ -1292,11 +1419,18 @@ async def api_chat(
     run = ActiveRun(run_id, owner_sub=user.get("sub"))
     run.project_key = _sanitize_project_key(cwd)
     ACTIVE_RUNS[run_id] = run
+    file_metas = await _save_uploaded_files(files, run_id)
+    effective_message = _file_attachment_prefix(file_metas) + message
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
     # echoes assistant content and tool results back).
     run.emit({"type": "run_started", "run_id": run_id, "project": run.project_key, "model": model or None})
-    run.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
+    run.emit({
+        "type": "user_prompt",
+        "text": message,
+        "image_count": len(image_blocks),
+        "file_count": len(file_metas),
+    })
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context):
         if tool_name in SAFE_TOOLS:
@@ -1458,7 +1592,7 @@ async def api_chat(
             async with ClaudeSDKClient(options=options) as client:
                 # Initial user message — already enqueued for transcript;
                 # send into the SDK now.
-                await _send_user_message(client, message, image_blocks)
+                await _send_user_message(client, effective_message, image_blocks)
 
                 async for msg in client.receive_messages():
                     run.last_activity = time.time()
@@ -1525,6 +1659,7 @@ async def api_chat_send(
     run_id: str,
     message: str = Form(...),
     images: list[UploadFile] = File(default_factory=list),
+    files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
     """Enqueue a user message into an already-running long-lived run.
@@ -1539,11 +1674,18 @@ async def api_chat_send(
         raise HTTPException(404, "no such run")
     _require_owner(run, user)
     image_blocks, _meta = await _read_uploaded_images(images)
-    run.emit({"type": "user_prompt", "text": message, "image_count": len(image_blocks)})
+    file_metas = await _save_uploaded_files(files, run_id)
+    effective = _file_attachment_prefix(file_metas) + message
+    run.emit({
+        "type": "user_prompt",
+        "text": message,
+        "image_count": len(image_blocks),
+        "file_count": len(file_metas),
+    })
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0
-    await run.user_input_queue.put({"text": message, "image_blocks": image_blocks})
+    await run.user_input_queue.put({"text": effective, "image_blocks": image_blocks})
     return JSONResponse({"ok": True}, status_code=202)
 
 
@@ -1829,7 +1971,13 @@ async def api_setup_status(user: dict = Depends(auth.require_user)):
     return {
         "configured": setup_flow.is_configured(),
         "flow": flow.to_public() if flow else None,
+        "whoami": setup_flow.whoami(),
     }
+
+
+@app.get("/api/setup/whoami")
+async def api_setup_whoami(user: dict = Depends(auth.require_user)):
+    return setup_flow.whoami()
 
 
 @app.post("/api/setup/oauth/start")
@@ -1854,6 +2002,8 @@ async def api_setup_oauth_code(
     code = (body.get("code") or "").strip()
     if not code:
         raise HTTPException(400, "code is required")
+    if len(code) > 200_000:
+        raise HTTPException(400, "code too long")
     try:
         state = await setup_flow.submit_code(code)
     except RuntimeError as e:

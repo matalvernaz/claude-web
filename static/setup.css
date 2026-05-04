@@ -95,6 +95,13 @@ details.setup-apikey > summary:focus {
   cursor: not-allowed;
 }
 
+.setup-whoami {
+  margin: 0 0 1.5rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.95rem;
+  color: var(--fg-muted, var(--fg));
+}
+
 .setup-error {
   margin-top: 0.5rem;
   padding: 0.5rem 0.75rem;

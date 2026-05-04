@@ -15,6 +15,8 @@
   const projectSelect = document.getElementById("project-select");
   const imageInput = document.getElementById("image-input");
   const attachmentsEl = document.getElementById("attachments");
+  const fileInput = document.getElementById("file-input");
+  const fileAttachmentsEl = document.getElementById("file-attachments");
   const slashMenu = document.getElementById("slash-menu");
   const contextMeter = document.getElementById("context-meter");
   const contextText = document.getElementById("context-text");
@@ -36,6 +38,10 @@
 
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
   let pendingImages = [];
+  // Pending non-image file attachments. Each entry is just {file}; we don't
+  // pre-read these on the client because the server saves them to disk and
+  // we don't want to hold the bytes in memory twice.
+  let pendingFiles = [];
 
   // Outgoing message queue. While a turn is streaming, pressing Send pushes
   // here instead of starting a new request; drainStream flushes the queue
@@ -253,6 +259,13 @@
     const note = document.createElement("div");
     note.className = "image-placeholder";
     note.textContent = `📎 ${count} image${count === 1 ? "" : "s"} attached`;
+    bodyEl.parentElement.appendChild(note);
+  }
+
+  function appendFilePlaceholder(bodyEl, count) {
+    const note = document.createElement("div");
+    note.className = "image-placeholder";
+    note.textContent = `📄 ${count} file${count === 1 ? "" : "s"} attached`;
     bodyEl.parentElement.appendChild(note);
   }
 
@@ -509,19 +522,19 @@
       return;
     }
     const text = promptEl.value.trim();
-    if (!text && pendingImages.length === 0) return;
+    if (!text && pendingImages.length === 0 && pendingFiles.length === 0) return;
     // Intercept client-side slash commands BEFORE we treat the input as a
     // user message to the model. Everything else (e.g. skills like
     // /security-review) flows through as text — the model recognises the
     // syntax even though the SDK doesn't.
-    if (text.startsWith("/") && pendingImages.length === 0) {
+    if (text.startsWith("/") && pendingImages.length === 0 && pendingFiles.length === 0) {
       const handled = await handleClientSlashCommand(text);
       if (handled) {
         promptEl.value = "";
         return;
       }
     }
-    const entry = { text, images: pendingImages.slice() };
+    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice() };
     promptEl.value = "";
     clearAttachments();
     if (isStreaming) {
@@ -571,6 +584,9 @@
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
       }
+      for (const f of (entry.files || [])) {
+        fd.append("files", f.file, f.file.name);
+      }
       const r = await fetch(`/api/chat/send/${encodeURIComponent(currentRunId)}`, { method: "POST", body: fd });
       if (r.status === 404) {
         // Run died on the server — fall back to opening a fresh one.
@@ -610,6 +626,9 @@
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
+      }
+      for (const f of (entry.files || [])) {
+        fd.append("files", f.file, f.file.name);
       }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: currentAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -735,6 +754,7 @@
       // streams render it the same way.
       const body = appendMessage("user", obj.text || "");
       if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
+      if (obj.file_count) appendFilePlaceholder(body, obj.file_count);
     } else if (obj.type === "stopped") {
       setStatus("Stopped.");
       announce("Stopped.");
@@ -1518,9 +1538,14 @@
 
   function clearAttachments() {
     pendingImages = [];
+    pendingFiles = [];
     if (attachmentsEl) {
       attachmentsEl.innerHTML = "";
       attachmentsEl.hidden = true;
+    }
+    if (fileAttachmentsEl) {
+      fileAttachmentsEl.innerHTML = "";
+      fileAttachmentsEl.hidden = true;
     }
   }
 
@@ -1598,16 +1623,98 @@
     imageInput.value = "";  // allow picking the same file again later
   });
 
+  // ─── Generic file attachments ──────────────────────────────────────────
+  // Non-image uploads. The server saves these to disk and prepends a
+  // [Attached files: …] block to the user's message so Claude can Read
+  // them with its tools. We don't pre-load the bytes client-side — file
+  // uploads can be much larger than images.
+  const MAX_FILE_BYTES = 25 * 1024 * 1024;
+  const MAX_FILES = 10;
+
+  function fileIconFor(name) {
+    const ext = (name || "").split(".").pop().toLowerCase();
+    if (["pdf"].includes(ext)) return "📕";
+    if (["zip", "tar", "gz", "tgz", "bz2", "xz", "7z"].includes(ext)) return "🗜️";
+    if (["mp3", "wav", "flac", "ogg", "m4a", "opus"].includes(ext)) return "🎵";
+    if (["mp4", "mkv", "mov", "webm", "avi"].includes(ext)) return "🎞️";
+    if (["csv", "tsv", "xlsx", "xls"].includes(ext)) return "📊";
+    if (["json", "yaml", "yml", "toml", "xml", "ini"].includes(ext)) return "🧾";
+    if (["py", "js", "ts", "tsx", "jsx", "go", "rs", "c", "cpp", "h", "java", "rb", "swift", "sh", "html", "css"].includes(ext)) return "📜";
+    return "📄";
+  }
+
+  function renderFileAttachments() {
+    if (!fileAttachmentsEl) return;
+    fileAttachmentsEl.innerHTML = "";
+    if (!pendingFiles.length) {
+      fileAttachmentsEl.hidden = true;
+      return;
+    }
+    fileAttachmentsEl.hidden = false;
+    pendingFiles.forEach((entry, idx) => {
+      const wrap = document.createElement("div");
+      wrap.className = "attachment";
+      const icon = document.createElement("span");
+      icon.className = "attachment-icon";
+      icon.textContent = fileIconFor(entry.file.name);
+      icon.setAttribute("aria-hidden", "true");
+      const name = document.createElement("div");
+      name.className = "attachment-name";
+      name.textContent = entry.file.name;
+      const meta = document.createElement("div");
+      meta.className = "attachment-meta";
+      meta.textContent = `${Math.round(entry.file.size / 1024)} KB`;
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "attachment-delete";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `Remove attachment ${entry.file.name}`);
+      del.addEventListener("click", () => {
+        pendingFiles.splice(idx, 1);
+        renderFileAttachments();
+      });
+      wrap.appendChild(icon);
+      wrap.appendChild(name);
+      wrap.appendChild(meta);
+      wrap.appendChild(del);
+      fileAttachmentsEl.appendChild(wrap);
+    });
+  }
+
+  async function addFile(file) {
+    if (!file) return;
+    if (file.size > MAX_FILE_BYTES) {
+      setStatus(`Skipped ${file.name}: larger than 25 MB`);
+      announce("File too large.");
+      return;
+    }
+    if (pendingFiles.length >= MAX_FILES) {
+      setStatus(`At most ${MAX_FILES} files per message`);
+      return;
+    }
+    pendingFiles.push({ file });
+    renderFileAttachments();
+    announce(`Attached ${file.name}.`);
+  }
+
+  fileInput?.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const f of files) await addFile(f);
+    fileInput.value = "";
+  });
+
   promptEl.addEventListener("paste", async (e) => {
     const items = (e.clipboardData && e.clipboardData.items) || [];
     let consumed = false;
     for (const item of items) {
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const file = item.getAsFile();
-        if (file) {
-          consumed = true;
-          await addImageFile(file);
-        }
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+      consumed = true;
+      if ((item.type || "").startsWith("image/")) {
+        await addImageFile(file);
+      } else {
+        await addFile(file);
       }
     }
     if (consumed) e.preventDefault();
@@ -1630,7 +1737,11 @@
     if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
     e.preventDefault();
     for (const f of e.dataTransfer.files) {
-      if (f.type.startsWith("image/")) await addImageFile(f);
+      if ((f.type || "").startsWith("image/")) {
+        await addImageFile(f);
+      } else {
+        await addFile(f);
+      }
     }
   });
 

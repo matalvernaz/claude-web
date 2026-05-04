@@ -19,6 +19,7 @@ written by ``claude auth login``, an env var, or our persisted key file.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -75,6 +76,30 @@ def is_configured() -> bool:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return True
     return credentials_path().exists()
+
+
+def whoami() -> dict:
+    """Describe the active credential without leaking the token itself.
+
+    Mirrors ``is_configured``'s priority: the env-var/persisted-key path
+    wins over OAuth, since that's what the SDK will pick up. Used by the
+    /setup page to tell the user what's connected.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY") or API_KEY_FILE.exists():
+        return {"mode": "api_key"}
+    cred = credentials_path()
+    if not cred.exists():
+        return {"mode": "none"}
+    try:
+        data = json.loads(cred.read_text())
+    except (OSError, ValueError):
+        return {"mode": "oauth"}
+    oauth = data.get("claudeAiOauth") or {}
+    return {
+        "mode": "oauth",
+        "subscription_type": oauth.get("subscriptionType"),
+        "expires_at": oauth.get("expiresAt"),
+    }
 
 
 def save_api_key(key: str) -> None:
