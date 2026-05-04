@@ -44,6 +44,14 @@
   let isStreaming = false;
   const queueArea = document.getElementById("queue-area");
 
+  // Stream stall watchdog. If isStreaming has been true with no SSE event
+  // for this long, treat the run as dead at submit-time and start a fresh
+  // one — otherwise a silently-broken stream traps every typed message in
+  // the queue with no recovery. Threshold is wide enough to absorb a long
+  // thinking step without false-positive bailing.
+  const STREAM_STALL_MS = 4 * 60 * 1000;
+  let streamStartedAt = 0;
+
   // Per-model context windows for the meter; null = unknown / hide bar.
   // Keyed on the picker value (which is the variant key, not the raw SDK
   // model id) so "claude-opus-4-7-1m" resolves to the 1M window even though
@@ -429,10 +437,17 @@
     // turns; this state toggles back and forth as result/auto_fire events
     // arrive.
     isStreaming = on;
+    if (on) streamStartedAt = Date.now();
     sendBtn.hidden = false;
     sendBtn.disabled = false;
     sendBtn.textContent = on ? "Queue" : "Send";
     stopBtn.hidden = !on;
+  }
+
+  function streamLooksStalled() {
+    if (!isStreaming) return false;
+    const lastSign = Math.max(lastVisibleActivityAt, streamStartedAt);
+    return lastSign > 0 && (Date.now() - lastSign) > STREAM_STALL_MS;
   }
 
   function renderQueue() {
@@ -510,6 +525,21 @@
     promptEl.value = "";
     clearAttachments();
     if (isStreaming) {
+      if (streamLooksStalled()) {
+        // No SSE events in STREAM_STALL_MS — assume the stream is dead
+        // client-side and recover by sending as a fresh run rather than
+        // queueing into a queue that will never drain.
+        if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+        currentAbort = null;
+        currentRunId = null;
+        sessionStorage.removeItem(RUN_KEY);
+        setStreaming(false);
+        setStatus("Previous turn looked stalled — sending as a new run.");
+        announce("Previous turn looked stalled. Sending as a new run.");
+        await sendOne(entry);
+        await drainQueue();
+        return;
+      }
       // Currently mid-turn — queue this for when the current run finishes.
       messageQueue.push(entry);
       renderQueue();
@@ -796,6 +826,10 @@
         lastInputTokens = obj.input_tokens;
         renderContextMeter();
       }
+      // End of turn: drop the bubble pointer so the next turn's first text
+      // block starts a fresh "Claude" article instead of appending into the
+      // bubble we just closed.
+      ctx.currentAssistantBody = null;
       // Treat each result as the end of THIS turn even if the SSE stays
       // open for an auto-fire chain. Spinner stops; user can send a new
       // message; if an auto_fire event arrives next we'll flip it back.
@@ -827,6 +861,11 @@
         announce("Error: " + (obj.result || ""));
       }
     } else if (obj.type === "error") {
+      // Driver crashed mid-turn. The server will emit `_done` and close
+      // the SSE shortly, but flip the local state now so the input isn't
+      // trapped in "Queue" mode while we wait for the close to land.
+      stopGerunds();
+      setStreaming(false);
       const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : (obj.message || obj.exit_code || "Error");
       setStatus("Error: " + (obj.message || obj.exit_code || "see transcript"));
       renderErrorBlock(String(detail));
