@@ -82,9 +82,9 @@
         </div>
       </section>
 
-      <section aria-labelledby="apikey-heading" class="setup-card">
-        <h2 id="apikey-heading">Or paste an API key</h2>
-        <p>Best for headless or shared instances where the OAuth flow isn't a fit. The key is stored in <code>$CLAUDE_WEB_STATE_DIR/anthropic_api_key</code> with mode 0600 and loaded into <code>ANTHROPIC_API_KEY</code> for the SDK.</p>
+      <details class="setup-card setup-apikey">
+        <summary>I'd rather paste an API key instead</summary>
+        <p>For headless or shared instances where the OAuth flow isn't a fit. The key is stored in <code>$CLAUDE_WEB_STATE_DIR/anthropic_api_key</code> with mode 0600 and loaded into <code>ANTHROPIC_API_KEY</code> for the SDK.</p>
 
         <form id="apikey-form">
           <p>
@@ -104,7 +104,7 @@
 
         <p id="apikey-status" role="status" aria-live="polite"></p>
         <p id="apikey-error" class="setup-error" role="alert" hidden></p>
-      </section>
+      </details>
     </div>
 
     {% if configured %}
