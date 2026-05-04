@@ -429,6 +429,7 @@
   let gerundTimer = null;
   let gerundSpeakTimer = null;
   let currentGerund = "Working";
+  let currentActiveTodo = null;  // activeForm of the in_progress todo, or null
   let lastVisibleActivityAt = 0;
   // Visual cycle stays fast (3.5s) so the gerund actually feels alive when
   // it does appear. Speech is paced wider (~12s) so NVDA isn't cut off
@@ -441,13 +442,21 @@
 
   function markVisibleActivity() {
     lastVisibleActivityAt = Date.now();
-    setStatus("");
+    // The CLI keeps the in_progress todo's activeForm pinned across other
+    // UI activity — only clear when no todo is driving the spinner.
+    if (!currentActiveTodo) setStatus("");
   }
 
   function startGerunds() {
     let last = -1;
     lastVisibleActivityAt = 0;  // start from "idle" so the gerund shows right away
     function visualTick() {
+      // When a todo is in_progress, the binary uses its activeForm as the
+      // spinner label (no idle gate, no random pick). Match that.
+      if (currentActiveTodo) {
+        setStatus("✻ " + currentActiveTodo + "…");
+        return;
+      }
       const idleMs = Date.now() - lastVisibleActivityAt;
       if (idleMs < GERUND_IDLE_MS) return;  // sighted users have other feedback
       let i;
@@ -461,12 +470,33 @@
     // Speech keeps firing regardless of visual activity — for NVDA users,
     // streaming text isn't auto-spoken, so the gerund heartbeat is still
     // their only "still working" cue.
-    gerundSpeakTimer = setInterval(() => announce(currentGerund + "…"), GERUND_SPEAK_MS);
+    gerundSpeakTimer = setInterval(() => announce((currentActiveTodo || currentGerund) + "…"), GERUND_SPEAK_MS);
   }
   function stopGerunds() {
     if (gerundTimer) { clearInterval(gerundTimer); gerundTimer = null; }
     if (gerundSpeakTimer) { clearInterval(gerundSpeakTimer); gerundSpeakTimer = null; }
+    // Drop any active todo label so the next run doesn't open with a stale
+    // "still working on the last task" spinner.
+    currentActiveTodo = null;
     setStatus("");
+  }
+
+  // Wire TodoWrite's "in_progress" activeForm to the spinner label, matching
+  // the CLI binary (whose activeForm schema literally says "shown in spinner
+  // when in_progress"). The Tasks panel still shows the full list separately.
+  function setActiveTodoLabel(label) {
+    const prev = currentActiveTodo;
+    currentActiveTodo = label || null;
+    if (currentActiveTodo) {
+      if (gerundTimer) setStatus("✻ " + currentActiveTodo + "…");
+      // Announce eagerly on change so NVDA picks up the new task without
+      // waiting up to 12s for the next speech tick.
+      if (currentActiveTodo !== prev) announce(currentActiveTodo + "…");
+    } else if (prev) {
+      // Hand the spinner back to the random cycler. Clear immediately;
+      // the next visualTick will repaint with a random gerund.
+      if (gerundTimer) setStatus("");
+    }
   }
 
   newChatBtn.addEventListener("click", () => {
@@ -1128,6 +1158,10 @@
   };
 
   function updateTodosPanel(todos) {
+    // The CLI uses the in_progress todo's activeForm as the spinner label.
+    // Keep the spinner in sync with the panel from a single source.
+    const inProgress = todos.find((t) => (t.status || "pending") === "in_progress");
+    setActiveTodoLabel(inProgress ? (inProgress.activeForm || inProgress.content || "") : null);
     if (!todos.length) {
       todosPanel.hidden = true;
       todosList.innerHTML = "";
