@@ -20,6 +20,7 @@ import re
 import sqlite3
 import time
 import traceback
+import unicodedata
 import uuid as uuid_mod
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
@@ -100,6 +101,30 @@ RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
 STATE_DB_PATH = USAGE_DIR / "state.db"
 UPLOADS_ROOT = USAGE_DIR / "uploads"
 UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Multi-user mode: when true, sessions are scoped to whoever first chatted in
+# them. Listing / loading / deleting / exporting requires owner match. Sessions
+# created via the host-shell `claude` CLI (no owner) are visible to everyone,
+# matching the README's "share state" promise. Default off so a single-user
+# homelab keeps working as before.
+PER_USER_SESSIONS = os.getenv("CLAUDE_WEB_PER_USER_SESSIONS", "").lower() in ("1", "true", "yes")
+
+# Comma-separated email allowlist for the destructive /setup endpoints
+# (apikey replacement, sign-Claude-out, OAuth re-flow). Only enforced in
+# PER_USER_SESSIONS mode — the single-user default trusts whoever logs in.
+# Empty list in multi-user mode means no one can run these endpoints from
+# the browser; admins must shell into the container.
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("CLAUDE_WEB_ADMIN_EMAILS", "").split(",") if e.strip()}
+
+
+def _require_admin(user: dict) -> None:
+    """Reject non-admins from credential-mutating /setup endpoints in
+    multi-user mode. No-op in single-user mode."""
+    if not PER_USER_SESSIONS:
+        return
+    email = (user.get("email") or "").lower()
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(403, "admin access required for credential changes")
 
 # How long persisted runs (events + metadata) survive before being purged.
 # Default 24h; tune via CLAUDE_WEB_PERSIST_RETENTION. The matching in-memory
@@ -213,6 +238,10 @@ def _is_user_visible(text: str) -> bool:
         text.startswith("<local-command-caveat>")
         or text.startswith("<command-name>")
         or text.startswith("<system-reminder>")
+        # Auto-fire synth messages aren't user input. The live UI hides them
+        # via the auto_fire event; this filter keeps the export and resumed
+        # transcript from mis-attributing them to the human.
+        or text.startswith(AUTO_FIRE_MARKER)
     )
 
 
@@ -253,8 +282,13 @@ def session_title(session_id: str, cwd: Optional[Path] = None) -> Optional[str]:
     return None
 
 
-def list_sessions() -> list[dict]:
-    """All sessions across every configured project, newest first."""
+def list_sessions(user: Optional[dict] = None) -> list[dict]:
+    """All sessions across every configured project, newest first.
+
+    In PER_USER_SESSIONS mode, sessions owned by other users are filtered
+    out. Sessions with no recorded owner (host-shell `claude` ones) remain
+    visible to everyone.
+    """
     rows: list[dict] = []
     for project in PROJECTS:
         d = _sessions_dir(project)
@@ -274,6 +308,8 @@ def list_sessions() -> list[dict]:
                 "_path": p,
             })
     rows.sort(key=lambda r: r["mtime"], reverse=True)
+    if PER_USER_SESSIONS and user is not None:
+        rows = [r for r in rows if _user_can_see_session(r["id"], user)]
     rows = rows[:MAX_LISTED_SESSIONS]
     out = []
     for r in rows:
@@ -429,8 +465,14 @@ def _md_summary(text: str, limit: int = 60) -> str:
     flat = text.replace("\n", " ").strip()
     if len(flat) > limit:
         flat = flat[:limit] + "…"
-    # < and ` would break either the summary's HTML or its inline-code render.
-    return flat.replace("<", "&lt;").replace("`", "ʼ")
+    # Escape & first so the &lt; / &gt; we add don't get re-escaped. Backtick
+    # would break the inline-code render inside the summary.
+    return (
+        flat.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("`", "ʼ")
+    )
 
 
 def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]:
@@ -600,8 +642,55 @@ def _state_db() -> sqlite3.Connection:
             payload TEXT NOT NULL,
             PRIMARY KEY(run_id, idx)
         )""")
+        # Tracks who owns each web-created session for PER_USER_SESSIONS.
+        # Sessions created via host-shell `claude` are absent → visible to all.
+        conn.execute("""CREATE TABLE IF NOT EXISTS session_owners (
+            session_id TEXT PRIMARY KEY,
+            owner_sub TEXT NOT NULL,
+            project_key TEXT,
+            created_at REAL NOT NULL
+        )""")
         _STATE_DB = conn
     return _STATE_DB
+
+
+def _claim_session_owner(session_id: str, owner_sub: Optional[str], project_key: Optional[str]) -> None:
+    """First-write-wins ownership claim. Idempotent on re-claims."""
+    if not session_id or not owner_sub:
+        return
+    try:
+        _state_db().execute(
+            "INSERT OR IGNORE INTO session_owners(session_id, owner_sub, project_key, created_at)"
+            " VALUES(?, ?, ?, ?)",
+            (session_id, owner_sub, project_key, time.time()),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("claim_session_owner failed: %s", e)
+
+
+def _session_owner(session_id: str) -> Optional[str]:
+    if not session_id:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT owner_sub FROM session_owners WHERE session_id = ?", (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def _user_can_see_session(session_id: str, user: dict) -> bool:
+    """In PER_USER_SESSIONS mode, hide other users' sessions. Sessions with
+    no recorded owner (host-shell `claude` ones, pre-feature ones) stay
+    visible to everyone — that's the documented "share with the shell" path.
+    """
+    if not PER_USER_SESSIONS:
+        return True
+    owner = _session_owner(session_id)
+    if owner is None:
+        return True
+    return owner == (user or {}).get("sub")
 
 
 def _persist_run_meta(run: "ActiveRun") -> None:
@@ -662,6 +751,8 @@ def _purge_old_persisted(now: float) -> None:
 
 _LAST_UPLOAD_PURGE = 0.0
 _UPLOAD_PURGE_INTERVAL_SECONDS = 600  # don't rescan the dir on every request
+_LAST_DB_PURGE = 0.0
+_DB_PURGE_INTERVAL_SECONDS = 3600  # one sqlite DELETE pass per hour is plenty
 
 
 def _purge_old_uploads(now: float) -> None:
@@ -829,8 +920,18 @@ class ActiveRun:
         if event.get("type") == "system" and event.get("subtype") == "init":
             sid = event.get("session_id")
             if sid and self.session_id != sid:
+                old = self.session_id
                 self.session_id = sid
+                # Re-index ACTIVE_RUNS_BY_SESSION too, since the SDK can
+                # report a different session_id than the resume= we passed
+                # (rare, but the resume protocol allows it).
+                if old and ACTIVE_RUNS_BY_SESSION.get(old) is self:
+                    ACTIVE_RUNS_BY_SESSION.pop(old, None)
+                ACTIVE_RUNS_BY_SESSION[sid] = self
                 meta_changed = True
+                # First-write-wins claim so PER_USER_SESSIONS mode knows who
+                # owns this transcript. Idempotent; no-op when disabled.
+                _claim_session_owner(sid, self.owner_sub, self.project_key)
         if event.get("type") == "run_started":
             meta_changed = True
         self.last_activity = time.time()
@@ -875,6 +976,21 @@ class ActiveRun:
 
 ACTIVE_RUNS: dict[str, ActiveRun] = {}
 ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
+# Per-session locks for /api/chat. The SDK only sets run.session_id once it
+# receives the init SystemMessage, so without this two near-simultaneous POSTs
+# for the same resumed session_id (multi-tab / fast double-submit) both miss
+# _existing_run_for_session and spawn separate runs — two CLI subprocesses
+# writing to the same jsonl. The lock only guards the find-or-create step;
+# we release before any long awaits on the SDK.
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _session_lock(session_id: str) -> asyncio.Lock:
+    lock = _SESSION_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[session_id] = lock
+    return lock
 # Match PERSIST_RETENTION_SECONDS so a finished run that's still on disk is
 # also still in memory — saves a "load on demand from sqlite" code path.
 RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
@@ -888,6 +1004,7 @@ _restore_persisted_runs()
 
 def _gc_runs() -> None:
     """Evict completed runs older than retention so the dict doesn't grow."""
+    global _LAST_DB_PURGE
     now = time.time()
     stale = [
         rid for rid, r in ACTIVE_RUNS.items()
@@ -900,6 +1017,9 @@ def _gc_runs() -> None:
             if existing is run:
                 ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
     _purge_old_uploads(now)
+    if now - _LAST_DB_PURGE >= _DB_PURGE_INTERVAL_SECONDS:
+        _LAST_DB_PURGE = now
+        _purge_old_persisted(now)
 
 
 def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
@@ -985,7 +1105,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
         return RedirectResponse(url="/setup", status_code=302)
     response = templates.TemplateResponse(
         request, "index.html", {
-            "sessions": list_sessions(),
+            "sessions": list_sessions(user),
             "user": user,
             "projects": [
                 {"key": _sanitize_project_key(p), "path": str(p), "name": p.name or str(p)}
@@ -993,6 +1113,11 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             ],
             "default_project": _sanitize_project_key(DEFAULT_CWD),
             "models": KNOWN_MODELS,
+            # Drop SDK-internal fields and expose only what the JS needs.
+            "models_json": json.dumps([
+                {"key": m["key"], "label": m["label"], "context": m.get("context")}
+                for m in KNOWN_MODELS
+            ]),
             "multi_project": len(PROJECTS) > 1,
         }
     )
@@ -1014,7 +1139,7 @@ async def api_projects(user: dict = Depends(auth.require_user)):
 
 @app.get("/api/sessions")
 async def api_sessions(user: dict = Depends(auth.require_user)):
-    return list_sessions()
+    return list_sessions(user)
 
 
 @app.get("/api/sessions/search")
@@ -1039,6 +1164,8 @@ async def api_sessions_search(
             continue
         key = _sanitize_project_key(project)
         for path in d.glob("*.jsonl"):
+            if not _user_can_see_session(path.stem, user):
+                continue
             try:
                 mtime = path.stat().st_mtime
             except FileNotFoundError:
@@ -1091,6 +1218,9 @@ async def api_session(
     user: dict = Depends(auth.require_user),
 ):
     sid = _safe_id(sid)
+    if not _user_can_see_session(sid, user):
+        # Mimic 404 rather than 403 so we don't leak existence to non-owners.
+        return JSONResponse({"error": "not found"}, status_code=404)
     path = _find_session_path(sid, project)
     if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -1116,6 +1246,8 @@ async def api_session_export(
     can copy to clipboard, while a direct browser navigation downloads it.
     """
     sid = _safe_id(sid)
+    if not _user_can_see_session(sid, user):
+        return JSONResponse({"error": "not found"}, status_code=404)
     md = session_to_markdown(sid, project)
     if md is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -1136,10 +1268,23 @@ async def api_delete_session(
     user: dict = Depends(auth.require_user),
 ):
     sid = _safe_id(sid)
+    if not _user_can_see_session(sid, user):
+        return JSONResponse({"error": "not found"}, status_code=404)
     path = _find_session_path(sid, project)
     if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    # Refuse if there's a live run writing to this jsonl. Otherwise the SDK
+    # subprocess keeps the unlinked file open and silently re-creates it on
+    # next write, leaving the user wondering why the session keeps coming back.
+    active = _existing_run_for_session(sid)
+    if active is not None:
+        raise HTTPException(409, "session is active — stop the run before deleting")
     path.unlink()
+    # Drop the ownership row too so we don't leak rows for deleted sessions.
+    try:
+        _state_db().execute("DELETE FROM session_owners WHERE session_id = ?", (sid,))
+    except sqlite3.Error:
+        pass
     return {"ok": True}
 
 
@@ -1309,9 +1454,11 @@ _FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 def _safe_filename(name: str) -> str:
     """Strip path separators / NULs / non-ASCII so the upload can't escape its
-    per-run directory or trip the OS on weird unicode. Falls back to "upload"
-    if nothing usable is left."""
+    per-run directory or trip the OS on weird unicode. NFKD-normalises first so
+    "résumé.pdf" survives as "resume.pdf" instead of becoming "r_sum_.pdf".
+    Falls back to "upload" if nothing usable is left."""
     base = os.path.basename(name or "")
+    base = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")
     cleaned = _FILENAME_RE.sub("_", base).strip("._") or "upload"
     return cleaned[:120]
 
@@ -1394,13 +1541,20 @@ async def _read_uploaded_images(images: list[UploadFile]) -> tuple[list[dict], l
     return blocks, meta
 
 
+AUTO_FIRE_MARKER = "<auto-injected-background-events>"
+
+
 def _compose_auto_fire_message(events: list[dict]) -> str:
     """Render buffered task notifications into a synthetic user message.
 
     The model sees this and decides what to do — the same as if you had
     typed it. Keep it terse so it doesn't crowd the agent's context.
+
+    Wrapped in AUTO_FIRE_MARKER so the JSONL replay can recognise it and
+    avoid rendering the synth as a "You" bubble (the live UI hides it via
+    the auto_fire event; the export and resumed view need this marker).
     """
-    lines = ["Background events from your tools (auto-injected):"]
+    lines = [AUTO_FIRE_MARKER, "Background events from your tools (auto-injected):"]
     for e in events:
         kind = e.get("kind") or "event"
         task_id = e.get("task_id") or "?"
@@ -1456,37 +1610,62 @@ async def api_chat(
 
     image_blocks, _image_meta = await _read_uploaded_images(images)
 
-    # Reuse an existing long-lived run for this session if we can.
-    existing = _existing_run_for_session(session_id) if session_id else None
-    if existing is not None:
-        _require_owner(existing, user)
-        file_metas = await _save_uploaded_files(files, existing.run_id)
-        effective = _file_attachment_prefix(file_metas) + message
-        # Subscribe BEFORE we emit the new user_prompt so the new subscriber
-        # only sees events from this turn forward, not the entire prior
-        # history that the browser already rendered.
-        start_index = len(existing.events)
-        existing.emit({
-            "type": "user_prompt",
-            "text": message,
-            "image_count": len(image_blocks),
-            "file_count": len(file_metas),
-        })
-        # Pending notifications get superseded by explicit user input — the
-        # user is now driving, no need to auto-fire. Reset the chain counter
-        # so the user gets a fresh budget if their reply itself triggers
-        # background work later.
-        existing.pending_notifications.clear()
-        existing.notification_grace_started_at = None
-        existing.consecutive_auto_fires = 0
-        await _inject_user_input(existing, effective, image_blocks)
-        return _stream_run_response(existing, start_index=start_index)
+    # Reuse an existing long-lived run for this session if we can. The lock
+    # ensures two near-simultaneous POSTs with the same session_id can't both
+    # miss _existing_run_for_session and spawn duplicate runs (only relevant
+    # for resumed sessions; a fresh session_id="" is unique per request).
+    sess_lock = _session_lock(session_id) if session_id else None
+    if sess_lock:
+        await sess_lock.acquire()
+    try:
+        existing = _existing_run_for_session(session_id) if session_id else None
+        if existing is not None:
+            _require_owner(existing, user)
+            file_metas = await _save_uploaded_files(files, existing.run_id)
+            effective = _file_attachment_prefix(file_metas) + message
+            # Subscribe BEFORE we emit the new user_prompt so the new subscriber
+            # only sees events from this turn forward, not the entire prior
+            # history that the browser already rendered.
+            start_index = len(existing.events)
+            existing.emit({
+                "type": "user_prompt",
+                "text": message,
+                "image_count": len(image_blocks),
+                "file_count": len(file_metas),
+            })
+            # Pending notifications get superseded by explicit user input —
+            # the user is now driving, no need to auto-fire. Reset the chain
+            # counter so the user gets a fresh budget if their reply itself
+            # triggers background work later.
+            existing.pending_notifications.clear()
+            existing.notification_grace_started_at = None
+            existing.consecutive_auto_fires = 0
+            await _inject_user_input(existing, effective, image_blocks)
+            return _stream_run_response(existing, start_index=start_index)
 
-    sid_in = session_id or None
-    run_id = str(uuid_mod.uuid4())
-    run = ActiveRun(run_id, owner_sub=user.get("sub"))
-    run.project_key = _sanitize_project_key(cwd)
-    ACTIVE_RUNS[run_id] = run
+        sid_in = session_id or None
+        run_id = str(uuid_mod.uuid4())
+        run = ActiveRun(run_id, owner_sub=user.get("sub"))
+        run.project_key = _sanitize_project_key(cwd)
+        ACTIVE_RUNS[run_id] = run
+        if session_id:
+            # Eager-claim the session id so a concurrent POST sees this run
+            # and reuses it instead of spawning a parallel one. The driver
+            # may overwrite this with whatever the SDK reports in init —
+            # usually the same value but the resume protocol allows new ids.
+            run.session_id = session_id
+            ACTIVE_RUNS_BY_SESSION[session_id] = run
+            # In multi-user mode, refuse to resume someone else's session.
+            if PER_USER_SESSIONS:
+                owner = _session_owner(session_id)
+                if owner is not None and owner != user.get("sub"):
+                    ACTIVE_RUNS_BY_SESSION.pop(session_id, None)
+                    ACTIVE_RUNS.pop(run_id, None)
+                    raise HTTPException(403, "not your session")
+            _claim_session_owner(session_id, user.get("sub"), run.project_key)
+    finally:
+        if sess_lock:
+            sess_lock.release()
     file_metas = await _save_uploaded_files(files, run_id)
     effective_message = _file_attachment_prefix(file_metas) + message
     # First two events: run_id (so a reload can reconnect) and the user's
@@ -1699,15 +1878,11 @@ async def api_chat(
                     async for msg in client.receive_messages():
                         run.last_activity = time.time()
                         for evt in _sdk_message_to_events(msg):
+                            # emit() also keeps ACTIVE_RUNS_BY_SESSION in sync
+                            # whenever an init event reveals (or changes) the
+                            # SDK session id, so follow-up /api/chat lookups
+                            # can find this run.
                             run.emit(evt)
-
-                        # Index by SDK session id once we know it, so a follow-up
-                        # /api/chat with the same session can find this run.
-                        if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                            sid = (msg.data or {}).get("session_id")
-                            if sid and run.session_id is None:
-                                run.session_id = sid
-                                ACTIVE_RUNS_BY_SESSION[sid] = run
 
                         if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
                             run.pending_notifications.append({
@@ -1972,8 +2147,14 @@ def _sdk_message_to_events(msg) -> list[dict]:
 
 
 def _save_rate_limit(rli: dict) -> None:
+    """Atomic write so a concurrent finish from another turn can't leave the
+    file half-written; the read in /api/usage would then JSON-fail and silently
+    drop the rate-limit panel."""
     try:
-        RATE_LIMIT_CACHE.write_text(json.dumps({"info": rli, "captured_at": int(time.time())}))
+        payload = json.dumps({"info": rli, "captured_at": int(time.time())})
+        tmp = RATE_LIMIT_CACHE.with_suffix(RATE_LIMIT_CACHE.suffix + ".tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, RATE_LIMIT_CACHE)
     except Exception:
         pass
 
@@ -2098,6 +2279,7 @@ async def api_setup_oauth_start(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
+    _require_admin(user)
     body = await request.json()
     variant = body.get("variant", "claudeai")
     if variant not in ("claudeai", "console"):
@@ -2111,6 +2293,7 @@ async def api_setup_oauth_code(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
+    _require_admin(user)
     body = await request.json()
     code = (body.get("code") or "").strip()
     if not code:
@@ -2129,6 +2312,7 @@ async def api_setup_oauth_code(
 
 @app.post("/api/setup/oauth/cancel")
 async def api_setup_oauth_cancel(user: dict = Depends(auth.require_user)):
+    _require_admin(user)
     await setup_flow.cancel_flow()
     return {"ok": True}
 
@@ -2138,6 +2322,7 @@ async def api_setup_apikey(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
+    _require_admin(user)
     body = await request.json()
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
@@ -2153,6 +2338,7 @@ async def api_setup_apikey(
 async def api_setup_signout(user: dict = Depends(auth.require_user)):
     """Forget all stored Claude credentials. Forward-auth (Keycloak) login
     is unaffected — this only signs the in-container Claude CLI out."""
+    _require_admin(user)
     await setup_flow.sign_out()
     return {"configured": setup_flow.is_configured()}
 

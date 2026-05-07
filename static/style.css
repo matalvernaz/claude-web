@@ -716,6 +716,16 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .msg.info .role { color: #d8a657; }
 .info-body { margin: 0.4rem 0 0; line-height: 1.4; }
+.msg.info.auto-fire {
+  border-style: dashed;
+  opacity: 0.85;
+}
+.permission-timeout-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: #d8a657;
+  font-style: italic;
+}
 .error-body {
   margin: 0.4rem 0 0;
   font-family: ui-monospace, SFMono-Regular, monospace;

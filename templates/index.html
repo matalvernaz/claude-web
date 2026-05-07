@@ -124,6 +124,10 @@
     </main>
   </div>
 
+  <script>
+    // Server-known model metadata: keep context windows in one place.
+    window.CLAUDE_WEB_MODELS = {{ models_json | safe }};
+  </script>
   <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
   <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
   <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>

@@ -50,6 +50,8 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `CLAUDE_HOME` | no | `$HOME/.claude` | Where Claude Code keeps its per-user state. |
 | `CLAUDE_WEB_STATE_DIR` | no | `$HOME/.claude-web` | Where this app keeps its usage log + cached rate-limit info. |
 | `SAFE_TOOLS` | no | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
+| `CLAUDE_WEB_PER_USER_SESSIONS` | no | `false` | When `true`, sessions are scoped to the user that created them — other signed-in users can't see, load, export, or delete them. Sessions created via the host-shell `claude` CLI have no recorded owner and stay visible to everyone (matches the "share state" promise). |
+| `CLAUDE_WEB_ADMIN_EMAILS` | no | (empty) | Comma-separated email allowlist for the destructive `/setup` endpoints (replace API key, sign Claude out). Only enforced when `CLAUDE_WEB_PER_USER_SESSIONS=true`. Empty in multi-user mode means "no one can mutate credentials from the browser — admin must shell into the container". |
 
 ## Setting up OIDC
 

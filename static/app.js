@@ -61,13 +61,16 @@
   // Per-model context windows for the meter; null = unknown / hide bar.
   // Keyed on the picker value (which is the variant key, not the raw SDK
   // model id) so "claude-opus-4-7-1m" resolves to the 1M window even though
-  // the underlying model id is plain "claude-opus-4-7".
-  const MODEL_CONTEXT = {
-    "claude-opus-4-7": 200000,
-    "claude-opus-4-7-1m": 1000000,
-    "claude-sonnet-4-6": 1000000,
-    "claude-haiku-4-5": 200000,
-  };
+  // the underlying model id is plain "claude-opus-4-7". Sourced from the
+  // server's KNOWN_MODELS so this list can't drift from what's offered in
+  // the dropdown.
+  const MODEL_CONTEXT = (() => {
+    const out = {};
+    for (const m of (window.CLAUDE_WEB_MODELS || [])) {
+      if (m.key && m.context) out[m.key] = m.context;
+    }
+    return out;
+  })();
   let lastSeenModel = null;
   let lastInputTokens = null;
 
@@ -103,6 +106,24 @@
     });
   }
   renderSessionTimes();
+
+  // Only auto-scroll if the user is already at (or near) the bottom of the
+  // transcript. If they've scrolled up to re-read earlier turns we don't
+  // want every incoming chunk to yank them back. 64px is enough headroom
+  // that a click-to-bottom is forgiving without re-pinning when they're
+  // actively scrolling away.
+  const SCROLL_PIN_PX = 64;
+  function isPinnedToBottom() {
+    const el = transcript;
+    if (!el) return true;
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) < SCROLL_PIN_PX;
+  }
+  function maybeAutoScroll(force) {
+    if (!transcript) return;
+    if (force || isPinnedToBottom()) {
+      transcript.scrollTop = transcript.scrollHeight;
+    }
+  }
 
   const params = new URLSearchParams(location.search);
   let sessionId = params.get("session") || "";
@@ -252,7 +273,8 @@
         insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
       }
     }
-    transcript.scrollTop = transcript.scrollHeight;
+    // Force-scroll on session load — we just replaced the entire transcript.
+    maybeAutoScroll(true);
   }
 
   function appendImagePlaceholder(bodyEl, count) {
@@ -327,7 +349,11 @@
     el.appendChild(header);
     el.appendChild(b);
     transcript.appendChild(el);
-    transcript.scrollTop = transcript.scrollHeight;
+    // appendMessage gets called both on initial render (where we want to
+    // scroll) and on streaming text chunks (where the streaming-text
+    // handler already calls maybeAutoScroll). Pin-respecting scroll here
+    // is the right default for both.
+    maybeAutoScroll();
     return b;
   }
 
@@ -510,6 +536,23 @@
     history.replaceState({}, "", location.pathname);
     markActive("");
     setStatus("");
+    // Drop every piece of "previous turn" state. Without this the next
+    // submit either tries sendInExistingRun against the dead run-id
+    // (404 + retry round-trip) or shows the old context-meter fill, and
+    // anything still queued from before would get sent into the new chat.
+    if (currentAbort) {
+      try { currentAbort.abort(); } catch (_) {}
+    }
+    currentAbort = null;
+    currentRunId = null;
+    sessionStorage.removeItem(RUN_KEY);
+    lastInputTokens = null;
+    if (contextMeter) contextMeter.hidden = true;
+    if (messageQueue.length) {
+      messageQueue.length = 0;
+      renderQueue();
+    }
+    setStreaming(false);
     promptEl.focus();
   });
 
@@ -532,6 +575,14 @@
     return lastSign > 0 && (Date.now() - lastSign) > STREAM_STALL_MS;
   }
 
+  function queuePreview(entry) {
+    if (entry.text) return entry.text;
+    const bits = [];
+    if (entry.images && entry.images.length) bits.push(`${entry.images.length} image${entry.images.length === 1 ? "" : "s"}`);
+    if (entry.files && entry.files.length) bits.push(`${entry.files.length} file${entry.files.length === 1 ? "" : "s"}`);
+    return bits.length ? `[${bits.join(", ")}]` : "(empty)";
+  }
+
   function renderQueue() {
     if (!queueArea) return;
     queueArea.innerHTML = "";
@@ -544,19 +595,23 @@
     heading.className = "queue-heading";
     heading.textContent = `${messageQueue.length} queued`;
     queueArea.appendChild(heading);
-    messageQueue.forEach((entry, idx) => {
+    messageQueue.forEach((entry) => {
       const chip = document.createElement("span");
       chip.className = "queue-chip";
       const label = document.createElement("span");
       label.className = "queue-text";
-      const previewText = entry.text || (entry.images.length ? `[${entry.images.length} image${entry.images.length === 1 ? "" : "s"}]` : "(empty)");
+      const previewText = queuePreview(entry);
       label.textContent = previewText.length > 60 ? previewText.slice(0, 60) + "…" : previewText;
       const del = document.createElement("button");
       del.type = "button";
       del.className = "queue-cancel";
       del.textContent = "×";
       del.setAttribute("aria-label", `Cancel queued message: ${previewText}`);
+      // Identify the entry by reference so a concurrent shift() (when a
+      // turn ends mid-render) doesn't make us splice the wrong index.
       del.addEventListener("click", () => {
+        const idx = messageQueue.indexOf(entry);
+        if (idx === -1) return;  // already drained, nothing to cancel
         messageQueue.splice(idx, 1);
         renderQueue();
         announce("Queued message cancelled.");
@@ -733,6 +788,12 @@
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      // Any bytes coming down the wire — including SSE pings that don't
+      // produce a renderable event — count as "stream is alive". Without
+      // this, a long Claude thinking phase (no events for several minutes,
+      // only pings) trips the stall watchdog and the next queued submit
+      // gets bumped into a fresh run unnecessarily.
+      lastVisibleActivityAt = Date.now();
       buf += dec.decode(value, { stream: true });
       let idx;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
@@ -777,12 +838,14 @@
       return false;
     }
     if (info.project) sessionProject = info.project;
+    // Wipe and announce BEFORE flipping streaming UI on, so there's never a
+    // frame where the spinner is overlaid on the stale transcript.
+    transcript.innerHTML = "";
     currentRunId = savedRunId;
-    setStreaming(true);
     currentAbort = new AbortController();
+    setStreaming(true);
     startGerunds();
     announce("Reconnecting to previous response.");
-    transcript.innerHTML = "";
     try {
       const r = await fetch(`/api/chat/stream/${encodeURIComponent(savedRunId)}`, { signal: currentAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -843,7 +906,7 @@
       article.appendChild(role);
       article.appendChild(body);
       transcript.appendChild(article);
-      transcript.scrollTop = transcript.scrollHeight;
+      maybeAutoScroll();
       announce("Server restarted while the previous turn was running.");
       setStatus("Server restarted mid-turn — send a new message to continue.");
     } else if (obj.type === "system" && obj.subtype === "init") {
@@ -859,14 +922,19 @@
     } else if (obj.type === "assistant" && obj.message) {
       const blocks = obj.message.content || [];
       for (const blk of blocks) {
-        if (blk.type === "text" && blk.text) {
+        if (blk.type === "thinking") {
+          // We don't render extended-thinking content (matches the CLI),
+          // but we DO want it to count as live activity so the stall
+          // watchdog and gerund-idle gate don't trip during long thinks.
+          markVisibleActivity();
+        } else if (blk.type === "text" && blk.text) {
           if (!ctx.currentAssistantBody) {
             ctx.currentAssistantBody = appendMessage("assistant", "");
           }
           const raw = (ctx.currentAssistantBody.dataset.raw || "") + blk.text;
           ctx.currentAssistantBody.dataset.raw = raw;
           ctx.currentAssistantBody.innerHTML = renderMarkdown(raw);
-          transcript.scrollTop = transcript.scrollHeight;
+          maybeAutoScroll();
           markVisibleActivity();
         } else if (blk.type === "tool_use") {
           // Subsequent text blocks should land in a new assistant article
@@ -895,6 +963,20 @@
       ctx.currentAssistantBody = null;
       announce(`Permission needed for ${obj.tool}.`);
       renderPermissionCard(obj);
+    } else if (obj.type === "permission_timeout") {
+      // Server's PENDING entry has been popped — any further click on the
+      // matching card would just 404 silently. Disable the card and label
+      // it so the user knows what happened.
+      ctx.currentAssistantBody = null;
+      const card = document.querySelector(`article.msg.permission[data-request-id="${obj.id}"]`);
+      if (card) {
+        card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        const note = document.createElement("p");
+        note.className = "permission-timeout-note";
+        note.textContent = `Timed out after ${obj.timeout_seconds || "?"}s — Claude was told the request was denied.`;
+        card.appendChild(note);
+      }
+      announce(`Permission request for ${obj.tool || "tool"} timed out.`);
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
     } else if (obj.type === "task_started") {
@@ -905,7 +987,32 @@
       renderTaskEvent("notification", obj);
     } else if (obj.type === "auto_fire") {
       // Server is auto-firing a follow-up turn driven by a buffered
-      // task notification. Flip the spinner back on.
+      // task notification. Render an info block so the user knows the
+      // upcoming Claude reply is *not* responding to something they typed,
+      // then flip the spinner back on.
+      ctx.currentAssistantBody = null;
+      const events = Array.isArray(obj.events) ? obj.events : [];
+      const summary = events.length
+        ? events.map((e) => {
+            const bits = [];
+            if (e.kind) bits.push(e.kind);
+            if (e.task_id) bits.push("task " + e.task_id);
+            if (e.status) bits.push(e.status);
+            return bits.join(" · ") || "background event";
+          }).join("; ")
+        : "background events";
+      const article = document.createElement("article");
+      article.className = "msg info auto-fire";
+      const role = document.createElement("h3");
+      role.className = "role";
+      role.textContent = "Auto-injected";
+      const body = document.createElement("p");
+      body.className = "info-body";
+      body.textContent = `Background tools settled — auto-firing a follow-up turn (${summary}).`;
+      article.appendChild(role);
+      article.appendChild(body);
+      transcript.appendChild(article);
+      maybeAutoScroll();
       setStreaming(true);
       startGerunds();
       announce("Auto-responding to background events.");
@@ -1007,7 +1114,7 @@
       line.textContent = obj.description || "started";
     }
     log.appendChild(line);
-    transcript.scrollTop = transcript.scrollHeight;
+    maybeAutoScroll();
     markVisibleActivity();
     if (kind === "notification") {
       announce(`Background task ${id}: ${obj.status || "done"}`);
@@ -1026,7 +1133,8 @@
     article.appendChild(role);
     article.appendChild(body);
     transcript.appendChild(article);
-    transcript.scrollTop = transcript.scrollHeight;
+    // Force-scroll on errors — the user almost always wants to see them.
+    maybeAutoScroll(true);
   }
 
   function renderContextMeter() {
@@ -1073,6 +1181,8 @@
     card.className = "msg permission";
     card.setAttribute("role", "alertdialog");
     card.setAttribute("aria-label", `Permission request: ${req.tool} ${summariseToolInput(req.input || {})}`);
+    // Lets the permission_timeout handler find this exact card later.
+    if (req.id) card.dataset.requestId = req.id;
 
     const heading = document.createElement("div");
     heading.className = "role";
@@ -1105,7 +1215,8 @@
     }
     card.appendChild(actions);
     transcript.appendChild(card);
-    transcript.scrollTop = transcript.scrollHeight;
+    // Force-scroll: a permission card needs to be on screen, full stop.
+    maybeAutoScroll(true);
 
     // Focus the safest button by default for high-risk tools.
     const focusBtn = isHighRisk ? actions.querySelector(".btn-danger") : actions.querySelector(".btn-primary");
@@ -1305,7 +1416,7 @@
     }
     wrap.appendChild(pre);
     transcript.appendChild(wrap);
-    transcript.scrollTop = transcript.scrollHeight;
+    maybeAutoScroll();
   }
 
   // Tiny, dependency-free LCS-based line diff. Output is a fragment of
@@ -1384,7 +1495,7 @@
     group.querySelector("summary").textContent = tools.length
       ? `Tools: ${tools.join(", ")} (${count})`
       : `Tools (${count})`;
-    transcript.scrollTop = transcript.scrollHeight;
+    maybeAutoScroll();
   }
 
   function summariseToolInput(input) {
