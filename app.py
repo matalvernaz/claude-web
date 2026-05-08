@@ -131,10 +131,19 @@ def _require_setup_access(user: dict) -> None:
       * In ``PER_USER_SESSIONS`` mode the user's email must additionally be in
         ``CLAUDE_WEB_ADMIN_EMAILS`` so one regular user can't reconfigure
         credentials shared by the whole instance.
+
+    Each rejection logs which gate triggered so a user wondering "why is
+    /setup locked" can diagnose from the journal.
     """
+    user_id = user.get("email") or user.get("sub") or "?"
     if ENABLE_SETUP == "false":
+        log.info("setup-gate reject %s: ENABLE_SETUP=false", user_id)
         raise HTTPException(403, "setup is locked (CLAUDE_WEB_ENABLE_SETUP=false)")
     if ENABLE_SETUP == "auto" and setup_flow.is_configured():
+        log.info(
+            "setup-gate reject %s: ENABLE_SETUP=auto and Claude already configured",
+            user_id,
+        )
         raise HTTPException(
             403,
             "setup is locked after first configuration. Set "
@@ -143,6 +152,9 @@ def _require_setup_access(user: dict) -> None:
     if PER_USER_SESSIONS:
         email = (user.get("email") or "").lower()
         if email not in ADMIN_EMAILS:
+            log.info(
+                "setup-gate reject %s: not in CLAUDE_WEB_ADMIN_EMAILS", user_id,
+            )
             raise HTTPException(403, "admin access required for credential changes")
 
 # How long persisted runs (events + metadata) survive before being purged.
@@ -310,17 +322,34 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         expected = auth.expected_origin(request)
         origin = request.headers.get("origin", "").rstrip("/")
         referer = request.headers.get("referer", "")
+        # Log rejections at WARNING so a user reporting "my browser is blocked"
+        # can be diagnosed from the journal without re-running the request —
+        # without this you can't tell CSRF rejection from auth failure (both
+        # surface as 403). Includes the offending header so a misconfigured
+        # reverse proxy or wrong OIDC_REDIRECT_URI is debuggable.
         if origin:
             if origin != expected:
+                log.warning(
+                    "CSRF reject %s %s: Origin=%r expected=%r",
+                    request.method, request.url.path, origin, expected,
+                )
                 return JSONResponse(
                     {"error": "csrf", "detail": f"bad Origin {origin!r}"}, status_code=403
                 )
         elif referer:
             if not referer.startswith(expected + "/") and referer.rstrip("/") != expected:
+                log.warning(
+                    "CSRF reject %s %s: Referer=%r expected=%r",
+                    request.method, request.url.path, referer, expected,
+                )
                 return JSONResponse(
                     {"error": "csrf", "detail": "bad Referer"}, status_code=403
                 )
         elif CSRF_STRICT:
+            log.warning(
+                "CSRF reject %s %s: no Origin/Referer (strict mode)",
+                request.method, request.url.path,
+            )
             return JSONResponse(
                 {"error": "csrf", "detail": "missing Origin/Referer"}, status_code=403
             )
@@ -2007,7 +2036,16 @@ async def api_chat(
     })
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context):
+        # Audit-trail logging: every tool invocation produces exactly one
+        # decision log line so "who allowed this command at 3am" is
+        # answerable from the journal without grepping the SSE event store.
+        # Includes run_id + owner_sub for cross-correlation with errors.
+        owner = run.owner_sub or "?"
         if tool_name in SAFE_TOOLS:
+            log.info(
+                "perm safe-auto %s tool=%s run=%s owner=%s", tool_name,
+                tool_name, run.run_id, owner,
+            )
             return PermissionResultAllow()
         sig = _tool_signature(tool_name, tool_input)
         # Tools in NO_SESSION_ALLOWLIST_TOOLS bypass the per-session allowlist
@@ -2016,6 +2054,10 @@ async def api_chat(
         # bless `echo "ok" && rm -rf ~`).
         allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
         if allow_session_supported and (tool_name, sig) in run.session_allowlist:
+            log.info(
+                "perm session-allowlist tool=%s sig=%r run=%s owner=%s",
+                tool_name, sig, run.run_id, owner,
+            )
             return PermissionResultAllow()
 
         request_id = str(uuid_mod.uuid4())
@@ -2034,6 +2076,10 @@ async def api_chat(
             try:
                 decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
+                log.info(
+                    "perm timeout tool=%s sig=%r run=%s owner=%s after=%ss",
+                    tool_name, sig, run.run_id, owner, PERMISSION_TIMEOUT_SECONDS,
+                )
                 run.emit({
                     "type": "permission_timeout",
                     "id": request_id,
@@ -2050,6 +2096,10 @@ async def api_chat(
             PENDING.pop(request_id, None)
 
         d = decision.get("decision")
+        log.info(
+            "perm decision=%s tool=%s sig=%r run=%s owner=%s",
+            d, tool_name, sig, run.run_id, owner,
+        )
         if d == "allow":
             return PermissionResultAllow()
         if d == "allow_session":
@@ -2060,8 +2110,9 @@ async def api_chat(
                 run.session_allowlist.add((tool_name, sig))
             else:
                 log.info(
-                    "ignoring allow_session for %s (signature unsafe to allowlist)",
-                    tool_name,
+                    "perm allow_session-downgraded tool=%s sig=%r run=%s "
+                    "(signature unsafe to allowlist)",
+                    tool_name, sig, run.run_id,
                 )
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied permission via web UI.")
