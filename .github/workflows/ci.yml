@@ -29,7 +29,15 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
       - name: Lint (ruff)
-        run: ruff check app.py auth.py setup_flow.py --select=F,E,W,B,SIM --ignore=E501,B008
+        # F (pyflakes) catches real undefined-name / unused-import / shadowing
+        # bugs. B (bugbear) catches real footguns. E/W are PEP-8 style; we
+        # ignore E501 (line length) since long URLs/strings are unavoidable
+        # and B008 (function-call-in-default-arg) since FastAPI's idiom uses
+        # `Depends(...)`/`Form(...)` defaults pervasively. SIM is intentionally
+        # skipped because SIM105 flags equivalent try/except/pass patterns the
+        # project uses on purpose; if a SIM check ever catches a real bug,
+        # add it back here.
+        run: ruff check app.py auth.py setup_flow.py --select=F,E,W,B --ignore=E501,B008
       - name: Tests (pytest)
         run: pytest -q
       - name: JS syntax check

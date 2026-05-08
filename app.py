@@ -2654,7 +2654,7 @@ async def api_setup_oauth_code(
     try:
         state = await setup_flow.submit_code(code)
     except RuntimeError as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, str(e)) from e
     return {
         "configured": setup_flow.is_configured(),
         "flow": state.to_public(),
@@ -2681,7 +2681,7 @@ async def api_setup_apikey(
     try:
         setup_flow.save_api_key(api_key)
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     return {"configured": setup_flow.is_configured()}
 
 
