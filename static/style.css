@@ -33,6 +33,29 @@ body {
   white-space: nowrap;
   border: 0;
 }
+/* Like sr-only but keeps the element focusable — used for native file inputs
+   wrapped by a visible label. Plain `hidden` removes them from the tab order
+   and the wrapping <label> isn't natively focusable, so keyboard users can't
+   reach the upload control. With this class the input is invisible but Tab
+   reaches it and Space/Enter opens the picker. */
+.sr-only-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  white-space: nowrap;
+  border: 0;
+  opacity: 0;
+}
+/* When the hidden input is focused (keyboard user has Tabbed to it), highlight
+   its visible label so they can see where focus is. */
+.image-btn:focus-within {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 nav#sessions-panel h2 {
   font-size: 0.85rem;
   text-transform: uppercase;

@@ -73,7 +73,16 @@ def load_api_key_into_env() -> Optional[str]:
 
 
 def is_configured() -> bool:
+    """True if the bundled CLI has any usable Claude credential.
+
+    Checked in priority order: live env var, persisted API key file (the env
+    var only gets populated by ``load_api_key_into_env`` during boot — without
+    this branch, a fresh container ships with the file but reports
+    ``unconfigured`` until first request), then OAuth credentials.
+    """
     if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    if API_KEY_FILE.exists():
         return True
     return credentials_path().exists()
 
@@ -115,11 +124,31 @@ def save_api_key(key: str) -> None:
     os.environ["ANTHROPIC_API_KEY"] = key
 
 
+async def _kill_and_reap(proc: asyncio.subprocess.Process, *, reap_timeout: float = 5.0) -> None:
+    """Send SIGKILL and wait for the process to exit so we don't leave zombies.
+
+    asyncio.subprocess.Process needs an explicit wait() after kill() — without
+    it the OS keeps the entry around until the parent reaps it, which never
+    happens for an orphaned background subprocess. Idempotent on
+    already-finished processes.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=reap_timeout)
+    except asyncio.TimeoutError:
+        log.warning("subprocess %s did not exit after kill within %ss", proc.pid, reap_timeout)
+
+
 async def sign_out() -> None:
     """Remove every form of stored Claude credential."""
     # Best-effort: ask the CLI to log out so the OAuth refresh token is
-    # revoked server-side. If that fails (CLI already in a bad state, no
-    # network, etc.) we still nuke the local files below.
+    # revoked server-side. If the CLI hangs or fails, kill+reap and proceed.
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude", "auth", "logout",
@@ -127,9 +156,17 @@ async def sign_out() -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        await asyncio.wait_for(proc.wait(), timeout=15)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            log.warning("claude auth logout timed out; killing")
+            await _kill_and_reap(proc)
+    except FileNotFoundError:
+        log.warning("claude CLI not on PATH; skipping logout subprocess")
     except Exception as e:
         log.warning("claude auth logout failed: %r", e)
+        if proc is not None:
+            await _kill_and_reap(proc)
 
     for p in (credentials_path(), API_KEY_FILE):
         try:
@@ -202,7 +239,7 @@ async def _drive(state: OAuthFlowState) -> None:
         except asyncio.TimeoutError:
             state.status = "failed"
             state.error = "claude auth login stalled before printing the sign-in URL"
-            proc.kill()
+            await _kill_and_reap(proc)
             return
         if not chunk:
             break
@@ -238,13 +275,11 @@ async def _drive(state: OAuthFlowState) -> None:
     except asyncio.TimeoutError:
         state.status = "failed"
         state.error = "Timed out waiting for the auth code from the browser"
-        if proc.returncode is None:
-            proc.kill()
+        await _kill_and_reap(proc)
         return
 
     if state.status == "cancelled":
-        if proc.returncode is None:
-            proc.kill()
+        await _kill_and_reap(proc)
         return
 
     state.status = "exchanging"
@@ -267,7 +302,7 @@ async def _drive(state: OAuthFlowState) -> None:
     try:
         rc = await asyncio.wait_for(proc.wait(), timeout=5)
     except asyncio.TimeoutError:
-        proc.kill()
+        await _kill_and_reap(proc)
         rc = -1
 
     if rc == 0 and credentials_path().exists():
@@ -287,13 +322,21 @@ async def start_oauth(variant: OAuthVariant) -> OAuthFlowState:
     """
     global _current
     async with _flow_lock:
-        if _current and _current.status in ("starting", "awaiting_code", "exchanging"):
-            _current.status = "cancelled"
-            _current.code_event.set()
-            if _current.proc and _current.proc.returncode is None:
+        prior = _current
+        if prior and prior.status in ("starting", "awaiting_code", "exchanging"):
+            prior.status = "cancelled"
+            prior.code_event.set()
+            if prior.proc is not None:
+                await _kill_and_reap(prior.proc)
+            # Cancel the driver task directly so we don't depend on it
+            # noticing the status change. Awaiting it here keeps shutdown
+            # deterministic — without this, the new flow could race the old
+            # task's tail-end output handling.
+            if prior.driver_task is not None and not prior.driver_task.done():
+                prior.driver_task.cancel()
                 try:
-                    _current.proc.kill()
-                except ProcessLookupError:
+                    await asyncio.wait_for(prior.driver_task, timeout=2)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
         state = OAuthFlowState(variant=variant)
         state.driver_task = asyncio.create_task(_drive(state))
@@ -334,8 +377,5 @@ async def cancel_flow() -> None:
         return
     _current.status = "cancelled"
     _current.code_event.set()
-    if _current.proc and _current.proc.returncode is None:
-        try:
-            _current.proc.kill()
-        except ProcessLookupError:
-            pass
+    if _current.proc is not None:
+        await _kill_and_reap(_current.proc)

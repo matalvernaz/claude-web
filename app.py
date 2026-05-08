@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
 import traceback
@@ -48,9 +49,12 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
 import setup_flow
+
+log = logging.getLogger("claude-web")
 
 
 def _sanitize_project_key(cwd: Path) -> str:
@@ -117,14 +121,29 @@ PER_USER_SESSIONS = os.getenv("CLAUDE_WEB_PER_USER_SESSIONS", "").lower() in ("1
 ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("CLAUDE_WEB_ADMIN_EMAILS", "").split(",") if e.strip()}
 
 
-def _require_admin(user: dict) -> None:
-    """Reject non-admins from credential-mutating /setup endpoints in
-    multi-user mode. No-op in single-user mode."""
-    if not PER_USER_SESSIONS:
-        return
-    email = (user.get("email") or "").lower()
-    if email not in ADMIN_EMAILS:
-        raise HTTPException(403, "admin access required for credential changes")
+def _require_setup_access(user: dict) -> None:
+    """Gate the credential-mutating /setup endpoints.
+
+    Three policies, layered from strictest:
+      * ``CLAUDE_WEB_ENABLE_SETUP=false`` → always 403, regardless of user.
+      * ``ENABLE_SETUP=auto`` (default) → 403 once a credential is provisioned;
+        admin must restart with ``ENABLE_SETUP=true`` to re-auth.
+      * In ``PER_USER_SESSIONS`` mode the user's email must additionally be in
+        ``CLAUDE_WEB_ADMIN_EMAILS`` so one regular user can't reconfigure
+        credentials shared by the whole instance.
+    """
+    if ENABLE_SETUP == "false":
+        raise HTTPException(403, "setup is locked (CLAUDE_WEB_ENABLE_SETUP=false)")
+    if ENABLE_SETUP == "auto" and setup_flow.is_configured():
+        raise HTTPException(
+            403,
+            "setup is locked after first configuration. Set "
+            "CLAUDE_WEB_ENABLE_SETUP=true and restart to re-auth.",
+        )
+    if PER_USER_SESSIONS:
+        email = (user.get("email") or "").lower()
+        if email not in ADMIN_EMAILS:
+            raise HTTPException(403, "admin access required for credential changes")
 
 # How long persisted runs (events + metadata) survive before being purged.
 # Default 24h; tune via CLAUDE_WEB_PERSIST_RETENTION. The matching in-memory
@@ -192,8 +211,166 @@ SAFE_TOOLS = set(
     t.strip() for t in os.getenv("SAFE_TOOLS", "TodoWrite").split(",") if t.strip()
 )
 
+# Tools where "Allow this session" is intentionally disabled. Their signature
+# (first Bash word, etc.) does not capture the actual content being executed,
+# so allowlisting `echo` once would also bless `echo "ok" && rm -rf ~`. The
+# permission UI hides the session-allow button when the tool is in this set;
+# the can_use_tool callback also refuses to extend the allowlist if the
+# decision arrives anyway (defense-in-depth against a tampered client).
+NO_SESSION_ALLOWLIST_TOOLS: set[str] = set(
+    t.strip() for t in os.getenv("NO_SESSION_ALLOWLIST_TOOLS", "Bash").split(",") if t.strip()
+)
+
+# Cap on per-subscriber SSE event queue depth. A slow or stuck client used to
+# accumulate every event for the run forever; with this cap a 1000-event
+# backlog disconnects the slow subscriber instead of growing memory unbounded.
+# Active subscribers should never approach this — events are bytes on the wire
+# the moment they're queued.
+MAX_SUBSCRIBER_QUEUE = int(os.getenv("CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE", "1000"))
+
+# Maximum bytes we'll buffer in memory for a single uploaded image. Smaller
+# than MAX_IMAGE_BYTES is fine — we stream and abort when the limit is hit
+# rather than reading the whole file just to reject it.
+MAX_IMAGE_READ_CHUNKS = 16  # 1MB chunks → 16MB ceiling matched to MAX_IMAGE_BYTES
+
+# Setup-flow lock-down. Three states:
+#   "true"  → /setup endpoints accept destructive actions for any signed-in
+#             user (subject to PER_USER_SESSIONS admin gating).
+#   "false" → /setup destructive actions always 403; admin must shell in.
+#   "auto"  → (default) acts like "true" while is_configured() returns False,
+#             "false" once a credential has been provisioned. Re-auth requires
+#             flipping to "true" and restarting.
+ENABLE_SETUP = os.getenv("CLAUDE_WEB_ENABLE_SETUP", "auto").strip().lower()
+if ENABLE_SETUP not in ("true", "false", "auto"):
+    raise RuntimeError(
+        f"CLAUDE_WEB_ENABLE_SETUP must be 'true', 'false', or 'auto'; got {ENABLE_SETUP!r}"
+    )
+
+# CSRF: known-safe methods bypass the Origin check entirely. Everything else
+# must carry an Origin/Referer that matches our expected origin (computed from
+# OIDC_REDIRECT_URI when set, falling back to request.base_url). When set to
+# "true", requests with no Origin AND no Referer are rejected — turn off only
+# for command-line testing.
+CSRF_STRICT = os.getenv("CLAUDE_WEB_CSRF_STRICT", "true").strip().lower() != "false"
+_CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Single-worker enforcement. Module-global state (ACTIVE_RUNS, PENDING,
+# _SESSION_LOCKS, etc.) does not survive a multi-worker uvicorn deployment —
+# permission requests pinned to one worker won't be visible from another, and
+# SSE streams will route at random. Refuse to start with WEB_CONCURRENCY>1
+# unless explicitly opted out.
+def _enforce_single_worker() -> None:
+    raw = os.getenv("WEB_CONCURRENCY", "").strip()
+    if not raw:
+        return
+    try:
+        n = int(raw)
+    except ValueError:
+        return
+    if n > 1 and os.getenv("CLAUDE_WEB_ALLOW_MULTI_WORKER", "").lower() != "true":
+        raise RuntimeError(
+            f"WEB_CONCURRENCY={n} but claude-web requires single-worker mode "
+            "(in-process state isn't shared across workers). Set "
+            "CLAUDE_WEB_ALLOW_MULTI_WORKER=true to override at your own risk."
+        )
+
+
+_enforce_single_worker()
+
+# Refuse the dangerous combination at startup: PER_USER_SESSIONS is meant to
+# isolate users from each other, but in AUTH_MODE=none every visitor is
+# `sub="anonymous"`, so isolation collapses. Ship explicit isolation or pick a
+# different mode.
+if PER_USER_SESSIONS and auth.AUTH_MODE == "none":
+    raise RuntimeError(
+        "CLAUDE_WEB_PER_USER_SESSIONS=true is incompatible with AUTH_MODE=none — "
+        "every visitor would share owner_sub='anonymous'. Either enable OIDC or "
+        "disable PER_USER_SESSIONS."
+    )
+
+class CSRFMiddleware(BaseHTTPMiddleware):
+    """Origin/Referer-based CSRF defense for state-changing requests.
+
+    SameSite=Lax cookies block most cross-site form POSTs in modern browsers,
+    but we layer this anyway because (a) older browsers and embedded webviews
+    have weaker SameSite enforcement, and (b) the endpoints downstream
+    authorize shell execution. The check skips safe methods plus the OIDC
+    callback (the IdP issues a top-level GET), and is configurable via
+    CLAUDE_WEB_CSRF_STRICT.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method in _CSRF_SAFE_METHODS:
+            return await call_next(request)
+        # Auth callback is a top-level GET from the IdP, but if a particular
+        # provider ever issues POST we still want it through unchecked.
+        if request.url.path.startswith("/auth/"):
+            return await call_next(request)
+
+        expected = auth.expected_origin(request)
+        origin = request.headers.get("origin", "").rstrip("/")
+        referer = request.headers.get("referer", "")
+        if origin:
+            if origin != expected:
+                return JSONResponse(
+                    {"error": "csrf", "detail": f"bad Origin {origin!r}"}, status_code=403
+                )
+        elif referer:
+            if not referer.startswith(expected + "/") and referer.rstrip("/") != expected:
+                return JSONResponse(
+                    {"error": "csrf", "detail": "bad Referer"}, status_code=403
+                )
+        elif CSRF_STRICT:
+            return JSONResponse(
+                {"error": "csrf", "detail": "missing Origin/Referer"}, status_code=403
+            )
+        return await call_next(request)
+
+
+# CSP defaults: 'self' for everything, allow data: and blob: for images so the
+# attachment thumbnails (FileReader → data URL) keep working, allow inline
+# style only because dynamic context-meter colours are set via element.style
+# (refactor target). frame-ancestors blocks clickjacking on permission cards;
+# X-Frame-Options is the legacy backstop for older browsers.
+_CSP_HEADER_VALUE = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'"
+)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Inject CSP + a few hardening headers on every response.
+
+    Cheap, no per-route exemptions needed — static assets get the same CSP and
+    nothing breaks because they're already same-origin.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("Content-Security-Policy", _CSP_HEADER_VALUE)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
+        return response
+
+
 app = FastAPI()
 auth.configure(app)
+# Order matters: SessionMiddleware (added by auth.configure) wraps the app
+# innermost so request.session is available to handlers. CSRF + security
+# headers wrap outside of it, so they see the request before session lookup
+# but after the underlying ASGI server. add_middleware adds outermost-first.
+app.add_middleware(CSRFMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 auth.install_routes(app)
 # Pull a persisted Anthropic API key (from a previous /setup api-key submission)
 # into the env so the SDK and CLI both see it without a container restart.
@@ -781,13 +958,12 @@ def _purge_old_uploads(now: float) -> None:
                 continue
         except FileNotFoundError:
             continue
-        for child in entry.iterdir():
-            try:
-                child.unlink()
-            except OSError:
-                pass
+        # Use rmtree so a stray subdirectory (created by an external process
+        # or a future feature that nests uploads) doesn't crash the GC pass
+        # with IsADirectoryError. ignore_errors=True so a transient permission
+        # blip doesn't take the whole sweep down.
         try:
-            entry.rmdir()
+            shutil.rmtree(entry, ignore_errors=True)
         except OSError:
             pass
 
@@ -971,9 +1147,23 @@ class ActiveRun:
         if event.get("type") == "run_started":
             meta_changed = True
         self.last_activity = time.time()
-        # Subscriber queues are unbounded, so put_nowait can't fail here.
+        # Subscriber queues are bounded (MAX_SUBSCRIBER_QUEUE) — a slow client
+        # that lets its queue fill up gets disconnected rather than growing
+        # the run's memory unbounded. The browser will fall back to /api/
+        # chat/stream/<run_id> + the persisted event log to catch up.
         for q in list(self.subscribers):
-            q.put_nowait(event)
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                self.subscribers.discard(q)
+                log.warning(
+                    "dropping slow SSE subscriber for run %s (queue at %d)",
+                    self.run_id, q.qsize(),
+                )
+                try:
+                    q.put_nowait({"type": "_overflow"})
+                except asyncio.QueueFull:
+                    pass
         # Persist after fan-out so a slow disk write never blocks the live
         # browser update. Failures are logged and swallowed.
         _persist_event(self.run_id, idx, event)
@@ -987,12 +1177,33 @@ class ActiveRun:
         len(events)-N for "give me only the newest N events" — used when a
         follow-up POST hits an already-running long-lived run and the
         browser already has the older events rendered.
+
+        Queue depth is capped at MAX_SUBSCRIBER_QUEUE; a slow subscriber that
+        falls behind will be dropped and emit() sends "_overflow" so the
+        client can reconnect cleanly via /api/chat/stream/<run_id>.
         """
-        q: asyncio.Queue = asyncio.Queue()
-        for e in self.events[start_index:]:
-            q.put_nowait(e)
+        q: asyncio.Queue = asyncio.Queue(maxsize=MAX_SUBSCRIBER_QUEUE)
+        # The replay can exceed maxsize for an already-finished run with a
+        # huge event log. Use unbounded put for the initial drain — once
+        # tailing live, subsequent put_nowait calls in emit() will respect
+        # the cap.
+        backlog = self.events[start_index:]
+        for e in backlog:
+            try:
+                q.put_nowait(e)
+            except asyncio.QueueFull:
+                # Replay too large to fit; signal the consumer so it knows
+                # to fetch the rest via the persisted store.
+                try:
+                    q.put_nowait({"type": "_overflow"})
+                except asyncio.QueueFull:
+                    pass
+                break
         if self.done:
-            q.put_nowait({"type": "_done"})
+            try:
+                q.put_nowait({"type": "_done"})
+            except asyncio.QueueFull:
+                pass
         else:
             self.subscribers.add(q)
         return q
@@ -1005,8 +1216,17 @@ class ActiveRun:
         self.finished_at = time.time()
         self.last_activity = self.finished_at
         for q in list(self.subscribers):
-            q.put_nowait({"type": "_done"})
+            try:
+                q.put_nowait({"type": "_done"})
+            except asyncio.QueueFull:
+                pass
         self.subscribers.clear()
+        # Drop the session-id mapping so a follow-up POST doesn't pin against
+        # a finished run. The run object stays in ACTIVE_RUNS until _gc_runs
+        # purges it (we still want /api/chat/stream/<run_id> reconnects to
+        # work for late-arriving SSE clients during the retention window).
+        if self.session_id and ACTIVE_RUNS_BY_SESSION.get(self.session_id) is self:
+            ACTIVE_RUNS_BY_SESSION.pop(self.session_id, None)
         _persist_run_meta(self)
 
 
@@ -1126,22 +1346,23 @@ async def _send_to_client(client, text: str, blocks: list[dict]) -> None:
         await client.query(text or "")
 
 
-async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> None:
+async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> bool:
     """Push mid-turn user input down to the bundled CLI immediately.
+
+    Returns ``True`` if the input was accepted (either delivered to the live
+    CLI or queued for the driver), ``False`` if the CLI subprocess pipe is
+    broken. Callers must check the return so the visible ``user_prompt``
+    event isn't persisted for input that never reached Claude.
 
     The bundled binary holds the message in its own concurrent-query queue
     and injects it at the next LLM pause (between tool calls, after a
-    subagent returns) — that's the steerability the binary has by default
-    and that we want here. Falls back to the Python-side queue only if the
-    driver hasn't fully started yet, so no input is ever silently dropped.
+    subagent returns) — that's the steerability the binary has by default.
+    Falls back to the Python-side queue only if the driver hasn't fully
+    started yet, so no input is silently dropped.
 
     Both branches run under client_write_lock so the driver's atomic
     "drain-queue-then-publish-client" setup step can rely on no new queue
     puts or direct sends happening behind its back.
-
-    A broken CLI pipe (subprocess crashed, OS-level pipe error) is surfaced
-    as an SSE error event so the browser can render it instead of bubbling
-    up to a 500 from the request handler.
     """
     async with run.client_write_lock:
         if run.client is not None:
@@ -1150,9 +1371,12 @@ async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> N
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 run.emit({
                     "type": "error",
-                    "message": f"Lost connection to the Claude CLI: {type(e).__name__}: {e}. Send a new message to start a fresh run.",
+                    "message": (
+                        f"Lost connection to the Claude CLI: {type(e).__name__}: {e}. "
+                        "Send a new message to start a fresh run."
+                    ),
                 })
-                return
+                return False
             run.pending_immediate_queries += 1
             # Wake the driver if it's sleeping on _wait_for_next_action's
             # idle-timeout — otherwise the CLI's response to this injection
@@ -1160,6 +1384,7 @@ async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> N
             run.injection_event.set()
         else:
             await run.user_input_queue.put({"text": text, "image_blocks": blocks})
+        return True
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -1493,8 +1718,9 @@ def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingRespo
 def _validate_image(upload: UploadFile, data: bytes) -> str:
     """Return the media type, raising HTTPException if the upload is rejected.
 
-    Trusts the client's content-type hint but cross-checks the magic bytes so
-    a renamed `.png` blob can't sneak past the allowlist.
+    Trusts the client's content-type hint but requires magic bytes to match a
+    known image format. Previously, an upload claiming ``image/png`` whose
+    bytes matched no known signature would slip through; now we require both.
     """
     media_type = (upload.content_type or "").lower()
     if media_type not in ALLOWED_IMAGE_MEDIA_TYPES:
@@ -1510,9 +1736,33 @@ def _validate_image(upload: UploadFile, data: bytes) -> str:
         sniffed = "image/gif"
     elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         sniffed = "image/webp"
-    if sniffed and sniffed != media_type:
+    if sniffed is None:
+        raise HTTPException(400, f"image bytes don't match any known format for {media_type!r}")
+    if sniffed != media_type:
         raise HTTPException(400, f"image bytes don't match content-type {media_type!r}")
     return media_type
+
+
+async def _read_with_cap(upload: UploadFile, cap: int) -> bytes:
+    """Read an UploadFile in chunks, aborting once we exceed ``cap`` bytes.
+
+    Starlette's UploadFile already spools to disk for large bodies, but a
+    direct ``await upload.read()`` still pulls every byte into memory before
+    we can check. Streaming lets us reject a 1GB upload after one chunk
+    instead of materialising it whole.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    chunk_size = 1024 * 1024  # 1 MiB
+    while True:
+        chunk = await upload.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise HTTPException(400, f"upload too large (>{cap} bytes)")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
@@ -1548,16 +1798,20 @@ async def _save_uploaded_files(files: list[UploadFile], run_id: str) -> list[dic
     target_dir.mkdir(parents=True, exist_ok=True)
     out: list[dict] = []
     for f in real:
-        data = await f.read()
+        # Stream-and-cap so a 100GB upload doesn't spike memory before the
+        # size check rejects it.
+        data = await _read_with_cap(f, MAX_UPLOAD_BYTES)
         if not data:
             continue
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(400, f"file '{f.filename}' too large (>{MAX_UPLOAD_BYTES} bytes)")
         base = _safe_filename(f.filename)
         target = target_dir / base
-        # Disambiguate name collisions within the same run.
+        # Disambiguate name collisions within the same run. Bounded so a
+        # filename pile-up can't loop forever; we'd rather fail loudly with
+        # a clear error than spin doing stat() calls.
         n = 1
         while target.exists():
+            if n > 1000:
+                raise HTTPException(409, f"too many name collisions for '{base}'")
             stem, dot, ext = base.rpartition(".")
             base2 = f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
             target = target_dir / base2
@@ -1591,7 +1845,10 @@ async def _read_uploaded_images(images: list[UploadFile]) -> tuple[list[dict], l
     for img in images or []:
         if not img or not img.filename:
             continue
-        data = await img.read()
+        # Stream-and-cap so an oversized image is rejected after the first
+        # chunk over the limit, not after we've already materialised every
+        # byte into the worker's RAM.
+        data = await _read_with_cap(img, MAX_IMAGE_BYTES)
         if not data:
             continue
         media_type = _validate_image(img, data)
@@ -1693,12 +1950,6 @@ async def api_chat(
             # only sees events from this turn forward, not the entire prior
             # history that the browser already rendered.
             start_index = len(existing.events)
-            existing.emit({
-                "type": "user_prompt",
-                "text": message,
-                "image_count": len(image_blocks),
-                "file_count": len(file_metas),
-            })
             # Pending notifications get superseded by explicit user input —
             # the user is now driving, no need to auto-fire. Reset the chain
             # counter so the user gets a fresh budget if their reply itself
@@ -1706,7 +1957,17 @@ async def api_chat(
             existing.pending_notifications.clear()
             existing.notification_grace_started_at = None
             existing.consecutive_auto_fires = 0
-            await _inject_user_input(existing, effective, image_blocks)
+            # Only persist the user_prompt event AFTER we know the input
+            # actually reached the CLI — otherwise a broken pipe would leave
+            # the transcript saying "you said X" when Claude never saw it.
+            delivered = await _inject_user_input(existing, effective, image_blocks)
+            if delivered:
+                existing.emit({
+                    "type": "user_prompt",
+                    "text": message,
+                    "image_count": len(image_blocks),
+                    "file_count": len(file_metas),
+                })
             return _stream_run_response(existing, start_index=start_index)
 
         sid_in = session_id or None
@@ -1749,7 +2010,12 @@ async def api_chat(
         if tool_name in SAFE_TOOLS:
             return PermissionResultAllow()
         sig = _tool_signature(tool_name, tool_input)
-        if (tool_name, sig) in run.session_allowlist:
+        # Tools in NO_SESSION_ALLOWLIST_TOOLS bypass the per-session allowlist
+        # entirely — their signature is too coarse to be safe (e.g. Bash maps
+        # every command to its first word, so allowlisting `echo` would
+        # bless `echo "ok" && rm -rf ~`).
+        allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
+        if allow_session_supported and (tool_name, sig) in run.session_allowlist:
             return PermissionResultAllow()
 
         request_id = str(uuid_mod.uuid4())
@@ -1763,6 +2029,7 @@ async def api_chat(
                 "input": tool_input,
                 "signature": sig,
                 "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                "allow_session_supported": allow_session_supported,
             })
             try:
                 decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
@@ -1786,7 +2053,16 @@ async def api_chat(
         if d == "allow":
             return PermissionResultAllow()
         if d == "allow_session":
-            run.session_allowlist.add((tool_name, sig))
+            # Defense-in-depth: refuse to extend the allowlist for tools that
+            # opt out, even if a tampered client posted allow_session anyway.
+            # Treat it as allow-once.
+            if allow_session_supported:
+                run.session_allowlist.add((tool_name, sig))
+            else:
+                log.info(
+                    "ignoring allow_session for %s (signature unsafe to allowlist)",
+                    tool_name,
+                )
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied permission via web UI.")
 
@@ -2030,16 +2306,23 @@ async def api_chat_send(
     image_blocks, _meta = await _read_uploaded_images(images)
     file_metas = await _save_uploaded_files(files, run_id)
     effective = _file_attachment_prefix(file_metas) + message
-    run.emit({
-        "type": "user_prompt",
-        "text": message,
-        "image_count": len(image_blocks),
-        "file_count": len(file_metas),
-    })
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0
-    await _inject_user_input(run, effective, image_blocks)
+    delivered = await _inject_user_input(run, effective, image_blocks)
+    if delivered:
+        run.emit({
+            "type": "user_prompt",
+            "text": message,
+            "image_count": len(image_blocks),
+            "file_count": len(file_metas),
+        })
+    else:
+        # Surface the failure as a 502 so the frontend can fall back to
+        # opening a fresh run instead of believing the message was queued.
+        return JSONResponse(
+            {"ok": False, "error": "delivery_failed"}, status_code=502,
+        )
     return JSONResponse({"ok": True}, status_code=202)
 
 
@@ -2222,7 +2505,9 @@ def _save_rate_limit(rli: dict) -> None:
         tmp.write_text(payload)
         os.replace(tmp, RATE_LIMIT_CACHE)
     except Exception:
-        pass
+        # Log so a permission/disk issue is debuggable, but don't propagate
+        # — rate-limit caching is non-critical relative to serving the turn.
+        log.exception("save_rate_limit failed")
 
 
 def _log_usage(msg) -> None:
@@ -2243,7 +2528,7 @@ def _log_usage(msg) -> None:
         with USAGE_LOG.open("a") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
-        pass
+        log.exception("log_usage failed")
 
 
 def _today_window() -> tuple[int, int]:
@@ -2345,7 +2630,7 @@ async def api_setup_oauth_start(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
-    _require_admin(user)
+    _require_setup_access(user)
     body = await request.json()
     variant = body.get("variant", "claudeai")
     if variant not in ("claudeai", "console"):
@@ -2359,7 +2644,7 @@ async def api_setup_oauth_code(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
-    _require_admin(user)
+    _require_setup_access(user)
     body = await request.json()
     code = (body.get("code") or "").strip()
     if not code:
@@ -2378,7 +2663,7 @@ async def api_setup_oauth_code(
 
 @app.post("/api/setup/oauth/cancel")
 async def api_setup_oauth_cancel(user: dict = Depends(auth.require_user)):
-    _require_admin(user)
+    _require_setup_access(user)
     await setup_flow.cancel_flow()
     return {"ok": True}
 
@@ -2388,7 +2673,7 @@ async def api_setup_apikey(
     request: Request,
     user: dict = Depends(auth.require_user),
 ):
-    _require_admin(user)
+    _require_setup_access(user)
     body = await request.json()
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
@@ -2404,7 +2689,7 @@ async def api_setup_apikey(
 async def api_setup_signout(user: dict = Depends(auth.require_user)):
     """Forget all stored Claude credentials. Forward-auth (Keycloak) login
     is unaffected — this only signs the in-container Claude CLI out."""
-    _require_admin(user)
+    _require_setup_access(user)
     await setup_flow.sign_out()
     return {"configured": setup_flow.is_configured()}
 

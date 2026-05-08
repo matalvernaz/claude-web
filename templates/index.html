@@ -104,7 +104,9 @@
         <form id="chat-form" autocomplete="off">
           <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline, paste or drop files)</span></label>
           <div class="prompt-wrap">
-            <textarea id="prompt" name="message" rows="3" placeholder="Ask Claude…"></textarea>
+            <textarea id="prompt" name="message" rows="3" placeholder="Ask Claude…"
+              role="combobox" aria-autocomplete="list" aria-expanded="false"
+              aria-controls="slash-menu" aria-haspopup="listbox"></textarea>
             <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
           </div>
           <div id="attachments" class="attachments" hidden aria-label="Attached images"></div>
@@ -112,13 +114,13 @@
           <div class="row">
             <button type="submit" id="send">Send</button>
             <button type="button" id="stop" hidden>Stop</button>
-            <label class="image-btn" for="image-input" aria-label="Attach images">
+            <label class="image-btn" for="image-input">
               <span aria-hidden="true">📎</span> Image
-              <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+              <input type="file" id="image-input" accept="image/png,image/jpeg,image/gif,image/webp" class="sr-only-input" aria-label="Attach images" multiple>
             </label>
-            <label class="image-btn" for="file-input" aria-label="Attach files">
+            <label class="image-btn" for="file-input">
               <span aria-hidden="true">📄</span> File
-              <input type="file" id="file-input" multiple hidden>
+              <input type="file" id="file-input" class="sr-only-input" aria-label="Attach files" multiple>
             </label>
             <span id="status" aria-hidden="true"></span>
           </div>
@@ -128,10 +130,7 @@
     </main>
   </div>
 
-  <script>
-    // Server-known model metadata: keep context windows in one place.
-    window.CLAUDE_WEB_MODELS = {{ models_json | safe }};
-  </script>
+  <script type="application/json" id="models-data">{{ models_json | safe }}</script>
   <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
   <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
   <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>

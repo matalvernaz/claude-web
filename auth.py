@@ -16,15 +16,17 @@ must be set in oidc mode.
 """
 from __future__ import annotations
 
+import logging
 import os
-import secrets
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
+
+log = logging.getLogger("claude-web.auth")
 
 
 AUTH_MODE = os.getenv("AUTH_MODE", "oidc").strip().lower()
@@ -53,6 +55,24 @@ def safe_next(value: Optional[str]) -> str:
     if value.startswith("//") or value.startswith("/\\"):
         return "/"
     return value
+
+
+def expected_origin(request: Request) -> str:
+    """Compute the origin (scheme://host[:port]) we expect for browser-issued
+    requests, used by the CSRF middleware. Honours OIDC_REDIRECT_URI when set
+    so deployments behind reverse proxies don't depend on guessing from the
+    Host header.
+    """
+    redirect_uri = os.getenv("OIDC_REDIRECT_URI", "").strip()
+    if redirect_uri:
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    base = str(request.base_url).rstrip("/")
+    parsed = urlparse(base)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return base
 
 
 _oauth: Optional[OAuth] = None
@@ -166,8 +186,10 @@ def install_routes(app) -> None:
             "groups": userinfo.get("groups") or [],
         }
         if not user["sub"]:
+            request.session.pop("post_login_next", None)
             return JSONResponse({"error": "missing_sub"}, status_code=400)
         if not _user_allowed(user):
+            request.session.pop("post_login_next", None)
             return JSONResponse(
                 {"error": "forbidden", "detail": "Account not permitted to use this instance."},
                 status_code=403,

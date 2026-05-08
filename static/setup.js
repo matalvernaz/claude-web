@@ -38,8 +38,15 @@
   // can't surface (driver task crashed after returning, claude CLI died
   // after printing the URL, etc.).
   const POLL_MS = 1500;
+  // Bail after this many consecutive polls without progress, so a stuck
+  // backend doesn't poll forever. CODE_TIMEOUT_SECONDS on the server is
+  // 600s, so 800 polls × 1.5s ≈ 20 min covers any legitimate awaiting_code
+  // window plus the post-exchange round-trip.
+  const MAX_POLLS = 800;
   const ACTIVE_STATUSES = new Set(["starting", "awaiting_code", "exchanging"]);
   let pollHandle = null;
+  let pollInFlight = false;
+  let pollCount = 0;
   let codeFocused = false;
 
   function show(el) { if (el) el.hidden = false; }
@@ -138,21 +145,37 @@
 
   function startPolling() {
     if (pollHandle != null) return;
+    pollCount = 0;
     pollHandle = setInterval(async () => {
-      const data = await fetchStatus();
-      if (!data) return;
-      if (data.whoami) applyWhoami(data.whoami);
-      if (data.flow) applyFlowState(data.flow);
-      // The /setup page is reachable even when configured (re-auth flow), so
-      // only auto-redirect if a flow we're tracking just finished.
-      if (data.configured && data.flow && data.flow.status === "done") {
-        stopPolling();
-        window.location.href = "/";
-        return;
-      }
-      const status = data.flow && data.flow.status;
-      if (!status || !ACTIVE_STATUSES.has(status)) {
-        stopPolling();
+      // Guard against overlapping polls — if fetchStatus takes longer than
+      // POLL_MS, the next interval fires before the previous response has
+      // landed and a stale response could regress the UI.
+      if (pollInFlight) return;
+      pollInFlight = true;
+      try {
+        pollCount += 1;
+        if (pollCount > MAX_POLLS) {
+          stopPolling();
+          showError(oauthError, "Sign-in is taking too long; refresh to try again.");
+          return;
+        }
+        const data = await fetchStatus();
+        if (!data) return;
+        if (data.whoami) applyWhoami(data.whoami);
+        if (data.flow) applyFlowState(data.flow);
+        // The /setup page is reachable even when configured (re-auth flow), so
+        // only auto-redirect if a flow we're tracking just finished.
+        if (data.configured && data.flow && data.flow.status === "done") {
+          stopPolling();
+          window.location.href = "/";
+          return;
+        }
+        const status = data.flow && data.flow.status;
+        if (!status || !ACTIVE_STATUSES.has(status)) {
+          stopPolling();
+        }
+      } finally {
+        pollInFlight = false;
       }
     }, POLL_MS);
   }
@@ -162,6 +185,8 @@
       clearInterval(pollHandle);
       pollHandle = null;
     }
+    pollInFlight = false;
+    pollCount = 0;
   }
 
   // Restore in-progress state on page load. If a flow is still going (the
@@ -243,6 +268,14 @@
         showError(oauthError, "Code exchange failed: " + e.message);
         oauthCodeSubmit.disabled = false;
         oauthStart.disabled = false;
+        // The status falls back to "awaiting_code" on rejection, but we
+        // already auto-focused once and codeFocused stays true forever
+        // unless reset — without this, the input doesn't refocus on retry.
+        codeFocused = false;
+        if (oauthCodeInput) {
+          oauthCodeInput.value = "";
+          oauthCodeInput.focus();
+        }
       }
     });
   }

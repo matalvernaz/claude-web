@@ -1,71 +1,156 @@
 # claude-web
 
-A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code), with native OIDC auth and per-tool permission prompts.
+A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) with native OIDC auth and per-tool permission prompts. Built for **single-user homelab or trusted-team** deployments.
 
 - Streams Claude's responses + tool calls in the browser via SSE.
 - Intercepts every tool invocation and asks the browser to allow / allow-for-session / deny.
 - Reads sessions directly from `~/.claude/projects/<project>/*.jsonl`, so the UI and the host-shell `claude` CLI share state — start a chat in one, resume it in the other.
 - OIDC sign-in (Keycloak, Authentik, Authelia, Auth0, Google, …) with optional email- or group-based allowlists.
-- One container, one `.env` file. No database.
+- One container, one `.env` file, no separate database.
 
-> **Security model.** Anyone who can sign in to your IdP and pass the allowlist gets a Claude that can read, write, and run shell commands inside the mounted workspace. The per-tool permission prompt is the *only* guardrail between the user and arbitrary code execution. Don't expose this to people you wouldn't hand a shell.
+> ## Trust model — read this first
+>
+> claude-web **does not sandbox Claude**. Approved tools (Bash, Edit, Write, …) execute with the permissions of the server process and can read, write, or run anything that user can. The per-tool permission prompt is the *only* guardrail between an authenticated user and arbitrary code execution on the host.
+>
+> Only deploy this to people you would be comfortable handing a shell. For untrusted users, run one isolated container or Unix user per person — the multi-user mode (`CLAUDE_WEB_PER_USER_SESSIONS`) is an *ownership filter*, not a security boundary; sessions from other users can't be listed but their files are still on the same filesystem the model can `Read` or `Bash` to.
+
+---
 
 ## Quick start (Docker Compose)
 
 ```bash
-git clone https://github.com/YOUR_GH_USER/claude-web.git
+git clone https://github.com/matalvernaz/claude-web.git
 cd claude-web
 cp .env.example .env
-# edit .env: set SESSION_SECRET, OIDC_*, OIDC_REDIRECT_URI
+# edit .env: set SESSION_SECRET (random) and the OIDC_* values for your IdP
 cp docker-compose.example.yml docker-compose.yml
 mkdir -p workspace claude-home claude-web-state
 docker compose up -d
 ```
 
-Open `https://claude.example.com` (whatever you set `OIDC_REDIRECT_URI` to point at). On first visit you'll be redirected to **`/setup`** — a one-time, in-browser sign-in flow for the in-container Claude Code CLI. Two options there:
+Open the URL you put in `OIDC_REDIRECT_URI` (minus `/auth/callback`). On first visit the app redirects to **`/setup`** — a one-time, in-browser sign-in flow for the bundled `claude` CLI. Two options:
 
 - **Sign in with a Claude account** — drives `claude auth login` (or `--console` for an Anthropic Console account) as a subprocess. Click the link to claude.com, sign in, copy the one-time code back into the textbox.
 - **Or paste an API key** — for headless / shared instances. The key is persisted to `$CLAUDE_WEB_STATE_DIR/anthropic_api_key` (mode 0600) and loaded into `ANTHROPIC_API_KEY` on startup.
 
-Either way, credentials persist in the `claude-home` (or `claude-web-state`) volume across container restarts. To switch accounts later, the `/setup` page also exposes a "Sign Claude out" button.
+Either way, credentials persist in the `claude-home` (or `claude-web-state`) volume across container restarts. The `/setup` page locks itself once a credential is provisioned (`CLAUDE_WEB_ENABLE_SETUP=auto`); to switch accounts later, set `CLAUDE_WEB_ENABLE_SETUP=true` and restart, or shell into the container and run `claude auth login` directly.
 
-If you'd rather sign in from a shell, that still works: `docker compose exec claude-web claude auth login`.
+If you'd rather sign in from a shell from the start: `docker compose exec claude-web claude auth login`.
+
+## Running from source (no Docker)
+
+Tested on Python 3.11+. You need Node.js for the bundled `@anthropic-ai/claude-code` CLI (the SDK shells out to it).
+
+```bash
+git clone https://github.com/matalvernaz/claude-web.git
+cd claude-web
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+npm install -g @anthropic-ai/claude-code      # provides the `claude` binary
+cp .env.example .env                          # edit values
+set -a; source .env; set +a
+uvicorn app:app --host 127.0.0.1 --port 3001
+```
+
+Then visit `http://localhost:3001/setup` (set `SESSION_COOKIE_INSECURE=true` and `AUTH_MODE=none` in `.env` for local-only testing) to sign Claude in.
+
+For a long-running install behind a reverse proxy, a systemd unit looks like:
+
+```ini
+# /etc/systemd/system/claude-web.service
+[Unit]
+Description=claude-web
+After=network-online.target
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/opt/claude-web
+EnvironmentFile=/opt/claude-web/.env
+ExecStart=/opt/claude-web/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3001
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> **Single worker only.** The app keeps in-memory state (active SSE subscribers, pending permission requests, per-session locks) that isn't shared across uvicorn/gunicorn workers. Running with `WEB_CONCURRENCY > 1` will misroute permission prompts and split-brain conversations. The startup checks `WEB_CONCURRENCY` and refuses to boot if it's set to more than one — set `CLAUDE_WEB_ALLOW_MULTI_WORKER=true` only if you've externalised state, which this app does not currently do.
 
 ## Configuration
 
-All configuration is via environment variables. See [`.env.example`](.env.example) for the full list with comments.
+All configuration is via environment variables. See [`.env.example`](.env.example) for the full list.
+
+### Auth
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `AUTH_MODE` | yes | `oidc` | `oidc` or `none`. `none` skips auth entirely — only use behind a trusted proxy or for localhost dev. |
+| `AUTH_MODE` | yes | `oidc` | `oidc` or `none`. `none` skips auth entirely — only safe behind a trusted proxy or for localhost dev. |
 | `SESSION_SECRET` | when `oidc` | — | Random string for cookie signing. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `SESSION_MAX_AGE_SECONDS` | no | `86400` | How long the signed session cookie is valid. |
+| `SESSION_COOKIE_INSECURE` | no | `false` | Set `true` only when serving plain HTTP (e.g. localhost dev). |
 | `OIDC_ISSUER_URL` | when `oidc` | — | Base URL your IdP advertises in `/.well-known/openid-configuration`. |
-| `OIDC_CLIENT_ID` | when `oidc` | — | OIDC client ID. |
+| `OIDC_CLIENT_ID` | when `oidc` | — | OIDC client id. |
 | `OIDC_CLIENT_SECRET` | when `oidc` | — | OIDC client secret (confidential client). |
-| `OIDC_REDIRECT_URI` | when `oidc` | — | Must match what's registered with the IdP. Usually `https://<your-host>/auth/callback`. |
+| `OIDC_REDIRECT_URI` | when `oidc` | — | Must match what's registered with the IdP. Usually `https://<your-host>/auth/callback`. Also drives the CSRF middleware's expected origin. |
 | `OIDC_ALLOWED_EMAILS` | no | (any) | Comma-separated allowlist. Empty = anyone with a valid token. |
-| `OIDC_ALLOWED_GROUPS` | no | (any) | Comma-separated. Matched against the `groups` claim. |
-| `SESSION_COOKIE_INSECURE` | no | `false` | Set `true` only when serving over plain HTTP (e.g. localhost). |
-| `CLAUDE_PROJECT_DIR` | no | `$HOME` | The directory Claude treats as its project root. |
-| `CLAUDE_HOME` | no | `$HOME/.claude` | Where Claude Code keeps its per-user state. |
-| `CLAUDE_WEB_STATE_DIR` | no | `$HOME/.claude-web` | Where this app keeps its usage log + cached rate-limit info. |
-| `SAFE_TOOLS` | no | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
-| `CLAUDE_WEB_PER_USER_SESSIONS` | no | `false` | When `true`, sessions are scoped to the user that created them — other signed-in users can't see, load, export, or delete them. Sessions created via the host-shell `claude` CLI have no recorded owner and stay visible to everyone (matches the "share state" promise). |
-| `CLAUDE_WEB_ADMIN_EMAILS` | no | (empty) | Comma-separated email allowlist for the destructive `/setup` endpoints (replace API key, sign Claude out). Only enforced when `CLAUDE_WEB_PER_USER_SESSIONS=true`. Empty in multi-user mode means "no one can mutate credentials from the browser — admin must shell into the container". |
+| `OIDC_ALLOWED_GROUPS` | no | (any) | Comma-separated, matched against the `groups` claim. |
+
+### Claude Code
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_PROJECT_DIR` | `$HOME` | The directory Claude treats as its project root. |
+| `CLAUDE_WEB_PROJECT_DIRS` | (unset) | Comma-separated list to expose multiple project roots in a picker. |
+| `CLAUDE_HOME` | `$HOME/.claude` | Where Claude Code keeps its per-user state (sessions, settings, MCP, hooks). |
+| `CLAUDE_WEB_STATE_DIR` | `$HOME/.claude-web` | Where this app keeps usage log, rate-limit cache, persisted runs, and uploads. |
+| `SAFE_TOOLS` | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
+| `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
+
+### Multi-user
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_PER_USER_SESSIONS` | `false` | When `true`, sessions are scoped to whoever first chatted in them. **Not a security boundary** — see the trust-model note above. Sessions created via the host-shell `claude` CLI have no recorded owner and stay visible to everyone. |
+| `CLAUDE_WEB_ADMIN_EMAILS` | (empty) | Comma-separated email allowlist for the credential-mutating `/setup` endpoints. Only enforced in `PER_USER_SESSIONS` mode. Empty in multi-user mode means **no one** can mutate credentials from the browser; admin must shell into the container. |
+
+`AUTH_MODE=none` + `PER_USER_SESSIONS=true` is refused at startup (every visitor would share `sub="anonymous"`, breaking isolation entirely).
+
+### Setup-flow lock
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_ENABLE_SETUP` | `auto` | Three values: `true` always allow `/setup` actions; `false` always block them (admin must shell in); `auto` allow during first-run, lock once a credential is configured. |
+
+### Hardening
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_CSRF_STRICT` | `true` | Reject mutating requests without a matching `Origin` or `Referer` header. Set `false` only for command-line testing. |
+| `CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE` | `1000` | Bound on in-memory SSE event queue per subscriber; slow clients are dropped (with `_overflow`) instead of growing memory. |
+
+### Retention / GC
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_PERSIST_RETENTION` | `86400` (24h) | Run/event store rows older than this are pruned. |
+| `CLAUDE_WEB_UPLOAD_RETENTION` | `604800` (7d) | Per-run upload directories older than this are deleted. |
+| `CLAUDE_WEB_PERMISSION_TIMEOUT` | `900` (15m) | Pending permission requests deny themselves after this. |
+| `CLAUDE_WEB_MAX_AUTO_FIRES` | `3` | How many synth-message turns can chain off background tool notifications before the driver waits for a human. |
 
 ## Setting up OIDC
 
 You need a *confidential* OIDC client at your IdP with:
 
-- **Redirect URI**: exactly what you set as `OIDC_REDIRECT_URI` (e.g. `https://claude.example.com/auth/callback`).
-- **Scopes**: `openid email profile` (the defaults — claude-web requests these).
-- **Optional**: a `groups` mapper if you plan to use `OIDC_ALLOWED_GROUPS`.
+- **Redirect URI:** exactly what you set as `OIDC_REDIRECT_URI` (e.g. `https://claude.example.com/auth/callback`).
+- **Scopes:** `openid email profile` (the defaults — claude-web requests these).
+- **Optional:** a `groups` mapper if you plan to use `OIDC_ALLOWED_GROUPS`.
 
 ### Keycloak
 
 1. Realm → Clients → **Create client**.
-2. Client type **OpenID Connect**, Client ID `claude-web`, Name whatever you like.
-3. Capability config: enable **Client authentication** (this makes it confidential). Authorization off. Authentication flow: keep `Standard flow` checked, leave the rest as defaults.
+2. Client type **OpenID Connect**, Client ID `claude-web`.
+3. Capability config: enable **Client authentication** (this makes it confidential). Authorization off. Authentication flow: keep `Standard flow` checked.
 4. Login settings → **Valid redirect URIs**: `https://claude.example.com/auth/callback`.
 5. Save → **Credentials** tab → copy the client secret into `.env` as `OIDC_CLIENT_SECRET`.
 6. (If you'll use `OIDC_ALLOWED_GROUPS`.) Client → **Client scopes** → `claude-web-dedicated` → **Add mapper** → **By configuration** → **Group Membership**. Token Claim Name `groups`, Full group path off, Add to ID token + userinfo on.
@@ -84,19 +169,18 @@ You need a *confidential* OIDC client at your IdP with:
 2. Allowed Callback URLs `https://claude.example.com/auth/callback`. Allowed Logout URLs `https://claude.example.com/`.
 3. Settings → Advanced → Endpoints copies the issuer (`https://your-tenant.auth0.com/`).
 
-## Running from source (no Docker)
+## Reverse-proxy deployment
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-npm install -g @anthropic-ai/claude-code
-cp .env.example .env  # edit values
-set -a; source .env; set +a
-uvicorn app:app --host 127.0.0.1 --port 3001
-```
+claude-web binds `0.0.0.0:3001` inside the container. Expose it however you like — Traefik, nginx, Caddy, oauth2-proxy in front. The only thing it needs from the upstream:
 
-Then visit `/setup` to sign Claude in via the in-browser flow, or run `claude auth login` from the shell if you prefer.
+- `X-Forwarded-Proto: https` so cookies are issued with `Secure` when actually serving HTTPS.
+- **No buffering on SSE.** The chat endpoints are `text/event-stream`; nginx needs `proxy_buffering off`, Traefik handles it out of the box. Cloudflare/cloudflared close streams after ~100s of byte-level silence — the app sends a `: ping` comment every 25s to keep them alive.
+
+If you want to layer claude-web *behind* an existing edge SSO (oauth2-proxy, Authelia forward-auth, Cloudflare Access), set `AUTH_MODE=none` and let the upstream do the gating. Note that you lose per-user identity in the cost log and `PER_USER_SESSIONS` becomes meaningless (refused at startup).
+
+### Security headers
+
+The app sends `Content-Security-Policy: default-src 'self'; script-src 'self'; ... ; frame-ancestors 'none'`, plus `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: same-origin` on every response. Don't strip these at the proxy.
 
 ## How sessions work
 
@@ -104,21 +188,45 @@ Claude Code writes per-conversation transcripts to `$CLAUDE_HOME/projects/<sanit
 
 The "sanitized cwd" is the absolute path with `/` replaced by `-`. So `CLAUDE_PROJECT_DIR=/workspace` → `~/.claude/projects/-workspace/`.
 
-## Reverse proxy notes
-
-claude-web binds `0.0.0.0:3001` inside the container; expose it however you like. The only thing it needs from upstream is `X-Forwarded-Proto: https` (so cookies are issued with `Secure`) when actually serving HTTPS. Streaming uses Server-Sent Events — make sure your proxy doesn't buffer (`proxy_buffering off` for nginx; Traefik handles SSE fine out of the box).
-
-If you want to layer claude-web *behind* an existing edge SSO (oauth2-proxy, Authelia forward-auth, Cloudflare Access), set `AUTH_MODE=none` and let the upstream do the gating. You lose per-user identity in the cost log but gain a uniform login surface.
+Run-level state (event log, permission requests, uploads) lives in a separate SQLite database at `$CLAUDE_WEB_STATE_DIR/state.db` so a `systemctl restart` doesn't lose an in-flight conversation. Anything in-flight at restart time (a partial tool call, a queued auto-fire) is gone, but the conversation jsonl on disk is intact.
 
 ## Permissions
 
 Every tool call goes through `can_use_tool`. The browser sees a card with the tool name + serialized input and three buttons:
 
-- **Allow** — this single call.
-- **Allow this session** — keyed on tool + a stable signature (first Bash word, file path, URL, etc.). Resets when you start a new chat.
-- **Deny** — the SDK gets a `PermissionResultDeny` and Claude moves on.
+- **Deny** — this single call. The default focus for high-risk tools (Bash, Write).
+- **Allow once** — this single call. The default focus for everything else. `Esc` always denies; pressing `Enter` activates the focused button (so a Deny-focused card won't accidentally approve).
+- **Allow this session** — keyed on tool + a stable signature (file path, URL, etc.). Resets when you start a new chat. **Hidden for tools in `NO_SESSION_ALLOWLIST_TOOLS`** (default: `Bash`) because the signature is too coarse to be safe.
 
 `SAFE_TOOLS` are auto-approved (default: `TodoWrite`, since it's pure UI bookkeeping).
+
+## Backup
+
+The data spans three locations:
+
+- `$CLAUDE_HOME/` — Claude credentials + session jsonl files. Most important; without this the user has to sign in again.
+- `$CLAUDE_WEB_STATE_DIR/` — `state.db` (run/event store), `uploads/<run_id>/` (file attachments), `usage.jsonl` (cost log), `rate_limit.json` (rate-limit cache).
+- `.env` — auth secrets and config.
+
+A nightly tarball of `$CLAUDE_HOME/` and `$CLAUDE_WEB_STATE_DIR/` is enough for a full restore. SQLite WAL is safe to copy live (`sqlite3 state.db ".backup state.db.bak"` if you want a checkpointed snapshot). The example homelab deployment uses a 14-day rolling tarball.
+
+## Development
+
+```bash
+git clone https://github.com/matalvernaz/claude-web.git
+cd claude-web
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+pytest                     # unit + smoke tests
+ruff check .               # lint
+node --check static/app.js # JS syntax
+```
+
+The CI workflow at `.github/workflows/ci.yml` runs the same on every push.
+
+Tests focus on security boundaries (CSRF, OIDC redirect protection, upload validation, tool-signature allowlist) rather than full coverage; PRs that touch those areas should bring or update tests.
 
 ## License
 

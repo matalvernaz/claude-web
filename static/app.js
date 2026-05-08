@@ -50,28 +50,43 @@
 
   // Outgoing message queue. While a turn is streaming, pressing Send pushes
   // here instead of starting a new request; drainStream flushes the queue
-  // when the current turn finishes. Entries: {text, images}.
+  // when the current turn finishes. Entries: {text, images, files}. Bounded
+  // so a long-idle tab + repeated submits with attachments can't grow the
+  // page heap unbounded.
   const messageQueue = [];
+  const MAX_QUEUE_LENGTH = 10;
   let isStreaming = false;
   const queueArea = document.getElementById("queue-area");
 
-  // Stream stall watchdog. If isStreaming has been true with no SSE event
-  // for this long, treat the run as dead at submit-time and start a fresh
-  // one — otherwise a silently-broken stream traps every typed message in
-  // the queue with no recovery. Threshold is wide enough to absorb a long
-  // thinking step without false-positive bailing.
+  // Stream stall watchdog. Two clocks:
+  //   lastNetworkActivityAt — every byte read from the SSE socket, including
+  //     `: ping` heartbeat comments. Detects dead TCP connections.
+  //   lastVisibleActivityAt — only updated for renderable events (assistant
+  //     text, tool use/result, task progress, etc.). Detects a hung CLI that
+  //     keeps emitting heartbeats but isn't actually working.
+  // The watchdog gates on lastVisibleActivityAt so a backend that stops
+  // producing real events trips the timeout even while pings keep flowing.
   const STREAM_STALL_MS = 4 * 60 * 1000;
+  const STREAM_STALL_CHECK_MS = 15 * 1000;
   let streamStartedAt = 0;
+  let lastNetworkActivityAt = 0;
+  let stallWatchdogHandle = null;
 
   // Per-model context windows for the meter; null = unknown / hide bar.
   // Keyed on the picker value (which is the variant key, not the raw SDK
   // model id) so "claude-opus-4-7-1m" resolves to the 1M window even though
   // the underlying model id is plain "claude-opus-4-7". Sourced from the
   // server's KNOWN_MODELS so this list can't drift from what's offered in
-  // the dropdown.
+  // the dropdown. Read from a <script type="application/json"> tag instead
+  // of a global so a strict CSP without 'unsafe-inline' for scripts works.
   const MODEL_CONTEXT = (() => {
     const out = {};
-    for (const m of (window.CLAUDE_WEB_MODELS || [])) {
+    let data = [];
+    const dataEl = document.getElementById("models-data");
+    if (dataEl) {
+      try { data = JSON.parse(dataEl.textContent); } catch (_) { data = []; }
+    }
+    for (const m of data) {
       if (m.key && m.context) out[m.key] = m.context;
     }
     return out;
@@ -585,7 +600,12 @@
     // turns; this state toggles back and forth as result/auto_fire events
     // arrive.
     isStreaming = on;
-    if (on) streamStartedAt = Date.now();
+    if (on) {
+      streamStartedAt = Date.now();
+      startStallWatchdog();
+    } else {
+      stopStallWatchdog();
+    }
     sendBtn.hidden = false;
     sendBtn.disabled = false;
     sendBtn.textContent = on ? "Queue" : "Send";
@@ -594,8 +614,38 @@
 
   function streamLooksStalled() {
     if (!isStreaming) return false;
+    // Gate ONLY on visible (semantic) activity. Pings update
+    // lastNetworkActivityAt so we know the socket isn't dead, but a backend
+    // that's looping on a stuck tool call would keep pings flowing while
+    // emitting no events — that's the case we need to detect.
     const lastSign = Math.max(lastVisibleActivityAt, streamStartedAt);
     return lastSign > 0 && (Date.now() - lastSign) > STREAM_STALL_MS;
+  }
+
+  function startStallWatchdog() {
+    // Background watchdog so a stalled run is caught even if the user
+    // doesn't try to submit. Re-checked every STREAM_STALL_CHECK_MS; on
+    // detection it aborts the SSE fetch and surfaces a recoverable error.
+    if (stallWatchdogHandle) return;
+    stallWatchdogHandle = setInterval(() => {
+      if (!streamLooksStalled()) return;
+      stopStallWatchdog();
+      announce("Stream looks stalled. Cancelling.");
+      setStatus("Stream looks stalled — send a new message to start a fresh run.");
+      if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+      currentAbort = null;
+      currentRunId = null;
+      sessionStorage.removeItem(RUN_KEY);
+      setStreaming(false);
+      stopGerunds();
+    }, STREAM_STALL_CHECK_MS);
+  }
+
+  function stopStallWatchdog() {
+    if (stallWatchdogHandle) {
+      clearInterval(stallWatchdogHandle);
+      stallWatchdogHandle = null;
+    }
   }
 
   function queuePreview(entry) {
@@ -701,6 +751,14 @@
         return;
       }
       // Currently mid-turn — queue this for when the current run finishes.
+      // Cap so a long-idle tab can't accumulate messages + attachments
+      // unboundedly. The user can clear the queue or wait for the running
+      // turn to drain.
+      if (messageQueue.length >= MAX_QUEUE_LENGTH) {
+        setStatus(`Queue full (${MAX_QUEUE_LENGTH}). Wait for the current turn to finish, or stop it.`);
+        announce("Queue is full.");
+        return;
+      }
       messageQueue.push(entry);
       renderQueue();
       announce(`Queued. ${messageQueue.length} message${messageQueue.length === 1 ? "" : "s"} pending.`);
@@ -717,10 +775,14 @@
     await drainQueue();
   });
 
+  // Returns true if the message was accepted (server 2xx OR fallback to a
+  // fresh run was started). Returns false if the user's input could not be
+  // delivered at all (401/403 redirect, hard network failure on fallback) so
+  // the queue drainer can choose to leave the entry in place for retry.
   async function sendInExistingRun(entry) {
     if (!currentRunId) {
       await sendOne(entry);
-      return;
+      return true;
     }
     setStreaming(true);
     startGerunds();
@@ -735,36 +797,66 @@
         fd.append("files", f.file, f.file.name);
       }
       const r = await fetch(`/api/chat/send/${encodeURIComponent(currentRunId)}`, { method: "POST", body: fd });
+      if (r.status === 401 || r.status === 403) {
+        // Auth expired or CSRF rejected — neither is recoverable by retrying
+        // against the same run. Surface to handleStreamError so the user is
+        // bounced through the IdP, and keep the entry in the queue so the
+        // post-login reload can flush it.
+        handleStreamError(new Error("HTTP " + r.status));
+        setStreaming(false);
+        return false;
+      }
       if (!r.ok) {
-        // Any non-2xx — 404 (run gone), 5xx (driver crashed), network blip
-        // through the proxy — means the existing stream can't carry this
-        // message. Drop the run handle and open a fresh one. Without this
-        // fallback a 5xx pinned the user to a broken endpoint forever.
+        // Any other non-2xx — 404 (run gone), 5xx (driver crashed), network
+        // blip through the proxy — means the existing stream can't carry
+        // this message. Abort the old SSE reader so its events don't bleed
+        // into the new run's transcript, then open a fresh one.
+        if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+        currentAbort = null;
         currentRunId = null;
         sessionStorage.removeItem(RUN_KEY);
         if (r.status !== 404) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
         await sendOne(entry);
-        return;
+        return true;
       }
       // The existing SSE stream will deliver the new turn's events; nothing
       // else to do here. setStreaming(false) happens on the next result.
+      return true;
     } catch (err) {
-      // Network failure (fetch threw) — same recovery as a non-2xx.
+      // Network failure (fetch threw). Abort the dead stream, drop the
+      // run handle, surface the error. Caller decides whether to retry.
+      if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+      currentAbort = null;
       currentRunId = null;
       sessionStorage.removeItem(RUN_KEY);
       handleStreamError(err);
       setStreaming(false);
+      return false;
     }
   }
 
-  function drainQueueIfPossible() {
+  async function drainQueueIfPossible() {
     if (!messageQueue.length || !currentRunId || isStreaming) return;
-    const entry = messageQueue.shift();
-    renderQueue();
+    // Peek-then-shift: leave the entry in the queue until the server has
+    // acknowledged it, so a network blip doesn't silently drop the message
+    // (and any attachments). The next drainQueueIfPossible call will retry
+    // the same entry; the user can also remove it manually via its
+    // queue-cancel button.
+    const entry = messageQueue[0];
     announce("Sending next queued message.");
-    sendInExistingRun(entry).catch((err) => handleStreamError(err));
+    let ok = false;
+    try {
+      ok = await sendInExistingRun(entry);
+    } catch (err) {
+      handleStreamError(err);
+      ok = false;
+    }
+    if (ok && messageQueue[0] === entry) {
+      messageQueue.shift();
+      renderQueue();
+    }
   }
 
   async function sendOne(entry) {
@@ -829,18 +921,33 @@
     let buf = "";
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
-      // Any bytes coming down the wire — including SSE pings that don't
-      // produce a renderable event — count as "stream is alive". Without
-      // this, a long Claude thinking phase (no events for several minutes,
-      // only pings) trips the stall watchdog and the next queued submit
-      // gets bumped into a fresh run unnecessarily.
-      lastVisibleActivityAt = Date.now();
+      if (done) {
+        // Final flush — flush() on the decoder catches any partial UTF-8
+        // sequence at the buffer tail. Without this a truncated multi-byte
+        // codepoint would silently drop on stream end.
+        buf += dec.decode();
+        if (buf.trim()) handleSSEEvent(buf, ctx);
+        break;
+      }
+      // Bytes on the wire prove the connection is alive but DON'T prove the
+      // backend is doing useful work — a hung CLI can keep the SSE ping
+      // heartbeat going forever. The stall watchdog gates on
+      // lastVisibleActivityAt, which is updated only by the per-event
+      // handlers below, so this clock is purely for connection-liveness
+      // diagnostics.
+      lastNetworkActivityAt = Date.now();
       buf += dec.decode(value, { stream: true });
       let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const evt = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
+      // Handle both LF and CRLF separators per the SSE spec.
+      while (true) {
+        const lf = buf.indexOf("\n\n");
+        const crlf = buf.indexOf("\r\n\r\n");
+        let cut, sep;
+        if (lf >= 0 && (crlf < 0 || lf < crlf)) { cut = lf; sep = 2; }
+        else if (crlf >= 0) { cut = crlf; sep = 4; }
+        else break;
+        const evt = buf.slice(0, cut);
+        buf = buf.slice(cut + sep);
         handleSSEEvent(evt, ctx);
       }
     }
@@ -857,10 +964,23 @@
     if (err.name === "AbortError") {
       setStatus("Stopped.");
       announce("Stopped.");
-    } else {
-      setStatus("Error: " + err.message);
-      announce("Error: " + err.message);
+      return;
     }
+    // Auth expired mid-session: cookie no longer signs in, so fetch returns
+    // 401/403 (or follows the 302 to /auth/login and lands on the login
+    // page's HTML). Send the user back through the IdP instead of leaving
+    // them staring at "HTTP 401". window.location.assign so a Back button
+    // can still rescue an in-flight composer.
+    const m = /^HTTP (40[13])$/.exec(err.message || "");
+    if (m) {
+      setStatus("Session expired — redirecting to sign-in.");
+      announce("Session expired. Redirecting to sign-in.");
+      const next = encodeURIComponent(location.pathname + location.search);
+      window.location.assign(`/auth/login?next=${next}`);
+      return;
+    }
+    setStatus("Error: " + err.message);
+    announce("Error: " + err.message);
   }
 
   async function tryResume() {
@@ -905,12 +1025,22 @@
   }
 
   function handleSSEEvent(evt, ctx) {
-    const lines = evt.split("\n");
-    let dataLine = "";
+    // Spec-correct SSE data assembly: each `data:` line contributes to the
+    // event payload, joined by literal "\n". The leading space after the
+    // colon is optional and stripped if present. Avoid trim() which would
+    // silently mutate JSON payloads with intentional leading/trailing
+    // whitespace — and lines from an event that have been split across SSE
+    // frames must not be smashed together without the newline separator.
+    const lines = evt.split(/\r?\n/);
+    const dataParts = [];
     for (const ln of lines) {
-      if (ln.startsWith("data:")) dataLine += ln.slice(5).trim();
+      if (!ln.startsWith("data:")) continue;
+      let v = ln.slice(5);
+      if (v.startsWith(" ")) v = v.slice(1);
+      dataParts.push(v);
     }
-    if (!dataLine) return;
+    if (!dataParts.length) return;
+    const dataLine = dataParts.join("\n");
     let obj;
     try { obj = JSON.parse(dataLine); } catch { return; }
 
@@ -942,6 +1072,7 @@
       if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
       if (obj.file_count) appendFilePlaceholder(body, obj.file_count);
     } else if (obj.type === "stopped") {
+      setActiveTodoLabel(null);
       setStatus("Stopped.");
       announce("Stopped.");
     } else if (obj.type === "restarted_during_run") {
@@ -1017,6 +1148,23 @@
       ctx.currentAssistantBody = null;
       announce(`Permission needed for ${obj.tool}.`);
       renderPermissionCard(obj);
+    } else if (obj.type === "_overflow") {
+      // Backend dropped us as a slow subscriber — fetch a fresh stream from
+      // the start so we don't miss anything. tryResume's reconnect path
+      // will replay the entire run from index 0 via the persisted store.
+      if (currentRunId) {
+        announce("Stream backlog overflowed; reconnecting from start.");
+        const rid = currentRunId;
+        if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+        currentAbort = null;
+        currentRunId = null;
+        sessionStorage.removeItem(RUN_KEY);
+        sessionStorage.setItem(RUN_KEY, rid);
+        // Schedule the resume on the next microtask so the in-flight reader
+        // can unwind cleanly before we open a new fetch.
+        setTimeout(() => { tryResume().catch(() => {}); }, 0);
+      }
+      return;
     } else if (obj.type === "permission_timeout") {
       // Server's PENDING entry has been popped — any further click on the
       // matching card would just 404 silently. Disable the card and label
@@ -1026,7 +1174,10 @@
       //    we synthesize a timeout so the replayed card isn't clickable.
       ctx.currentAssistantBody = null;
       const restarted = obj.reason === "server_restart";
-      const card = document.querySelector(`article.msg.permission[data-request-id="${obj.id}"]`);
+      // CSS.escape defensively in case the id format ever changes from
+      // dash-hex UUID to something with special characters.
+      const safeId = (typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(obj.id) : obj.id;
+      const card = document.querySelector(`article.msg.permission[data-request-id="${safeId}"]`);
       if (card) {
         card.querySelectorAll("button").forEach((b) => (b.disabled = true));
         const note = document.createElement("p");
@@ -1091,6 +1242,10 @@
       // Treat each result as the end of THIS turn even if the SSE stays
       // open for an auto-fire chain. Spinner stops; user can send a new
       // message; if an auto_fire event arrives next we'll flip it back.
+      // Clear the sticky in_progress todo label too — without this, a turn
+      // that ended mid-todo (rare but possible) would carry the stale
+      // activeForm into the next turn's spinner.
+      setActiveTodoLabel(null);
       stopGerunds();
       const summary = summariseResult(obj);
       setStatus(summary);
@@ -1114,19 +1269,22 @@
         delete dump.type;
         lines.push("--- raw result ---", JSON.stringify(dump, null, 2));
         const detail = lines.join("\n");
-        setStatus("Error: " + (obj.result || obj.subtype || "see transcript"));
-        renderErrorBlock(detail);
+        const summary = obj.result || obj.subtype || "see technical details";
+        setStatus("Error: " + summary);
+        renderErrorBlock(detail, { summary });
         announce("Error: " + (obj.result || ""));
       }
     } else if (obj.type === "error") {
       // Driver crashed mid-turn. The server will emit `_done` and close
       // the SSE shortly, but flip the local state now so the input isn't
       // trapped in "Queue" mode while we wait for the close to land.
+      setActiveTodoLabel(null);
       stopGerunds();
       setStreaming(false);
-      const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : (obj.message || obj.exit_code || "Error");
-      setStatus("Error: " + (obj.message || obj.exit_code || "see transcript"));
-      renderErrorBlock(String(detail));
+      const summary = obj.message || obj.exit_code || "see technical details";
+      const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : null;
+      setStatus("Error: " + summary);
+      renderErrorBlock(detail ? String(detail) : null, { summary });
       announce("Error: " + (obj.message || ""));
     }
   }
@@ -1183,17 +1341,37 @@
     }
   }
 
-  function renderErrorBlock(detail) {
+  function renderErrorBlock(detail, opts) {
+    // Two-tier rendering: a short summary line is always visible, and the
+    // raw payload (stderr, traceback, model errors) is folded into a
+    // <details> disclosure. This keeps the UI honest without dumping
+    // filesystem paths and env diagnostics directly into the page when
+    // claude-web is shared with other users.
+    opts = opts || {};
     const article = document.createElement("article");
     article.className = "msg error";
+    if (opts.cls) article.classList.add(opts.cls);
     const role = document.createElement("h3");
     role.className = "role";
-    role.textContent = "Error";
-    const body = document.createElement("pre");
-    body.className = "error-body";
-    body.textContent = detail;
+    role.textContent = opts.heading || "Error";
     article.appendChild(role);
-    article.appendChild(body);
+    if (opts.summary) {
+      const lead = document.createElement("p");
+      lead.className = "error-summary";
+      lead.textContent = opts.summary;
+      article.appendChild(lead);
+    }
+    if (detail) {
+      const det = document.createElement("details");
+      const sum = document.createElement("summary");
+      sum.textContent = "Show technical details";
+      det.appendChild(sum);
+      const body = document.createElement("pre");
+      body.className = "error-body";
+      body.textContent = detail;
+      det.appendChild(body);
+      article.appendChild(det);
+    }
     transcript.appendChild(article);
     // Force-scroll on errors — the user almost always wants to see them.
     maybeAutoScroll(true);
@@ -1242,34 +1420,56 @@
     const card = document.createElement("article");
     card.className = "msg permission";
     card.setAttribute("role", "alertdialog");
-    card.setAttribute("aria-label", `Permission request: ${req.tool} ${summariseToolInput(req.input || {})}`);
-    // Lets the permission_timeout handler find this exact card later.
+    card.setAttribute("aria-modal", "false"); // inline, not a screen-blocking modal
     if (req.id) card.dataset.requestId = req.id;
 
     // h3 (not div) so NVDA's H-key heading navigation finds the card —
     // a permission prompt is the most urgent thing on screen, it should
     // be reachable the same way every other message header is.
+    const headingId = `perm-heading-${req.id || Math.random().toString(36).slice(2)}`;
+    const detailId = `perm-detail-${req.id || Math.random().toString(36).slice(2)}`;
     const heading = document.createElement("h3");
     heading.className = "role";
+    heading.id = headingId;
     heading.textContent = `Claude wants to use ${req.tool}`;
     card.appendChild(heading);
+    card.setAttribute("aria-labelledby", headingId);
+    card.setAttribute("aria-describedby", detailId);
 
-    const detail = document.createElement("pre");
-    detail.className = "permission-input";
-    detail.textContent = formatToolInput(req.tool, req.input || {});
+    // Full payload preview — no truncation. Diff/Edit/Write inputs live
+    // inside an expandable <details> so a 50-line replacement doesn't fill
+    // the viewport, but the entire content is reachable before the user
+    // can approve. Truncating at this stage means the user could approve
+    // an `rm -rf` hidden after the truncation point.
+    const detail = document.createElement("div");
+    detail.id = detailId;
+    detail.className = "permission-input-wrap";
+    appendPermissionPayload(detail, req.tool, req.input || {});
     card.appendChild(detail);
 
     const actions = document.createElement("div");
     actions.className = "permission-actions";
 
+    const isHighRisk = req.tool === "Bash" || req.tool === "Write";
+    // Server tells us whether this tool's signature is safe to allowlist
+    // for the session. For tools where the signature is too coarse (Bash:
+    // first word only) the session button is hidden entirely so the user
+    // can't accidentally bless future arbitrary commands.
+    const allowSessionSupported = req.allow_session_supported !== false;
     const sigLabel = req.signature ? ` "${truncate(req.signature, 30)}"` : "";
+
     const buttons = [
       { decision: "deny", label: "Deny", variant: "danger" },
       { decision: "allow", label: "Allow once", variant: "primary" },
-      { decision: "allow_session", label: `Allow this session${sigLabel}`, variant: "secondary" },
     ];
+    if (allowSessionSupported) {
+      buttons.push({
+        decision: "allow_session",
+        label: `Allow this session${sigLabel}`,
+        variant: "secondary",
+      });
+    }
 
-    const isHighRisk = req.tool === "Bash" || req.tool === "Write";
     for (const b of buttons) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -1287,13 +1487,68 @@
     const focusBtn = isHighRisk ? actions.querySelector(".btn-danger") : actions.querySelector(".btn-primary");
     if (focusBtn) focusBtn.focus();
 
-    // Esc denies, Enter allows once.
+    // Esc denies. Enter is intentionally NOT bound to "allow once" — that
+    // would over-ride the focused-button default, so a user with focus on
+    // the Deny button (the default for Bash/Write) would still approve by
+    // pressing Enter. Native button activation handles Enter/Space on the
+    // focused button correctly.
     card.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         e.preventDefault();
         decide(req.id, "deny", card);
       }
     });
+  }
+
+  function appendPermissionPayload(parent, tool, input) {
+    const block = document.createElement("pre");
+    block.className = "permission-input";
+    if (tool === "Bash" && input.command) {
+      block.textContent = "$ " + input.command;
+      parent.appendChild(block);
+      return;
+    }
+    if (tool === "Edit") {
+      const path = input.file_path || input.path || "";
+      const head = document.createElement("p");
+      head.className = "permission-input-path";
+      head.textContent = path;
+      parent.appendChild(head);
+      const oldS = input.old_string || "";
+      const newS = input.new_string || "";
+      const details = document.createElement("details");
+      details.open = true;
+      const summary = document.createElement("summary");
+      summary.textContent = `Replace ${oldS.split("\n").length} line(s) → ${newS.split("\n").length} line(s)`;
+      details.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.className = "permission-input";
+      pre.appendChild(diffLines(oldS, newS));
+      details.appendChild(pre);
+      parent.appendChild(details);
+      return;
+    }
+    if (tool === "Write") {
+      const path = input.file_path || input.path || "";
+      const head = document.createElement("p");
+      head.className = "permission-input-path";
+      head.textContent = path;
+      parent.appendChild(head);
+      const content = input.content || "";
+      const details = document.createElement("details");
+      details.open = content.length < 800;
+      const summary = document.createElement("summary");
+      summary.textContent = `Write ${content.length.toLocaleString()} char${content.length === 1 ? "" : "s"} (${content.split("\n").length} line${content.split("\n").length === 1 ? "" : "s"})`;
+      details.appendChild(summary);
+      const pre = document.createElement("pre");
+      pre.className = "permission-input";
+      pre.textContent = content;
+      details.appendChild(pre);
+      parent.appendChild(details);
+      return;
+    }
+    block.textContent = JSON.stringify(input, null, 2);
+    parent.appendChild(block);
   }
 
   async function decide(requestId, decision, card) {
@@ -2021,9 +2276,17 @@
       "sent to Claude as text. The model recognises the convention and runs",
       "the corresponding skill — but it's the model doing it, not the harness.",
     ];
-    renderErrorBlock(lines.join("\n"));
-    transcript.lastElementChild.classList.remove("error");
-    transcript.lastElementChild.classList.add("info");
+    renderErrorBlock(lines.join("\n"), {
+      heading: "Slash commands",
+      summary: "Commands handled in the browser. Anything else falls through to the model.",
+      cls: "info-block",
+    });
+    // Re-tag the just-appended article as info, not error.
+    const article = transcript.lastElementChild;
+    if (article && article.classList) {
+      article.classList.remove("error");
+      article.classList.add("info");
+    }
   }
 
   function switchModel(arg) {
@@ -2090,6 +2353,10 @@
     slashMenu.innerHTML = "";
     slashItems = [];
     slashActive = -1;
+    if (promptEl) {
+      promptEl.setAttribute("aria-expanded", "false");
+      promptEl.removeAttribute("aria-activedescendant");
+    }
   }
 
   function showSlashMenu(matches) {
@@ -2101,9 +2368,12 @@
       const row = document.createElement("button");
       row.type = "button";
       row.className = "slash-item";
+      // Stable id per option so aria-activedescendant on the textarea can
+      // point screen readers to the highlighted choice.
+      row.id = `slash-option-${i}`;
       row.dataset.index = String(i);
       row.setAttribute("role", "option");
-      row.innerHTML = "";
+      row.setAttribute("aria-selected", "false");
       const name = document.createElement("span");
       name.className = "slash-name";
       name.textContent = "/" + cmd.name;
@@ -2122,15 +2392,29 @@
       });
       slashMenu.appendChild(row);
     });
-    slashMenu.hidden = matches.length === 0;
+    const open = matches.length > 0;
+    slashMenu.hidden = !open;
+    if (promptEl) {
+      promptEl.setAttribute("aria-expanded", open ? "true" : "false");
+    }
     updateSlashHighlight();
   }
 
   function updateSlashHighlight() {
     if (!slashMenu) return;
     [...slashMenu.children].forEach((el, i) => {
-      el.classList.toggle("active", i === slashActive);
+      const active = i === slashActive;
+      el.classList.toggle("active", active);
+      el.setAttribute("aria-selected", active ? "true" : "false");
     });
+    if (promptEl) {
+      const activeEl = slashMenu.children[slashActive];
+      if (activeEl && activeEl.id) {
+        promptEl.setAttribute("aria-activedescendant", activeEl.id);
+      } else {
+        promptEl.removeAttribute("aria-activedescendant");
+      }
+    }
   }
 
   function acceptSlash(index) {

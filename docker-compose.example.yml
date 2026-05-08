@@ -1,30 +1,27 @@
 services:
   claude-web:
-    image: ghcr.io/YOUR_GH_USER/claude-web:latest
-    # Or build from source:
-    # build: .
+    # Build from source (recommended until images are published):
+    build: .
+    # Or, once image hosting is set up:
+    # image: ghcr.io/matalvernaz/claude-web:latest
     container_name: claude-web
     restart: unless-stopped
     env_file: .env
     environment:
-      # Required when AUTH_MODE=oidc.
-      AUTH_MODE: oidc
-      OIDC_ISSUER_URL: https://auth.example.com/realms/main
-      OIDC_CLIENT_ID: claude-web
-      # OIDC_CLIENT_SECRET set in .env (don't commit)
-      OIDC_REDIRECT_URI: https://claude.example.com/auth/callback
-      # OIDC_ALLOWED_EMAILS: you@example.com,partner@example.com
-      # SESSION_SECRET set in .env
-
-      # The directory Claude Code treats as its project root.
+      # The directory Claude Code treats as its project root. Must match the
+      # mount below.
       CLAUDE_PROJECT_DIR: /workspace
     volumes:
       # The tree Claude can read/write/run in.
       - ./workspace:/workspace
-      # Claude Code's per-user state: API key, sessions, settings, MCP, hooks.
+      # Claude Code's per-user state: API key/OAuth, sessions, settings, MCP, hooks.
       - ./claude-home:/home/claude/.claude
-      # claude-web's own state: usage log, last-seen rate-limit info.
+      # claude-web's own state: usage log, persisted runs/events, uploads.
       - ./claude-web-state:/home/claude/.claude-web
+    # Bind to localhost only — your reverse proxy (Traefik / nginx / Caddy /
+    # oauth2-proxy) terminates TLS and forwards to this port. If you're not
+    # behind a proxy, drop "127.0.0.1:" to expose the port directly (and set
+    # SESSION_COOKIE_INSECURE=true for HTTP, which is unsafe over a network).
     ports:
       - "127.0.0.1:3001:3001"
     healthcheck:
