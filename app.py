@@ -827,11 +827,41 @@ def _restore_persisted_runs() -> None:
             ).fetchall()
         except sqlite3.Error:
             evt_rows = []
+        # Track permission_requests that never got resolved/timed out on
+        # disk, so we can synthesize a timeout for them after replay. Without
+        # this, a browser reconnect would render the permission card and the
+        # user's click would 404 (PENDING is in-process state, blown away by
+        # the restart).
+        unresolved_perms: dict[str, int] = {}
         for (payload,) in evt_rows:
             try:
-                run.events.append(json.loads(payload))
+                evt = json.loads(payload)
             except (TypeError, ValueError):
                 continue
+            # Backfill _idx for events persisted before emit() started
+            # tagging — keeps replay dedup consistent across mixed batches.
+            evt.setdefault("_idx", len(run.events))
+            run.events.append(evt)
+            etype = evt.get("type")
+            eid = evt.get("id")
+            if etype == "permission_request" and eid:
+                unresolved_perms[eid] = len(run.events) - 1
+            elif etype == "permission_timeout" and eid:
+                unresolved_perms.pop(eid, None)
+        # Append a synthetic timeout for each orphaned request so the
+        # browser disables its card on resume instead of letting a click
+        # 404 silently.
+        for pid in unresolved_perms:
+            synth = {
+                "type": "permission_timeout",
+                "id": pid,
+                "tool": None,
+                "timeout_seconds": 0,
+                "reason": "server_restart",
+                "_idx": len(run.events),
+            }
+            run.events.append(synth)
+            _persist_event(run_id, len(run.events) - 1, synth)
         was_killed = finished_at is None
         if was_killed:
             synth = {
@@ -842,6 +872,7 @@ def _restore_persisted_runs() -> None:
                     "will pick up from here."
                 ),
                 "ts": now,
+                "_idx": len(run.events),
             }
             run.events.append(synth)
             _persist_event(run_id, len(run.events) - 1, synth)
@@ -916,6 +947,11 @@ class ActiveRun:
     def emit(self, event: dict) -> None:
         self.events.append(event)
         idx = len(self.events) - 1
+        # Tag with monotonic per-run index so the browser can dedupe if the
+        # same event reaches its DOM twice (e.g. two open SSE subscribers
+        # against this run, or a stream resume that replays). Cheaper and
+        # more reliable than client-side content hashing.
+        event["_idx"] = idx
         meta_changed = False
         if event.get("type") == "system" and event.get("subtype") == "init":
             sid = event.get("session_id")
@@ -991,6 +1027,24 @@ def _session_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _SESSION_LOCKS[session_id] = lock
     return lock
+
+
+def _gc_session_locks() -> None:
+    """Evict locks for sessions with no live run.
+
+    Without this, _SESSION_LOCKS grows once per resumed session_id forever —
+    a homelab open for months accumulates thousands of unused Lock objects.
+    Held locks are skipped so an in-flight find-or-create can't race with
+    the cleanup; a future request just creates a fresh one if needed.
+    """
+    stale = [
+        sid for sid, lock in _SESSION_LOCKS.items()
+        if not lock.locked() and sid not in ACTIVE_RUNS_BY_SESSION
+    ]
+    for sid in stale:
+        _SESSION_LOCKS.pop(sid, None)
+
+
 # Match PERSIST_RETENTION_SECONDS so a finished run that's still on disk is
 # also still in memory — saves a "load on demand from sqlite" code path.
 RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
@@ -1017,6 +1071,7 @@ def _gc_runs() -> None:
             if existing is run:
                 ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
     _purge_old_uploads(now)
+    _gc_session_locks()
     if now - _LAST_DB_PURGE >= _DB_PURGE_INTERVAL_SECONDS:
         _LAST_DB_PURGE = now
         _purge_old_persisted(now)
@@ -1083,10 +1138,21 @@ async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> N
     Both branches run under client_write_lock so the driver's atomic
     "drain-queue-then-publish-client" setup step can rely on no new queue
     puts or direct sends happening behind its back.
+
+    A broken CLI pipe (subprocess crashed, OS-level pipe error) is surfaced
+    as an SSE error event so the browser can render it instead of bubbling
+    up to a 500 from the request handler.
     """
     async with run.client_write_lock:
         if run.client is not None:
-            await _send_to_client(run.client, text, blocks)
+            try:
+                await _send_to_client(run.client, text, blocks)
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                run.emit({
+                    "type": "error",
+                    "message": f"Lost connection to the Claude CLI: {type(e).__name__}: {e}. Send a new message to start a fresh run.",
+                })
+                return
             run.pending_immediate_queries += 1
             # Wake the driver if it's sleeping on _wait_for_next_action's
             # idle-timeout — otherwise the CLI's response to this injection

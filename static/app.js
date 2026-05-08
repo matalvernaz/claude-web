@@ -32,6 +32,11 @@
   // Run-id of the in-flight turn. Persisted to sessionStorage so a reload
   // can rejoin via /api/chat/stream/{run_id}.
   let currentRunId = null;
+  // Highest server-assigned `_idx` rendered per run. Events arrive in idx
+  // order within any one SSE stream, so a monotonic guard is enough to
+  // collapse duplicates that come from the same event reaching the DOM
+  // twice (overlapping subscribers, replay-then-tail races, etc.).
+  const renderedIdxByRun = new Map();
   const RUN_KEY = "claude-web.active-run";
   const MODEL_KEY = "claude-web.model";
   const PROJECT_KEY = "claude-web.project";
@@ -257,6 +262,9 @@
     const data = await r.json();
     sessionProject = data.project || sessionProject || "";
     transcript.innerHTML = "";
+    // Switching sessions: any prior run's dedup state belongs to a different
+    // conversation now and shouldn't influence rendering of the new one.
+    renderedIdxByRun.clear();
     for (const m of data.messages) {
       if (m.role === "user") {
         const body = appendMessage("user", m.text || "");
@@ -474,6 +482,16 @@
   }
 
   function startGerunds() {
+    // Defensive: clear any existing timers before creating new ones. Without
+    // this, a startGerunds() called while gerundTimer is already set orphans
+    // the old setInterval handle — the timer keeps firing forever and a
+    // later stopGerunds() only clears the most recent one. Reproduces from
+    // sendInExistingRun → 404 fallback into sendOne (both call startGerunds),
+    // and from any path where an auto_fire event lands before the previous
+    // turn's result was cleanly processed. Symptom: spinner cycles verbs
+    // perpetually between turns until page reload.
+    if (gerundTimer) { clearInterval(gerundTimer); gerundTimer = null; }
+    if (gerundSpeakTimer) { clearInterval(gerundSpeakTimer); gerundSpeakTimer = null; }
     let last = -1;
     lastVisibleActivityAt = 0;  // start from "idle" so the gerund shows right away
     function visualTick() {
@@ -535,7 +553,12 @@
     updateTodosPanel([]);
     history.replaceState({}, "", location.pathname);
     markActive("");
+    stopGerunds();
     setStatus("");
+    // Drop the per-run dedup state so a long-lived tab doesn't accumulate
+    // a Map entry per chat. Run ids are random UUIDs, so once a chat is
+    // closed the entry is just dead weight.
+    renderedIdxByRun.clear();
     // Drop every piece of "previous turn" state. Without this the next
     // submit either tries sendInExistingRun against the dead run-id
     // (404 + retry round-trip) or shows the old context-meter fill, and
@@ -712,17 +735,25 @@
         fd.append("files", f.file, f.file.name);
       }
       const r = await fetch(`/api/chat/send/${encodeURIComponent(currentRunId)}`, { method: "POST", body: fd });
-      if (r.status === 404) {
-        // Run died on the server — fall back to opening a fresh one.
+      if (!r.ok) {
+        // Any non-2xx — 404 (run gone), 5xx (driver crashed), network blip
+        // through the proxy — means the existing stream can't carry this
+        // message. Drop the run handle and open a fresh one. Without this
+        // fallback a 5xx pinned the user to a broken endpoint forever.
         currentRunId = null;
         sessionStorage.removeItem(RUN_KEY);
+        if (r.status !== 404) {
+          setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
+        }
         await sendOne(entry);
         return;
       }
-      if (!r.ok) throw new Error("HTTP " + r.status);
       // The existing SSE stream will deliver the new turn's events; nothing
       // else to do here. setStreaming(false) happens on the next result.
     } catch (err) {
+      // Network failure (fetch threw) — same recovery as a non-2xx.
+      currentRunId = null;
+      sessionStorage.removeItem(RUN_KEY);
       handleStreamError(err);
       setStreaming(false);
     }
@@ -738,7 +769,13 @@
 
   async function sendOne(entry) {
     setStreaming(true);
-    currentAbort = new AbortController();
+    // Capture our own abort/signal so the finally block can tell whether
+    // it's still the active turn. The stall-recovery path aborts an old
+    // sendOne and immediately starts a new one — without this guard the
+    // old finally would run after the new sendOne had already set
+    // currentAbort/isStreaming, clobbering them mid-flight.
+    const myAbort = new AbortController();
+    currentAbort = myAbort;
     startGerunds();
     announce("Sent. Claude is responding.");
     try {
@@ -754,17 +791,22 @@
       for (const f of (entry.files || [])) {
         fd.append("files", f.file, f.file.name);
       }
-      const r = await fetch("/api/chat", { method: "POST", body: fd, signal: currentAbort.signal });
+      const r = await fetch("/api/chat", { method: "POST", body: fd, signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
       await drainStream(r);
     } catch (err) {
       handleStreamError(err);
     } finally {
-      currentAbort = null;
-      currentRunId = null;
-      sessionStorage.removeItem(RUN_KEY);
-      setStreaming(false);
-      promptEl.focus();
+      // Only clean up if we're still the current turn. If a stall-recovery
+      // submit started a fresh sendOne while we were aborting, leave its
+      // state alone.
+      if (currentAbort === myAbort) {
+        currentAbort = null;
+        currentRunId = null;
+        sessionStorage.removeItem(RUN_KEY);
+        setStreaming(false);
+        promptEl.focus();
+      }
     }
   }
 
@@ -872,6 +914,18 @@
     let obj;
     try { obj = JSON.parse(dataLine); } catch { return; }
 
+    // Drop events the DOM has already rendered for this run. Same _idx
+    // arriving twice means a duplicate delivery (overlapping SSE subscribers
+    // or an out-of-band replay) — render once, ignore the rest.
+    if (typeof obj._idx === "number") {
+      const runKey = (obj.type === "run_started" && obj.run_id) ? obj.run_id : currentRunId;
+      if (runKey) {
+        const seen = renderedIdxByRun.get(runKey);
+        if (seen !== undefined && obj._idx <= seen) return;
+        renderedIdxByRun.set(runKey, obj._idx);
+      }
+    }
+
     if (obj.type === "run_started") {
       // Save the run-id so a reload can rejoin via /api/chat/stream/{id}.
       if (obj.run_id) {
@@ -966,17 +1020,25 @@
     } else if (obj.type === "permission_timeout") {
       // Server's PENDING entry has been popped — any further click on the
       // matching card would just 404 silently. Disable the card and label
-      // it so the user knows what happened.
+      // it so the user knows what happened. Two reasons land here:
+      //  - timed out (the normal case, after PERMISSION_TIMEOUT_SECONDS)
+      //  - server restart cleared the in-memory PENDING dict; on resume
+      //    we synthesize a timeout so the replayed card isn't clickable.
       ctx.currentAssistantBody = null;
+      const restarted = obj.reason === "server_restart";
       const card = document.querySelector(`article.msg.permission[data-request-id="${obj.id}"]`);
       if (card) {
         card.querySelectorAll("button").forEach((b) => (b.disabled = true));
         const note = document.createElement("p");
         note.className = "permission-timeout-note";
-        note.textContent = `Timed out after ${obj.timeout_seconds || "?"}s — Claude was told the request was denied.`;
+        note.textContent = restarted
+          ? "Server restarted before this was answered — the request is gone. Send a new message to continue."
+          : `Timed out after ${obj.timeout_seconds || "?"}s — Claude was told the request was denied.`;
         card.appendChild(note);
       }
-      announce(`Permission request for ${obj.tool || "tool"} timed out.`);
+      announce(restarted
+        ? `Permission request for ${obj.tool || "tool"} discarded due to server restart.`
+        : `Permission request for ${obj.tool || "tool"} timed out.`);
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
     } else if (obj.type === "task_started") {
@@ -1184,7 +1246,10 @@
     // Lets the permission_timeout handler find this exact card later.
     if (req.id) card.dataset.requestId = req.id;
 
-    const heading = document.createElement("div");
+    // h3 (not div) so NVDA's H-key heading navigation finds the card —
+    // a permission prompt is the most urgent thing on screen, it should
+    // be reachable the same way every other message header is.
+    const heading = document.createElement("h3");
     heading.className = "role";
     heading.textContent = `Claude wants to use ${req.tool}`;
     card.appendChild(heading);
