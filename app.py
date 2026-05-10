@@ -1411,9 +1411,9 @@ async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> b
                 })
                 return False
             run.pending_immediate_queries += 1
-            # Wake the driver if it's sleeping on _wait_for_next_action's
-            # idle-timeout — otherwise the CLI's response to this injection
-            # streams back into a driver that's about to time out and exit.
+            # Wake the driver if it's sleeping on its main wait — otherwise
+            # the auto-fire grace timer could fire before the CLI's response
+            # to this injection, sending a stale synth into an active turn.
             run.injection_event.set()
         else:
             await run.user_input_queue.put({"text": text, "image_blocks": blocks})
@@ -2189,163 +2189,214 @@ async def api_chat(
         async with run.client_write_lock:
             await _send_to_client(client, text, blocks)
 
-    async def _wait_for_next_action(client: ClaudeSDKClient) -> Optional[dict]:
-        """After ResultMessage, decide whether to send another turn or exit.
+    def _drain_pending_for_auto_fire() -> dict:
+        events = run.pending_notifications[:]
+        run.pending_notifications = []
+        run.notification_grace_started_at = None
+        run.consecutive_auto_fires += 1
+        synth = _compose_auto_fire_message(events)
+        run.emit({"type": "auto_fire", "events": events})
+        return {"synth": synth}
 
-        - Mid-turn user query already pushed via _inject_user_input → noop
-          (the next turn is already inbound from the CLI; just keep reading).
-        - Queued user input (fallback, race-window only) → return it.
-        - Pending task notifications + AUTO_FIRE_GRACE_MS settle → auto-fire,
-          unless the auto-fire chain has already hit MAX_CONSECUTIVE_AUTO_FIRES
-          (then we drop the notifications and wait for the human).
-        - Neither for SESSION_IDLE_TIMEOUT_MS → return None (driver exits,
-          subprocess closes, monitors die).
-        """
-        if run.pending_immediate_queries > 0:
-            run.pending_immediate_queries -= 1
-            run.consecutive_auto_fires = 0
-            if run.pending_immediate_queries == 0:
-                run.injection_event.clear()
-            return {"kind": "noop"}
-        # Nothing pending right now. If a mid-turn injection happens during
-        # the wait below, the handler will set injection_event; we want that
-        # to wake the wait so we don't idle-timeout while the CLI is mid-
-        # streaming a response to that injection.
-        run.injection_event.clear()
-        cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
-
-        def _drain_pending_for_auto_fire() -> dict:
-            events = run.pending_notifications[:]
-            run.pending_notifications = []
-            run.notification_grace_started_at = None
-            run.consecutive_auto_fires += 1
-            synth = _compose_auto_fire_message(events)
-            run.emit({"type": "auto_fire", "events": events})
-            return {"kind": "auto_fire", "synth": synth}
-
-        def _drop_pending_capped() -> None:
-            dropped = run.pending_notifications[:]
-            run.pending_notifications = []
-            run.notification_grace_started_at = None
-            run.emit({
-                "type": "auto_fire_capped",
-                "events": dropped,
-                "limit": MAX_CONSECUTIVE_AUTO_FIRES,
-            })
-
-        # Auto-fire path: short timeout, then synth message.
-        if run.pending_notifications and run.notification_grace_started_at and not cap_reached:
-            grace_remaining = AUTO_FIRE_GRACE_MS / 1000 - (time.time() - run.notification_grace_started_at)
-            if grace_remaining <= 0:
-                return _drain_pending_for_auto_fire()
-            timeout = grace_remaining
-        else:
-            if cap_reached and run.pending_notifications:
-                _drop_pending_capped()
-            timeout = SESSION_IDLE_TIMEOUT_MS / 1000
-
-        # Race three things: a queued fallback message, a direct-path
-        # injection (signalled via injection_event), or the timeout.
-        # Whichever fires first wins; we cancel the others before returning.
-        get_task = asyncio.create_task(run.user_input_queue.get())
-        evt_task = asyncio.create_task(run.injection_event.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {get_task, evt_task},
-                timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            for t in (get_task, evt_task):
-                if not t.done():
-                    t.cancel()
-        if get_task in done:
-            item = get_task.result()
-            run.consecutive_auto_fires = 0
-            return {"kind": "user", "item": item}
-        if evt_task in done:
-            # Direct-path injection happened during the wait. Re-enter so
-            # the pending_immediate_queries early-return at the top runs.
-            return await _wait_for_next_action(client)
-        # Timeout — neither queue nor event fired.
-        if run.pending_notifications and not cap_reached:
-            return _drain_pending_for_auto_fire()
-        if run.pending_notifications:
-            _drop_pending_capped()
-        # Defensive: if a put happened on the queue between asyncio.wait
-        # returning and our cancel of get_task, the item stays in the
-        # queue's internal deque (no other waiters to receive it). Don't
-        # exit the driver while there's still work to do — drain it now so
-        # the user's prompt isn't silently lost.
-        if not run.user_input_queue.empty():
-            try:
-                item = run.user_input_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return None
-            run.consecutive_auto_fires = 0
-            return {"kind": "user", "item": item}
-        return None
+    def _drop_pending_capped() -> None:
+        dropped = run.pending_notifications[:]
+        run.pending_notifications = []
+        run.notification_grace_started_at = None
+        run.emit({
+            "type": "auto_fire_capped",
+            "events": dropped,
+            "limit": MAX_CONSECUTIVE_AUTO_FIRES,
+        })
 
     async def driver():
+        # The CLI's stdout flows continuously: assistant text, tool calls,
+        # tool results, ResultMessage at end-of-turn, AND any background
+        # task events (Monitor / run_in_background Bash / etc.) in between
+        # turns. We want all of those to dispatch to the UI immediately,
+        # not just whatever happened to fit between user keystrokes.
+        #
+        # Architecture: a "pump" coroutine owns the SDK iterator and feeds
+        # messages into our own bounded queue. The driver's main loop
+        # races that queue against user input and a timeout. When a
+        # background TaskNotification arrives during what used to be the
+        # idle wait, msg_queue fires, the message dispatches, and the
+        # auto-fire grace timer arms naturally.
+        #
+        # Why a pump task instead of racing aiter.__anext__() directly:
+        # cancelling __anext__ mid-yield can drop a message. asyncio.Queue
+        # doesn't have that hazard — the pump owns the iterator
+        # exclusively and never cancels mid-yield.
+        msg_queue: asyncio.Queue = asyncio.Queue()
+        pump_done = object()  # sentinel for "iterator exhausted"
+
+        async def _pump_messages(client) -> None:
+            try:
+                async for msg in client.receive_messages():
+                    await msg_queue.put(msg)
+            finally:
+                await msg_queue.put(pump_done)
+
         try:
             async with ClaudeSDKClient(options=options) as client:
-                # Atomic startup: hold the write lock so no handler can race
-                # a queue.put or direct query against us. Drain anything that
-                # arrived during the run-creation window before publishing
-                # run.client, so subsequent direct-path messages strictly
-                # come AFTER any already-queued ones.
-                async with run.client_write_lock:
-                    await _send_to_client(client, effective_message, image_blocks)
-                    while not run.user_input_queue.empty():
-                        item = run.user_input_queue.get_nowait()
-                        await _send_to_client(
-                            client, item.get("text") or "", item.get("image_blocks") or [],
-                        )
-                        run.pending_immediate_queries += 1
-                    # Publish under the same lock — handlers waiting on the
-                    # lock will see the published client and use the direct
-                    # path; new arrivals see the same.
-                    run.client = client
-                    if run.pending_immediate_queries > 0:
-                        run.injection_event.set()
+                pump_task = asyncio.create_task(_pump_messages(client))
                 try:
-                    async for msg in client.receive_messages():
-                        run.last_activity = time.time()
-                        for evt in _sdk_message_to_events(msg):
-                            # emit() also keeps ACTIVE_RUNS_BY_SESSION in sync
-                            # whenever an init event reveals (or changes) the
-                            # SDK session id, so follow-up /api/chat lookups
-                            # can find this run.
-                            run.emit(evt)
+                    # Atomic startup: hold the write lock so no handler can
+                    # race a queue.put or direct query against us. Drain
+                    # anything that arrived during the run-creation window
+                    # before publishing run.client, so subsequent
+                    # direct-path messages strictly come AFTER any
+                    # already-queued ones.
+                    async with run.client_write_lock:
+                        await _send_to_client(client, effective_message, image_blocks)
+                        while not run.user_input_queue.empty():
+                            item = run.user_input_queue.get_nowait()
+                            await _send_to_client(
+                                client, item.get("text") or "", item.get("image_blocks") or [],
+                            )
+                            run.pending_immediate_queries += 1
+                        # Publish under the same lock — handlers waiting on
+                        # the lock will see the published client and use the
+                        # direct path; new arrivals see the same.
+                        run.client = client
+                        if run.pending_immediate_queries > 0:
+                            run.injection_event.set()
 
-                        if isinstance(msg, (TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)):
-                            run.pending_notifications.append({
-                                "task_id": msg.task_id,
-                                "kind": type(msg).__name__,
-                                "description": getattr(msg, "description", None),
-                                "summary": getattr(msg, "summary", None),
-                                "status": getattr(msg, "status", None),
-                                "output_file": getattr(msg, "output_file", None),
-                            })
-                            run.notification_grace_started_at = time.time()
+                    # `between_turns` flips to True on each ResultMessage
+                    # and back to False whenever we send something to the
+                    # CLI (user input or auto-fire synth). Auto-fire only
+                    # arms while between_turns — we never auto-fire while
+                    # an LLM turn is still in flight.
+                    between_turns = False
 
-                        if isinstance(msg, ResultMessage):
-                            next_action = await _wait_for_next_action(client)
-                            if next_action is None:
+                    while True:
+                        cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
+
+                        # Compute the wait timeout. Three regimes:
+                        #   1. Notifications buffered + between turns + not
+                        #      capped → grace remaining (auto-fire when it
+                        #      expires).
+                        #   2. Capped notifications between turns → drop
+                        #      them once and fall through to idle timeout.
+                        #   3. Otherwise → idle timeout.
+                        if (between_turns and run.pending_notifications
+                                and run.notification_grace_started_at is not None
+                                and not cap_reached):
+                            elapsed = time.time() - run.notification_grace_started_at
+                            timeout = max(0.0, AUTO_FIRE_GRACE_MS / 1000 - elapsed)
+                        else:
+                            if (between_turns and cap_reached
+                                    and run.pending_notifications):
+                                _drop_pending_capped()
+                            timeout = SESSION_IDLE_TIMEOUT_MS / 1000
+
+                        msg_get = asyncio.create_task(msg_queue.get())
+                        user_get = asyncio.create_task(run.user_input_queue.get())
+                        evt_wait = asyncio.create_task(run.injection_event.wait())
+                        try:
+                            done, _pending = await asyncio.wait(
+                                {msg_get, user_get, evt_wait},
+                                timeout=timeout,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        finally:
+                            # Queue.get() / Event.wait() are cancellation-safe:
+                            # the awaited future is just a notification, not
+                            # a payload-carrying transfer. The pump still owns
+                            # the SDK iterator exclusively, so we never lose
+                            # a message by cancelling msg_get here.
+                            for t in (msg_get, user_get, evt_wait):
+                                if not t.done():
+                                    t.cancel()
+
+                        if msg_get in done:
+                            msg = msg_get.result()
+                            if msg is pump_done:
+                                # SDK iterator exhausted — CLI subprocess
+                                # closed. Nothing more will arrive; exit.
                                 break
-                            if next_action["kind"] == "noop":
-                                # Mid-turn input was already injected via
-                                # _inject_user_input; the next turn is on
-                                # its way from the CLI. Just keep reading.
-                                continue
-                            if next_action["kind"] == "user":
-                                item = next_action["item"]
-                                await _send_user_message(client, item.get("text") or "", item.get("image_blocks") or [])
-                            else:  # auto_fire
-                                async with run.client_write_lock:
-                                    await client.query(next_action["synth"])
+                            run.last_activity = time.time()
+                            for evt in _sdk_message_to_events(msg):
+                                # emit() also keeps ACTIVE_RUNS_BY_SESSION in
+                                # sync whenever an init event reveals (or
+                                # changes) the SDK session id, so follow-up
+                                # /api/chat lookups can find this run.
+                                run.emit(evt)
+
+                            if isinstance(msg, (TaskStartedMessage,
+                                                TaskProgressMessage,
+                                                TaskNotificationMessage)):
+                                run.pending_notifications.append({
+                                    "task_id": msg.task_id,
+                                    "kind": type(msg).__name__,
+                                    "description": getattr(msg, "description", None),
+                                    "summary": getattr(msg, "summary", None),
+                                    "status": getattr(msg, "status", None),
+                                    "output_file": getattr(msg, "output_file", None),
+                                })
+                                run.notification_grace_started_at = time.time()
+
+                            if isinstance(msg, ResultMessage):
+                                between_turns = True
+                                if run.pending_immediate_queries > 0:
+                                    run.pending_immediate_queries -= 1
+                                    run.consecutive_auto_fires = 0
+                                    if run.pending_immediate_queries == 0:
+                                        run.injection_event.clear()
+                            elif isinstance(msg, (AssistantMessage, UserMessage)):
+                                # Active LLM turn / tool dance. We're not
+                                # between-turns again until the next Result.
+                                between_turns = False
+                            # Task* and Init messages are out-of-band — they
+                            # don't change between_turns. A TaskNotification
+                            # arriving between turns must keep between_turns
+                            # = True so the grace timer can arm.
+                            continue
+
+                        if user_get in done:
+                            item = user_get.result()
+                            run.consecutive_auto_fires = 0
+                            await _send_user_message(
+                                client,
+                                item.get("text") or "",
+                                item.get("image_blocks") or [],
+                            )
+                            between_turns = False
+                            continue
+
+                        if evt_wait in done:
+                            # A handler injected mid-turn input directly via
+                            # client.query(). The CLI is now processing it;
+                            # the response will arrive as messages we'll
+                            # pick up on the next iteration. Just clear the
+                            # signal and loop.
+                            run.injection_event.clear()
+                            continue
+
+                        # Timeout fired — three sub-cases:
+                        if (between_turns and run.pending_notifications
+                                and not cap_reached):
+                            # Grace period elapsed with notifications buffered:
+                            # auto-fire a synth user message.
+                            action = _drain_pending_for_auto_fire()
+                            async with run.client_write_lock:
+                                await client.query(action["synth"])
+                            between_turns = False
+                            continue
+                        if between_turns and run.pending_notifications:
+                            _drop_pending_capped()
+                            # Don't exit yet — give the user another idle
+                            # window to send something before tearing down.
+                            continue
+                        # Idle timeout with nothing pending — exit cleanly.
+                        break
                 finally:
                     run.client = None
+                    if not pump_task.done():
+                        pump_task.cancel()
+                        try:
+                            await pump_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
         except asyncio.CancelledError:
             # Explicit /api/chat/stop or process shutdown — surface as a
