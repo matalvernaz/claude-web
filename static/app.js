@@ -13,9 +13,8 @@
   const headerCostEl = document.getElementById("header-cost");
   const modelSelect = document.getElementById("model-select");
   const projectSelect = document.getElementById("project-select");
-  const imageInput = document.getElementById("image-input");
+  const attachInput = document.getElementById("attach-input");
   const attachmentsEl = document.getElementById("attachments");
-  const fileInput = document.getElementById("file-input");
   const fileAttachmentsEl = document.getElementById("file-attachments");
   const slashMenu = document.getElementById("slash-menu");
   const contextMeter = document.getElementById("context-meter");
@@ -2121,10 +2120,16 @@
     }
   }
 
-  imageInput?.addEventListener("change", async (e) => {
+  attachInput?.addEventListener("change", async (e) => {
     const files = Array.from(e.target.files || []);
-    for (const f of files) await addImageFile(f);
-    imageInput.value = "";  // allow picking the same file again later
+    for (const f of files) {
+      if ((f.type || "").startsWith("image/")) {
+        await addImageFile(f);
+      } else {
+        await addFile(f);
+      }
+    }
+    attachInput.value = "";  // allow picking the same file again later
   });
 
   // ─── Generic file attachments ──────────────────────────────────────────
@@ -2200,12 +2205,6 @@
     renderFileAttachments();
     announce(`Attached ${file.name}.`);
   }
-
-  fileInput?.addEventListener("change", async (e) => {
-    const files = Array.from(e.target.files || []);
-    for (const f of files) await addFile(f);
-    fileInput.value = "";
-  });
 
   promptEl.addEventListener("paste", async (e) => {
     const items = (e.clipboardData && e.clipboardData.items) || [];
