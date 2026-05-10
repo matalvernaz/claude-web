@@ -592,14 +592,50 @@
   let currentGerund = "Working";
   let currentActiveTodo = null;  // activeForm of the in_progress todo, or null
   let lastVisibleActivityAt = 0;
-  // Visual cycle stays fast (3.5s) so the gerund actually feels alive when
-  // it does appear. Speech is paced wider (~12s) so NVDA isn't cut off
-  // mid-word. Sighted users already have streaming text + tool lines as
-  // "still working" feedback; we only show the gerund when the rest of
-  // the UI has been quiet for IDLE_MS.
-  const GERUND_VISUAL_MS = 3500;
+  // Tools currently mid-call, keyed by tool_use_id so a parallel-tool
+  // turn doesn't lose track when one finishes before another. The
+  // first-inserted entry wins for the spinner label — flipping between
+  // names every 3.5s would be more noise than signal. Cleared on result /
+  // stop / error so a stale tool name can't survive into the next turn.
+  const inFlightTools = new Map();
+  // Two clocks:
+  //   GERUND_PICK_MS — how often the random gerund word changes (3.5s, so
+  //     the verb actually feels alive when it shows up).
+  //   GERUND_TICK_MS — how often we repaint the status text (1s, so the
+  //     elapsed-time suffix updates "2m 13s → 2m 14s" smoothly without
+  //     flipping the gerund word more often than is readable).
+  // Speech is paced wider (~12s) so NVDA isn't cut off mid-word.
+  const GERUND_PICK_MS = 3500;
+  const GERUND_TICK_MS = 1000;
   const GERUND_SPEAK_MS = 12000;
   const GERUND_IDLE_MS = 3000;
+  // Don't show "0s" — the first second of a turn is fast enough that the
+  // elapsed-time suffix just adds visual noise. Above this threshold the
+  // turn is long enough that knowing the elapsed time is useful.
+  const ELAPSED_SUFFIX_THRESHOLD_MS = 5000;
+
+  function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return r === 0 ? m + "m" : `${m}m ${r < 10 ? "0" : ""}${r}s`;
+  }
+
+  function currentToolLabel() {
+    if (inFlightTools.size === 0) return null;
+    // First-inserted: a long-running Bash isn't kicked off the spinner by
+    // a quick Read it spawned. iterator.next().value is the oldest entry.
+    return inFlightTools.values().next().value;
+  }
+
+  function buildSpinnerLabel(base) {
+    const elapsedMs = streamStartedAt ? Date.now() - streamStartedAt : 0;
+    const suffix = elapsedMs > ELAPSED_SUFFIX_THRESHOLD_MS
+      ? "  ·  " + formatElapsed(elapsedMs)
+      : "";
+    return "✻ " + base + "…" + suffix;
+  }
 
   function markVisibleActivity() {
     lastVisibleActivityAt = Date.now();
@@ -620,35 +656,62 @@
     if (gerundTimer) { clearInterval(gerundTimer); gerundTimer = null; }
     if (gerundSpeakTimer) { clearInterval(gerundSpeakTimer); gerundSpeakTimer = null; }
     let last = -1;
+    let lastGerundPickAt = 0;
     lastVisibleActivityAt = 0;  // start from "idle" so the gerund shows right away
     function visualTick() {
-      // When a todo is in_progress, the binary uses its activeForm as the
-      // spinner label (no idle gate, no random pick). Match that.
+      // Priority order, matching the value of each signal:
+      //   1. Currently-running tool — the most concrete "what is Claude
+      //      actually doing right now" signal we have, so it wins.
+      //   2. In-progress todo's activeForm — matches the CLI binary.
+      //   3. Random gerund, gated on idle (so it doesn't drown out
+      //      streaming text when the assistant is mid-reply).
+      // The elapsed-time suffix gets added in all cases past the threshold.
+      const tool = currentToolLabel();
+      if (tool) {
+        const label = tool.summary ? `${tool.name}: ${tool.summary}` : tool.name;
+        setStatus(buildSpinnerLabel(label));
+        return;
+      }
       if (currentActiveTodo) {
-        setStatus("✻ " + currentActiveTodo + "…");
+        setStatus(buildSpinnerLabel(currentActiveTodo));
         return;
       }
       const idleMs = Date.now() - lastVisibleActivityAt;
       if (idleMs < GERUND_IDLE_MS) return;  // sighted users have other feedback
-      let i;
-      do { i = Math.floor(Math.random() * GERUNDS.length); } while (i === last);
-      last = i;
-      currentGerund = GERUNDS[i];
-      setStatus("✻ " + currentGerund + "…");
+      // Re-pick the gerund word at the slower cadence; repaint (with
+      // updated elapsed time) at the faster cadence.
+      if (Date.now() - lastGerundPickAt >= GERUND_PICK_MS) {
+        let i;
+        do { i = Math.floor(Math.random() * GERUNDS.length); } while (i === last);
+        last = i;
+        currentGerund = GERUNDS[i];
+        lastGerundPickAt = Date.now();
+      }
+      setStatus(buildSpinnerLabel(currentGerund));
     }
     visualTick();
-    gerundTimer = setInterval(visualTick, GERUND_VISUAL_MS);
+    gerundTimer = setInterval(visualTick, GERUND_TICK_MS);
     // Speech keeps firing regardless of visual activity — for NVDA users,
     // streaming text isn't auto-spoken, so the gerund heartbeat is still
-    // their only "still working" cue.
-    gerundSpeakTimer = setInterval(() => announce((currentActiveTodo || currentGerund) + "…"), GERUND_SPEAK_MS);
+    // their only "still working" cue. Don't speak elapsed time — it'd be
+    // dominant noise every 12s ("Bash pytest 2m 14s, Bash pytest 2m 26s…").
+    gerundSpeakTimer = setInterval(() => {
+      const tool = currentToolLabel();
+      const label = tool
+        ? (tool.summary ? `${tool.name}: ${tool.summary}` : tool.name)
+        : (currentActiveTodo || currentGerund);
+      announce(label + "…");
+    }, GERUND_SPEAK_MS);
   }
   function stopGerunds() {
     if (gerundTimer) { clearInterval(gerundTimer); gerundTimer = null; }
     if (gerundSpeakTimer) { clearInterval(gerundSpeakTimer); gerundSpeakTimer = null; }
     // Drop any active todo label so the next run doesn't open with a stale
-    // "still working on the last task" spinner.
+    // "still working on the last task" spinner. Same for in-flight tools —
+    // a turn that ended mid-tool (cancel, error) shouldn't carry "Bash:
+    // pytest" into the next turn's spinner.
     currentActiveTodo = null;
+    inFlightTools.clear();
     setStatus("");
   }
 
@@ -659,7 +722,12 @@
     const prev = currentActiveTodo;
     currentActiveTodo = label || null;
     if (currentActiveTodo) {
-      if (gerundTimer) setStatus("✻ " + currentActiveTodo + "…");
+      // A running tool overrides the todo label in visualTick, so don't
+      // overwrite the status here if there's a tool in flight — the next
+      // tick will repaint with the tool name.
+      if (gerundTimer && !currentToolLabel()) {
+        setStatus(buildSpinnerLabel(currentActiveTodo));
+      }
       // Announce eagerly on change so NVDA picks up the new task without
       // waiting up to 12s for the next speech tick.
       if (currentActiveTodo !== prev) announce(currentActiveTodo + "…");
@@ -1342,6 +1410,23 @@
           } else {
             insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
           }
+          // Track this tool as in-flight so the spinner can show the
+          // concrete activity ("Bash: pytest -q · 2m 14s") instead of a
+          // random gerund. Cleared when the matching tool_result arrives.
+          if (blk.id) {
+            inFlightTools.set(blk.id, {
+              name: blk.name,
+              summary: summariseToolInput(blk.input || {}),
+            });
+            // Repaint immediately so the user doesn't wait up to 3.5s for
+            // the next visualTick to flip "Pondering…" → "Bash: …".
+            if (gerundTimer) {
+              const label = inFlightTools.get(blk.id);
+              setStatus(buildSpinnerLabel(
+                label.summary ? `${label.name}: ${label.summary}` : label.name,
+              ));
+            }
+          }
           markVisibleActivity();
         }
       }
@@ -1353,6 +1438,9 @@
           const txt = typeof blk.content === "string" ? blk.content : JSON.stringify(blk.content);
           const prefix = blk.is_error ? "✗ " : "← ";
           insertToolMessage(prefix + truncate(txt, 200));
+          // Drop the matching in-flight entry so the spinner stops
+          // claiming this tool is still running.
+          if (blk.tool_use_id) inFlightTools.delete(blk.tool_use_id);
           markVisibleActivity();
         }
       }
@@ -1957,29 +2045,43 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
+  // Diffs longer than this default to collapsed. The threshold is set by
+  // the keyboard / screen-reader cost of stepping through a long diff line
+  // by line — past ~40 lines the body dominates the transcript and pushes
+  // newer content off-screen for sighted users too. Tuned by feel; lower
+  // it if 40 still feels noisy.
+  const DIFF_COLLAPSE_THRESHOLD_LINES = 40;
+
   function insertDiffMessage(toolName, input) {
     // Edit/Write get a real diff block instead of the one-line tool chip,
     // so reviewing what Claude wrote doesn't require expanding tool output.
     const path = input.file_path || input.path || "";
     const wrap = document.createElement("article");
     wrap.className = "msg diff";
-    const header = document.createElement("div");
-    header.className = "diff-header";
-    header.textContent = (toolName === "Edit" ? "✎ Edit " : "✎ Write ") + path;
-    wrap.appendChild(header);
 
+    // Build the diff body first (pre + diffLines) and decide whether the
+    // total line count warrants default-collapsing.
     const pre = document.createElement("pre");
     pre.className = "diff-body";
+    let lineCounts = "";
+    let totalLines = 0;
     if (toolName === "Edit") {
       const oldS = input.old_string || "";
       const newS = input.new_string || "";
+      const oldN = oldS.split("\n").length;
+      const newN = newS.split("\n").length;
+      lineCounts = `−${oldN} +${newN}`;
+      totalLines = oldN + newN;
       pre.appendChild(diffLines(oldS, newS));
     } else {
       // Write: just preview the new content (no "old" side).
       const content = input.content || "";
       const max = 4000;
       const preview = content.length > max ? content.slice(0, max) + "\n… (" + (content.length - max) + " more chars)" : content;
-      preview.split("\n").forEach((line) => {
+      const lines = preview.split("\n");
+      totalLines = lines.length;
+      lineCounts = `+${totalLines}`;
+      lines.forEach((line) => {
         const span = document.createElement("span");
         span.className = "diff-add";
         const sr = document.createElement("span");
@@ -1991,7 +2093,28 @@
         pre.appendChild(document.createTextNode("\n"));
       });
     }
-    wrap.appendChild(pre);
+
+    const headerText = `${toolName === "Edit" ? "✎ Edit" : "✎ Write"} ${path}  ·  ${lineCounts}`;
+    if (totalLines > DIFF_COLLAPSE_THRESHOLD_LINES) {
+      // Big diff: collapse by default. Native <details> handles the
+      // keyboard / aria-expanded plumbing for free; clicking the summary
+      // expands without javascript.
+      const det = document.createElement("details");
+      det.className = "diff-collapsible";
+      const sum = document.createElement("summary");
+      sum.className = "diff-header";
+      sum.textContent = headerText;
+      det.appendChild(sum);
+      det.appendChild(pre);
+      wrap.appendChild(det);
+    } else {
+      const header = document.createElement("div");
+      header.className = "diff-header";
+      header.textContent = headerText;
+      wrap.appendChild(header);
+      wrap.appendChild(pre);
+    }
+
     transcript.appendChild(wrap);
     maybeAutoScroll();
   }

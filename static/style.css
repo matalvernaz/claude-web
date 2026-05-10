@@ -630,6 +630,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* When the header is the <summary> of a collapsible diff, give it the
+   pointer cursor + a focus ring matching every other interactive control. */
+summary.diff-header {
+  cursor: pointer;
+  user-select: none;
+}
+summary.diff-header:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+details.diff-collapsible[open] > summary.diff-header { border-bottom: 1px solid var(--border); }
+details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
 .diff-body {
   margin: 0;
   padding: 0.5rem 0.75rem;
