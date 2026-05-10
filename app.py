@@ -1152,23 +1152,16 @@ class ActiveRun:
         # auto-fire forever; this counter caps the chain.
         self.consecutive_auto_fires: int = 0
         self.last_activity: float = now
-        # The live SDK client, set once the driver has entered its async
-        # context. Mid-turn user input is sent through it directly so the
-        # bundled CLI's "next LLM pause" queue can inject it between tool
-        # calls — matching the binary's steerability instead of waiting until
-        # end-of-turn. Lock serializes writes between driver + handlers and
-        # gates the run.client publish so handlers never see a partial state.
+        # The live SDK client, published once the driver has finished the
+        # initial query. Held only as a debug breadcrumb / capability
+        # marker — handlers no longer write to it directly. All user input
+        # flows through ``user_input_queue`` and is dequeued by the driver
+        # while ``between_turns`` is True, which serialises every CLI write
+        # through one writer (the driver). The previous direct-write
+        # design caused queued messages to land in the CLI's stdin
+        # mid-turn and be silently consumed/discarded.
         self.client: Optional[Any] = None  # ClaudeSDKClient
         self.client_write_lock: asyncio.Lock = asyncio.Lock()
-        # How many mid-turn queries we've already pushed into the CLI but
-        # haven't yet seen a ResultMessage for. The driver decrements on
-        # each ResultMessage and skips its post-turn wait while > 0, since
-        # the next turn is already inbound from the CLI.
-        self.pending_immediate_queries: int = 0
-        # Set whenever a direct-path injection happens, so a driver blocked
-        # on idle-wait (post-ResultMessage with no queued items) wakes up
-        # instead of timing out while the CLI is mid-stream on the new query.
-        self.injection_event: asyncio.Event = asyncio.Event()
 
     def emit(self, event: dict) -> None:
         self.events.append(event)
@@ -1400,44 +1393,26 @@ async def _send_to_client(client, text: str, blocks: list[dict]) -> None:
 
 
 async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> bool:
-    """Push mid-turn user input down to the bundled CLI immediately.
+    """Queue user input for the driver to deliver to the CLI.
 
-    Returns ``True`` if the input was accepted (either delivered to the live
-    CLI or queued for the driver), ``False`` if the CLI subprocess pipe is
-    broken. Callers must check the return so the visible ``user_prompt``
-    event isn't persisted for input that never reached Claude.
+    Originally this also wrote directly to ``client.query()`` from the HTTP
+    handler when the driver was running, in pursuit of "binary-style
+    steerability" — push input mid-turn and let the bundled CLI's
+    concurrent-query queue handle it. In practice, writing to stdin while
+    the CLI was still generating a turn caused the message to be silently
+    discarded — bytes landed in the OS pipe but the CLI's state machine
+    wasn't polling stdin for new turns, so it consumed and dropped them.
+    Symptom (reported by user): queued message after a long task gets
+    "Accepted" 202 from the server but no Claude response.
 
-    The bundled binary holds the message in its own concurrent-query queue
-    and injects it at the next LLM pause (between tool calls, after a
-    subagent returns) — that's the steerability the binary has by default.
-    Falls back to the Python-side queue only if the driver hasn't fully
-    started yet, so no input is silently dropped.
-
-    Both branches run under client_write_lock so the driver's atomic
-    "drain-queue-then-publish-client" setup step can rely on no new queue
-    puts or direct sends happening behind its back.
+    The fix is to always enqueue. The driver only pops from this queue
+    when ``between_turns`` is True (i.e., the CLI is idle and ready),
+    serializing every write through one writer. Returns ``True`` because
+    queue.put on an unbounded queue can't fail; kept the bool return for
+    call-site compatibility.
     """
-    async with run.client_write_lock:
-        if run.client is not None:
-            try:
-                await _send_to_client(run.client, text, blocks)
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                run.emit({
-                    "type": "error",
-                    "message": (
-                        f"Lost connection to the Claude CLI: {type(e).__name__}: {e}. "
-                        "Send a new message to start a fresh run."
-                    ),
-                })
-                return False
-            run.pending_immediate_queries += 1
-            # Wake the driver if it's sleeping on its main wait — otherwise
-            # the auto-fire grace timer could fire before the CLI's response
-            # to this injection, sending a stale synth into an active turn.
-            run.injection_event.set()
-        else:
-            await run.user_input_queue.put({"text": text, "image_blocks": blocks})
-        return True
+    await run.user_input_queue.put({"text": text, "image_blocks": blocks})
+    return True
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -2260,32 +2235,24 @@ async def api_chat(
             async with ClaudeSDKClient(options=options) as client:
                 pump_task = asyncio.create_task(_pump_messages(client))
                 try:
-                    # Atomic startup: hold the write lock so no handler can
-                    # race a queue.put or direct query against us. Drain
-                    # anything that arrived during the run-creation window
-                    # before publishing run.client, so subsequent
-                    # direct-path messages strictly come AFTER any
-                    # already-queued ones.
+                    # Send the initial query, then publish run.client so
+                    # handlers can enqueue follow-up messages. Anything that
+                    # was already queued during the run-creation window stays
+                    # in the queue — the driver loop's user_get branch will
+                    # pop them in order once we're between turns.
                     async with run.client_write_lock:
                         await _send_to_client(client, effective_message, image_blocks)
-                        while not run.user_input_queue.empty():
-                            item = run.user_input_queue.get_nowait()
-                            await _send_to_client(
-                                client, item.get("text") or "", item.get("image_blocks") or [],
-                            )
-                            run.pending_immediate_queries += 1
-                        # Publish under the same lock — handlers waiting on
-                        # the lock will see the published client and use the
-                        # direct path; new arrivals see the same.
                         run.client = client
-                        if run.pending_immediate_queries > 0:
-                            run.injection_event.set()
 
-                    # `between_turns` flips to True on each ResultMessage
-                    # and back to False whenever we send something to the
-                    # CLI (user input or auto-fire synth). Auto-fire only
-                    # arms while between_turns — we never auto-fire while
-                    # an LLM turn is still in flight.
+                    # `between_turns` flips to True on each ResultMessage and
+                    # back to False whenever we send something to the CLI
+                    # (user input or auto-fire synth). Auto-fire only arms
+                    # while between_turns — we never auto-fire while an LLM
+                    # turn is still in flight, and we likewise never pop a
+                    # queued user message into a busy CLI (writing to the
+                    # CLI's stdin mid-turn caused the message to be silently
+                    # consumed-and-discarded; queueing serialises everything
+                    # through one writer so that bug can't recur).
                     between_turns = False
 
                     while True:
@@ -2310,22 +2277,30 @@ async def api_chat(
                             timeout = SESSION_IDLE_TIMEOUT_MS / 1000
 
                         msg_get = asyncio.create_task(msg_queue.get())
-                        user_get = asyncio.create_task(run.user_input_queue.get())
-                        evt_wait = asyncio.create_task(run.injection_event.wait())
+                        # Only race on user_input_queue when the CLI is idle.
+                        # If we polled it while a turn was still streaming,
+                        # we'd write user input into a CLI that isn't ready
+                        # to consume it, with the same disappear-into-the-
+                        # void failure mode the queue is designed to avoid.
+                        waitables: set[asyncio.Task] = {msg_get}
+                        user_get: Optional[asyncio.Task] = None
+                        if between_turns:
+                            user_get = asyncio.create_task(run.user_input_queue.get())
+                            waitables.add(user_get)
                         try:
                             done, _pending = await asyncio.wait(
-                                {msg_get, user_get, evt_wait},
+                                waitables,
                                 timeout=timeout,
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                         finally:
-                            # Queue.get() / Event.wait() are cancellation-safe:
-                            # the awaited future is just a notification, not
-                            # a payload-carrying transfer. The pump still owns
-                            # the SDK iterator exclusively, so we never lose
-                            # a message by cancelling msg_get here.
-                            for t in (msg_get, user_get, evt_wait):
-                                if not t.done():
+                            # Queue.get() is cancellation-safe — the awaited
+                            # future is just a notification, not a payload-
+                            # carrying transfer. The pump still owns the SDK
+                            # iterator exclusively, so we never lose a
+                            # message by cancelling msg_get here.
+                            for t in (msg_get, user_get):
+                                if t is not None and not t.done():
                                     t.cancel()
 
                         if msg_get in done:
@@ -2357,11 +2332,6 @@ async def api_chat(
 
                             if isinstance(msg, ResultMessage):
                                 between_turns = True
-                                if run.pending_immediate_queries > 0:
-                                    run.pending_immediate_queries -= 1
-                                    run.consecutive_auto_fires = 0
-                                    if run.pending_immediate_queries == 0:
-                                        run.injection_event.clear()
                             elif isinstance(msg, (AssistantMessage, UserMessage)):
                                 # Active LLM turn / tool dance. We're not
                                 # between-turns again until the next Result.
@@ -2372,7 +2342,7 @@ async def api_chat(
                             # = True so the grace timer can arm.
                             continue
 
-                        if user_get in done:
+                        if user_get is not None and user_get in done:
                             item = user_get.result()
                             run.consecutive_auto_fires = 0
                             await _send_user_message(
@@ -2381,15 +2351,6 @@ async def api_chat(
                                 item.get("image_blocks") or [],
                             )
                             between_turns = False
-                            continue
-
-                        if evt_wait in done:
-                            # A handler injected mid-turn input directly via
-                            # client.query(). The CLI is now processing it;
-                            # the response will arrive as messages we'll
-                            # pick up on the next iteration. Just clear the
-                            # signal and loop.
-                            run.injection_event.clear()
                             continue
 
                         # Timeout fired — three sub-cases:
