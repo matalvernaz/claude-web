@@ -92,6 +92,10 @@
   })();
   let lastSeenModel = null;
   let lastInputTokens = null;
+  // Highest context-fill threshold already announced this session, so a
+  // single turn that nudges from 79% → 81% doesn't keep re-announcing while
+  // a turn that drops back below (after compaction or a new chat) re-arms.
+  let lastContextThresholdAnnounced = 0;
 
   // Quietly tell NVDA / VoiceOver something interesting happened. The
   // visible "Thinking…" text in #status is also live, but this region is
@@ -268,6 +272,23 @@
     if (link) link.parentElement.classList.add("active");
   }
 
+  // Mirrors the CLI's terminal-title behavior: tab title reflects the active
+  // chat so multiple open tabs are distinguishable. The session title comes
+  // from the sidebar — if the active chat hasn't been listed yet (newly
+  // created mid-turn, before the next refreshSessions), fall back to the
+  // default. A later refresh will pick the title up automatically because
+  // renderSessionList calls back into here.
+  const DEFAULT_PAGE_TITLE = "Claude — homelab";
+  function updatePageTitle() {
+    if (!sessionId) {
+      document.title = DEFAULT_PAGE_TITLE;
+      return;
+    }
+    const link = sessionList.querySelector(`a[data-session="${sessionId}"] .session-title`);
+    const title = link && link.textContent.trim();
+    document.title = title ? `${title} — Claude` : DEFAULT_PAGE_TITLE;
+  }
+
   async function loadSession(id, project) {
     const url = new URL(`/api/sessions/${id}`, location.origin);
     if (project) url.searchParams.set("project", project);
@@ -297,6 +318,7 @@
     }
     // Force-scroll on session load — we just replaced the entire transcript.
     maybeAutoScroll(true);
+    updatePageTitle();
   }
 
   function appendImagePlaceholder(bodyEl, count) {
@@ -584,12 +606,14 @@
     currentRunId = null;
     sessionStorage.removeItem(RUN_KEY);
     lastInputTokens = null;
+    lastContextThresholdAnnounced = 0;
     if (contextMeter) contextMeter.hidden = true;
     if (messageQueue.length) {
       messageQueue.length = 0;
       renderQueue();
     }
     setStreaming(false);
+    updatePageTitle();
     promptEl.focus();
   });
 
@@ -1101,6 +1125,9 @@
         url.searchParams.set("session", sessionId);
         if (sessionProject) url.searchParams.set("project", sessionProject);
         history.replaceState({}, "", url.toString());
+        // Sidebar may not yet have this session — title gets picked up on
+        // the next refreshSessions(). Until then, leave the default in place.
+        updatePageTitle();
       }
       if (obj.model) lastSeenModel = obj.model;
     } else if (obj.type === "assistant" && obj.message) {
@@ -1391,6 +1418,15 @@
       contextText.textContent = `${pretty(lastInputTokens)} / ${pretty(max)} (${pct}%)`;
       contextFill.style.width = pct + "%";
       contextFill.style.background = pct > 85 ? "#d96868" : pct > 70 ? "#d8a657" : "var(--accent)";
+      let crossed = 0;
+      if (pct >= 95) crossed = 95;
+      else if (pct >= 80) crossed = 80;
+      if (crossed > lastContextThresholdAnnounced) {
+        announce(`Context at ${pct}%.`);
+        lastContextThresholdAnnounced = crossed;
+      } else if (pct < 80) {
+        lastContextThresholdAnnounced = 0;
+      }
     } else {
       contextText.textContent = pretty(lastInputTokens);
       contextFill.style.width = "0%";
@@ -1728,7 +1764,11 @@
       preview.split("\n").forEach((line) => {
         const span = document.createElement("span");
         span.className = "diff-add";
-        span.textContent = "+ " + line;
+        const sr = document.createElement("span");
+        sr.className = "sr-only";
+        sr.textContent = "Added line: ";
+        span.appendChild(sr);
+        span.appendChild(document.createTextNode("+ " + line));
         pre.appendChild(span);
         pre.appendChild(document.createTextNode("\n"));
       });
@@ -1761,7 +1801,17 @@
     function pushLine(cls, prefix, text) {
       const span = document.createElement("span");
       span.className = cls;
-      span.textContent = prefix + text;
+      // sr-only label so NVDA reads "Added line: foo" / "Removed line: bar"
+      // instead of "plus space foo" (which depends on punctuation level).
+      // Context lines stay unannotated — labelling every unchanged line would
+      // drown out the actual change in long diffs.
+      if (cls === "diff-add" || cls === "diff-del") {
+        const sr = document.createElement("span");
+        sr.className = "sr-only";
+        sr.textContent = cls === "diff-add" ? "Added line: " : "Removed line: ";
+        span.appendChild(sr);
+      }
+      span.appendChild(document.createTextNode(prefix + text));
       frag.appendChild(span);
       frag.appendChild(document.createTextNode("\n"));
     }
@@ -1895,6 +1945,7 @@
       sessionList.appendChild(li);
     }
     markActive(sessionId);
+    updatePageTitle();
   }
 
   async function exportSession(id, project, title) {
@@ -1961,6 +2012,7 @@
         updateTodosPanel([]);
         history.replaceState({}, "", location.pathname);
         setStatus("Session deleted.");
+        updatePageTitle();
       }
     } catch (err) {
       setStatus("Delete failed: " + err.message);
@@ -1985,11 +2037,13 @@
 
   async function runTranscriptSearch(q) {
     const myToken = ++searchToken;
+    const wasActive = searchActive;
     searchActive = true;
     if (searchModeEl) {
       searchModeEl.hidden = false;
       searchModeLabel.textContent = "Searching transcripts…";
     }
+    if (!wasActive) announce("Searching transcripts.");
     try {
       const r = await fetch(`/api/sessions/search?q=${encodeURIComponent(q)}`);
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -1999,10 +2053,12 @@
       if (searchModeLabel) {
         const n = (data.hits || []).length;
         searchModeLabel.textContent = `${n} match${n === 1 ? "" : "es"} for "${q}"`;
+        announce(`${n} match${n === 1 ? "" : "es"}.`);
       }
     } catch (err) {
       if (myToken !== searchToken) return;
       if (searchModeLabel) searchModeLabel.textContent = "Search failed: " + err.message;
+      announce("Search failed.");
     }
   }
 
@@ -2022,6 +2078,7 @@
       if (searchActive) {
         searchActive = false;
         if (searchModeEl) searchModeEl.hidden = true;
+        announce("Filtering session titles.");
         refreshSessions();
       } else {
         filterSessions();
