@@ -465,14 +465,34 @@ def _iter_jsonl(path: Path) -> Iterable[dict]:
 
 
 def session_title_from(path: Path) -> Optional[str]:
+    """Return the best display title for a session.
+
+    Preference order:
+      1. The most recent ``ai-title`` entry the bundled CLI wrote to the
+         JSONL — that's the short summary the host-shell ``claude`` shows
+         in its own session list, and the same value users see in the
+         terminal title. The CLI rewrites this as the conversation
+         evolves, so the last occurrence wins.
+      2. First user-visible message text (legacy behaviour).
+      3. None.
+    """
+    ai_title: Optional[str] = None
+    first_user_text: Optional[str] = None
     for obj in _iter_jsonl(path):
-        if obj.get("type") != "user" or obj.get("isMeta"):
+        kind = obj.get("type")
+        if kind == "ai-title":
+            t = obj.get("aiTitle")
+            if isinstance(t, str) and t.strip():
+                ai_title = t.strip()
             continue
-        text = _extract_text(obj.get("message"))
-        if text and _is_user_visible(text):
-            stripped = text.strip()
-            return (stripped[:MAX_TITLE_CHARS] + "…") if len(stripped) > MAX_TITLE_CHARS else stripped
-    return None
+        if first_user_text is None and kind == "user" and not obj.get("isMeta"):
+            text = _extract_text(obj.get("message"))
+            if text and _is_user_visible(text):
+                first_user_text = text.strip()
+    chosen = ai_title or first_user_text
+    if not chosen:
+        return None
+    return (chosen[:MAX_TITLE_CHARS] + "…") if len(chosen) > MAX_TITLE_CHARS else chosen
 
 
 def session_title(session_id: str, cwd: Optional[Path] = None) -> Optional[str]:
