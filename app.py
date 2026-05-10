@@ -1973,6 +1973,13 @@ async def api_chat(
         )
     _gc_runs()
 
+    # Validate any provided session_id: it ends up as `resume=<id>` on the
+    # bundled CLI subprocess and as part of dict keys and audit logs. A
+    # `../` here would have the SDK write a session file outside its
+    # configured directory.
+    if session_id:
+        session_id = _safe_id(session_id)
+
     cwd = _resolve_project(project)
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, "unknown model")
