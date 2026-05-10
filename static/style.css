@@ -353,6 +353,9 @@ main {
 #usage-body th { color: #aaa; font-weight: 600; font-size: 0.8rem; }
 #usage-body .summary { margin: 0.25rem 0 0.75rem; }
 #usage-body .summary span { display: inline-block; margin-right: 1rem; }
+#usage-body .usage-section { font-size: 0.9rem; margin: 0.5rem 0 0.25rem; }
+#usage-body .usage-empty { color: #aaa; font-size: 0.9rem; }
+#usage-body .usage-note { color: #888; font-size: 0.75rem; margin-top: 0.75rem; }
 form#chat-form {
   border-top: 1px solid var(--border);
   padding: 0.75rem 1rem;
@@ -668,8 +671,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   height: 100%;
   width: 0%;
   background: var(--accent);
-  transition: width 0.2s;
+  transition: width 0.2s, background 0.2s;
 }
+.context-fill.ctx-warn { background: #d8a657; }
+.context-fill.ctx-danger { background: #d96868; }
 
 /* ─── Outgoing-message queue chips ────────────────────────────────────── */
 .queue-area {

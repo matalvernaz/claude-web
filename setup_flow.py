@@ -213,105 +213,120 @@ async def _drive(state: OAuthFlowState) -> None:
     if state.variant == "console":
         args.append("--console")
 
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        state.status = "failed"
-        state.error = "claude CLI not found on PATH"
-        return
-    state.proc = proc
-    assert proc.stdout is not None and proc.stdin is not None
-
-    # Read until we see the "Paste code" prompt. We deliberately don't try
-    # to extract the URL incrementally — a 256-byte chunk can split the URL
-    # in half and we'd capture a truncated string. Once the prompt has
-    # arrived, the full URL line is guaranteed to be in the buffer.
-    buf = bytearray()
-    saw_prompt = False
-    while True:
         try:
-            chunk = await asyncio.wait_for(proc.stdout.read(256), timeout=30)
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except FileNotFoundError:
+            state.status = "failed"
+            state.error = "claude CLI not found on PATH"
+            return
+        state.proc = proc
+        assert proc.stdout is not None and proc.stdin is not None
+
+        # Read until we see the "Paste code" prompt. We deliberately don't
+        # extract the URL incrementally — a 256-byte chunk can split the URL
+        # in half and we'd capture a truncated string. Once the prompt has
+        # arrived, the full URL line is guaranteed to be in the buffer.
+        buf = bytearray()
+        saw_prompt = False
+        while True:
+            try:
+                chunk = await asyncio.wait_for(proc.stdout.read(256), timeout=30)
+            except asyncio.TimeoutError:
+                if state.status != "cancelled":
+                    state.status = "failed"
+                    state.error = "claude auth login stalled before printing the sign-in URL"
+                return
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if _PROMPT_MARKER in buf:
+                saw_prompt = True
+                break
+
+        # An external cancel_flow may have flipped state.status to "cancelled"
+        # while we were reading. Don't overwrite it with a "failed" verdict
+        # derived from the EOF we now see.
+        if state.status == "cancelled":
+            return
+
+        m = _URL_RE.search(buf.decode("utf-8", errors="replace"))
+        if m:
+            state.url = m.group(0).rstrip(".,)")
+
+        if state.url is None:
+            state.status = "failed"
+            state.error = (
+                buf.decode("utf-8", errors="replace").strip()
+                or "claude auth login exited without printing a sign-in URL"
+            )
+            return
+
+        if not saw_prompt:
+            state.status = "failed"
+            state.error = (
+                buf.decode("utf-8", errors="replace").strip()
+                or "claude auth login closed before requesting an auth code"
+            )
+            return
+
+        state.status = "awaiting_code"
+
+        try:
+            await asyncio.wait_for(state.code_event.wait(), timeout=CODE_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             state.status = "failed"
-            state.error = "claude auth login stalled before printing the sign-in URL"
-            await _kill_and_reap(proc)
+            state.error = "Timed out waiting for the auth code from the browser"
             return
-        if not chunk:
-            break
-        buf.extend(chunk)
-        if _PROMPT_MARKER in buf:
-            saw_prompt = True
-            break
 
-    m = _URL_RE.search(buf.decode("utf-8", errors="replace"))
-    if m:
-        state.url = m.group(0).rstrip(".,)")
+        if state.status == "cancelled":
+            return
 
-    if state.url is None:
+        state.status = "exchanging"
+        code = ((state.code or "").strip() + "\n").encode()
+        try:
+            proc.stdin.write(code)
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+        # Drain remaining stdout so an error message can surface.
+        try:
+            rest = await asyncio.wait_for(proc.stdout.read(), timeout=EXCHANGE_TIMEOUT_SECONDS)
+            if rest:
+                buf.extend(rest)
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            rc = -1
+
+        if state.status == "cancelled":
+            return
+
+        if rc == 0 and credentials_path().exists():
+            state.status = "done"
+            return
+
         state.status = "failed"
-        state.error = (
-            buf.decode("utf-8", errors="replace").strip()
-            or "claude auth login exited without printing a sign-in URL"
-        )
-        return
-
-    if not saw_prompt:
-        state.status = "failed"
-        state.error = (
-            buf.decode("utf-8", errors="replace").strip()
-            or "claude auth login closed before requesting an auth code"
-        )
-        return
-
-    state.status = "awaiting_code"
-
-    try:
-        await asyncio.wait_for(state.code_event.wait(), timeout=CODE_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        state.status = "failed"
-        state.error = "Timed out waiting for the auth code from the browser"
-        await _kill_and_reap(proc)
-        return
-
-    if state.status == "cancelled":
-        await _kill_and_reap(proc)
-        return
-
-    state.status = "exchanging"
-    code = ((state.code or "").strip() + "\n").encode()
-    try:
-        proc.stdin.write(code)
-        await proc.stdin.drain()
-        proc.stdin.close()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-
-    # Drain remaining stdout so an error message can surface.
-    try:
-        rest = await asyncio.wait_for(proc.stdout.read(), timeout=EXCHANGE_TIMEOUT_SECONDS)
-        if rest:
-            buf.extend(rest)
-    except asyncio.TimeoutError:
-        pass
-
-    try:
-        rc = await asyncio.wait_for(proc.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        await _kill_and_reap(proc)
-        rc = -1
-
-    if rc == 0 and credentials_path().exists():
-        state.status = "done"
-        return
-
-    state.status = "failed"
-    tail = buf.decode("utf-8", errors="replace").strip()
-    state.error = tail or f"claude auth login exited with code {rc}"
+        tail = buf.decode("utf-8", errors="replace").strip()
+        state.error = tail or f"claude auth login exited with code {rc}"
+    finally:
+        # Single point of subprocess cleanup. Reached on every exit path
+        # (normal return, exception, CancelledError), so a CancelledError
+        # raised mid-spawn or mid-read can't leak the process. Idempotent
+        # on already-finished processes.
+        if proc is not None:
+            await _kill_and_reap(proc)
 
 
 async def start_oauth(variant: OAuthVariant) -> OAuthFlowState:
@@ -342,7 +357,12 @@ async def start_oauth(variant: OAuthVariant) -> OAuthFlowState:
         state.driver_task = asyncio.create_task(_drive(state))
         _current = state
 
-    for _ in range(100):  # up to ~10s
+    # Wait up to ~30s for the URL or a terminal status. The driver itself
+    # gives the CLI 30s per stdout chunk; if we returned earlier the HTTP
+    # response would carry url=None and the browser would have to poll for
+    # it via /api/setup/status anyway. The polling loop in setup.js handles
+    # both cases, but a synchronous URL on the first response is friendlier.
+    for _ in range(300):
         if state.url or state.status in ("failed", "done"):
             break
         await asyncio.sleep(0.1)
@@ -354,28 +374,36 @@ def current_flow() -> Optional[OAuthFlowState]:
 
 
 async def submit_code(code: str) -> OAuthFlowState:
-    if _current is None:
+    # Capture the global into a local before any await — without this, a
+    # concurrent start_oauth() (which swaps `_current` for a fresh state
+    # object) could cause us to write the code into the new flow's
+    # code_event before it reaches `awaiting_code`, instantly failing the
+    # new flow with stale code.
+    flow = _current
+    if flow is None:
         raise RuntimeError("no flow in progress")
-    if _current.status != "awaiting_code":
-        raise RuntimeError(f"flow is in status {_current.status!r}, not awaiting_code")
-    _current.code = code
-    _current.code_event.set()
+    if flow.status != "awaiting_code":
+        raise RuntimeError(f"flow is in status {flow.status!r}, not awaiting_code")
+    flow.code = code
+    flow.code_event.set()
     # Block the HTTP response until the exchange is done, so the browser
     # can redirect immediately on success.
     deadline = EXCHANGE_TIMEOUT_SECONDS + 5
     for _ in range(deadline * 10):
-        if _current.status in ("done", "failed", "cancelled"):
+        if flow.status in ("done", "failed", "cancelled"):
             break
         await asyncio.sleep(0.1)
-    return _current
+    return flow
 
 
 async def cancel_flow() -> None:
-    if _current is None:
+    flow = _current
+    if flow is None:
         return
-    if _current.status in ("done", "failed", "cancelled"):
+    if flow.status in ("done", "failed", "cancelled"):
         return
-    _current.status = "cancelled"
-    _current.code_event.set()
-    if _current.proc is not None:
-        await _kill_and_reap(_current.proc)
+    flow.status = "cancelled"
+    flow.code_event.set()
+    # _drive's finally clause will _kill_and_reap the subprocess; we don't
+    # need to do it here. But the driver may be blocked on stdin/code_event
+    # await — set the event (already done) and let it unwind.

@@ -23,6 +23,7 @@ import time
 import traceback
 import unicodedata
 import uuid as uuid_mod
+import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
 
@@ -1189,6 +1190,17 @@ class ActiveRun:
                     "dropping slow SSE subscriber for run %s (queue at %d)",
                     self.run_id, q.qsize(),
                 )
+                # The queue is full by definition (that's why put_nowait
+                # raised). Evict one buffered event to make room for the
+                # overflow signal — without this, the consumer reads the
+                # backlog, blocks on the next get(), and never learns that
+                # it was dropped. The frontend handles _overflow by
+                # reconnecting via /api/chat/stream/<run_id> + the
+                # persisted store, so the dropped event is recovered there.
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
                 try:
                     q.put_nowait({"type": "_overflow"})
                 except asyncio.QueueFull:
@@ -1267,7 +1279,16 @@ ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
 # _existing_run_for_session and spawn separate runs — two CLI subprocesses
 # writing to the same jsonl. The lock only guards the find-or-create step;
 # we release before any long awaits on the SDK.
-_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+#
+# WeakValueDictionary so a lock disappears once no live request holds a
+# reference. The previous size-bounded GC sweep had a race: a request that
+# called _session_lock() and yielded before .acquire() (the inevitable
+# `await` below) could have its lock evicted by a concurrent _gc_runs call,
+# letting a second request for the same session create a *different* lock.
+# Both would then "acquire" non-overlapping locks and corrupt the
+# find-or-create invariant. With WeakValueDictionary, the lock survives as
+# long as any task holds it on the stack — exactly the lifetime we need.
+_SESSION_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
 def _session_lock(session_id: str) -> asyncio.Lock:
@@ -1276,22 +1297,6 @@ def _session_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _SESSION_LOCKS[session_id] = lock
     return lock
-
-
-def _gc_session_locks() -> None:
-    """Evict locks for sessions with no live run.
-
-    Without this, _SESSION_LOCKS grows once per resumed session_id forever —
-    a homelab open for months accumulates thousands of unused Lock objects.
-    Held locks are skipped so an in-flight find-or-create can't race with
-    the cleanup; a future request just creates a fresh one if needed.
-    """
-    stale = [
-        sid for sid, lock in _SESSION_LOCKS.items()
-        if not lock.locked() and sid not in ACTIVE_RUNS_BY_SESSION
-    ]
-    for sid in stale:
-        _SESSION_LOCKS.pop(sid, None)
 
 
 # Match PERSIST_RETENTION_SECONDS so a finished run that's still on disk is
@@ -1320,7 +1325,6 @@ def _gc_runs() -> None:
             if existing is run:
                 ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
     _purge_old_uploads(now)
-    _gc_session_locks()
     if now - _LAST_DB_PURGE >= _DB_PURGE_INTERVAL_SECONDS:
         _LAST_DB_PURGE = now
         _purge_old_persisted(now)
@@ -1754,8 +1758,8 @@ def _validate_image(upload: UploadFile, data: bytes) -> str:
     media_type = (upload.content_type or "").lower()
     if media_type not in ALLOWED_IMAGE_MEDIA_TYPES:
         raise HTTPException(400, f"unsupported image type: {media_type!r}")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(400, f"image too large (>{MAX_IMAGE_BYTES} bytes)")
+    # Note: the size cap is already enforced in _read_with_cap before this is
+    # called. We only need to verify content-type vs magic bytes here.
     sniffed: Optional[str] = None
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         sniffed = "image/png"
@@ -1795,6 +1799,20 @@ async def _read_with_cap(upload: UploadFile, cap: int) -> bytes:
 
 
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+# Strict media-type token. RFC 6838 limits these to ASCII letters, digits,
+# and a few punctuation characters; we additionally allow `;` + space + `=`
+# so a `; charset=utf-8` parameter passes through. Anything else (newlines,
+# control chars, brackets) is rejected — those would otherwise confuse the
+# prompt-injection prefix Claude reads via _file_attachment_prefix.
+_CONTENT_TYPE_RE = re.compile(r"^[A-Za-z0-9.+/=;\- ]{1,128}$")
+
+
+def _safe_content_type(value: Optional[str]) -> str:
+    """Return a safe ASCII media type or 'application/octet-stream'."""
+    if value and _CONTENT_TYPE_RE.match(value):
+        return value
+    return "application/octet-stream"
 
 
 def _safe_filename(name: str) -> str:
@@ -1850,7 +1868,7 @@ async def _save_uploaded_files(files: list[UploadFile], run_id: str) -> list[dic
             "filename": target.name,
             "path": str(target),
             "size": len(data),
-            "content_type": (f.content_type or "application/octet-stream"),
+            "content_type": _safe_content_type(f.content_type),
         })
     return out
 
@@ -2022,7 +2040,19 @@ async def api_chat(
     finally:
         if sess_lock:
             sess_lock.release()
-    file_metas = await _save_uploaded_files(files, run_id)
+    # Save uploads BEFORE emitting run_started — if the upload validation
+    # rejects the request, we mustn't leave an orphan run pinned in
+    # ACTIVE_RUNS / ACTIVE_RUNS_BY_SESSION with no driver task. A future
+    # /api/chat for the same session_id would otherwise hit the orphan and
+    # queue messages into a dead queue forever. On any failure here we
+    # remove the run from both registries and re-raise the original error.
+    try:
+        file_metas = await _save_uploaded_files(files, run_id)
+    except Exception:
+        ACTIVE_RUNS.pop(run_id, None)
+        if session_id and ACTIVE_RUNS_BY_SESSION.get(session_id) is run:
+            ACTIVE_RUNS_BY_SESSION.pop(session_id, None)
+        raise
     effective_message = _file_attachment_prefix(file_metas) + message
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
@@ -2243,6 +2273,18 @@ async def api_chat(
             return _drain_pending_for_auto_fire()
         if run.pending_notifications:
             _drop_pending_capped()
+        # Defensive: if a put happened on the queue between asyncio.wait
+        # returning and our cancel of get_task, the item stays in the
+        # queue's internal deque (no other waiters to receive it). Don't
+        # exit the driver while there's still work to do — drain it now so
+        # the user's prompt isn't silently lost.
+        if not run.user_input_queue.empty():
+            try:
+                item = run.user_input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+            run.consecutive_auto_fires = 0
+            return {"kind": "user", "item": item}
         return None
 
     async def driver():

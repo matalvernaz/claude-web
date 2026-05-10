@@ -21,6 +21,15 @@ import auth
         # External absolute — must reject.
         ("https://evil.com/", "/"),
         ("javascript:alert(1)", "/"),
+        # Browsers strip whitespace from Location headers — `/<TAB>/evil.com`
+        # becomes `//evil.com` post-strip, opening a protocol-relative redirect
+        # if we only checked the leading "//" form.
+        ("/\t/evil.com", "/"),
+        ("/\n/evil.com", "/"),
+        ("/\r/evil.com", "/"),
+        ("/ /evil.com", "/"),  # space at index 1 — same risk
+        # urlparse-detected absolute despite leading "/" prefix.
+        ("/foo:bar/baz", "/foo:bar/baz"),  # this is fine — no scheme
     ],
 )
 def test_safe_next(value: str | None, expected: str) -> None:

@@ -48,11 +48,24 @@ def safe_next(value: Optional[str]) -> str:
     r"""Constrain a post-login redirect to a same-origin path.
 
     `startswith("/")` alone admits `//evil.com` and `/\evil.com`, which
-    browsers parse as protocol-relative or backslash-host URLs.
+    browsers parse as protocol-relative or backslash-host URLs. Whitespace
+    and control characters can also fool browsers into stripping them and
+    parsing the result as protocol-relative — `/<TAB>/evil.com` becomes
+    `//evil.com` after the browser normalises the Location header. Reject
+    any value with non-printable bytes, leading double-slash variants, or
+    a parsed scheme/netloc.
     """
     if not value or not value.startswith("/"):
         return "/"
+    # Drop anything with control / whitespace bytes that browsers may strip.
+    # Including space (0x20) — Chromium/Firefox normalise leading whitespace
+    # in Location headers, so `/ /evil.com` can become `//evil.com` post-strip.
+    if any(c <= " " or c == "\x7f" for c in value):
+        return "/"
     if value.startswith("//") or value.startswith("/\\"):
+        return "/"
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
         return "/"
     return value
 
@@ -217,7 +230,12 @@ def install_routes(app) -> None:
             end_session = None
 
         if end_session:
-            params = {"post_logout_redirect_uri": str(request.base_url)}
+            # Use expected_origin (which honours OIDC_REDIRECT_URI) instead
+            # of request.base_url. base_url derives from the Host header,
+            # so an attacker who could spoof Host (typically can't behind
+            # a strict proxy, but defence-in-depth) could redirect the
+            # post-logout target to a site they control.
+            params = {"post_logout_redirect_uri": expected_origin(request) + "/"}
             if id_token:
                 params["id_token_hint"] = id_token
             return RedirectResponse(url=f"{end_session}?{urlencode(params)}", status_code=302)

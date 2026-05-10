@@ -31,6 +31,12 @@
   // Run-id of the in-flight turn. Persisted to sessionStorage so a reload
   // can rejoin via /api/chat/stream/{run_id}.
   let currentRunId = null;
+  // Monotonic stream generation token. Bumped every time a new stream is
+  // opened (sendOne / sendInExistingRun / tryResume / loadSession). Late
+  // events from an aborted stream check this before mutating UI state, so
+  // a stall-recovery sequence (abort old → start new) can't have the old
+  // stream's trailing events bleed into the new run's transcript.
+  let streamGeneration = 0;
   // Highest server-assigned `_idx` rendered per run. Events arrive in idx
   // order within any one SSE stream, so a monotonic guard is enough to
   // collapse duplicates that come from the same event reaching the DOM
@@ -41,6 +47,20 @@
   const PROJECT_KEY = "claude-web.project";
 
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
+  // Storage helpers that swallow the SecurityError some browsers throw on
+  // localStorage access in private mode / cookie-blocked origins / embedded
+  // webviews. Persistence is best-effort — if it fails we just don't
+  // persist, never crash the whole app at boot.
+  function safeGet(storage, key) {
+    try { return storage.getItem(key); } catch { return null; }
+  }
+  function safeSet(storage, key, value) {
+    try { storage.setItem(key, value); } catch { /* ignore */ }
+  }
+  function safeRemove(storage, key) {
+    try { storage.removeItem(key); } catch { /* ignore */ }
+  }
+
   let pendingImages = [];
   // Pending non-image file attachments. Each entry is just {file}; we don't
   // pre-read these on the client because the server saves them to disk and
@@ -106,14 +126,26 @@
     // NVDA needs a real gap between clearing and re-filling, otherwise the
     // mutation gets coalesced and nothing speaks. 10ms wasn't enough; 120ms
     // is reliable in NVDA + Chrome/Firefox without feeling laggy.
+    // Cancel any pending announcement so multiple calls within the gap
+    // don't fire out of order — the most recent message is what matters.
+    if (announceTimer) clearTimeout(announceTimer);
     announcer.textContent = "";
-    setTimeout(() => { announcer.textContent = text; }, 120);
+    announceTimer = setTimeout(() => {
+      announcer.textContent = text;
+      announceTimer = null;
+    }, 120);
   }
+  let announceTimer = null;
 
   // Format unix timestamp as a short human-friendly relative/absolute string.
   function formatTime(unixSec) {
-    const ms = unixSec * 1000;
-    const diff = (Date.now() - ms) / 1000;
+    const n = Number(unixSec);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    const ms = n * 1000;
+    // Clamp small clock-skew futures so the label doesn't read "in -3m";
+    // larger futures (a session somehow stamped tomorrow) fall back to
+    // the absolute date format below.
+    const diff = Math.max(0, (Date.now() - ms) / 1000);
     if (diff < 60) return "just now";
     if (diff < 3600) return Math.floor(diff / 60) + "m ago";
     if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
@@ -129,6 +161,9 @@
     });
   }
   renderSessionTimes();
+  // Re-render every 60s so a long-lived tab doesn't show "2h ago" on a
+  // session that was active 7 hours back. Cheap (≤100 nodes typically).
+  setInterval(renderSessionTimes, 60_000);
 
   // Only auto-scroll if the user is already at (or near) the bottom of the
   // transcript. If they've scrolled up to re-read earlier turns we don't
@@ -148,24 +183,36 @@
     }
   }
 
+  // Capture the pinned state BEFORE a DOM mutation, then pass that to
+  // maybeAutoScroll afterwards. Without this pattern, appending a tall
+  // message can push the user past SCROLL_PIN_PX from the bottom in the
+  // very same frame, causing isPinnedToBottom() to return false and the
+  // viewport to stay frozen even though the user was at-bottom moments ago.
+  function withScrollPin(mutate) {
+    const wasPinned = isPinnedToBottom();
+    const result = mutate();
+    maybeAutoScroll(wasPinned);
+    return result;
+  }
+
   const params = new URLSearchParams(location.search);
   let sessionId = params.get("session") || "";
   let sessionProject = params.get("project") || "";
 
   // Restore model + project from localStorage so the picks persist across reloads.
   if (modelSelect) {
-    const savedModel = localStorage.getItem(MODEL_KEY);
+    const savedModel = safeGet(localStorage, MODEL_KEY);
     if (savedModel !== null && [...modelSelect.options].some((o) => o.value === savedModel)) {
       modelSelect.value = savedModel;
     }
     modelSelect.addEventListener("change", () => {
-      localStorage.setItem(MODEL_KEY, modelSelect.value);
+      safeSet(localStorage, MODEL_KEY, modelSelect.value);
       lastSeenModel = modelSelect.value || lastSeenModel;
       renderContextMeter();
     });
   }
   if (projectSelect) {
-    const savedProject = localStorage.getItem(PROJECT_KEY);
+    const savedProject = safeGet(localStorage, PROJECT_KEY);
     if (savedProject !== null && [...projectSelect.options].some((o) => o.value === savedProject)) {
       projectSelect.value = savedProject;
     }
@@ -173,7 +220,7 @@
       projectSelect.value = sessionProject;
     }
     projectSelect.addEventListener("change", () => {
-      localStorage.setItem(PROJECT_KEY, projectSelect.value);
+      safeSet(localStorage, PROJECT_KEY, projectSelect.value);
     });
   }
 
@@ -223,12 +270,12 @@
     document.body.classList.toggle("sidebar-collapsed", collapsed);
     toggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
   }
-  const saved = localStorage.getItem(SIDEBAR_KEY);
+  const saved = safeGet(localStorage, SIDEBAR_KEY);
   applySidebar(saved === "1" || (saved === null && window.matchMedia("(max-width: 720px)").matches));
   toggleBtn.addEventListener("click", () => {
     const willCollapse = !document.body.classList.contains("sidebar-collapsed");
     applySidebar(willCollapse);
-    localStorage.setItem(SIDEBAR_KEY, willCollapse ? "1" : "0");
+    safeSet(localStorage, SIDEBAR_KEY, willCollapse ? "1" : "0");
   });
 
   // Enter to send, Shift+Enter for newline. Skip when the Send button is
@@ -248,9 +295,17 @@
         updateSlashHighlight();
         return;
       }
-      if (e.key === "Enter" || e.key === "Tab") {
+      if (e.key === "Enter") {
         e.preventDefault();
         acceptSlash(slashActive);
+        return;
+      }
+      // Tab closes the menu and lets the browser move focus normally.
+      // Trapping Tab here used to break the keyboard escape route for NVDA
+      // users — once the menu opened, Tab/Shift+Tab couldn't reach the
+      // surrounding controls. Esc still dismisses without focus change.
+      if (e.key === "Tab") {
+        hideSlashMenu();
         return;
       }
       if (e.key === "Escape") {
@@ -290,12 +345,33 @@
   }
 
   async function loadSession(id, project) {
-    const url = new URL(`/api/sessions/${id}`, location.origin);
+    const url = new URL(`/api/sessions/${encodeURIComponent(id)}`, location.origin);
     if (project) url.searchParams.set("project", project);
     const r = await fetch(url);
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
-    sessionProject = data.project || sessionProject || "";
+    // Cancel any in-flight stream from the previous session — without this,
+    // late SSE events can land in the newly-loaded transcript.
+    if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+    currentAbort = null;
+    currentRunId = null;
+    safeRemove(sessionStorage, RUN_KEY);
+    setStreaming(false);
+    streamGeneration++;
+    sessionId = id || "";
+    // Use ?? not || so the loaded session's own (possibly empty) project
+    // wins over the URL-pinned project — otherwise switching to an
+    // unprojected session keeps applying the previous project to sends.
+    sessionProject = data.project ?? sessionProject ?? "";
+    if (projectSelect && sessionProject &&
+        [...projectSelect.options].some((o) => o.value === sessionProject)) {
+      projectSelect.value = sessionProject;
+    }
+    // Per-session token state belongs to the previous chat — clearing
+    // these prevents the context meter from reflecting the wrong session.
+    lastInputTokens = null;
+    lastContextThresholdAnnounced = 0;
+    renderContextMeter();
     transcript.innerHTML = "";
     // Switching sessions: any prior run's dedup state belongs to a different
     // conversation now and shouldn't influence rendering of the new one.
@@ -304,6 +380,7 @@
       if (m.role === "user") {
         const body = appendMessage("user", m.text || "");
         if (m.image_count) appendImagePlaceholder(body, m.image_count);
+        if (m.file_count) appendFilePlaceholder(body, m.file_count);
       } else if (m.role === "assistant") {
         appendMessage("assistant", m.text);
       } else if (m.role === "tool_use") {
@@ -318,6 +395,7 @@
     }
     // Force-scroll on session load — we just replaced the entire transcript.
     maybeAutoScroll(true);
+    markActive(sessionId);
     updatePageTitle();
   }
 
@@ -371,7 +449,15 @@
     return div.innerHTML;
   }
 
+  // Per-body raw-markdown cache. Stored off-DOM so the unrendered text
+  // doesn't double the DOM weight in long conversations (the previous
+  // dataset.raw approach copied every assistant message into an attribute).
+  // WeakMap also clears entries automatically when the body element is
+  // detached, which `transcript.innerHTML = ""` does on session switch.
+  const rawByBody = new WeakMap();
+
   function appendMessage(role, text) {
+    const wasPinned = isPinnedToBottom();
     const el = document.createElement("article");
     el.className = "msg " + role;
     // Heading + actions row. The H3 keeps NVDA's H-key cycling working.
@@ -385,7 +471,7 @@
     b.className = "body";
     if (role === "assistant") {
       b.innerHTML = renderMarkdown(text);
-      b.dataset.raw = text || "";
+      rawByBody.set(b, text || "");
       header.appendChild(makeCopyButton(b));
     } else {
       b.textContent = text;
@@ -396,8 +482,10 @@
     // appendMessage gets called both on initial render (where we want to
     // scroll) and on streaming text chunks (where the streaming-text
     // handler already calls maybeAutoScroll). Pin-respecting scroll here
-    // is the right default for both.
-    maybeAutoScroll();
+    // is the right default for both — but capture the pinned state
+    // BEFORE the mutation so a tall message doesn't push the user past
+    // SCROLL_PIN_PX in the same frame.
+    maybeAutoScroll(wasPinned);
     return b;
   }
 
@@ -408,7 +496,7 @@
     btn.textContent = "Copy";
     btn.setAttribute("aria-label", "Copy reply to clipboard");
     btn.addEventListener("click", async () => {
-      const raw = bodyEl.dataset.raw || bodyEl.textContent || "";
+      const raw = rawByBody.get(bodyEl) || bodyEl.textContent || "";
       try {
         await navigator.clipboard.writeText(raw);
         btn.textContent = "Copied";
@@ -604,7 +692,7 @@
     }
     currentAbort = null;
     currentRunId = null;
-    sessionStorage.removeItem(RUN_KEY);
+    safeRemove(sessionStorage, RUN_KEY);
     lastInputTokens = null;
     lastContextThresholdAnnounced = 0;
     if (contextMeter) contextMeter.hidden = true;
@@ -658,7 +746,7 @@
       if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
       currentAbort = null;
       currentRunId = null;
-      sessionStorage.removeItem(RUN_KEY);
+      safeRemove(sessionStorage, RUN_KEY);
       setStreaming(false);
       stopGerunds();
     }, STREAM_STALL_CHECK_MS);
@@ -765,7 +853,7 @@
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
-        sessionStorage.removeItem(RUN_KEY);
+        safeRemove(sessionStorage, RUN_KEY);
         setStreaming(false);
         setStatus("Previous turn looked stalled — sending as a new run.");
         announce("Previous turn looked stalled. Sending as a new run.");
@@ -810,6 +898,13 @@
     setStreaming(true);
     startGerunds();
     announce("Sent. Claude is responding.");
+    // The POST itself isn't bound to currentAbort (which owns the SSE
+    // reader). A separate controller lets a Stop click — which calls
+    // currentAbort.abort() AND posts /api/chat/stop — also cut the
+    // in-flight POST cleanly without waiting for it to time out.
+    const sendAbort = new AbortController();
+    const onStopForSend = () => { try { sendAbort.abort(); } catch (_) {} };
+    if (currentAbort) currentAbort.signal.addEventListener("abort", onStopForSend, { once: true });
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
@@ -819,7 +914,10 @@
       for (const f of (entry.files || [])) {
         fd.append("files", f.file, f.file.name);
       }
-      const r = await fetch(`/api/chat/send/${encodeURIComponent(currentRunId)}`, { method: "POST", body: fd });
+      const r = await fetch(
+        `/api/chat/send/${encodeURIComponent(currentRunId)}`,
+        { method: "POST", body: fd, signal: sendAbort.signal },
+      );
       if (r.status === 401 || r.status === 403) {
         // Auth expired or CSRF rejected — neither is recoverable by retrying
         // against the same run. Surface to handleStreamError so the user is
@@ -837,7 +935,7 @@
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
-        sessionStorage.removeItem(RUN_KEY);
+        safeRemove(sessionStorage, RUN_KEY);
         if (r.status !== 404) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
@@ -848,15 +946,22 @@
       // else to do here. setStreaming(false) happens on the next result.
       return true;
     } catch (err) {
+      if (err.name === "AbortError") {
+        // Stop fired during the POST. The SSE side is being torn down by the
+        // same Stop click; nothing further to do here.
+        return false;
+      }
       // Network failure (fetch threw). Abort the dead stream, drop the
       // run handle, surface the error. Caller decides whether to retry.
       if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
       currentAbort = null;
       currentRunId = null;
-      sessionStorage.removeItem(RUN_KEY);
+      safeRemove(sessionStorage, RUN_KEY);
       handleStreamError(err);
       setStreaming(false);
       return false;
+    } finally {
+      if (currentAbort) currentAbort.signal.removeEventListener("abort", onStopForSend);
     }
   }
 
@@ -884,11 +989,12 @@
 
   async function sendOne(entry) {
     setStreaming(true);
-    // Capture our own abort/signal so the finally block can tell whether
-    // it's still the active turn. The stall-recovery path aborts an old
-    // sendOne and immediately starts a new one — without this guard the
-    // old finally would run after the new sendOne had already set
-    // currentAbort/isStreaming, clobbering them mid-flight.
+    // Bump the stream generation BEFORE any await, so handleSSEEvent calls
+    // from a previously-aborted stream see ctx.gen !== streamGeneration and
+    // bail out instead of mutating the new run's state. The myAbort capture
+    // also gates the finally cleanup so an in-flight catch from the old
+    // stream doesn't clobber the new currentAbort/isStreaming.
+    const gen = ++streamGeneration;
     const myAbort = new AbortController();
     currentAbort = myAbort;
     startGerunds();
@@ -908,17 +1014,29 @@
       }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      await drainStream(r);
+      await drainStream(r, gen);
     } catch (err) {
-      handleStreamError(err);
+      // Aborts from a Stop click or stall-recovery aren't user-facing
+      // errors. Only the active turn shows "Stopped." — a stale abort from
+      // a superseded sendOne stays silent so it doesn't clobber the new
+      // turn's status.
+      if (err.name === "AbortError") {
+        if (gen === streamGeneration) {
+          stopGerunds();
+          setStatus("Stopped.");
+          announce("Stopped.");
+        }
+      } else if (gen === streamGeneration) {
+        handleStreamError(err);
+      }
     } finally {
       // Only clean up if we're still the current turn. If a stall-recovery
       // submit started a fresh sendOne while we were aborting, leave its
       // state alone.
-      if (currentAbort === myAbort) {
+      if (gen === streamGeneration && currentAbort === myAbort) {
         currentAbort = null;
         currentRunId = null;
-        sessionStorage.removeItem(RUN_KEY);
+        safeRemove(sessionStorage, RUN_KEY);
         setStreaming(false);
         promptEl.focus();
       }
@@ -934,11 +1052,13 @@
     }
   }
 
-  async function drainStream(response) {
+  async function drainStream(response, gen) {
     // Mutable holder so handleSSEEvent can lazy-create a new assistant
     // article each time text follows a tool call — keeps DOM order matching
-    // chronological order.
-    const ctx = { currentAssistantBody: null };
+    // chronological order. ctx.runId is set when run_started arrives so
+    // dedup keys to the stream's own run rather than the global currentRunId
+    // (which can change mid-stream during stall-recovery handovers).
+    const ctx = { currentAssistantBody: null, runId: null, gen };
     const reader = response.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -958,9 +1078,8 @@
       // lastVisibleActivityAt, which is updated only by the per-event
       // handlers below, so this clock is purely for connection-liveness
       // diagnostics.
-      lastNetworkActivityAt = Date.now();
+      if (gen === streamGeneration) lastNetworkActivityAt = Date.now();
       buf += dec.decode(value, { stream: true });
-      let idx;
       // Handle both LF and CRLF separators per the SSE spec.
       while (true) {
         const lf = buf.indexOf("\n\n");
@@ -974,10 +1093,17 @@
         handleSSEEvent(evt, ctx);
       }
     }
+    // Late EOF: if a newer stream has taken over since this one started,
+    // do nothing. The newer stream owns status/announcer/header refresh.
+    if (gen !== streamGeneration) return;
     stopGerunds();
-    const summary = summariseResult(ctx.lastResult);
-    setStatus(summary);
-    announce(summary);
+    // Don't overwrite an explicit terminal status (stopped, error) with a
+    // generic "Response complete." derived from a missing ctx.lastResult.
+    if (ctx.lastResult) {
+      const summary = summariseResult(ctx.lastResult);
+      setStatus(summary);
+      announce(summary);
+    }
     refreshSessions();
     refreshHeaderCost();
   }
@@ -1007,7 +1133,7 @@
   }
 
   async function tryResume() {
-    const savedRunId = sessionStorage.getItem(RUN_KEY);
+    const savedRunId = safeGet(sessionStorage, RUN_KEY);
     if (!savedRunId) return false;
     let info;
     try {
@@ -1015,39 +1141,59 @@
       if (!r.ok) throw new Error("HTTP " + r.status);
       info = await r.json();
     } catch {
-      sessionStorage.removeItem(RUN_KEY);
+      safeRemove(sessionStorage, RUN_KEY);
       return false;
     }
     if (!info.active && !info.buffered_events) {
-      sessionStorage.removeItem(RUN_KEY);
+      safeRemove(sessionStorage, RUN_KEY);
       return false;
     }
     if (info.project) sessionProject = info.project;
     // Wipe and announce BEFORE flipping streaming UI on, so there's never a
-    // frame where the spinner is overlaid on the stale transcript.
+    // frame where the spinner is overlaid on the stale transcript. Replay
+    // is from index 0, so this run's dedup watermark must reset too.
     transcript.innerHTML = "";
+    renderedIdxByRun.delete(savedRunId);
+    const gen = ++streamGeneration;
+    const myAbort = new AbortController();
     currentRunId = savedRunId;
-    currentAbort = new AbortController();
+    currentAbort = myAbort;
     setStreaming(true);
     startGerunds();
     announce("Reconnecting to previous response.");
     try {
-      const r = await fetch(`/api/chat/stream/${encodeURIComponent(savedRunId)}`, { signal: currentAbort.signal });
+      const r = await fetch(`/api/chat/stream/${encodeURIComponent(savedRunId)}`, { signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      await drainStream(r);
+      await drainStream(r, gen);
     } catch (err) {
-      handleStreamError(err);
+      if (err.name === "AbortError") {
+        if (gen === streamGeneration) {
+          stopGerunds();
+          setStatus("Stopped.");
+          announce("Stopped.");
+        }
+      } else if (gen === streamGeneration) {
+        handleStreamError(err);
+      }
     } finally {
-      currentAbort = null;
-      currentRunId = null;
-      sessionStorage.removeItem(RUN_KEY);
-      setStreaming(false);
-      promptEl.focus();
+      // Same generation guard as sendOne — only clear globals if this resume
+      // is still the active stream. A newer sendOne/sendInExistingRun that
+      // started during the resume must not be clobbered by our finally.
+      if (gen === streamGeneration && currentAbort === myAbort) {
+        currentAbort = null;
+        currentRunId = null;
+        safeRemove(sessionStorage, RUN_KEY);
+        setStreaming(false);
+        promptEl.focus();
+      }
     }
     return true;
   }
 
   function handleSSEEvent(evt, ctx) {
+    // Drop everything if this stream has been superseded — late events from
+    // an aborted stream must not mutate the new one's transcript or status.
+    if (ctx && ctx.gen !== undefined && ctx.gen !== streamGeneration) return;
     // Spec-correct SSE data assembly: each `data:` line contributes to the
     // event payload, joined by literal "\n". The leading space after the
     // colon is optional and stripped if present. Avoid trim() which would
@@ -1065,13 +1211,31 @@
     if (!dataParts.length) return;
     const dataLine = dataParts.join("\n");
     let obj;
-    try { obj = JSON.parse(dataLine); } catch { return; }
+    try {
+      obj = JSON.parse(dataLine);
+    } catch (err) {
+      // A truncated frame or malformed JSON is rare but real — log so it's
+      // diagnosable from devtools without breaking the stream.
+      if (typeof console !== "undefined") console.warn("Bad SSE frame", err);
+      return;
+    }
 
-    // Drop events the DOM has already rendered for this run. Same _idx
-    // arriving twice means a duplicate delivery (overlapping SSE subscribers
-    // or an out-of-band replay) — render once, ignore the rest.
+    // Drop events the DOM has already rendered for THIS stream's run. Key
+    // on ctx.runId (set when this stream's own run_started lands), not the
+    // global currentRunId — a late event from an aborted stream would
+    // otherwise be deduped against a different run's watermark and either
+    // poison the new run's dedup state or get rendered as if it belonged
+    // to the new run.
     if (typeof obj._idx === "number") {
-      const runKey = (obj.type === "run_started" && obj.run_id) ? obj.run_id : currentRunId;
+      let runKey = null;
+      if (obj.type === "run_started" && obj.run_id) {
+        runKey = obj.run_id;
+        if (ctx) ctx.runId = obj.run_id;
+      } else if (ctx && ctx.runId) {
+        runKey = ctx.runId;
+      } else {
+        runKey = currentRunId;
+      }
       if (runKey) {
         const seen = renderedIdxByRun.get(runKey);
         if (seen !== undefined && obj._idx <= seen) return;
@@ -1083,7 +1247,7 @@
       // Save the run-id so a reload can rejoin via /api/chat/stream/{id}.
       if (obj.run_id) {
         currentRunId = obj.run_id;
-        sessionStorage.setItem(RUN_KEY, obj.run_id);
+        safeSet(sessionStorage, RUN_KEY, obj.run_id);
       }
       if (obj.project) sessionProject = obj.project;
       if (obj.model) lastSeenModel = obj.model;
@@ -1142,10 +1306,26 @@
           if (!ctx.currentAssistantBody) {
             ctx.currentAssistantBody = appendMessage("assistant", "");
           }
-          const raw = (ctx.currentAssistantBody.dataset.raw || "") + blk.text;
-          ctx.currentAssistantBody.dataset.raw = raw;
-          ctx.currentAssistantBody.innerHTML = renderMarkdown(raw);
-          maybeAutoScroll();
+          const wasPinned = isPinnedToBottom();
+          const raw = (rawByBody.get(ctx.currentAssistantBody) || "") + blk.text;
+          rawByBody.set(ctx.currentAssistantBody, raw);
+          // Throttle full markdown re-render to roughly one per animation
+          // frame (~16ms). Without this, every streaming text chunk
+          // re-parses + re-sanitises the entire accumulated message — an
+          // O(n²) scan that visibly stutters on long replies. Plain text
+          // gets shown immediately; markdown structure (headings, code
+          // blocks, etc.) catches up on the next rAF tick.
+          ctx.currentAssistantBody.textContent = raw;
+          if (!ctx._mdScheduled) {
+            ctx._mdScheduled = true;
+            const target = ctx.currentAssistantBody;
+            requestAnimationFrame(() => {
+              ctx._mdScheduled = false;
+              if (!target.isConnected) return;
+              target.innerHTML = renderMarkdown(rawByBody.get(target) || "");
+            });
+          }
+          maybeAutoScroll(wasPinned);
           markVisibleActivity();
         } else if (blk.type === "tool_use") {
           // Subsequent text blocks should land in a new assistant article
@@ -1177,15 +1357,18 @@
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from
       // the start so we don't miss anything. tryResume's reconnect path
-      // will replay the entire run from index 0 via the persisted store.
+      // replays from index 0 via the persisted store, but we MUST clear
+      // this run's dedup watermark first — otherwise the high-water mark
+      // from before the overflow drops every replayed event as a duplicate
+      // and the transcript stays blank.
       if (currentRunId) {
         announce("Stream backlog overflowed; reconnecting from start.");
         const rid = currentRunId;
+        renderedIdxByRun.delete(rid);
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
-        sessionStorage.removeItem(RUN_KEY);
-        sessionStorage.setItem(RUN_KEY, rid);
+        safeSet(sessionStorage, RUN_KEY, rid);
         // Schedule the resume on the next microtask so the in-flight reader
         // can unwind cleanly before we open a new fetch.
         setTimeout(() => { tryResume().catch(() => {}); }, 0);
@@ -1200,11 +1383,13 @@
       //    we synthesize a timeout so the replayed card isn't clickable.
       ctx.currentAssistantBody = null;
       const restarted = obj.reason === "server_restart";
-      // CSS.escape defensively in case the id format ever changes from
-      // dash-hex UUID to something with special characters.
-      const safeId = (typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(obj.id) : obj.id;
-      const card = document.querySelector(`article.msg.permission[data-request-id="${safeId}"]`);
+      // Iterate rather than building a CSS selector — request IDs are
+      // server-side UUIDs today but a future change could include
+      // characters that need escaping; .find() doesn't care.
+      const cards = document.querySelectorAll("article.msg.permission");
+      const card = [...cards].find((el) => el.dataset.requestId === String(obj.id));
       if (card) {
+        card.dataset.state = "timed_out";
         card.querySelectorAll("button").forEach((b) => (b.disabled = true));
         const note = document.createElement("p");
         note.className = "permission-timeout-note";
@@ -1417,7 +1602,11 @@
       const pct = Math.min(100, Math.round((lastInputTokens / max) * 100));
       contextText.textContent = `${pretty(lastInputTokens)} / ${pretty(max)} (${pct}%)`;
       contextFill.style.width = pct + "%";
-      contextFill.style.background = pct > 85 ? "#d96868" : pct > 70 ? "#d8a657" : "var(--accent)";
+      // Threshold colour driven by class so we can drop 'unsafe-inline' from
+      // style-src once every other inline style is gone too. Width can stay
+      // inline (it's a numeric percentage, can't be classed cleanly).
+      contextFill.classList.toggle("ctx-warn", pct > 70 && pct <= 85);
+      contextFill.classList.toggle("ctx-danger", pct > 85);
       let crossed = 0;
       if (pct >= 95) crossed = 95;
       else if (pct >= 80) crossed = 80;
@@ -1457,6 +1646,7 @@
     card.setAttribute("role", "alertdialog");
     card.setAttribute("aria-modal", "false"); // inline, not a screen-blocking modal
     if (req.id) card.dataset.requestId = req.id;
+    card.dataset.state = "pending";
 
     // h3 (not div) so NVDA's H-key heading navigation finds the card —
     // a permission prompt is the most urgent thing on screen, it should
@@ -1587,30 +1777,50 @@
   }
 
   async function decide(requestId, decision, card) {
+    // State machine: pending → deciding → (resolved | timed_out).
+    // A second click while a fetch is in flight, or an Esc keypress while
+    // the click is mid-POST, would otherwise issue a duplicate decision.
+    // Once timed_out arrives, the card is locked even if a request fails.
+    if (!card || card.dataset.state === "deciding" || card.dataset.state === "timed_out" || card.dataset.state === "resolved") {
+      return;
+    }
+    card.dataset.state = "deciding";
     card.querySelectorAll("button").forEach((b) => (b.disabled = true));
     try {
       const fd = new FormData();
       fd.append("decision", decision);
-      const r = await fetch(`/api/permission/${requestId}`, { method: "POST", body: fd });
+      const r = await fetch(
+        `/api/permission/${encodeURIComponent(requestId)}`,
+        { method: "POST", body: fd },
+      );
       if (!r.ok) throw new Error("HTTP " + r.status);
-      // Replace card with a compact record of the decision.
+      card.dataset.state = "resolved";
+      // Replace card with a compact record of the decision. Prefer a
+      // semantic summary line (the heading already says "Claude wants to
+      // use {tool}", and the path is in .permission-input-path for
+      // Edit/Write) over the first line of the diff body.
       const summary = document.createElement("article");
       summary.className = "msg permission-resolved";
       const labels = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
-      summary.textContent = `${labels[decision] || decision}: ${card.querySelector(".permission-input").textContent.split("\n")[0]}`;
+      const heading = card.querySelector(".role")?.textContent?.replace(/^Claude wants to use\s+/, "") || "tool";
+      const path = card.querySelector(".permission-input-path")?.textContent?.trim();
+      const firstInput = card.querySelector(".permission-input")?.textContent?.split("\n")[0]?.trim();
+      const detail = path || firstInput || "";
+      summary.textContent = detail
+        ? `${labels[decision] || decision} — ${heading}: ${detail}`
+        : `${labels[decision] || decision} — ${heading}`;
       card.replaceWith(summary);
     } catch (err) {
-      card.querySelectorAll("button").forEach((b) => (b.disabled = false));
+      // Only re-enable if no terminal state arrived during the in-flight
+      // fetch. A late permission_timeout would have flipped state to
+      // "timed_out" — re-enabling there would let the user click an
+      // already-discarded request.
+      if (card.dataset.state === "deciding") {
+        card.dataset.state = "pending";
+        card.querySelectorAll("button").forEach((b) => (b.disabled = false));
+      }
       setStatus("Failed to send decision: " + err.message);
     }
-  }
-
-  function formatToolInput(tool, input) {
-    if (tool === "Bash" && input.command) return "$ " + input.command;
-    if (tool === "Edit" || tool === "Write" || tool === "Read") {
-      return (input.file_path || input.path || "") + (input.old_string ? "\n--- replace ---\n" + truncate(input.old_string, 200) : "");
-    }
-    return JSON.stringify(input, null, 2);
   }
 
   // ─── Tasks panel ────────────────────────────────────────────────────────
@@ -1705,7 +1915,7 @@
       html += `<div class="summary"><em>No rate-limit info captured yet — send one message and reopen.</em></div>`;
     }
 
-    html += `<h3 style="font-size:0.9rem;margin:0.5rem 0 0.25rem">Today</h3>`;
+    html += `<h3 class="usage-section">Today</h3>`;
     html += `<div class="summary">
       <span><strong>${t.turns || 0}</strong> turns</span>
       <span><strong>${cost(t.cost_usd)}</strong></span>
@@ -1720,10 +1930,10 @@
       }
       html += `</tbody></table>`;
     } else {
-      html += `<p style="color:#aaa;font-size:0.9rem">No turns recorded yet today.</p>`;
+      html += `<p class="usage-empty">No turns recorded yet today.</p>`;
     }
 
-    html += `<p style="color:#888;font-size:0.75rem;margin-top:0.75rem">Anthropic doesn't expose plan-level capacity via API. "Today" is what this app has logged since it started.</p>`;
+    html += `<p class="usage-note">Anthropic doesn't expose plan-level capacity via API. "Today" is what this app has logged since it started.</p>`;
     usageBody.innerHTML = html;
   }
 
@@ -2096,7 +2306,16 @@
   const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
   const MAX_IMAGES = 10;
 
+  // Attachment epoch — bumped every time we clear pending attachments. An
+  // in-flight async read (FileReader → data URL for pasted images) carries
+  // the epoch it started under; on completion it only pushes if the epoch
+  // still matches. Without this, a paste-then-Enter sequence finishes the
+  // read AFTER clearAttachments and resurrects the attachment as a ghost
+  // for the next message.
+  let attachmentEpoch = 0;
+
   function clearAttachments() {
+    attachmentEpoch++;
     pendingImages = [];
     pendingFiles = [];
     if (attachmentsEl) {
@@ -2107,6 +2326,10 @@
       fileAttachmentsEl.innerHTML = "";
       fileAttachmentsEl.hidden = true;
     }
+  }
+
+  function attachmentSignature(file) {
+    return `${file.name}:${file.size}:${file.lastModified || 0}:${file.type || ""}`;
   }
 
   function renderAttachments() {
@@ -2167,8 +2390,17 @@
       setStatus(`At most ${MAX_IMAGES} images per message`);
       return;
     }
+    const sig = attachmentSignature(file);
+    if (pendingImages.some((e) => attachmentSignature(e.file) === sig)) {
+      announce(`${file.name} is already attached.`);
+      return;
+    }
+    const epoch = attachmentEpoch;
     try {
       const dataUrl = await readAsDataURL(file);
+      // The user might have submitted (clearing attachments) while the
+      // FileReader was still working. Don't resurrect the attachment.
+      if (epoch !== attachmentEpoch) return;
       pendingImages.push({ file, dataUrl });
       renderAttachments();
       announce(`Attached ${file.name}.`);
@@ -2258,6 +2490,11 @@
       setStatus(`At most ${MAX_FILES} files per message`);
       return;
     }
+    const sig = attachmentSignature(file);
+    if (pendingFiles.some((e) => attachmentSignature(e.file) === sig)) {
+      announce(`${file.name} is already attached.`);
+      return;
+    }
     pendingFiles.push({ file });
     renderFileAttachments();
     announce(`Attached ${file.name}.`);
@@ -2281,19 +2518,30 @@
   });
 
   // Drop zone covers the whole prompt region so the user doesn't have to
-  // aim. Visual feedback via a class on the <main>.
+  // aim. Visual feedback via a class on the <main>. dragenter / dragleave
+  // fire on every child element, so naively toggling the class would
+  // flicker off as the cursor passes over a button or chip. Counter the
+  // events instead — only remove the class when the leave count returns
+  // to zero (cursor truly outside the prompt region).
   const dropTarget = document.querySelector(".prompt-region") || document.body;
-  ["dragenter", "dragover"].forEach((ev) => {
-    dropTarget.addEventListener(ev, (e) => {
-      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
-      e.preventDefault();
-      dropTarget.classList.add("dragging");
-    });
+  let dragDepth = 0;
+  dropTarget.addEventListener("dragenter", (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+    dragDepth++;
+    dropTarget.classList.add("dragging");
   });
-  ["dragleave", "drop"].forEach((ev) => {
-    dropTarget.addEventListener(ev, () => dropTarget.classList.remove("dragging"));
+  dropTarget.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+    e.preventDefault();
+  });
+  dropTarget.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropTarget.classList.remove("dragging");
   });
   dropTarget.addEventListener("drop", async (e) => {
+    dragDepth = 0;
+    dropTarget.classList.remove("dragging");
     if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
     e.preventDefault();
     for (const f of e.dataTransfer.files) {
@@ -2425,11 +2673,14 @@
       row.type = "button";
       row.className = "slash-item";
       // Stable id per option so aria-activedescendant on the textarea can
-      // point screen readers to the highlighted choice.
+      // point screen readers to the highlighted choice. tabindex=-1 so Tab
+      // doesn't dive into the menu — focus stays on the textarea and the
+      // listbox is driven by aria-activedescendant.
       row.id = `slash-option-${i}`;
       row.dataset.index = String(i);
       row.setAttribute("role", "option");
       row.setAttribute("aria-selected", "false");
+      row.tabIndex = -1;
       const name = document.createElement("span");
       name.className = "slash-name";
       name.textContent = "/" + cmd.name;
