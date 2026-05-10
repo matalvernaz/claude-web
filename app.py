@@ -2021,6 +2021,18 @@ async def api_chat(
         run_id = str(uuid_mod.uuid4())
         run = ActiveRun(run_id, owner_sub=user.get("sub"))
         run.project_key = _sanitize_project_key(cwd)
+        # Multi-user ownership check before any upload work.
+        if session_id and PER_USER_SESSIONS:
+            owner = _session_owner(session_id)
+            if owner is not None and owner != user.get("sub"):
+                raise HTTPException(403, "not your session")
+        # Save uploads inside the session lock so upload validation failures
+        # never leave an orphan ActiveRun pinned in ACTIVE_RUNS_BY_SESSION.
+        # If we registered first and then awaited the upload, a concurrent
+        # request for the same session could find the orphan, queue input
+        # into its (driver-less) queue, and report success while the message
+        # silently disappears when the original request raises.
+        file_metas = await _save_uploaded_files(files, run_id)
         ACTIVE_RUNS[run_id] = run
         if session_id:
             # Eager-claim the session id so a concurrent POST sees this run
@@ -2029,30 +2041,10 @@ async def api_chat(
             # usually the same value but the resume protocol allows new ids.
             run.session_id = session_id
             ACTIVE_RUNS_BY_SESSION[session_id] = run
-            # In multi-user mode, refuse to resume someone else's session.
-            if PER_USER_SESSIONS:
-                owner = _session_owner(session_id)
-                if owner is not None and owner != user.get("sub"):
-                    ACTIVE_RUNS_BY_SESSION.pop(session_id, None)
-                    ACTIVE_RUNS.pop(run_id, None)
-                    raise HTTPException(403, "not your session")
             _claim_session_owner(session_id, user.get("sub"), run.project_key)
     finally:
         if sess_lock:
             sess_lock.release()
-    # Save uploads BEFORE emitting run_started — if the upload validation
-    # rejects the request, we mustn't leave an orphan run pinned in
-    # ACTIVE_RUNS / ACTIVE_RUNS_BY_SESSION with no driver task. A future
-    # /api/chat for the same session_id would otherwise hit the orphan and
-    # queue messages into a dead queue forever. On any failure here we
-    # remove the run from both registries and re-raise the original error.
-    try:
-        file_metas = await _save_uploaded_files(files, run_id)
-    except Exception:
-        ACTIVE_RUNS.pop(run_id, None)
-        if session_id and ACTIVE_RUNS_BY_SESSION.get(session_id) is run:
-            ACTIVE_RUNS_BY_SESSION.pop(session_id, None)
-        raise
     effective_message = _file_attachment_prefix(file_metas) + message
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only

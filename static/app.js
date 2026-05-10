@@ -257,8 +257,11 @@
       const r = await fetch("/api/usage");
       if (!r.ok) return;
       const data = await r.json();
-      const cost = (data.today && data.today.cost_usd) || 0;
-      headerCostEl.textContent = "$" + cost.toFixed(4);
+      const raw = data.today && data.today.cost_usd;
+      const cost = Number(raw);
+      if (Number.isFinite(cost)) {
+        headerCostEl.textContent = "$" + cost.toFixed(4);
+      }
     } catch { /* ignore */ }
   }
 
@@ -693,6 +696,9 @@
     currentAbort = null;
     currentRunId = null;
     safeRemove(sessionStorage, RUN_KEY);
+    // Bump the stream generation so any tail events still in flight from
+    // the aborted stream are dropped by handleSSEEvent's gen guard.
+    streamGeneration++;
     lastInputTokens = null;
     lastContextThresholdAnnounced = 0;
     if (contextMeter) contextMeter.hidden = true;
@@ -1354,6 +1360,7 @@
       ctx.currentAssistantBody = null;
       announce(`Permission needed for ${obj.tool}.`);
       renderPermissionCard(obj);
+      markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from
       // the start so we don't miss anything. tryResume's reconnect path
@@ -1403,6 +1410,7 @@
         : `Permission request for ${obj.tool || "tool"} timed out.`);
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
+      markVisibleActivity();
     } else if (obj.type === "task_started") {
       renderTaskEvent("started", obj);
     } else if (obj.type === "task_progress") {
