@@ -31,4 +31,4 @@ ENV CLAUDE_HOME=/home/claude/.claude \
     CLAUDE_PROJECT_DIR=/workspace
 
 EXPOSE 3001
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3001"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3001", "--proxy-headers", "--forwarded-allow-ips=*"]
