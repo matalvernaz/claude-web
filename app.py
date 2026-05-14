@@ -114,6 +114,19 @@ UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 # homelab keeps working as before.
 PER_USER_SESSIONS = os.getenv("CLAUDE_WEB_PER_USER_SESSIONS", "").lower() in ("1", "true", "yes")
 
+# Per-user "personal account" support. Each logged-in user can register their
+# own Claude credentials and toggle between the shared (default) account and
+# their personal one. Personal credentials live in PERSONAL_HOMES_DIR/<sub>/
+# as a directory that's mostly symlinks back to CLAUDE_HOME, with .credentials.json
+# as the only real file — so transcripts/sessions/skills all stay shared and
+# switching mid-chat is seamless. The slot identifiers in code are 'shared' and
+# 'personal' (never 'office'); display labels come from SHARED_ACCOUNT_LABEL
+# below and the per-user personal_label column in user_account.
+PERSONAL_HOMES_DIR = Path(os.getenv(
+    "CLAUDE_WEB_PERSONAL_HOMES_DIR", str(Path.home() / ".claude-homes")
+)).resolve()
+SHARED_ACCOUNT_LABEL = os.getenv("CLAUDE_WEB_SHARED_ACCOUNT_LABEL", "Shared").strip() or "Shared"
+
 # Comma-separated email allowlist for the destructive /setup endpoints
 # (apikey replacement, sign-Claude-out, OAuth re-flow). Only enforced in
 # PER_USER_SESSIONS mode — the single-user default trusts whoever logs in.
@@ -877,6 +890,17 @@ def _state_db() -> sqlite3.Connection:
             project_key TEXT,
             created_at REAL NOT NULL
         )""")
+        # Per-user account preference: which credential slot ('shared' or
+        # 'personal') the user's next run should authenticate as, and whether
+        # they've actually registered personal credentials. personal_label is
+        # an optional user-facing name for their personal account.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_account (
+            user_sub TEXT PRIMARY KEY,
+            active TEXT NOT NULL CHECK(active IN ('shared','personal')) DEFAULT 'shared',
+            has_personal INTEGER NOT NULL DEFAULT 0,
+            personal_label TEXT,
+            updated_at REAL NOT NULL
+        )""")
         _STATE_DB = conn
     return _STATE_DB
 
@@ -905,6 +929,65 @@ def _session_owner(session_id: str) -> Optional[str]:
     except sqlite3.Error:
         return None
     return row[0] if row else None
+
+
+def _user_account(user_sub: Optional[str]) -> dict:
+    """Return {active, has_personal, personal_label} for a user.
+
+    Defaults to the shared slot for users who've never touched the toggle
+    or who aren't logged in (AUTH_MODE=none → sub='anonymous').
+    """
+    default = {"active": "shared", "has_personal": False, "personal_label": None}
+    if not user_sub:
+        return default
+    try:
+        row = _state_db().execute(
+            "SELECT active, has_personal, personal_label FROM user_account WHERE user_sub = ?",
+            (user_sub,),
+        ).fetchone()
+    except sqlite3.Error:
+        return default
+    if not row:
+        return default
+    return {
+        "active": row[0],
+        "has_personal": bool(row[1]),
+        "personal_label": row[2],
+    }
+
+
+def _set_user_active(user_sub: str, active: str) -> None:
+    """Flip a user's active slot. Caller must validate active ∈ {'shared','personal'}."""
+    if active not in ("shared", "personal"):
+        raise ValueError(f"invalid active slot: {active!r}")
+    try:
+        _state_db().execute(
+            """INSERT INTO user_account(user_sub, active, has_personal, personal_label, updated_at)
+               VALUES(?, ?, 0, NULL, ?)
+               ON CONFLICT(user_sub) DO UPDATE SET
+                   active=excluded.active,
+                   updated_at=excluded.updated_at""",
+            (user_sub, active, time.time()),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("set_user_active failed: %s", e)
+
+
+def _mark_personal_registered(user_sub: str, label: Optional[str] = None) -> None:
+    """Record that a user has provisioned personal credentials. Idempotent;
+    setting label to None leaves any existing label intact."""
+    try:
+        _state_db().execute(
+            """INSERT INTO user_account(user_sub, active, has_personal, personal_label, updated_at)
+               VALUES(?, 'shared', 1, ?, ?)
+               ON CONFLICT(user_sub) DO UPDATE SET
+                   has_personal=1,
+                   personal_label=COALESCE(excluded.personal_label, user_account.personal_label),
+                   updated_at=excluded.updated_at""",
+            (user_sub, label, time.time()),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("mark_personal_registered failed: %s", e)
 
 
 def _user_can_see_session(session_id: str, user: dict) -> bool:
