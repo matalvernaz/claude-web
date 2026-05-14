@@ -1871,8 +1871,12 @@ async def api_permission(
 
 
 def _account_payload(user: dict) -> dict:
-    state = _user_account((user or {}).get("sub"))
+    sub = (user or {}).get("sub")
+    state = _user_account(sub)
     return {
+        # The OIDC subject — surfaced here so a user can copy/paste it to
+        # an admin for scripts/add-personal without having to inspect cookies.
+        "user_sub": sub,
         "active": state["active"],
         "has_personal": state["has_personal"],
         "personal_label": state["personal_label"] or "My account",

@@ -116,6 +116,26 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 
 `AUTH_MODE=none` + `PER_USER_SESSIONS=true` is refused at startup (every visitor would share `sub="anonymous"`, breaking isolation entirely).
 
+### Per-user accounts
+
+By default every signed-in user authenticates as the deployment-wide *shared* Claude account whose credentials sit in `$CLAUDE_HOME/.credentials.json`. Optionally, each user can register their own *personal* Claude account and flip between the two from a `<select>` in the header.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_PERSONAL_HOMES_DIR` | `$HOME/.claude-homes` | Where per-user personal `CLAUDE_CONFIG_DIR` directories are created. Bind-mount this in your compose so personal credentials survive container rebuilds (`./claude-homes:/home/claude/.claude-homes`). |
+| `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` | `Shared` | Display name for the shared slot in the UI. Set this per deployment, e.g. `Office`, `Team`, `Workspace`. |
+
+Per-user homes are mostly symlinks back to `CLAUDE_HOME`, with only `.credentials.json` as a real per-user file. That means `projects/`, `sessions/`, `settings.json`, `skills/`, `commands/`, etc. all stay shared — the chat transcript JSONL for a session is the same file regardless of which slot is active, so toggling between accounts mid-conversation does not break or split the user's history.
+
+To register a personal account for a user (admin task — needs shell access to the host):
+
+```bash
+# Run on whatever host the claude-web container lives on.
+./scripts/add-personal --sub <oidc-sub> [--label "<display name>"]
+```
+
+This drops the user into an interactive `claude /login` against their personal directory, then flips `has_personal=1` so the toggle becomes available in their UI. The user can find their `<oidc-sub>` by signing in and reading `GET /api/account` (or any field of their session — the `sub` is the OIDC subject identifier from your IdP).
+
 ### Setup-flow lock
 
 | Variable | Default | Notes |
