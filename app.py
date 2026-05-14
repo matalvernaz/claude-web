@@ -2535,7 +2535,7 @@ async def api_chat(
                                 # closed. Nothing more will arrive; exit.
                                 break
                             run.last_activity = time.time()
-                            for evt in _sdk_message_to_events(msg):
+                            for evt in _sdk_message_to_events(msg, run):
                                 # emit() also keeps ACTIVE_RUNS_BY_SESSION in
                                 # sync whenever an init event reveals (or
                                 # changes) the SDK session id, so follow-up
@@ -2723,7 +2723,7 @@ async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
     return {"ok": True}
 
 
-def _sdk_message_to_events(msg) -> list[dict]:
+def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
     """Translate one SDK message into one or more SSE-payload dicts.
 
     The frontend already knows how to render text / tool_use / tool_result /
@@ -2816,7 +2816,11 @@ def _sdk_message_to_events(msg) -> list[dict]:
             "tool_use_id": msg.tool_use_id,
         }]
     if isinstance(msg, ResultMessage):
-        _log_usage(msg)
+        _log_usage(
+            msg,
+            account_slot=(run.account_slot if run is not None else "shared"),
+            owner_sub=(run.owner_sub if run is not None else None),
+        )
         usage = msg.usage or {}
         return [{
             "type": "result",
@@ -2859,8 +2863,14 @@ def _save_rate_limit(rli: dict) -> None:
         log.exception("save_rate_limit failed")
 
 
-def _log_usage(msg) -> None:
-    """Append one row per completed turn to usage.jsonl."""
+def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = None) -> None:
+    """Append one row per completed turn to usage.jsonl.
+
+    ``account_slot`` records which credential slot this turn authenticated as
+    ('shared' or 'personal'), and ``owner_sub`` records which logged-in user
+    spawned the run. Both are written so /api/usage can break out personal
+    spend per user from the deployment-wide shared spend.
+    """
     usage = getattr(msg, "usage", None) or {}
     row = {
         "ts": int(time.time()),
@@ -2872,6 +2882,8 @@ def _log_usage(msg) -> None:
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
         "is_error": msg.is_error,
+        "account_slot": account_slot,
+        "owner_sub": owner_sub,
     }
     try:
         with USAGE_LOG.open("a") as f:
@@ -2901,11 +2913,11 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     by_session: dict[str, dict] = {}
     for r in today_rows:
         sid = r.get("session_id") or "?"
-        slot = by_session.setdefault(sid, {"turns": 0, "cost": 0.0, "input": 0, "output": 0})
-        slot["turns"] += 1
-        slot["cost"] += float(r.get("total_cost_usd") or 0.0)
-        slot["input"] += int(r.get("input_tokens") or 0)
-        slot["output"] += int(r.get("output_tokens") or 0)
+        agg = by_session.setdefault(sid, {"turns": 0, "cost": 0.0, "input": 0, "output": 0})
+        agg["turns"] += 1
+        agg["cost"] += float(r.get("total_cost_usd") or 0.0)
+        agg["input"] += int(r.get("input_tokens") or 0)
+        agg["output"] += int(r.get("output_tokens") or 0)
 
     sessions = []
     for sid, s in sorted(by_session.items(), key=lambda kv: kv[1]["cost"], reverse=True):
@@ -2922,6 +2934,29 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     total_input = sum(s["input_tokens"] for s in sessions)
     total_output = sum(s["output_tokens"] for s in sessions)
 
+    # Slot breakdown: shared is deployment-wide (everyone shares one bill);
+    # personal is filtered to the current user so each user sees only their
+    # own spend on their own credentials. Rows from before the slot-tagging
+    # change (missing account_slot) are treated as 'shared'.
+    user_sub = user.get("sub")
+    slot_totals = {
+        "shared": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+        "personal": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+    }
+    for r in today_rows:
+        slot = r.get("account_slot") or "shared"
+        if slot not in slot_totals:
+            continue
+        if slot == "personal" and r.get("owner_sub") != user_sub:
+            continue
+        bucket = slot_totals[slot]
+        bucket["turns"] += 1
+        bucket["cost_usd"] += float(r.get("total_cost_usd") or 0.0)
+        bucket["input_tokens"] += int(r.get("input_tokens") or 0)
+        bucket["output_tokens"] += int(r.get("output_tokens") or 0)
+    for bucket in slot_totals.values():
+        bucket["cost_usd"] = round(bucket["cost_usd"], 4)
+
     rate_limit = None
     try:
         if RATE_LIMIT_CACHE.exists():
@@ -2936,6 +2971,7 @@ async def api_usage(user: dict = Depends(auth.require_user)):
             "input_tokens": total_input,
             "output_tokens": total_output,
             "sessions": sessions[:20],
+            "by_slot": slot_totals,
         },
         "rate_limit": rate_limit,
     }
