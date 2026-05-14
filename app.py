@@ -990,6 +990,82 @@ def _mark_personal_registered(user_sub: str, label: Optional[str] = None) -> Non
         logging.getLogger("claude-web").warning("mark_personal_registered failed: %s", e)
 
 
+def _safe_sub(user_sub: str) -> str:
+    """Sanitise an OIDC subject for use as a directory name. Subs are
+    typically opaque UUIDs but we don't trust the IdP to keep them out of
+    `/` / `..` territory."""
+    sanitised = re.sub(r"[^A-Za-z0-9_-]", "_", user_sub or "")[:64]
+    return sanitised or "anonymous"
+
+
+def _personal_home_path(user_sub: str) -> Path:
+    return PERSONAL_HOMES_DIR / _safe_sub(user_sub)
+
+
+def _ensure_personal_home(user_sub: str) -> Path:
+    """Create or refresh the per-user CLAUDE_CONFIG_DIR.
+
+    The personal home is a directory that mirrors CLAUDE_HOME via symlinks,
+    *except* for .credentials.json which is the user's real (personal)
+    credential file. The symlinks mean projects/, sessions/, settings.json,
+    skills/, etc. all resolve back to the shared home — so a user's
+    transcript history is identical regardless of which slot is active and
+    switching between slots mid-conversation does not move the JSONL file
+    the CLI is appending to.
+
+    Idempotent. Existing entries are never overwritten, so the user's
+    real .credentials.json is safe.
+    """
+    home = _personal_home_path(user_sub)
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        entries = list(CLAUDE_HOME.iterdir())
+    except FileNotFoundError:
+        return home
+    for entry in entries:
+        # Never symlink the credentials file — it must be a real per-user
+        # file or the personal slot would auth as the shared account.
+        if entry.name == ".credentials.json":
+            continue
+        link = home / entry.name
+        # is_symlink() guards the "broken symlink pointing into the shared
+        # home" case where exists() returns False but the link is set up.
+        if link.is_symlink() or link.exists():
+            continue
+        try:
+            link.symlink_to(entry.resolve())
+        except OSError as e:
+            logging.getLogger("claude-web").warning(
+                "personal-home symlink %s → %s failed: %s", link, entry, e
+            )
+    return home
+
+
+def _resolve_account_for_run(user: dict) -> dict:
+    """Pick the credential slot for the user's next run.
+
+    Returns ``{"slot": "shared"|"personal", "env": dict[str,str], "label": str}``.
+    ``env`` is empty for shared (CLAUDE_HOME wins naturally) and carries
+    CLAUDE_CONFIG_DIR for personal. If the user is marked has_personal but
+    their .credentials.json is missing, falls back to shared rather than
+    spawning a CLI that would crash on first API call.
+    """
+    sub = (user or {}).get("sub")
+    state = _user_account(sub)
+    if state["active"] == "personal" and state["has_personal"] and sub:
+        home = _ensure_personal_home(sub)
+        if (home / ".credentials.json").exists():
+            return {
+                "slot": "personal",
+                "env": {"CLAUDE_CONFIG_DIR": str(home)},
+                "label": state["personal_label"] or "My account",
+            }
+        logging.getLogger("claude-web").warning(
+            "personal creds missing for sub=%s; falling back to shared", sub
+        )
+    return {"slot": "shared", "env": {}, "label": SHARED_ACCOUNT_LABEL}
+
+
 def _user_can_see_session(session_id: str, user: dict) -> bool:
     """In PER_USER_SESSIONS mode, hide other users' sessions. Sessions with
     no recorded owner (host-shell `claude` ones, pre-feature ones) stay
@@ -1213,9 +1289,15 @@ class ActiveRun:
     reconnecting browser replay-then-tail.
     """
 
-    def __init__(self, run_id: str, owner_sub: Optional[str] = None):
+    def __init__(self, run_id: str, owner_sub: Optional[str] = None,
+                 account_slot: str = "shared"):
         self.run_id = run_id
         self.owner_sub = owner_sub
+        # Which credential slot this run's CLI subprocess was spawned with.
+        # The CLI reads .credentials.json once at startup, so we can't change
+        # the auth identity mid-run — api_chat compares this against the
+        # user's current toggle and respawns the run when they differ.
+        self.account_slot = account_slot
         self.events: list[dict] = []
         self.subscribers: set[asyncio.Queue] = set()
         self.done = False
@@ -2072,8 +2154,28 @@ async def api_chat(
     sess_lock = _session_lock(session_id) if session_id else None
     if sess_lock:
         await sess_lock.acquire()
+    # Resolve the credential slot once per request. Used both to decide
+    # whether to reuse an existing run (whose CLI was spawned with possibly
+    # different creds) and to pass into the SDK on fresh spawns.
+    account = _resolve_account_for_run(user)
+
     try:
         existing = _existing_run_for_session(session_id) if session_id else None
+        if existing is not None and existing.account_slot != account["slot"]:
+            # User toggled their account between turns. The CLI subprocess
+            # bound its credentials at startup, so we can't just keep using
+            # it; cancel the driver and fall through to spawning a fresh run
+            # with `resume=session_id`. The session JSONL is in the shared
+            # projects/ directory (personal home symlinks back to it), so
+            # the conversation continues unbroken from the new CLI.
+            log.info(
+                "account-toggle respawn session=%s run=%s %s→%s",
+                session_id, existing.run_id, existing.account_slot, account["slot"],
+            )
+            _require_owner(existing, user)
+            if existing.task and not existing.task.done():
+                existing.task.cancel()
+            existing = None
         if existing is not None:
             _require_owner(existing, user)
             file_metas = await _save_uploaded_files(files, existing.run_id)
@@ -2104,7 +2206,7 @@ async def api_chat(
 
         sid_in = session_id or None
         run_id = str(uuid_mod.uuid4())
-        run = ActiveRun(run_id, owner_sub=user.get("sub"))
+        run = ActiveRun(run_id, owner_sub=user.get("sub"), account_slot=account["slot"])
         run.project_key = _sanitize_project_key(cwd)
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
@@ -2256,6 +2358,11 @@ async def api_chat(
         # only set this when the picked variant actually wants it (currently
         # only Opus 4.7's 1M-context option).
         options_kwargs["betas"] = sdk_betas
+    if account["env"]:
+        # CLAUDE_CONFIG_DIR points the spawned CLI at the user's per-user
+        # home (mostly symlinks to CLAUDE_HOME, real .credentials.json) so
+        # this run authenticates as their personal account.
+        options_kwargs["env"] = account["env"]
     options = ClaudeAgentOptions(**options_kwargs)
 
     async def _send_user_message(client: ClaudeSDKClient, text: str, blocks: list[dict]) -> None:
