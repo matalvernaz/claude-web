@@ -1603,6 +1603,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
                 for m in KNOWN_MODELS
             ]),
             "multi_project": len(PROJECTS) > 1,
+            "account": _account_payload(user),
         }
     )
     # Don't cache the HTML — sidebar contents are time-sensitive.
@@ -1867,6 +1868,40 @@ async def api_permission(
         raise HTTPException(400, "bad decision")
     fut.set_result({"decision": decision})
     return {"ok": True}
+
+
+def _account_payload(user: dict) -> dict:
+    state = _user_account((user or {}).get("sub"))
+    return {
+        "active": state["active"],
+        "has_personal": state["has_personal"],
+        "personal_label": state["personal_label"] or "My account",
+        "shared_label": SHARED_ACCOUNT_LABEL,
+    }
+
+
+@app.get("/api/account")
+async def api_account_get(user: dict = Depends(auth.require_user)):
+    return _account_payload(user)
+
+
+@app.post("/api/account/active")
+async def api_account_set_active(
+    active: str = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    if active not in ("shared", "personal"):
+        raise HTTPException(400, "invalid slot")
+    if active == "personal" and not _user_account(sub)["has_personal"]:
+        # Refuse to flip to personal when no credentials exist — the spawn
+        # path would just fall back to shared anyway, which would confuse
+        # the toggle UI.
+        raise HTTPException(400, "no personal credentials registered")
+    _set_user_active(sub, active)
+    return _account_payload(user)
 
 
 def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:

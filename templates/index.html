@@ -25,6 +25,17 @@
           {% endfor %}
         </select>
       </label>
+      <label class="header-select" for="account-select">
+        <span class="sr-only">Account</span>
+        <select id="account-select" aria-label="Account">
+          <option value="shared" {% if account.active == 'shared' %}selected{% endif %}>{{ account.shared_label }}</option>
+          {% if account.has_personal %}
+            <option value="personal" {% if account.active == 'personal' %}selected{% endif %}>{{ account.personal_label }}</option>
+          {% else %}
+            <option value="personal" disabled>{{ account.personal_label }} (not set up)</option>
+          {% endif %}
+        </select>
+      </label>
       {% if multi_project %}
         <label class="header-select" for="project-select">
           <span class="sr-only">Project</span>

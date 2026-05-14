@@ -224,6 +224,41 @@
     });
   }
 
+  // Account slot toggle (shared vs personal credentials). The server stores
+  // the preference per OIDC user; switching here POSTs that change. The
+  // next /api/chat call notices the new slot and respawns the CLI with the
+  // right CLAUDE_CONFIG_DIR — a turn already in flight keeps using the old
+  // slot since its CLI subprocess loaded its credentials at startup.
+  const accountSelect = document.getElementById("account-select");
+  if (accountSelect) {
+    let lastAccount = accountSelect.value;
+    accountSelect.addEventListener("change", async () => {
+      const target = accountSelect.value;
+      if (target === lastAccount) return;
+      try {
+        const fd = new FormData();
+        fd.append("active", target);
+        const r = await fetch("/api/account/active", { method: "POST", body: fd });
+        if (!r.ok) {
+          let detail = `HTTP ${r.status}`;
+          try {
+            const body = await r.json();
+            if (body && body.detail) detail = body.detail;
+          } catch (_) {}
+          throw new Error(detail);
+        }
+        lastAccount = target;
+        if (announcer) {
+          const label = accountSelect.options[accountSelect.selectedIndex]?.text || target;
+          announcer.textContent = `Account switched to ${label}. Takes effect on your next message.`;
+        }
+      } catch (err) {
+        accountSelect.value = lastAccount;
+        if (announcer) announcer.textContent = `Could not switch account: ${err.message}`;
+      }
+    });
+  }
+
   function currentProject() {
     if (sessionProject) return sessionProject;
     return projectSelect ? projectSelect.value : "";
