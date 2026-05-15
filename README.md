@@ -67,8 +67,12 @@ After=network-online.target
 Type=simple
 User=claude
 WorkingDirectory=/opt/claude-web
+Environment=HOME=/home/claude
+# Systemd strips PATH to a minimal default that won't include ~/.local/bin
+# (where `npm install -g` places the claude binary). Include it explicitly.
+Environment=PATH=/home/claude/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/opt/claude-web/.env
-ExecStart=/opt/claude-web/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3001
+ExecStart=/opt/claude-web/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3001 --proxy-headers --forwarded-allow-ips=*
 Restart=on-failure
 
 [Install]
