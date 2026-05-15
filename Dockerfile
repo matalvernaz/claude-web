@@ -20,7 +20,6 @@ RUN pip install -r requirements.txt
 COPY app.py auth.py setup_flow.py ./
 COPY static ./static
 COPY templates ./templates
-COPY scripts ./scripts
 
 # UID/GID match the most common LinuxServer.io / docker-compose convention.
 # Override at runtime if your mounted dirs need different ownership.
