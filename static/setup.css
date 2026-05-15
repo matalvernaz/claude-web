@@ -121,3 +121,65 @@ details.setup-apikey > summary:focus {
   border-radius: 4px;
   font-size: 0.85rem;
 }
+
+/* /account page — per-user credential list. */
+.cred-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.cred-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+.cred-item.cred-shared {
+  background: var(--bg-alt);
+}
+
+.cred-label {
+  font-weight: 600;
+  flex: 1 1 auto;
+}
+
+.cred-meta {
+  font-size: 0.9rem;
+  color: var(--fg-muted, var(--fg));
+}
+
+.cred-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.cred-actions button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.7rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.cred-actions button:hover:not(:disabled),
+.cred-actions button:focus:not(:disabled) {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.cred-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

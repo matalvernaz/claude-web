@@ -224,11 +224,12 @@
     });
   }
 
-  // Account slot toggle (shared vs personal credentials). The server stores
-  // the preference per OIDC user; switching here POSTs that change. The
-  // next /api/chat call notices the new slot and respawns the CLI with the
-  // right CLAUDE_CONFIG_DIR — a turn already in flight keeps using the old
-  // slot since its CLI subprocess loaded its credentials at startup.
+  // Account slot toggle (shared vs one of the user's personal credentials).
+  // The select value is "shared" or "cred:<id>". The server stores the
+  // preference per OIDC user; switching here POSTs that change. The next
+  // /api/chat call notices the new slot and respawns the CLI with the right
+  // CLAUDE_CONFIG_DIR — a turn already in flight keeps using the old slot
+  // since its CLI subprocess loaded its credentials at startup.
   const accountSelect = document.getElementById("account-select");
   if (accountSelect) {
     let lastAccount = accountSelect.value;

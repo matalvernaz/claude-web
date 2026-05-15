@@ -1,9 +1,9 @@
 services:
   claude-web:
-    # Build from source (recommended until images are published):
-    build: .
-    # Or, once image hosting is set up:
-    # image: ghcr.io/matalvernaz/claude-web:latest
+    # Pull the published image from GHCR (recommended):
+    image: ghcr.io/matalvernaz/claude-web:latest
+    # Or build from source if you're hacking on this checkout:
+    # build: .
     container_name: claude-web
     restart: unless-stopped
     env_file: .env
@@ -18,12 +18,13 @@ services:
       - ./claude-home:/home/claude/.claude
       # claude-web's own state: usage log, persisted runs/events, uploads.
       - ./claude-web-state:/home/claude/.claude-web
-      # Per-user personal-account credentials. Each logged-in user that
-      # registers a personal Claude account via scripts/add-personal gets a
-      # subdirectory here with their own .credentials.json — everything else
-      # in the directory is a symlink back to the shared claude-home so
-      # transcripts/sessions stay shared across slot toggles. Omit this
-      # mount if you don't need per-user accounts.
+      # Per-user personal-account credentials. Each signed-in user can add
+      # their own labeled Claude accounts via the /account page; each one
+      # gets a subdirectory here keyed by user-sub and credential id, with
+      # its own .credentials.json. Everything else in the directory is a
+      # symlink back to the shared claude-home so transcripts/sessions stay
+      # shared across slot toggles. Omit this mount if you don't need
+      # per-user accounts.
       - ./claude-homes:/home/claude/.claude-homes
     # Bind to localhost only — your reverse proxy (Traefik / nginx / Caddy /
     # oauth2-proxy) terminates TLS and forwards to this port. If you're not

@@ -1,7 +1,6 @@
-"""Interactive setup for the in-container Claude Code authentication.
+"""Interactive setup for in-container Claude Code authentication.
 
-Until the bundled `claude` CLI has credentials, the main UI redirects to
-/setup. Two flows are supported:
+Two flows are supported:
 
   * **subscription** — drives `claude auth login` (Claude.ai) or
     `claude auth login --console` (Anthropic Console) as a subprocess.
@@ -9,12 +8,15 @@ Until the bundled `claude` CLI has credentials, the main UI redirects to
     blocks on stdin reading "Paste code here if prompted > ". We scrape
     the URL, surface it to the browser, and pipe the user's pasted code
     back into stdin to complete the exchange.
-  * **api_key** — the user pastes an Anthropic API key. We persist it to
-    ``$CLAUDE_WEB_STATE_DIR/anthropic_api_key`` (mode 0600) and load it
-    into ``ANTHROPIC_API_KEY`` at app startup so the CLI/SDK pick it up.
+  * **api_key** — the user pastes an Anthropic API key. We persist it
+    inside the target home (``.anthropic_api_key`` next to the OAuth
+    credentials) so each credential slot is self-contained.
 
-Detection (``is_configured``) is the union of both: a credentials file
-written by ``claude auth login``, an env var, or our persisted key file.
+Multiple flows can be in flight at once, keyed by a caller-chosen string
+("shared" for the in-container CLI's default home, "cred:<sub>:<id>"
+for a per-user credential). Each flow targets its own
+``CLAUDE_CONFIG_DIR`` so a user setting up their personal account never
+trips the shared in-container CLI sign-in, and vice versa.
 """
 from __future__ import annotations
 
@@ -32,7 +34,10 @@ log = logging.getLogger(__name__)
 
 CLAUDE_HOME = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).resolve()
 STATE_DIR = Path(os.getenv("CLAUDE_WEB_STATE_DIR", str(Path.home() / ".claude-web"))).resolve()
+# Legacy shared-slot API key location. Still read for back-compat; new keys
+# go into <home>/.anthropic_api_key so each slot is self-contained.
 API_KEY_FILE = STATE_DIR / "anthropic_api_key"
+SHARED_FLOW_KEY = "shared"
 
 # `claude auth login` prints the URL on its own line. Match the first
 # https:// run of non-whitespace, which is correct because the URL has no
@@ -50,53 +55,62 @@ CODE_TIMEOUT_SECONDS = 600
 EXCHANGE_TIMEOUT_SECONDS = 60
 
 
-def credentials_path() -> Path:
-    return CLAUDE_HOME / ".credentials.json"
+def credentials_path(home: Optional[Path] = None) -> Path:
+    return (home or CLAUDE_HOME) / ".credentials.json"
+
+
+def api_key_path(home: Optional[Path] = None) -> Path:
+    """Per-home Anthropic API key file. The shared slot also keeps a
+    legacy copy at ``STATE_DIR/anthropic_api_key`` so existing deployments
+    keep working after upgrade."""
+    return (home or CLAUDE_HOME) / ".anthropic_api_key"
 
 
 def load_api_key_into_env() -> Optional[str]:
-    """Idempotent: read the persisted key into ``ANTHROPIC_API_KEY`` if set.
+    """Idempotent: read the shared-slot persisted key into
+    ``ANTHROPIC_API_KEY`` if set.
 
     Called once at app startup. An env var passed in at container start
     wins (so users with their own secret manager aren't overridden).
+    Only the shared slot's key feeds ``ANTHROPIC_API_KEY`` — per-user
+    credential slots are loaded on-demand when a run spawns.
     """
     if os.environ.get("ANTHROPIC_API_KEY"):
         return os.environ["ANTHROPIC_API_KEY"]
-    try:
-        key = API_KEY_FILE.read_text().strip()
-    except FileNotFoundError:
-        return None
-    if key:
-        os.environ["ANTHROPIC_API_KEY"] = key
-        return key
+    for candidate in (api_key_path(CLAUDE_HOME), API_KEY_FILE):
+        try:
+            key = candidate.read_text().strip()
+        except FileNotFoundError:
+            continue
+        if key:
+            os.environ["ANTHROPIC_API_KEY"] = key
+            return key
     return None
 
 
-def is_configured() -> bool:
-    """True if the bundled CLI has any usable Claude credential.
+def is_configured(home: Optional[Path] = None) -> bool:
+    """True if the given slot (default: shared) has any usable credential.
 
-    Checked in priority order: live env var, persisted API key file (the env
-    var only gets populated by ``load_api_key_into_env`` during boot — without
-    this branch, a fresh container ships with the file but reports
-    ``unconfigured`` until first request), then OAuth credentials.
+    For the shared slot, the boot-time env var counts as configured (the
+    SDK will pick it up regardless of which home the CLI uses). For
+    per-user homes, only on-disk credentials count.
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
+    if home is None and os.environ.get("ANTHROPIC_API_KEY"):
         return True
-    if API_KEY_FILE.exists():
+    if api_key_path(home).exists():
         return True
-    return credentials_path().exists()
+    if home is None and API_KEY_FILE.exists():
+        return True
+    return credentials_path(home).exists()
 
 
-def whoami() -> dict:
-    """Describe the active credential without leaking the token itself.
-
-    Mirrors ``is_configured``'s priority: the env-var/persisted-key path
-    wins over OAuth, since that's what the SDK will pick up. Used by the
-    /setup page to tell the user what's connected.
-    """
-    if os.environ.get("ANTHROPIC_API_KEY") or API_KEY_FILE.exists():
+def whoami(home: Optional[Path] = None) -> dict:
+    """Describe the slot's credential without leaking the token itself."""
+    if home is None and (os.environ.get("ANTHROPIC_API_KEY") or API_KEY_FILE.exists()):
         return {"mode": "api_key"}
-    cred = credentials_path()
+    if api_key_path(home).exists():
+        return {"mode": "api_key"}
+    cred = credentials_path(home)
     if not cred.exists():
         return {"mode": "none"}
     try:
@@ -111,17 +125,28 @@ def whoami() -> dict:
     }
 
 
-def save_api_key(key: str) -> None:
+def save_api_key(key: str, home: Optional[Path] = None) -> None:
     key = (key or "").strip()
     if not key:
         raise ValueError("api key is empty")
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    API_KEY_FILE.write_text(key)
+    target_home = home or CLAUDE_HOME
+    target_home.mkdir(parents=True, exist_ok=True)
+    path = api_key_path(target_home)
+    path.write_text(key)
     try:
-        API_KEY_FILE.chmod(0o600)
+        path.chmod(0o600)
     except OSError:
         pass
-    os.environ["ANTHROPIC_API_KEY"] = key
+    # Only the shared slot feeds the process-wide env var; per-user keys
+    # are pulled into the spawned CLI's env on demand.
+    if home is None:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        API_KEY_FILE.write_text(key)
+        try:
+            API_KEY_FILE.chmod(0o600)
+        except OSError:
+            pass
+        os.environ["ANTHROPIC_API_KEY"] = key
 
 
 async def _kill_and_reap(proc: asyncio.subprocess.Process, *, reap_timeout: float = 5.0) -> None:
@@ -144,17 +169,21 @@ async def _kill_and_reap(proc: asyncio.subprocess.Process, *, reap_timeout: floa
         log.warning("subprocess %s did not exit after kill within %ss", proc.pid, reap_timeout)
 
 
-async def sign_out() -> None:
-    """Remove every form of stored Claude credential."""
+async def sign_out(home: Optional[Path] = None) -> None:
+    """Remove every form of stored Claude credential for the given slot."""
+    target_home = home or CLAUDE_HOME
     # Best-effort: ask the CLI to log out so the OAuth refresh token is
     # revoked server-side. If the CLI hangs or fails, kill+reap and proceed.
     proc: Optional[asyncio.subprocess.Process] = None
     try:
+        env = dict(os.environ)
+        env["CLAUDE_CONFIG_DIR"] = str(target_home)
         proc = await asyncio.create_subprocess_exec(
             "claude", "auth", "logout",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
         try:
             await asyncio.wait_for(proc.wait(), timeout=15)
@@ -168,12 +197,16 @@ async def sign_out() -> None:
         if proc is not None:
             await _kill_and_reap(proc)
 
-    for p in (credentials_path(), API_KEY_FILE):
+    candidates = [credentials_path(target_home), api_key_path(target_home)]
+    if home is None:
+        candidates.append(API_KEY_FILE)
+    for p in candidates:
         try:
             p.unlink()
         except FileNotFoundError:
             pass
-    os.environ.pop("ANTHROPIC_API_KEY", None)
+    if home is None:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
 
 
 # ── OAuth subprocess driver ────────────────────────────────────────────
@@ -187,6 +220,8 @@ FlowStatus = Literal[
 @dataclass
 class OAuthFlowState:
     variant: OAuthVariant
+    flow_key: str = SHARED_FLOW_KEY
+    home: Path = field(default_factory=lambda: CLAUDE_HOME)
     status: FlowStatus = "starting"
     url: Optional[str] = None
     error: Optional[str] = None
@@ -205,7 +240,9 @@ class OAuthFlowState:
 
 
 _flow_lock = asyncio.Lock()
-_current: Optional[OAuthFlowState] = None
+# Per-flow state, keyed by caller-supplied identifier. The shared slot
+# uses SHARED_FLOW_KEY; per-user credential slots use "cred:<sub>:<id>".
+_flows: dict[str, OAuthFlowState] = {}
 
 
 async def _drive(state: OAuthFlowState) -> None:
@@ -216,11 +253,21 @@ async def _drive(state: OAuthFlowState) -> None:
     proc: Optional[asyncio.subprocess.Process] = None
     try:
         try:
+            env = dict(os.environ)
+            env["CLAUDE_CONFIG_DIR"] = str(state.home)
+            # The CLI inherits ANTHROPIC_API_KEY from the parent process,
+            # which is set when the *shared* slot has an API key configured.
+            # If we leave it set when running login for any slot, the CLI
+            # skips OAuth entirely. Strip it so the user can actually sign
+            # in interactively.
+            env.pop("ANTHROPIC_API_KEY", None)
+            state.home.mkdir(parents=True, exist_ok=True)
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
         except FileNotFoundError:
             state.status = "failed"
@@ -313,7 +360,7 @@ async def _drive(state: OAuthFlowState) -> None:
         if state.status == "cancelled":
             return
 
-        if rc == 0 and credentials_path().exists():
+        if rc == 0 and credentials_path(state.home).exists():
             state.status = "done"
             return
 
@@ -329,39 +376,36 @@ async def _drive(state: OAuthFlowState) -> None:
             await _kill_and_reap(proc)
 
 
-async def start_oauth(variant: OAuthVariant) -> OAuthFlowState:
-    """Begin a new OAuth flow, cancelling any one already in progress.
+async def start_oauth(
+    variant: OAuthVariant,
+    *,
+    flow_key: str = SHARED_FLOW_KEY,
+    home: Optional[Path] = None,
+) -> OAuthFlowState:
+    """Begin a new OAuth flow for the given slot, cancelling any prior
+    flow for that same slot.
 
     Returns once the URL is known (or the flow has already failed), so the
     HTTP response can deliver the link without a second round-trip.
     """
-    global _current
+    target_home = home or CLAUDE_HOME
     async with _flow_lock:
-        prior = _current
+        prior = _flows.get(flow_key)
         if prior and prior.status in ("starting", "awaiting_code", "exchanging"):
             prior.status = "cancelled"
             prior.code_event.set()
             if prior.proc is not None:
                 await _kill_and_reap(prior.proc)
-            # Cancel the driver task directly so we don't depend on it
-            # noticing the status change. Awaiting it here keeps shutdown
-            # deterministic — without this, the new flow could race the old
-            # task's tail-end output handling.
             if prior.driver_task is not None and not prior.driver_task.done():
                 prior.driver_task.cancel()
                 try:
                     await asyncio.wait_for(prior.driver_task, timeout=2)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
-        state = OAuthFlowState(variant=variant)
+        state = OAuthFlowState(variant=variant, flow_key=flow_key, home=target_home)
         state.driver_task = asyncio.create_task(_drive(state))
-        _current = state
+        _flows[flow_key] = state
 
-    # Wait up to ~30s for the URL or a terminal status. The driver itself
-    # gives the CLI 30s per stdout chunk; if we returned earlier the HTTP
-    # response would carry url=None and the browser would have to poll for
-    # it via /api/setup/status anyway. The polling loop in setup.js handles
-    # both cases, but a synchronous URL on the first response is friendlier.
     for _ in range(300):
         if state.url or state.status in ("failed", "done"):
             break
@@ -369,25 +413,20 @@ async def start_oauth(variant: OAuthVariant) -> OAuthFlowState:
     return state
 
 
-def current_flow() -> Optional[OAuthFlowState]:
-    return _current
+def current_flow(flow_key: str = SHARED_FLOW_KEY) -> Optional[OAuthFlowState]:
+    return _flows.get(flow_key)
 
 
-async def submit_code(code: str) -> OAuthFlowState:
-    # Capture the global into a local before any await — without this, a
-    # concurrent start_oauth() (which swaps `_current` for a fresh state
-    # object) could cause us to write the code into the new flow's
-    # code_event before it reaches `awaiting_code`, instantly failing the
-    # new flow with stale code.
-    flow = _current
+async def submit_code(code: str, *, flow_key: str = SHARED_FLOW_KEY) -> OAuthFlowState:
+    # Capture into a local before any await — a concurrent start_oauth()
+    # for the same key could swap _flows[key] for a fresh state.
+    flow = _flows.get(flow_key)
     if flow is None:
         raise RuntimeError("no flow in progress")
     if flow.status != "awaiting_code":
         raise RuntimeError(f"flow is in status {flow.status!r}, not awaiting_code")
     flow.code = code
     flow.code_event.set()
-    # Block the HTTP response until the exchange is done, so the browser
-    # can redirect immediately on success.
     deadline = EXCHANGE_TIMEOUT_SECONDS + 5
     for _ in range(deadline * 10):
         if flow.status in ("done", "failed", "cancelled"):
@@ -396,8 +435,8 @@ async def submit_code(code: str) -> OAuthFlowState:
     return flow
 
 
-async def cancel_flow() -> None:
-    flow = _current
+async def cancel_flow(flow_key: str = SHARED_FLOW_KEY) -> None:
+    flow = _flows.get(flow_key)
     if flow is None:
         return
     if flow.status in ("done", "failed", "cancelled"):

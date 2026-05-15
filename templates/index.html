@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Claude — homelab</title>
+  <title>{{ site_title }}</title>
   <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
 </head>
 <body>
@@ -14,7 +14,7 @@
   </div>
 
   <header>
-    <h1>Claude — homelab</h1>
+    <h1>{{ site_title }}</h1>
     <div class="header-actions">
       <button type="button" id="toggle-sessions" aria-controls="sessions-panel" aria-expanded="true">Sessions</button>
       <label class="header-select" for="model-select">
@@ -29,13 +29,16 @@
         <span class="sr-only">Account</span>
         <select id="account-select" aria-label="Account">
           <option value="shared" {% if account.active == 'shared' %}selected{% endif %}>{{ account.shared_label }}</option>
-          {% if account.has_personal %}
-            <option value="personal" {% if account.active == 'personal' %}selected{% endif %}>{{ account.personal_label }}</option>
-          {% else %}
-            <option value="personal" disabled>{{ account.personal_label }} (not set up)</option>
-          {% endif %}
+          {% for c in account.credentials %}
+            {% if c.configured %}
+              <option value="cred:{{ c.id }}" {% if account.active == 'cred:' ~ c.id %}selected{% endif %}>{{ c.label }}</option>
+            {% else %}
+              <option value="cred:{{ c.id }}" disabled>{{ c.label }} (not signed in)</option>
+            {% endif %}
+          {% endfor %}
         </select>
       </label>
+      <a href="/account" class="header-link" aria-label="Manage your Claude accounts">Manage accounts</a>
       {% if multi_project %}
         <label class="header-select" for="project-select">
           <span class="sr-only">Project</span>

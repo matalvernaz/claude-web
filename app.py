@@ -126,6 +126,10 @@ PERSONAL_HOMES_DIR = Path(os.getenv(
     "CLAUDE_WEB_PERSONAL_HOMES_DIR", str(Path.home() / ".claude-homes")
 )).resolve()
 SHARED_ACCOUNT_LABEL = os.getenv("CLAUDE_WEB_SHARED_ACCOUNT_LABEL", "Shared").strip() or "Shared"
+# Branding overrides so a deployment can rename "Claude — homelab" without
+# patching templates. SITE_TITLE shows in <title> and the <h1>; if unset,
+# the original homelab branding is used.
+SITE_TITLE = os.getenv("CLAUDE_WEB_SITE_TITLE", "").strip() or "Claude — homelab"
 
 # Comma-separated email allowlist for the destructive /setup endpoints
 # (apikey replacement, sign-Claude-out, OAuth re-flow). Only enforced in
@@ -890,19 +894,89 @@ def _state_db() -> sqlite3.Connection:
             project_key TEXT,
             created_at REAL NOT NULL
         )""")
-        # Per-user account preference: which credential slot ('shared' or
-        # 'personal') the user's next run should authenticate as, and whether
-        # they've actually registered personal credentials. personal_label is
-        # an optional user-facing name for their personal account.
+        # Per-user account preference: which credential slot is active for
+        # the user's next run. 'shared' for the in-container Claude CLI's
+        # default credentials; 'cred:<id>' for a row in user_credential.
         conn.execute("""CREATE TABLE IF NOT EXISTS user_account (
             user_sub TEXT PRIMARY KEY,
-            active TEXT NOT NULL CHECK(active IN ('shared','personal')) DEFAULT 'shared',
-            has_personal INTEGER NOT NULL DEFAULT 0,
-            personal_label TEXT,
+            active TEXT NOT NULL DEFAULT 'shared',
             updated_at REAL NOT NULL
         )""")
+        # Per-user labeled credential slots. Each row owns a CLAUDE_CONFIG_DIR
+        # at PERSONAL_HOMES_DIR/<safe_sub>/<id>/, which the spawned CLI
+        # authenticates as. Labels are user-visible names; the (user_sub, label)
+        # unique index keeps a user from creating two slots with the same name.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_credential (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_sub TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(user_sub, label)
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_credential_sub ON user_credential(user_sub)"
+        )
+        _migrate_user_account_legacy(conn)
         _STATE_DB = conn
     return _STATE_DB
+
+
+def _migrate_user_account_legacy(conn: sqlite3.Connection) -> None:
+    """Migrate the pre-multi-credential schema (has_personal + personal_label
+    columns, CHECK constraint on active) to the new layout. No-op if the
+    legacy columns aren't there."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(user_account)").fetchall()]
+    if "has_personal" not in cols:
+        return
+    log = logging.getLogger("claude-web")
+    log.info("migrating legacy user_account schema to multi-credential layout")
+    rows = conn.execute(
+        "SELECT user_sub, active, has_personal, personal_label FROM user_account"
+    ).fetchall()
+    new_actives: dict[str, str] = {}
+    for sub, active, has_personal, label in rows:
+        if has_personal:
+            cred_id = _insert_credential_row(conn, sub, label or "My account")
+            old_home = _personal_homes_root() / _safe_sub(sub)
+            old_creds = old_home / ".credentials.json"
+            if old_creds.exists():
+                new_home = old_home / str(cred_id)
+                new_home.mkdir(parents=True, exist_ok=True)
+                try:
+                    old_creds.rename(new_home / ".credentials.json")
+                except OSError as e:
+                    log.warning("migrate: could not move %s: %s", old_creds, e)
+            new_actives[sub] = f"cred:{cred_id}" if active == "personal" else "shared"
+        else:
+            new_actives[sub] = "shared"
+    conn.execute("ALTER TABLE user_account RENAME TO user_account_legacy")
+    conn.execute("""CREATE TABLE user_account (
+        user_sub TEXT PRIMARY KEY,
+        active TEXT NOT NULL DEFAULT 'shared',
+        updated_at REAL NOT NULL
+    )""")
+    now = time.time()
+    for sub, active in new_actives.items():
+        conn.execute(
+            "INSERT INTO user_account(user_sub, active, updated_at) VALUES(?, ?, ?)",
+            (sub, active, now),
+        )
+    conn.execute("DROP TABLE user_account_legacy")
+
+
+def _personal_homes_root() -> Path:
+    """Indirection so the migrator can call this before PERSONAL_HOMES_DIR
+    helpers are defined further down — they're all just thin wrappers over
+    PERSONAL_HOMES_DIR, which is set at module import time."""
+    return PERSONAL_HOMES_DIR
+
+
+def _insert_credential_row(conn: sqlite3.Connection, user_sub: str, label: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO user_credential(user_sub, label, created_at) VALUES(?, ?, ?)",
+        (user_sub, label, time.time()),
+    )
+    return int(cur.lastrowid)
 
 
 def _claim_session_owner(session_id: str, owner_sub: Optional[str], project_key: Optional[str]) -> None:
@@ -931,39 +1005,26 @@ def _session_owner(session_id: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def _user_account(user_sub: Optional[str]) -> dict:
-    """Return {active, has_personal, personal_label} for a user.
-
-    Defaults to the shared slot for users who've never touched the toggle
-    or who aren't logged in (AUTH_MODE=none → sub='anonymous').
-    """
-    default = {"active": "shared", "has_personal": False, "personal_label": None}
+def _user_active_slot(user_sub: Optional[str]) -> str:
+    """Return the active slot identifier for the user. 'shared' if unset."""
     if not user_sub:
-        return default
+        return "shared"
     try:
         row = _state_db().execute(
-            "SELECT active, has_personal, personal_label FROM user_account WHERE user_sub = ?",
-            (user_sub,),
+            "SELECT active FROM user_account WHERE user_sub = ?", (user_sub,),
         ).fetchone()
     except sqlite3.Error:
-        return default
-    if not row:
-        return default
-    return {
-        "active": row[0],
-        "has_personal": bool(row[1]),
-        "personal_label": row[2],
-    }
+        return "shared"
+    return row[0] if row else "shared"
 
 
 def _set_user_active(user_sub: str, active: str) -> None:
-    """Flip a user's active slot. Caller must validate active ∈ {'shared','personal'}."""
-    if active not in ("shared", "personal"):
-        raise ValueError(f"invalid active slot: {active!r}")
+    """Flip a user's active slot. ``active`` must be 'shared' or 'cred:<id>'
+    where <id> is a credential row the user owns. Callers validate."""
     try:
         _state_db().execute(
-            """INSERT INTO user_account(user_sub, active, has_personal, personal_label, updated_at)
-               VALUES(?, ?, 0, NULL, ?)
+            """INSERT INTO user_account(user_sub, active, updated_at)
+               VALUES(?, ?, ?)
                ON CONFLICT(user_sub) DO UPDATE SET
                    active=excluded.active,
                    updated_at=excluded.updated_at""",
@@ -973,21 +1034,119 @@ def _set_user_active(user_sub: str, active: str) -> None:
         logging.getLogger("claude-web").warning("set_user_active failed: %s", e)
 
 
-def _mark_personal_registered(user_sub: str, label: Optional[str] = None) -> None:
-    """Record that a user has provisioned personal credentials. Idempotent;
-    setting label to None leaves any existing label intact."""
+# Active-slot string format. The active column stores either the literal
+# 'shared' or 'cred:<id>'; this regex is used to extract the id.
+_CRED_ACTIVE_RE = re.compile(r"^cred:(\d+)$")
+
+
+def _parse_cred_active(active: str) -> Optional[int]:
+    """Return the credential id for a 'cred:<id>' active value, else None."""
+    if not active:
+        return None
+    m = _CRED_ACTIVE_RE.match(active)
+    return int(m.group(1)) if m else None
+
+
+def _list_user_credentials(user_sub: str) -> list[dict]:
+    """All credential rows owned by this user, oldest first."""
+    if not user_sub:
+        return []
+    try:
+        rows = _state_db().execute(
+            "SELECT id, label, created_at FROM user_credential "
+            "WHERE user_sub = ? ORDER BY id",
+            (user_sub,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [
+        {"id": r[0], "label": r[1], "created_at": r[2]}
+        for r in rows
+    ]
+
+
+def _get_credential(user_sub: str, cred_id: int) -> Optional[dict]:
+    """Fetch one credential row, scoped by owner so a user can't see
+    another user's slots even if they guess an id."""
+    if not user_sub:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT id, label, created_at FROM user_credential "
+            "WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "label": row[1], "created_at": row[2]}
+
+
+def _create_credential(user_sub: str, label: str) -> dict:
+    """Create a new credential row. Caller is responsible for spawning the
+    OAuth/apikey flow that actually populates the home; this just reserves
+    the id+label."""
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    if len(label) > 80:
+        raise HTTPException(400, "label too long (max 80 chars)")
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    try:
+        cred_id = _insert_credential_row(_state_db(), user_sub, label)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "you already have a credential with that label")
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("create_credential failed: %s", e)
+        raise HTTPException(500, "could not create credential")
+    return {"id": cred_id, "label": label}
+
+
+def _rename_credential(user_sub: str, cred_id: int, label: str) -> dict:
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    if len(label) > 80:
+        raise HTTPException(400, "label too long (max 80 chars)")
+    if not _get_credential(user_sub, cred_id):
+        raise HTTPException(404, "no such credential")
     try:
         _state_db().execute(
-            """INSERT INTO user_account(user_sub, active, has_personal, personal_label, updated_at)
-               VALUES(?, 'shared', 1, ?, ?)
-               ON CONFLICT(user_sub) DO UPDATE SET
-                   has_personal=1,
-                   personal_label=COALESCE(excluded.personal_label, user_account.personal_label),
-                   updated_at=excluded.updated_at""",
-            (user_sub, label, time.time()),
+            "UPDATE user_credential SET label = ? WHERE user_sub = ? AND id = ?",
+            (label, user_sub, cred_id),
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "you already have a credential with that label")
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("rename_credential failed: %s", e)
+        raise HTTPException(500, "could not rename credential")
+    return {"id": cred_id, "label": label}
+
+
+def _delete_credential(user_sub: str, cred_id: int) -> None:
+    """Drop the row, wipe its home dir, and reset active to 'shared' if it
+    pointed at this credential."""
+    cred = _get_credential(user_sub, cred_id)
+    if not cred:
+        raise HTTPException(404, "no such credential")
+    try:
+        _state_db().execute(
+            "DELETE FROM user_credential WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
         )
     except sqlite3.Error as e:
-        logging.getLogger("claude-web").warning("mark_personal_registered failed: %s", e)
+        logging.getLogger("claude-web").warning("delete_credential failed: %s", e)
+        raise HTTPException(500, "could not delete credential")
+    # Wipe the home so a re-created credential with the same id won't pick
+    # up stale OAuth tokens. The shared-home symlinks under it are fine to
+    # remove — they're regenerated by _ensure_credential_home on next use.
+    home = _credential_home_path(user_sub, cred_id)
+    if home.exists():
+        shutil.rmtree(home, ignore_errors=True)
+    if _user_active_slot(user_sub) == f"cred:{cred_id}":
+        _set_user_active(user_sub, "shared")
 
 
 def _safe_sub(user_sub: str) -> str:
@@ -998,45 +1157,40 @@ def _safe_sub(user_sub: str) -> str:
     return sanitised or "anonymous"
 
 
-def _personal_home_path(user_sub: str) -> Path:
-    return PERSONAL_HOMES_DIR / _safe_sub(user_sub)
+def _credential_home_path(user_sub: str, cred_id: int) -> Path:
+    return PERSONAL_HOMES_DIR / _safe_sub(user_sub) / str(cred_id)
 
 
-def _ensure_personal_home(user_sub: str) -> Path:
-    """Create or refresh the per-user CLAUDE_CONFIG_DIR.
+def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
+    """Create or refresh the per-credential CLAUDE_CONFIG_DIR.
 
-    The personal home is a directory that mirrors CLAUDE_HOME via symlinks,
-    *except* for .credentials.json which is the user's real (personal)
-    credential file. The symlinks mean projects/, sessions/, settings.json,
-    skills/, etc. all resolve back to the shared home — so a user's
-    transcript history is identical regardless of which slot is active and
-    switching between slots mid-conversation does not move the JSONL file
-    the CLI is appending to.
+    Mirrors CLAUDE_HOME via symlinks except for ``.credentials.json`` and
+    ``.anthropic_api_key`` (the only files that must be per-credential).
+    Projects/, sessions/, settings.json, skills/, etc. all resolve back to
+    the shared home so transcripts/history stay shared regardless of which
+    slot is active.
 
-    Idempotent. Existing entries are never overwritten, so the user's
-    real .credentials.json is safe.
+    Idempotent.
     """
-    home = _personal_home_path(user_sub)
+    home = _credential_home_path(user_sub, cred_id)
     home.mkdir(parents=True, exist_ok=True)
     try:
         entries = list(CLAUDE_HOME.iterdir())
     except FileNotFoundError:
         return home
     for entry in entries:
-        # Never symlink the credentials file — it must be a real per-user
-        # file or the personal slot would auth as the shared account.
-        if entry.name == ".credentials.json":
+        # Per-credential files: must be real, not symlinked back to shared.
+        if entry.name in (".credentials.json", ".anthropic_api_key"):
             continue
         link = home / entry.name
-        # is_symlink() guards the "broken symlink pointing into the shared
-        # home" case where exists() returns False but the link is set up.
+        # is_symlink() catches broken symlinks that exists() reports as False.
         if link.is_symlink() or link.exists():
             continue
         try:
             link.symlink_to(entry.resolve())
         except OSError as e:
             logging.getLogger("claude-web").warning(
-                "personal-home symlink %s → %s failed: %s", link, entry, e
+                "credential-home symlink %s → %s failed: %s", link, entry, e
             )
     return home
 
@@ -1044,25 +1198,43 @@ def _ensure_personal_home(user_sub: str) -> Path:
 def _resolve_account_for_run(user: dict) -> dict:
     """Pick the credential slot for the user's next run.
 
-    Returns ``{"slot": "shared"|"personal", "env": dict[str,str], "label": str}``.
+    Returns ``{"slot": "shared"|"cred:<id>", "env": dict[str,str], "label": str}``.
     ``env`` is empty for shared (CLAUDE_HOME wins naturally) and carries
-    CLAUDE_CONFIG_DIR for personal. If the user is marked has_personal but
-    their .credentials.json is missing, falls back to shared rather than
-    spawning a CLI that would crash on first API call.
+    CLAUDE_CONFIG_DIR for any per-user credential. If the user's active
+    credential is missing its .credentials.json (deleted out-of-band, or a
+    setup flow was reserved but never completed), falls back to shared
+    rather than spawning a CLI that would crash on first API call.
     """
     sub = (user or {}).get("sub")
-    state = _user_account(sub)
-    if state["active"] == "personal" and state["has_personal"] and sub:
-        home = _ensure_personal_home(sub)
-        if (home / ".credentials.json").exists():
-            return {
-                "slot": "personal",
-                "env": {"CLAUDE_CONFIG_DIR": str(home)},
-                "label": state["personal_label"] or "My account",
-            }
-        logging.getLogger("claude-web").warning(
-            "personal creds missing for sub=%s; falling back to shared", sub
-        )
+    active = _user_active_slot(sub)
+    cred_id = _parse_cred_active(active)
+    if cred_id is not None and sub:
+        cred = _get_credential(sub, cred_id)
+        if cred:
+            home = _ensure_credential_home(sub, cred_id)
+            if (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists():
+                env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(home)}
+                # An API key in the per-credential home overrides the
+                # shared-slot ANTHROPIC_API_KEY for this run.
+                try:
+                    key = (home / ".anthropic_api_key").read_text().strip()
+                except FileNotFoundError:
+                    key = ""
+                if key:
+                    env["ANTHROPIC_API_KEY"] = key
+                else:
+                    # Prevent a shared ANTHROPIC_API_KEY from masking the
+                    # per-credential OAuth token.
+                    env["ANTHROPIC_API_KEY"] = ""
+                return {
+                    "slot": active,
+                    "env": env,
+                    "label": cred["label"],
+                }
+            logging.getLogger("claude-web").warning(
+                "active credential %s missing credentials for sub=%s; falling back to shared",
+                cred_id, sub,
+            )
     return {"slot": "shared", "env": {}, "label": SHARED_ACCOUNT_LABEL}
 
 
@@ -1604,6 +1776,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             ]),
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
+            "site_title": SITE_TITLE,
         }
     )
     # Don't cache the HTML — sidebar contents are time-sensitive.
@@ -1870,17 +2043,24 @@ async def api_permission(
     return {"ok": True}
 
 
+def _credential_is_configured(user_sub: str, cred_id: int) -> bool:
+    """True if the credential's home has a usable OAuth token or API key."""
+    home = _credential_home_path(user_sub, cred_id)
+    return (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists()
+
+
 def _account_payload(user: dict) -> dict:
     sub = (user or {}).get("sub")
-    state = _user_account(sub)
+    active = _user_active_slot(sub)
+    creds = _list_user_credentials(sub) if sub else []
+    for c in creds:
+        c["configured"] = _credential_is_configured(sub, c["id"])
     return {
-        # The OIDC subject — surfaced here so a user can copy/paste it to
-        # an admin for scripts/add-personal without having to inspect cookies.
+        # The OIDC subject — useful for support and debugging.
         "user_sub": sub,
-        "active": state["active"],
-        "has_personal": state["has_personal"],
-        "personal_label": state["personal_label"] or "My account",
+        "active": active,
         "shared_label": SHARED_ACCOUNT_LABEL,
+        "credentials": creds,
     }
 
 
@@ -1894,18 +2074,207 @@ async def api_account_set_active(
     active: str = Form(...),
     user: dict = Depends(auth.require_user),
 ):
+    """Switch the user's active credential slot.
+
+    ``active`` is either ``shared`` or ``cred:<id>``. For credential slots
+    we require the row to be both owned by the caller and actually
+    configured — flipping to a half-setup slot would fall back to shared on
+    the next run anyway and confuse the UI.
+    """
     sub = user.get("sub")
     if not sub:
         raise HTTPException(401, "no user identity")
-    if active not in ("shared", "personal"):
+    if active == "shared":
+        _set_user_active(sub, "shared")
+        return _account_payload(user)
+    cred_id = _parse_cred_active(active)
+    if cred_id is None:
         raise HTTPException(400, "invalid slot")
-    if active == "personal" and not _user_account(sub)["has_personal"]:
-        # Refuse to flip to personal when no credentials exist — the spawn
-        # path would just fall back to shared anyway, which would confuse
-        # the toggle UI.
-        raise HTTPException(400, "no personal credentials registered")
+    cred = _get_credential(sub, cred_id)
+    if not cred:
+        raise HTTPException(404, "no such credential")
+    if not _credential_is_configured(sub, cred_id):
+        raise HTTPException(400, "credential is not signed in yet")
     _set_user_active(sub, active)
     return _account_payload(user)
+
+
+# ─── per-user credential CRUD ─────────────────────────────────────────────────
+#
+# All of these are scoped to the caller's OIDC subject. No admin gate — each
+# user manages their own slots end-to-end. The forward-auth (Keycloak) layer
+# already ensures we know who's calling; we never trust client-supplied subs.
+
+
+def _credential_flow_key(user_sub: str, cred_id: int) -> str:
+    return f"cred:{_safe_sub(user_sub)}:{cred_id}"
+
+
+def _require_owned_credential(user_sub: Optional[str], cred_id: int) -> dict:
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    cred = _get_credential(user_sub, cred_id)
+    if not cred:
+        # 404 not 403: don't even acknowledge that a row with this id might
+        # exist under another user's ownership.
+        raise HTTPException(404, "no such credential")
+    return cred
+
+
+@app.get("/api/account/credentials")
+async def api_credentials_list(user: dict = Depends(auth.require_user)):
+    return _account_payload(user)
+
+
+@app.post("/api/account/credentials")
+async def api_credentials_create(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    sub = user.get("sub")
+    cred = _create_credential(sub, body.get("label") or "")
+    return cred
+
+
+@app.patch("/api/account/credentials/{cred_id}")
+async def api_credentials_rename(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    body = await request.json()
+    return _rename_credential(sub, cred_id, body.get("label") or "")
+
+
+@app.delete("/api/account/credentials/{cred_id}")
+async def api_credentials_delete(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    # Cancel any in-flight OAuth flow before wiping the home so the driver
+    # doesn't fight the deletion.
+    await setup_flow.cancel_flow(flow_key=_credential_flow_key(sub, cred_id))
+    _delete_credential(sub, cred_id)
+    return _account_payload(user)
+
+
+@app.get("/api/account/credentials/{cred_id}/status")
+async def api_credentials_status(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    cred = _require_owned_credential(sub, cred_id)
+    home = _credential_home_path(sub, cred_id)
+    flow = setup_flow.current_flow(_credential_flow_key(sub, cred_id))
+    return {
+        "credential": {
+            "id": cred["id"],
+            "label": cred["label"],
+            "configured": _credential_is_configured(sub, cred_id),
+        },
+        "flow": flow.to_public() if flow else None,
+        "whoami": setup_flow.whoami(home),
+    }
+
+
+@app.post("/api/account/credentials/{cred_id}/oauth/start")
+async def api_credentials_oauth_start(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    body = await request.json()
+    variant = body.get("variant", "claudeai")
+    if variant not in ("claudeai", "console"):
+        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    home = _ensure_credential_home(sub, cred_id)
+    state = await setup_flow.start_oauth(
+        variant,
+        flow_key=_credential_flow_key(sub, cred_id),
+        home=home,
+    )
+    return state.to_public()
+
+
+@app.post("/api/account/credentials/{cred_id}/oauth/code")
+async def api_credentials_oauth_code(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    if not code:
+        raise HTTPException(400, "code is required")
+    if len(code) > 200_000:
+        raise HTTPException(400, "code too long")
+    try:
+        state = await setup_flow.submit_code(
+            code, flow_key=_credential_flow_key(sub, cred_id)
+        )
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {
+        "configured": _credential_is_configured(sub, cred_id),
+        "flow": state.to_public(),
+    }
+
+
+@app.post("/api/account/credentials/{cred_id}/oauth/cancel")
+async def api_credentials_oauth_cancel(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    await setup_flow.cancel_flow(flow_key=_credential_flow_key(sub, cred_id))
+    return {"ok": True}
+
+
+@app.post("/api/account/credentials/{cred_id}/apikey")
+async def api_credentials_apikey(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    body = await request.json()
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(400, "api_key is required")
+    home = _ensure_credential_home(sub, cred_id)
+    try:
+        setup_flow.save_api_key(api_key, home)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"configured": _credential_is_configured(sub, cred_id)}
+
+
+@app.post("/api/account/credentials/{cred_id}/signout")
+async def api_credentials_signout(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    """Remove the credential's stored token without dropping the row, so the
+    user can re-sign-in under the same label."""
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    home = _credential_home_path(sub, cred_id)
+    await setup_flow.sign_out(home)
+    if _user_active_slot(sub) == f"cred:{cred_id}":
+        _set_user_active(sub, "shared")
+    return {"configured": _credential_is_configured(sub, cred_id)}
 
 
 def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
@@ -2939,9 +3308,9 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     total_output = sum(s["output_tokens"] for s in sessions)
 
     # Slot breakdown: shared is deployment-wide (everyone shares one bill);
-    # personal is filtered to the current user so each user sees only their
-    # own spend on their own credentials. Rows from before the slot-tagging
-    # change (missing account_slot) are treated as 'shared'.
+    # per-credential slots are filtered to the current user so each user
+    # sees only their own spend on their own credentials. Rows from before
+    # the slot-tagging change (missing account_slot) are treated as 'shared'.
     user_sub = user.get("sub")
     slot_totals = {
         "shared": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
@@ -2949,11 +3318,18 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     }
     for r in today_rows:
         slot = r.get("account_slot") or "shared"
-        if slot not in slot_totals:
+        # Per-credential slots (`cred:<id>`) and the legacy 'personal' string
+        # both roll up into a single 'personal' bucket for the UI. Filtering
+        # by owner_sub keeps cross-user leakage out — only your own
+        # credential runs count toward your personal bucket.
+        if slot.startswith("cred:") or slot == "personal":
+            if r.get("owner_sub") != user_sub:
+                continue
+            bucket = slot_totals["personal"]
+        elif slot == "shared":
+            bucket = slot_totals["shared"]
+        else:
             continue
-        if slot == "personal" and r.get("owner_sub") != user_sub:
-            continue
-        bucket = slot_totals[slot]
         bucket["turns"] += 1
         bucket["cost_usd"] += float(r.get("total_cost_usd") or 0.0)
         bucket["input_tokens"] += int(r.get("input_tokens") or 0)
@@ -2979,6 +3355,25 @@ async def api_usage(user: dict = Depends(auth.require_user)):
         },
         "rate_limit": rate_limit,
     }
+
+
+@app.get("/account")
+async def account_page(request: Request, user: dict = Depends(auth.require_user)):
+    """Per-user credential management — add/remove/rename Claude accounts.
+
+    Unlike /setup (which configures the shared in-container CLI and is admin-
+    gated), this page is reachable by any signed-in user; each user only
+    sees and manipulates their own credentials.
+    """
+    response = templates.TemplateResponse(
+        request, "account.html", {
+            "user": user,
+            "account": _account_payload(user),
+            "site_title": SITE_TITLE,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/setup")

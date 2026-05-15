@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your Claude accounts — claude-web</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Your Claude accounts</h1>
+    <div class="header-actions">
+      <a href="/">Back to chat</a>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="setup">
+    <p class="setup-intro">
+      Each account you add is yours — only you can see, switch to, or delete
+      it. The shared <strong>{{ account.shared_label }}</strong> account is
+      managed by an admin and is available to everyone.
+    </p>
+
+    <section aria-labelledby="creds-heading" class="setup-card">
+      <h2 id="creds-heading">Accounts</h2>
+      <ul id="cred-list" class="cred-list" aria-live="polite">
+        <li class="cred-item cred-shared">
+          <span class="cred-label">{{ account.shared_label }}</span>
+          <span class="cred-meta">Shared with everyone</span>
+        </li>
+        {% for c in account.credentials %}
+          <li class="cred-item" data-cred-id="{{ c.id }}">
+            <span class="cred-label">{{ c.label }}</span>
+            <span class="cred-meta">
+              {% if c.configured %}Signed in{% else %}Not signed in{% endif %}
+            </span>
+            <span class="cred-actions">
+              {% if not c.configured %}
+                <button type="button" class="cred-setup" data-cred-id="{{ c.id }}">Sign in</button>
+              {% else %}
+                <button type="button" class="cred-signout" data-cred-id="{{ c.id }}">Sign out</button>
+              {% endif %}
+              <button type="button" class="cred-rename" data-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Rename</button>
+              <button type="button" class="cred-delete" data-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Remove</button>
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+
+      <form id="add-form">
+        <p>
+          <label for="add-label">Add a new account</label><br>
+          <input type="text" id="add-label" name="label" maxlength="80" autocomplete="off"
+            placeholder="e.g. Personal Pro" required>
+        </p>
+        <p>
+          <button type="submit" id="add-submit">Add account</button>
+        </p>
+      </form>
+      <p id="add-error" class="setup-error" role="alert" hidden></p>
+      <p id="add-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="signin-section" aria-labelledby="signin-heading" class="setup-card" hidden>
+      <h2 id="signin-heading">Sign in to <span id="signin-label"></span></h2>
+      <p>
+        Pick whichever flow matches the Claude account you're connecting.
+        This is your account — only you can use it from claude-web.
+      </p>
+
+      <form id="oauth-form">
+        <fieldset>
+          <legend>Account type</legend>
+          <p class="radio-row">
+            <input type="radio" id="variant-claudeai" name="variant" value="claudeai" checked>
+            <label for="variant-claudeai">Claude subscription (claude.ai)</label>
+          </p>
+          <p class="radio-row">
+            <input type="radio" id="variant-console" name="variant" value="console">
+            <label for="variant-console">Anthropic Console (API billing)</label>
+          </p>
+        </fieldset>
+        <p>
+          <button type="submit" id="oauth-start">Start sign-in</button>
+          <button type="button" id="signin-close">Close</button>
+        </p>
+      </form>
+
+      <div id="oauth-progress" hidden>
+        <p id="oauth-status" role="status" aria-live="polite"></p>
+
+        <div id="oauth-link-block" hidden>
+          <p>
+            <a id="oauth-url" href="#" target="_blank" rel="noopener noreferrer">Open the Claude sign-in page</a>
+            (opens in a new tab)
+          </p>
+          <p class="hint">
+            After signing in, claude.com will show a one-time code. Copy it
+            and paste it below.
+          </p>
+          <form id="oauth-code-form">
+            <p>
+              <label for="oauth-code">Auth code</label><br>
+              <input type="text" id="oauth-code" name="code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+            </p>
+            <p>
+              <button type="submit" id="oauth-code-submit">Finish sign-in</button>
+              <button type="button" id="oauth-cancel">Cancel</button>
+            </p>
+          </form>
+        </div>
+
+        <p id="oauth-error" class="setup-error" role="alert" hidden></p>
+      </div>
+
+      <details class="setup-apikey">
+        <summary>I'd rather paste an API key</summary>
+        <p>The key is stored in this credential's home (mode 0600) and used only when this account is active.</p>
+        <form id="apikey-form">
+          <p>
+            <label for="apikey-input">Anthropic API key</label><br>
+            <input type="password" id="apikey-input" name="api_key" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+          </p>
+          <p>
+            <label class="checkbox-row">
+              <input type="checkbox" id="apikey-show">
+              Show key
+            </label>
+          </p>
+          <p>
+            <button type="submit" id="apikey-submit">Save key</button>
+          </p>
+        </form>
+        <p id="apikey-status" role="status" aria-live="polite"></p>
+        <p id="apikey-error" class="setup-error" role="alert" hidden></p>
+      </details>
+    </section>
+  </main>
+
+  <script src="/static/account.js?v={{ asset_version('account.js') }}"></script>
+</body>
+</html>
