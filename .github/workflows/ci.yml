@@ -44,3 +44,4 @@ jobs:
         run: |
           node --check static/app.js
           node --check static/setup.js
+          node --check static/account.js
