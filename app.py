@@ -2901,11 +2901,26 @@ async def api_chat(
                                 if t is not None and not t.done():
                                     t.cancel()
 
-                        if msg_get in done:
+                        # asyncio.wait(FIRST_COMPLETED) returns as soon as ANY
+                        # task is done, but other tasks can transition to done
+                        # before the await returns. Process every completed
+                        # task — discarding a second one silently drops its
+                        # value. For user_get that means the queued message
+                        # is gone for good: .result() popped it from the queue
+                        # before we got here, and the next iteration creates a
+                        # fresh task that won't see it. The race fires often
+                        # when background TaskNotifications are streaming and
+                        # the user queues a message at the same time.
+                        msg_done = msg_get in done
+                        user_done = user_get is not None and user_get in done
+                        if msg_done:
                             msg = msg_get.result()
                             if msg is pump_done:
                                 # SDK iterator exhausted — CLI subprocess
-                                # closed. Nothing more will arrive; exit.
+                                # closed. Nothing more will arrive; exit. Any
+                                # queued user message we also pulled from
+                                # user_get is unavoidably lost — there's no
+                                # CLI left to deliver it to.
                                 break
                             run.last_activity = time.time()
                             for evt in _sdk_message_to_events(msg, run):
@@ -2938,9 +2953,8 @@ async def api_chat(
                             # don't change between_turns. A TaskNotification
                             # arriving between turns must keep between_turns
                             # = True so the grace timer can arm.
-                            continue
 
-                        if user_get is not None and user_get in done:
+                        if user_done:
                             item = user_get.result()
                             run.consecutive_auto_fires = 0
                             await _send_user_message(
@@ -2948,7 +2962,14 @@ async def api_chat(
                                 item.get("text") or "",
                                 item.get("image_blocks") or [],
                             )
+                            # The send writes to the CLI's stdin, so the CLI
+                            # is now mid-turn regardless of what msg_get just
+                            # delivered (a TaskNotification can co-occur with
+                            # the user POST without flipping between_turns
+                            # itself).
                             between_turns = False
+
+                        if msg_done or user_done:
                             continue
 
                         # Timeout fired — three sub-cases:
