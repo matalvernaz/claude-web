@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import json
 import logging
@@ -1488,6 +1489,15 @@ class ActiveRun:
         # message. If the synth's tool calls emit more notifications we'd
         # auto-fire forever; this counter caps the chain.
         self.consecutive_auto_fires: int = 0
+        # tool_use_ids of tools the model invoked with run_in_background=True
+        # (Bash) or that are inherently background (Monitor). Populated as
+        # AssistantMessage(tool_use) blocks arrive; consulted when
+        # TaskNotificationMessage fires to distinguish a real background
+        # completion (worth waking the model with a synth) from a routine
+        # foreground tool completion (model already saw the tool_result
+        # inline; a synth would be redundant noise and would burn the
+        # MAX_CONSECUTIVE_AUTO_FIRES cap on no-op follow-ups).
+        self.bg_tool_use_ids: set[str] = set()
         self.last_activity: float = now
         # The live SDK client, published once the driver has finished the
         # initial query. Held only as a debug breadcrumb / capability
@@ -1654,6 +1664,14 @@ def _session_lock(session_id: str) -> asyncio.Lock:
 RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
 AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
 SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
+# Mid-turn silence cap: when the CLI is mid-turn (between_turns=False) the
+# normal idle timeout doesn't apply — a Bash that takes 20 min or a Monitor
+# watching a slow process emits nothing while it's working. But we still need
+# *some* upper bound so a genuinely wedged subprocess eventually surfaces an
+# error instead of pinning the driver forever. 30 min is generous enough for
+# real long tools and short enough that a wedge is noticed before the user
+# walks away thinking it's still working.
+MIDTURN_SILENCE_TIMEOUT_MS = 30 * 60 * 1000
 
 # Hydrate from sqlite at module load so uvicorn's first request already sees
 # whatever state survived the last restart.
@@ -2300,7 +2318,14 @@ def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingRespo
                     yield b": ping\n\n"
                     continue
                 if evt.get("type") == "_done":
-                    yield b"event: done\ndata: {}\n\n"
+                    # Emit as a regular data: frame so the client's SSE
+                    # parser (which only reads ``data:`` lines, not ``event:``
+                    # markers) actually sees it. The previous
+                    # ``event: done\ndata: {}`` form was silently dropped
+                    # client-side, leaving the EOF-recovery path to think a
+                    # cleanly-finished replay was a premature drop and
+                    # firing tryResume() in a loop on restart-killed runs.
+                    yield b'data: {"type":"_done"}\n\n'
                     break
                 yield f"data: {json.dumps(evt)}\n\n".encode()
         finally:
@@ -2822,10 +2847,32 @@ async def api_chat(
         msg_queue: asyncio.Queue = asyncio.Queue()
         pump_done = object()  # sentinel for "iterator exhausted"
 
+        class _PumpFailed:
+            """Sentinel enqueued when receive_messages() raises.
+
+            Without this, a SDK iterator exception was swallowed by the pump's
+            bare try/finally: the finally enqueued ``pump_done``, the driver
+            saw the normal exhaustion sentinel and exited cleanly, and the
+            user never saw an error. With this sentinel the driver can emit a
+            visible error event before unwinding.
+            """
+
+            __slots__ = ("exc", "traceback")
+
+            def __init__(self, exc: BaseException, tb: str) -> None:
+                self.exc = exc
+                self.traceback = tb
+
         async def _pump_messages(client) -> None:
             try:
                 async for msg in client.receive_messages():
                     await msg_queue.put(msg)
+            except asyncio.CancelledError:
+                # Re-raise without dropping a PumpFailed; cancellation is the
+                # driver's own teardown signal, not a SDK failure.
+                raise
+            except Exception as exc:
+                await msg_queue.put(_PumpFailed(exc, traceback.format_exc()))
             finally:
                 await msg_queue.put(pump_done)
 
@@ -2853,24 +2900,40 @@ async def api_chat(
                     # through one writer so that bug can't recur).
                     between_turns = False
 
+                    # Mid-turn silence clock. Bumped whenever an SDK message
+                    # arrives or we send something to the CLI. Used only when
+                    # between_turns is False, to bound how long a wedged
+                    # subprocess can pin the driver. time.monotonic() (not
+                    # time.time()) so a wall-clock jump doesn't trip it.
+                    last_cli_activity = time.monotonic()
+
                     while True:
                         cap_reached = run.consecutive_auto_fires >= MAX_CONSECUTIVE_AUTO_FIRES
 
-                        # Compute the wait timeout. Three regimes:
+                        # Compute the wait timeout. Four regimes:
                         #   1. Notifications buffered + between turns + not
                         #      capped → grace remaining (auto-fire when it
                         #      expires).
                         #   2. Capped notifications between turns → drop
                         #      them once and fall through to idle timeout.
-                        #   3. Otherwise → idle timeout.
+                        #   3. Mid-turn (CLI is running a tool / monitor /
+                        #      long bash) → mid-turn silence cap. We don't
+                        #      apply the normal session idle timeout because
+                        #      a foreground Bash that takes 20 min is silent
+                        #      until it completes, and a Monitor watching a
+                        #      slow process is silent by design. The cap is
+                        #      a safety net for a wedged subprocess only.
+                        #   4. Between turns, nothing pending → session idle.
                         if (between_turns and run.pending_notifications
                                 and run.notification_grace_started_at is not None
                                 and not cap_reached):
-                            elapsed = time.time() - run.notification_grace_started_at
+                            elapsed = time.monotonic() - run.notification_grace_started_at
                             timeout = max(0.0, AUTO_FIRE_GRACE_MS / 1000 - elapsed)
+                        elif not between_turns:
+                            elapsed = time.monotonic() - last_cli_activity
+                            timeout = max(0.0, MIDTURN_SILENCE_TIMEOUT_MS / 1000 - elapsed)
                         else:
-                            if (between_turns and cap_reached
-                                    and run.pending_notifications):
+                            if (cap_reached and run.pending_notifications):
                                 _drop_pending_capped()
                             timeout = SESSION_IDLE_TIMEOUT_MS / 1000
 
@@ -2922,7 +2985,61 @@ async def api_chat(
                                 # user_get is unavoidably lost — there's no
                                 # CLI left to deliver it to.
                                 break
+                            if isinstance(msg, _PumpFailed):
+                                # SDK iterator raised before exhausting. The
+                                # pump still enqueued pump_done after this so
+                                # the loop will exit on the next iteration;
+                                # surface the failure to the UI before we go.
+                                log.error(
+                                    "SDK receive_messages failed: %s\n%s",
+                                    msg.exc, msg.traceback,
+                                )
+                                tail = "\n".join(stderr_buf[-30:]).strip()
+                                detail_parts: list[str] = []
+                                if tail:
+                                    detail_parts.append("--- CLI stderr ---\n" + tail)
+                                detail_parts.append("--- pump traceback ---\n" + msg.traceback)
+                                run.emit({
+                                    "type": "error",
+                                    "message": f"SDK message stream failed: {type(msg.exc).__name__}: {msg.exc}",
+                                    "stderr": "\n\n".join(detail_parts),
+                                })
+                                break
                             run.last_activity = time.time()
+                            last_cli_activity = time.monotonic()
+
+                            # Track which tool invocations are "real
+                            # background" so the TaskNotificationMessage
+                            # gate below can distinguish them from routine
+                            # foreground tool completions. Both paths emit
+                            # TaskNotificationMessage at the SDK level —
+                            # task_type is "local_bash" for both — and the
+                            # only signal we have is the tool_use input
+                            # on the AssistantMessage that originated the
+                            # call.
+                            #
+                            # Tool-name handling: Monitor is always
+                            # background; anything else qualifies by the
+                            # ``run_in_background=True`` input flag. This
+                            # phrasing means a future tool that opts into
+                            # the same convention (Python REPL, Docker
+                            # exec, etc.) is supported without editing
+                            # this gate.
+                            if isinstance(msg, AssistantMessage):
+                                for blk in msg.content:
+                                    if not isinstance(blk, ToolUseBlock):
+                                        continue
+                                    # Defensive: malformed inputs from the
+                                    # API or a future tool with a non-dict
+                                    # input schema would crash on .get().
+                                    inp = blk.input if isinstance(blk.input, dict) else {}
+                                    is_bg = (
+                                        blk.name == "Monitor"
+                                        or bool(inp.get("run_in_background"))
+                                    )
+                                    if is_bg and blk.id:
+                                        run.bg_tool_use_ids.add(blk.id)
+
                             for evt in _sdk_message_to_events(msg, run):
                                 # emit() also keeps ACTIVE_RUNS_BY_SESSION in
                                 # sync whenever an init event reveals (or
@@ -2930,18 +3047,51 @@ async def api_chat(
                                 # /api/chat lookups can find this run.
                                 run.emit(evt)
 
-                            if isinstance(msg, (TaskStartedMessage,
-                                                TaskProgressMessage,
-                                                TaskNotificationMessage)):
-                                run.pending_notifications.append({
-                                    "task_id": msg.task_id,
-                                    "kind": type(msg).__name__,
-                                    "description": getattr(msg, "description", None),
-                                    "summary": getattr(msg, "summary", None),
-                                    "status": getattr(msg, "status", None),
-                                    "output_file": getattr(msg, "output_file", None),
-                                })
-                                run.notification_grace_started_at = time.time()
+                            # Auto-fire eligibility: queue notifications for
+                            # genuinely-background tools regardless of
+                            # turn state, so a background Bash launched in
+                            # turn N that completes during turn N+1 still
+                            # has its notification preserved for the next
+                            # between-turns auto-fire window. The auto-fire
+                            # branch itself gates on between_turns + the
+                            # grace timer, so a mid-turn completion just
+                            # waits for the current dance to end.
+                            #
+                            # Two layered gates here:
+                            #   * isinstance TaskNotificationMessage — drop
+                            #     TaskStarted/Progress (UI-only).
+                            #   * tool_use_id in bg_tool_use_ids — drops
+                            #     foreground Bash completions; their
+                            #     tool_result lands inline within the same
+                            #     turn so a synth follow-up would be
+                            #     redundant noise and would burn the
+                            #     MAX_CONSECUTIVE_AUTO_FIRES cap.
+                            if isinstance(msg, TaskNotificationMessage):
+                                tid = msg.tool_use_id
+                                if tid and tid in run.bg_tool_use_ids:
+                                    run.pending_notifications.append({
+                                        "task_id": msg.task_id,
+                                        "kind": type(msg).__name__,
+                                        "description": getattr(msg, "description", None),
+                                        "summary": getattr(msg, "summary", None),
+                                        "status": getattr(msg, "status", None),
+                                        "output_file": getattr(msg, "output_file", None),
+                                    })
+                                    run.notification_grace_started_at = time.monotonic()
+                                else:
+                                    # Either no tool_use_id (SDK-internal
+                                    # task not initiated by the model) or
+                                    # the originating tool wasn't flagged
+                                    # background — log at debug so an
+                                    # unexpected emitter or an ordering
+                                    # race (notification beating the
+                                    # AssistantMessage registration) can
+                                    # be diagnosed from the journal.
+                                    log.debug(
+                                        "TaskNotification dropped: tool_use_id=%r "
+                                        "not in bg_tool_use_ids (size=%d) run=%s",
+                                        tid, len(run.bg_tool_use_ids), run.run_id,
+                                    )
 
                             if isinstance(msg, ResultMessage):
                                 between_turns = True
@@ -2962,6 +3112,7 @@ async def api_chat(
                                 item.get("text") or "",
                                 item.get("image_blocks") or [],
                             )
+                            last_cli_activity = time.monotonic()
                             # The send writes to the CLI's stdin, so the CLI
                             # is now mid-turn regardless of what msg_get just
                             # delivered (a TaskNotification can co-occur with
@@ -2972,7 +3123,7 @@ async def api_chat(
                         if msg_done or user_done:
                             continue
 
-                        # Timeout fired — three sub-cases:
+                        # Timeout fired — four sub-cases:
                         if (between_turns and run.pending_notifications
                                 and not cap_reached):
                             # Grace period elapsed with notifications buffered:
@@ -2980,6 +3131,7 @@ async def api_chat(
                             action = _drain_pending_for_auto_fire()
                             async with run.client_write_lock:
                                 await client.query(action["synth"])
+                            last_cli_activity = time.monotonic()
                             between_turns = False
                             continue
                         if between_turns and run.pending_notifications:
@@ -2987,16 +3139,61 @@ async def api_chat(
                             # Don't exit yet — give the user another idle
                             # window to send something before tearing down.
                             continue
+                        if not between_turns:
+                            # Mid-turn silence cap fired. The subprocess is
+                            # likely wedged (a Bash that's been hung for 30
+                            # min, or a Monitor whose target died without
+                            # the watcher noticing). Surface the failure
+                            # before we tear down so the user knows why —
+                            # without this, a wedge looked identical to a
+                            # clean idle exit from the UI's side.
+                            log.warning(
+                                "midturn silence cap fired for run %s after %.0fs",
+                                run.run_id, MIDTURN_SILENCE_TIMEOUT_MS / 1000,
+                            )
+                            tail = "\n".join(stderr_buf[-30:]).strip()
+                            run.emit({
+                                "type": "error",
+                                "message": (
+                                    "Claude Code produced no output for "
+                                    f"{MIDTURN_SILENCE_TIMEOUT_MS // 60000} minutes "
+                                    "while a turn was in progress. The subprocess "
+                                    "is likely wedged; tearing it down."
+                                ),
+                                "stderr": (
+                                    "--- CLI stderr ---\n" + tail if tail else
+                                    "(no recent CLI stderr captured)"
+                                ),
+                            })
+                            break
                         # Idle timeout with nothing pending — exit cleanly.
                         break
                 finally:
                     run.client = None
                     if not pump_task.done():
                         pump_task.cancel()
-                        try:
+                        # Only suppress the cancellation we initiated. A real
+                        # SDK iterator exception that hadn't been delivered as
+                        # a _PumpFailed sentinel yet should be logged, not
+                        # silently dropped (the previous
+                        # ``except (asyncio.CancelledError, Exception): pass``
+                        # hid every failure mode equally).
+                        with contextlib.suppress(asyncio.CancelledError):
                             await pump_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                    elif not pump_task.cancelled():
+                        # ``task.exception()`` raises CancelledError on a
+                        # cancelled task — guard with cancelled() before
+                        # asking. Cancellation is benign here (the pump's
+                        # ``except CancelledError: raise`` clause means the
+                        # task is cancelled but the SDK iterator unwound
+                        # cleanly via __aexit__).
+                        exc = pump_task.exception()
+                        if exc is not None:
+                            log.warning(
+                                "pump task terminated with exception "
+                                "(already surfaced via _PumpFailed sentinel "
+                                "if applicable): %s", exc,
+                            )
 
         except asyncio.CancelledError:
             # Explicit /api/chat/stop or process shutdown — surface as a

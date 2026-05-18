@@ -85,8 +85,17 @@
   //     keeps emitting heartbeats but isn't actually working.
   // The watchdog gates on lastVisibleActivityAt so a backend that stops
   // producing real events trips the timeout even while pings keep flowing.
-  const STREAM_STALL_MS = 4 * 60 * 1000;
-  const STREAM_STALL_CHECK_MS = 15 * 1000;
+  //
+  // 35 minutes (was 4) so a legitimate long foreground tool (compile, big
+  // test run, `npm install` on a fat monorepo) doesn't get aborted by the
+  // client while it's still working. Deliberately set GREATER than the
+  // server's MIDTURN_SILENCE_TIMEOUT_MS (30 min) — that's the authoritative
+  // "the CLI is wedged" signal and will emit an error event before this
+  // client watchdog would have tripped, so we don't tear down a stream the
+  // server still considers healthy. This 5-minute buffer absorbs SSE
+  // delivery + UI render lag.
+  const STREAM_STALL_MS = 35 * 60 * 1000;
+  const STREAM_STALL_CHECK_MS = 30 * 1000;
   let streamStartedAt = 0;
   let lastNetworkActivityAt = 0;
   let stallWatchdogHandle = null;
@@ -1392,10 +1401,27 @@
       setActiveTodoLabel(null);
       setStatus("Stopped.");
       announce("Stopped.");
+    } else if (obj.type === "_done") {
+      // Server end-of-stream sentinel. The replay/tail is finished — there
+      // is nothing more coming on this run. Drop streaming state so the
+      // EOF-recovery code at the bottom of drainStream doesn't loop calling
+      // tryResume() for a finished run whose replay carried no ``result``
+      // event (e.g. a run killed mid-turn by server restart). The premature-
+      // EOF path used to see isStreaming=true after the replay drained and
+      // immediately reopen the same stream; that loop was invisible to
+      // users but burned CPU and network.
+      stopGerunds();
+      setStreaming(false);
+      return;
     } else if (obj.type === "restarted_during_run") {
       // The server was restarted while a previous turn was running. The
       // SDK subprocess is gone, but the conversation jsonl on disk and our
       // session_id are intact — sending a new message will resume cleanly.
+      // Belt-and-braces with the _done handler above: marking the stream
+      // not-streaming here closes the EOF-retry loop even if a future
+      // server change emits restarted_during_run without a trailing _done.
+      stopGerunds();
+      setStreaming(false);
       ctx.currentAssistantBody = null;
       const article = document.createElement("article");
       article.className = "msg info";
@@ -1561,6 +1587,38 @@
       renderTaskEvent("progress", obj);
     } else if (obj.type === "task_notification") {
       renderTaskEvent("notification", obj);
+    } else if (obj.type === "auto_fire_capped") {
+      // Server reached MAX_CONSECUTIVE_AUTO_FIRES and dropped the latest
+      // batch of background-task notifications instead of auto-firing
+      // another synth turn. Without this handler the server's "we stopped
+      // pinging Claude" signal was invisible — the user just noticed
+      // background events arriving in the transcript and Claude going
+      // quiet. Render an info block so the cause is obvious and treat the
+      // run as paused-awaiting-user so the composer is hot again.
+      ctx.currentAssistantBody = null;
+      const dropped = Array.isArray(obj.events) ? obj.events : [];
+      const limit = typeof obj.limit === "number" ? obj.limit : null;
+      const article = document.createElement("article");
+      article.className = "msg info auto-fire-capped";
+      const role = document.createElement("h3");
+      role.className = "role";
+      role.textContent = "Auto-followups paused";
+      const body = document.createElement("p");
+      body.className = "info-body";
+      const limitText = limit !== null ? ` (cap: ${limit})` : "";
+      const droppedText = dropped.length
+        ? ` ${dropped.length} background notification${dropped.length === 1 ? "" : "s"} were not auto-sent to Claude.`
+        : "";
+      body.textContent =
+        `Hit the consecutive auto-followup limit${limitText}.${droppedText} ` +
+        "Send a message to continue.";
+      article.appendChild(role);
+      article.appendChild(body);
+      transcript.appendChild(article);
+      maybeAutoScroll();
+      stopGerunds();
+      setStreaming(false);
+      announce("Auto-followups paused — send a message to continue.");
     } else if (obj.type === "auto_fire") {
       // Server is auto-firing a follow-up turn driven by a buffered
       // task notification. Render an info block so the user knows the
