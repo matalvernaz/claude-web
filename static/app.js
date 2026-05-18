@@ -1206,6 +1206,26 @@
     // Late EOF: if a newer stream has taken over since this one started,
     // do nothing. The newer stream owns status/announcer/header refresh.
     if (gen !== streamGeneration) return;
+    // Premature EOF: the reader hit done=true while a turn was still
+    // in flight (no `result` event seen, so isStreaming is still true).
+    // Typical cause is a browser tab freeze: Chrome's intensive throttling
+    // pauses the fetch reader on backgrounded tabs, cloudflared/Traefik
+    // eventually closes the idle response, and on thaw we see EOF. The
+    // SDK task lives server-side independently, so reconnect via the
+    // event store rather than leaving the UI stuck on stale state.
+    if (isStreaming && currentRunId) {
+      const rid = currentRunId;
+      announce("Stream dropped; reconnecting.");
+      renderedIdxByRun.delete(rid);
+      // Null currentAbort so the caller's finally guard
+      // (`currentAbort === myAbort`) fails and skips the RUN_KEY wipe
+      // we need for tryResume to find the run.
+      currentAbort = null;
+      currentRunId = null;
+      safeSet(sessionStorage, RUN_KEY, rid);
+      setTimeout(() => { tryResume().catch(() => {}); }, 0);
+      return;
+    }
     stopGerunds();
     // Don't overwrite an explicit terminal status (stopped, error) with a
     // generic "Response complete." derived from a missing ctx.lastResult.
@@ -2921,4 +2941,35 @@
 
   promptEl.addEventListener("input", maybeUpdateSlashMenu);
   promptEl.addEventListener("blur", () => setTimeout(hideSlashMenu, 150));
+
+  // Chrome's intensive throttling / tab freezing pauses the SSE fetch
+  // reader on backgrounded tabs after a few minutes. If the connection
+  // dies during the freeze (cloudflared/Traefik idle timeout while
+  // pings can't be drained) the UI stays stuck on stale state until the
+  // user manually pokes the page. On visibility return, if we have an
+  // in-flight run and the network has been quiet long enough that the
+  // server's 25s pings clearly haven't been arriving, abort and rejoin
+  // via tryResume() so the transcript catches up from the event store.
+  const VISIBILITY_STALE_MS = 35_000;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (!isStreaming || !currentRunId) return;
+    if (Date.now() - lastNetworkActivityAt < VISIBILITY_STALE_MS) return;
+    const rid = currentRunId;
+    announce("Reconnecting to running task.");
+    renderedIdxByRun.delete(rid);
+    // Bump streamGeneration BEFORE abort so the old sendOne/tryResume's
+    // AbortError catch sees gen !== streamGeneration and skips the
+    // "Stopped." setStatus/announce — otherwise NVDA gets two contradictory
+    // announcements ("Stopped." then "Reconnecting to previous response.").
+    streamGeneration++;
+    if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+    // Same finally-guard trick as the _overflow handler: nulling
+    // currentAbort makes the in-flight sendOne/tryResume skip its
+    // RUN_KEY wipe so tryResume below can find the run.
+    currentAbort = null;
+    currentRunId = null;
+    safeSet(sessionStorage, RUN_KEY, rid);
+    setTimeout(() => { tryResume().catch(() => {}); }, 0);
+  });
 })();
