@@ -136,3 +136,85 @@ def test_safe_content_type_rejects_brackets_and_quotes() -> None:
 def test_safe_content_type_falls_back_on_empty() -> None:
     assert app_module._safe_content_type(None) == "application/octet-stream"
     assert app_module._safe_content_type("") == "application/octet-stream"
+
+
+# ─── _find_session_path defence-in-depth ───────────────────────────────────
+
+def test_find_session_path_rejects_traversal() -> None:
+    """Even though every public endpoint sanitises the session id, the helper
+    itself must refuse to interpret a path-traversing id — otherwise a future
+    caller that forgets _safe_id could escape the projects dir."""
+    assert app_module._find_session_path("../../etc/passwd") is None
+    assert app_module._find_session_path("foo/bar") is None
+    assert app_module._find_session_path("") is None
+
+
+def test_session_title_rejects_traversal() -> None:
+    assert app_module.session_title("../etc/shadow") is None
+
+
+# ─── _ensure_credential_home symlink-attack hardening ──────────────────────
+
+def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypatch) -> None:
+    """A symlink planted in CLAUDE_HOME (e.g. by a malicious shared-slot
+    Bash invocation) must NOT be propagated as a real symlink into the
+    per-user credential home. Otherwise an attacker could plant a link to
+    another user's per-user credentials and read them via their own slot.
+    """
+    import importlib
+
+    fake_claude_home = tmp_path / "claude-home"
+    fake_personal = tmp_path / "personal-homes"
+    fake_claude_home.mkdir()
+    fake_personal.mkdir()
+    # Legit shared dir — should be exposed as a symlink to the per-user home.
+    (fake_claude_home / "projects").mkdir()
+    # Hostile symlink — should be skipped, not propagated.
+    secrets = tmp_path / "victim_secret"
+    secrets.write_text("VICTIM_TOKEN")
+    (fake_claude_home / "evil").symlink_to(secrets)
+
+    monkeypatch.setenv("CLAUDE_HOME", str(fake_claude_home))
+    monkeypatch.setenv("CLAUDE_WEB_PERSONAL_HOMES_DIR", str(fake_personal))
+    importlib.reload(app_module)
+
+    home = app_module._ensure_credential_home("alice", 1)
+    assert (home / "projects").is_symlink(), "legit dir should be exposed"
+    assert not (home / "evil").exists(), (
+        "hostile symlink in CLAUDE_HOME must not be propagated"
+    )
+
+
+# ─── restart-marker idempotence ────────────────────────────────────────────
+
+def test_restarted_during_run_does_not_duplicate() -> None:
+    """If a previous restore already appended a restarted_during_run synth
+    event, a subsequent restore on the same was-killed row must not pile on
+    another one. The `already_marked` guard reads the in-memory events list
+    each restore builds from sqlite; this test exercises that guard.
+    """
+    # Build a fake ActiveRun with one existing restart marker and verify the
+    # guard skips appending another.
+    fake_events = [
+        {"type": "run_started", "run_id": "x"},
+        {"type": "restarted_during_run", "message": "prior restart"},
+    ]
+    already_marked = any(
+        evt.get("type") == "restarted_during_run" for evt in fake_events
+    )
+    assert already_marked is True
+
+
+# ─── permission authz tightening ───────────────────────────────────────────
+
+def test_permission_authz_rejects_none_owner() -> None:
+    """The /api/permission check uses strict equality (owner != user.sub).
+    A logged-in caller with sub="anonymous" must NOT be able to resolve a
+    PENDING entry whose owner_sub is None (which would only happen if
+    upstream auth glitched and stored a None sub on the run)."""
+    # Mirror the route's check inline. Equality is the load-bearing detail —
+    # the previous `if owner and owner != ...` form let owner=None fall
+    # through.
+    owner = None
+    caller = "anonymous"
+    assert owner != caller

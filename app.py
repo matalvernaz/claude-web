@@ -333,9 +333,15 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method in _CSRF_SAFE_METHODS:
             return await call_next(request)
-        # Auth callback is a top-level GET from the IdP, but if a particular
-        # provider ever issues POST we still want it through unchecked.
-        if request.url.path.startswith("/auth/"):
+        # Auth callback is a top-level navigation from the IdP, carrying a
+        # signed `state` parameter that the OIDC client validates. The
+        # browser's Origin/Referer points at the IdP, not our own origin, so
+        # the standard CSRF check would always reject it. Every other
+        # ``/auth/`` route is GET today (login, logout) and never reaches
+        # this branch — narrowing the exemption to the one path that needs
+        # it means a future POST endpoint under ``/auth/`` won't silently
+        # bypass CSRF just because of the path prefix.
+        if request.url.path == "/auth/callback":
             return await call_next(request)
 
         expected = auth.expected_origin(request)
@@ -517,8 +523,11 @@ def session_title(session_id: str, cwd: Optional[Path] = None) -> Optional[str]:
     """Look up a session's first user line.
 
     If `cwd` is given, only the matching project's dir is consulted; otherwise
-    every configured project is searched.
+    every configured project is searched. Same defence-in-depth as
+    ``_find_session_path``: refuse to interpret a malformed session id.
     """
+    if not _ID_RE.match(session_id or ""):
+        return None
     candidates = [cwd] if cwd is not None else PROJECTS
     for project in candidates:
         path = _sessions_dir(project) / f"{session_id}.jsonl"
@@ -580,7 +589,18 @@ def _summarise_tool_input(name: str, inp: dict) -> str:
 
 
 def _find_session_path(session_id: str, project_key: str = "") -> Optional[Path]:
-    """Locate a session file in the configured projects."""
+    """Locate a session file in the configured projects.
+
+    Defence-in-depth: every public route that takes a session id passes it
+    through ``_safe_id`` first, but this helper is also called from
+    ``session_title`` / ``_log_usage`` paths where the id comes from
+    ``msg.session_id``. The SDK shouldn't hand us anything weird, but
+    treating the id as untrusted here closes the door on any future caller
+    that forgets to sanitise — a ``../../etc/passwd``-shaped session id
+    would otherwise resolve a real-but-out-of-bounds ``.jsonl`` path.
+    """
+    if not _ID_RE.match(session_id or ""):
+        return None
     if project_key:
         cwd = _resolve_project(project_key)
         path = _sessions_dir(cwd) / f"{session_id}.jsonl"
@@ -1172,6 +1192,17 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     slot is active.
 
     Idempotent.
+
+    Symlink-attack hardening: a malicious entry in CLAUDE_HOME could be a
+    symlink pointing into another user's per-user home dir. If we followed it
+    blindly we'd plant a real link to that target inside this credential's
+    home — and the spawned CLI (running with CLAUDE_CONFIG_DIR=home) would
+    happily read it as its own. Two guards: skip entries that are themselves
+    symlinks (we won't follow attacker-planted ones), and use
+    ``entry.absolute()`` rather than ``entry.resolve()`` so the link points at
+    the literal CLAUDE_HOME path rather than its resolved target (a later
+    symlink swap there is still subject to the skip-symlinks check on the
+    next refresh).
     """
     home = _credential_home_path(user_sub, cred_id)
     home.mkdir(parents=True, exist_ok=True)
@@ -1183,12 +1214,23 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
         # Per-credential files: must be real, not symlinked back to shared.
         if entry.name in (".credentials.json", ".anthropic_api_key"):
             continue
+        # Refuse to follow a symlink planted in CLAUDE_HOME. A shared-instance
+        # deployment lets every signed-in user write here (via the Bash tool
+        # under the shared slot); without this check, a planted symlink to
+        # another user's PERSONAL_HOMES_DIR/<sub>/<id>/.credentials.json would
+        # expose that credential under the attacker's own home.
+        if entry.is_symlink():
+            logging.getLogger("claude-web").warning(
+                "skipping symlinked entry %s in CLAUDE_HOME (refusing to "
+                "rebroadcast it into per-user home)", entry,
+            )
+            continue
         link = home / entry.name
         # is_symlink() catches broken symlinks that exists() reports as False.
         if link.is_symlink() or link.exists():
             continue
         try:
-            link.symlink_to(entry.resolve())
+            link.symlink_to(entry.absolute())
         except OSError as e:
             logging.getLogger("claude-web").warning(
                 "credential-home symlink %s → %s failed: %s", link, entry, e
@@ -1421,7 +1463,15 @@ def _restore_persisted_runs() -> None:
             run.events.append(synth)
             _persist_event(run_id, len(run.events) - 1, synth)
         was_killed = finished_at is None
-        if was_killed:
+        # Idempotent restart marker: if a previous restore already appended a
+        # restarted_during_run event (and crashed before _persist_run_meta
+        # could mark finished_at), don't pile on another one this boot.
+        # Without this guard, consecutive crashes accumulate one synth per
+        # restart — the user gets N "server restarted" banners instead of one.
+        already_marked = any(
+            evt.get("type") == "restarted_during_run" for evt in run.events
+        )
+        if was_killed and not already_marked:
             synth = {
                 "type": "restarted_during_run",
                 "message": (
@@ -2053,7 +2103,11 @@ async def api_permission(
     if fut.done():
         raise HTTPException(404, "no such pending request")
     owner = entry.get("owner_sub")
-    if owner and owner != user.get("sub"):
+    # Strict equality (not truthiness) so an entry with owner_sub=None can't
+    # be resolved by an arbitrary signed-in user. owner_sub is set from
+    # user.get("sub") at PENDING insertion and AUTH_MODE=none uses the literal
+    # "anonymous", so a None here means something went wrong upstream — refuse.
+    if owner != user.get("sub"):
         raise HTTPException(403, "not your permission request")
     if decision not in {"allow", "allow_session", "deny"}:
         raise HTTPException(400, "bad decision")
@@ -2444,19 +2498,41 @@ async def _save_uploaded_files(files: list[UploadFile], run_id: str) -> list[dic
         if not data:
             continue
         base = _safe_filename(f.filename)
-        target = target_dir / base
-        # Disambiguate name collisions within the same run. Bounded so a
-        # filename pile-up can't loop forever; we'd rather fail loudly with
-        # a clear error than spin doing stat() calls.
-        n = 1
-        while target.exists():
-            if n > 1000:
-                raise HTTPException(409, f"too many name collisions for '{base}'")
-            stem, dot, ext = base.rpartition(".")
-            base2 = f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
-            target = target_dir / base2
-            n += 1
-        target.write_bytes(data)
+        # Atomic collision-and-create with O_CREAT|O_EXCL. The previous
+        # exists()-then-write_bytes() pattern was a TOCTOU race: two
+        # concurrent calls into _save_uploaded_files for the same run_id
+        # could both observe target.exists() == False and overwrite each
+        # other's bytes. Single-worker mode keeps this nearly impossible in
+        # practice, but O_EXCL turns "nearly impossible" into "actually
+        # impossible" for the price of one syscall per attempt.
+        target: Optional[Path] = None
+        fd: Optional[int] = None
+        for n in range(1, 1002):
+            if n == 1:
+                candidate = target_dir / base
+            else:
+                stem, dot, ext = base.rpartition(".")
+                candidate = target_dir / (
+                    f"{stem}-{n}.{ext}" if dot else f"{base}-{n}"
+                )
+            try:
+                fd = os.open(
+                    candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+            except FileExistsError:
+                continue
+            target = candidate
+            break
+        if target is None or fd is None:
+            raise HTTPException(409, f"too many name collisions for '{base}'")
+        try:
+            with os.fdopen(fd, "wb") as outf:
+                outf.write(data)
+        except BaseException:
+            # If write failed, leave the empty placeholder behind for the
+            # GC pass to clean up — better than swallowing the error and
+            # claiming the upload succeeded.
+            raise
         out.append({
             "filename": target.name,
             "path": str(target),
@@ -2587,12 +2663,16 @@ async def api_chat(
     sess_lock = _session_lock(session_id) if session_id else None
     if sess_lock:
         await sess_lock.acquire()
-    # Resolve the credential slot once per request. Used both to decide
-    # whether to reuse an existing run (whose CLI was spawned with possibly
-    # different creds) and to pass into the SDK on fresh spawns.
-    account = _resolve_account_for_run(user)
 
     try:
+        # Resolve the credential slot once per request. Used both to decide
+        # whether to reuse an existing run (whose CLI was spawned with
+        # possibly different creds) and to pass into the SDK on fresh spawns.
+        # MUST run inside the try so a synchronous failure here (sqlite,
+        # HTTPException from a bad active slot, etc.) still releases the
+        # session lock — without this, one bad call would deadlock the
+        # session for the worker's lifetime.
+        account = _resolve_account_for_run(user)
         existing = _existing_run_for_session(session_id) if session_id else None
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
@@ -2872,9 +2952,14 @@ async def api_chat(
                 # driver's own teardown signal, not a SDK failure.
                 raise
             except Exception as exc:
-                await msg_queue.put(_PumpFailed(exc, traceback.format_exc()))
+                # Terminal sentinels must enqueue without suspending so that
+                # _PumpFailed and pump_done land back-to-back in the queue.
+                # The driver harvests both in one wait tick; awaiting put()
+                # here is harmless today (queue is unbounded) but would
+                # deadlock if the queue ever grew a maxsize.
+                msg_queue.put_nowait(_PumpFailed(exc, traceback.format_exc()))
             finally:
-                await msg_queue.put(pump_done)
+                msg_queue.put_nowait(pump_done)
 
         try:
             async with ClaudeSDKClient(options=options) as client:
@@ -2976,16 +3061,25 @@ async def api_chat(
                         # the user queues a message at the same time.
                         msg_done = msg_get in done
                         user_done = user_get is not None and user_get in done
+                        # Harvest user_get's result FIRST so a terminal msg
+                        # (pump_done / _PumpFailed) in the same wait round
+                        # can't make us break before reading the user's
+                        # queued message. Without this, `if msg is pump_done:
+                        # break` left a popped user input stranded — the
+                        # queue had already given it up, the next driver
+                        # iteration never ran, and the user's message
+                        # vanished with no UI signal at all.
+                        popped_user_item: Optional[dict] = (
+                            user_get.result() if user_done else None
+                        )
                         if msg_done:
                             msg = msg_get.result()
+                            terminal_kind: Optional[str] = None
                             if msg is pump_done:
                                 # SDK iterator exhausted — CLI subprocess
-                                # closed. Nothing more will arrive; exit. Any
-                                # queued user message we also pulled from
-                                # user_get is unavoidably lost — there's no
-                                # CLI left to deliver it to.
-                                break
-                            if isinstance(msg, _PumpFailed):
+                                # closed. Nothing more will arrive; exit.
+                                terminal_kind = "pump_done"
+                            elif isinstance(msg, _PumpFailed):
                                 # SDK iterator raised before exhausting. The
                                 # pump still enqueued pump_done after this so
                                 # the loop will exit on the next iteration;
@@ -3004,6 +3098,32 @@ async def api_chat(
                                     "message": f"SDK message stream failed: {type(msg.exc).__name__}: {msg.exc}",
                                     "stderr": "\n\n".join(detail_parts),
                                 })
+                                terminal_kind = "pump_failed"
+                            if terminal_kind is not None:
+                                if popped_user_item is not None:
+                                    # The user's message rode the same wait
+                                    # tick as the terminal — there's no CLI
+                                    # left to deliver it to. Surface as an
+                                    # error event so the UI knows to retry
+                                    # in a new run instead of leaving the
+                                    # user staring at an unanswered prompt.
+                                    text = popped_user_item.get("text") or ""
+                                    preview = text[:200] + ("…" if len(text) > 200 else "")
+                                    run.emit({
+                                        "type": "error",
+                                        "message": (
+                                            "Your message arrived just as the "
+                                            "Claude Code subprocess exited; it "
+                                            "wasn't delivered. Re-send it in a "
+                                            "new chat or after the run resumes."
+                                        ),
+                                        "lost_input": preview,
+                                    })
+                                    log.warning(
+                                        "driver lost queued user input on %s "
+                                        "(reason=%s, preview=%r)",
+                                        run.run_id, terminal_kind, preview,
+                                    )
                                 break
                             run.last_activity = time.time()
                             last_cli_activity = time.monotonic()
@@ -3104,8 +3224,8 @@ async def api_chat(
                             # arriving between turns must keep between_turns
                             # = True so the grace timer can arm.
 
-                        if user_done:
-                            item = user_get.result()
+                        if popped_user_item is not None:
+                            item = popped_user_item
                             run.consecutive_auto_fires = 0
                             await _send_user_message(
                                 client,
@@ -3490,9 +3610,14 @@ def _today_window() -> tuple[int, int]:
     return int(start.timestamp()), int((start + datetime.timedelta(days=1)).timestamp())
 
 
-@app.get("/api/usage")
-async def api_usage(user: dict = Depends(auth.require_user)):
-    """Aggregate today's usage and return whatever rate-limit info we last saw."""
+def _compute_usage_payload(user_sub: Optional[str]) -> dict:
+    """Synchronous body of /api/usage — invoked on a worker thread so a fat
+    usage.jsonl doesn't block the event loop.
+
+    The full file is scanned per call because today's rows are interleaved
+    with history. The naive linear scan is fine up to ~100k rows; rotate
+    the log or move to sqlite if the file grows past that.
+    """
     start, end = _today_window()
     today_rows: list[dict] = []
     for row in _iter_jsonl(USAGE_LOG):
@@ -3529,7 +3654,6 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     # per-credential slots are filtered to the current user so each user
     # sees only their own spend on their own credentials. Rows from before
     # the slot-tagging change (missing account_slot) are treated as 'shared'.
-    user_sub = user.get("sub")
     slot_totals = {
         "shared": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
         "personal": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
@@ -3573,6 +3697,19 @@ async def api_usage(user: dict = Depends(auth.require_user)):
         },
         "rate_limit": rate_limit,
     }
+
+
+@app.get("/api/usage")
+async def api_usage(user: dict = Depends(auth.require_user)):
+    """Aggregate today's usage and return whatever rate-limit info we last saw.
+
+    Delegates the disk scan + JSON parsing to a worker thread because
+    usage.jsonl grows monotonically. With a few hundred rows it's fine on
+    the event loop; at 100k rows the linear scan is multi-hundred-ms of
+    blocking work, which starves every other in-flight request and stalls
+    SSE streams. asyncio.to_thread is the minimal-blast-radius fix.
+    """
+    return await asyncio.to_thread(_compute_usage_payload, user.get("sub"))
 
 
 @app.get("/account")
