@@ -1298,16 +1298,32 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     return home
 
 
+def _identity_env_for(user: dict) -> dict[str, str]:
+    """Identity vars surfaced to every spawned CLI so hooks/personalities can
+    address the signed-in user by name. Empty strings are emitted (rather than
+    omitted) in AUTH_MODE=none / missing-field cases so a SessionStart hook
+    sees a stable schema instead of "is this set or not."
+    """
+    u = user or {}
+    return {
+        "CLAUDE_WEB_USER_SUB": u.get("sub") or "",
+        "CLAUDE_WEB_USER_EMAIL": u.get("email") or "",
+        "CLAUDE_WEB_USER_NAME": u.get("name") or "",
+    }
+
+
 def _resolve_account_for_run(user: dict) -> dict:
     """Pick the credential slot for the user's next run.
 
     Returns ``{"slot": "shared"|"cred:<id>", "env": dict[str,str], "label": str}``.
-    ``env`` is empty for shared (CLAUDE_HOME wins naturally) and carries
-    CLAUDE_CONFIG_DIR for any per-user credential. If the user's active
-    credential is missing its .credentials.json (deleted out-of-band, or a
-    setup flow was reserved but never completed), falls back to shared
-    rather than spawning a CLI that would crash on first API call.
+    ``env`` always carries the CLAUDE_WEB_USER_* identity vars; for a
+    per-user credential it additionally carries CLAUDE_CONFIG_DIR (and
+    possibly ANTHROPIC_API_KEY). If the user's active credential is missing
+    its .credentials.json (deleted out-of-band, or a setup flow was reserved
+    but never completed), falls back to shared rather than spawning a CLI
+    that would crash on first API call.
     """
+    identity_env = _identity_env_for(user)
     sub = (user or {}).get("sub")
     active = _user_active_slot(sub)
     cred_id = _parse_cred_active(active)
@@ -1316,7 +1332,10 @@ def _resolve_account_for_run(user: dict) -> dict:
         if cred:
             home = _ensure_credential_home(sub, cred_id)
             if (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists():
-                env: dict[str, str] = {"CLAUDE_CONFIG_DIR": str(home)}
+                env: dict[str, str] = {
+                    **identity_env,
+                    "CLAUDE_CONFIG_DIR": str(home),
+                }
                 # An API key in the per-credential home overrides the
                 # shared-slot ANTHROPIC_API_KEY for this run.
                 try:
@@ -1338,7 +1357,7 @@ def _resolve_account_for_run(user: dict) -> dict:
                 "active credential %s missing credentials for sub=%s; falling back to shared",
                 cred_id, sub,
             )
-    return {"slot": "shared", "env": {}, "label": SHARED_ACCOUNT_LABEL}
+    return {"slot": "shared", "env": dict(identity_env), "label": SHARED_ACCOUNT_LABEL}
 
 
 def _user_can_see_session(session_id: str, user: dict) -> bool:
@@ -3228,9 +3247,11 @@ async def api_chat(
         # only Opus 4.7's 1M-context option).
         options_kwargs["betas"] = sdk_betas
     if account["env"]:
-        # CLAUDE_CONFIG_DIR points the spawned CLI at the user's per-user
-        # home (mostly symlinks to CLAUDE_HOME, real .credentials.json) so
-        # this run authenticates as their personal account.
+        # Identity (CLAUDE_WEB_USER_*) is always present so SessionStart
+        # hooks can address the user by name; CLAUDE_CONFIG_DIR/
+        # ANTHROPIC_API_KEY are added when the user has activated a personal
+        # credential slot. The SDK merges this dict over inherited env, so
+        # PATH/HOME/etc. survive.
         options_kwargs["env"] = account["env"]
     options = ClaudeAgentOptions(**options_kwargs)
 

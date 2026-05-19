@@ -185,6 +185,55 @@ def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypa
     )
 
 
+# ─── identity env passthrough ──────────────────────────────────────────────
+
+def test_identity_env_for_full_user() -> None:
+    """Every CLAUDE_WEB_USER_* key is emitted from the OIDC user dict."""
+    env = app_module._identity_env_for(
+        {"sub": "abc-123", "email": "j@example.com", "name": "Jocelyn"}
+    )
+    assert env == {
+        "CLAUDE_WEB_USER_SUB": "abc-123",
+        "CLAUDE_WEB_USER_EMAIL": "j@example.com",
+        "CLAUDE_WEB_USER_NAME": "Jocelyn",
+    }
+
+
+def test_identity_env_for_anonymous_emits_empty_strings() -> None:
+    """AUTH_MODE=none / missing fields produce empty strings, not missing
+    keys. A SessionStart hook can rely on a stable schema."""
+    env = app_module._identity_env_for(
+        {"sub": "anonymous", "email": "anonymous@localhost", "name": "anonymous"}
+    )
+    assert set(env) == {
+        "CLAUDE_WEB_USER_SUB",
+        "CLAUDE_WEB_USER_EMAIL",
+        "CLAUDE_WEB_USER_NAME",
+    }
+    env_none = app_module._identity_env_for({})
+    assert env_none == {
+        "CLAUDE_WEB_USER_SUB": "",
+        "CLAUDE_WEB_USER_EMAIL": "",
+        "CLAUDE_WEB_USER_NAME": "",
+    }
+    env_null = app_module._identity_env_for(None)  # type: ignore[arg-type]
+    assert env_null["CLAUDE_WEB_USER_SUB"] == ""
+
+
+def test_resolve_account_for_run_shared_carries_identity() -> None:
+    """The shared slot path now carries identity env (used to be empty)."""
+    account = app_module._resolve_account_for_run(
+        {"sub": "u1", "email": "u1@example.com", "name": "User One"}
+    )
+    assert account["slot"] == "shared"
+    assert account["env"]["CLAUDE_WEB_USER_EMAIL"] == "u1@example.com"
+    assert account["env"]["CLAUDE_WEB_USER_NAME"] == "User One"
+    assert account["env"]["CLAUDE_WEB_USER_SUB"] == "u1"
+    # Shared slot must not carry CLAUDE_CONFIG_DIR — that would point the
+    # spawned CLI away from the shared CLAUDE_HOME.
+    assert "CLAUDE_CONFIG_DIR" not in account["env"]
+
+
 # ─── restart-marker idempotence ────────────────────────────────────────────
 
 def test_restarted_during_run_does_not_duplicate() -> None:
