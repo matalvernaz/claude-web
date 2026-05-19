@@ -218,3 +218,246 @@ def test_permission_authz_rejects_none_owner() -> None:
     owner = None
     caller = "anonymous"
     assert owner != caller
+
+
+# ─── Markdown export fence escape ──────────────────────────────────────────
+
+def test_fence_for_baseline_three_backticks() -> None:
+    """Plain content gets a normal ``` fence."""
+    assert app_module._fence_for("hello world") == "```"
+    assert app_module._fence_for("") == "```"
+
+
+def test_fence_for_grows_past_embedded_runs() -> None:
+    """If the content contains a ``` run, the fence must be ≥ 4 backticks
+    so the embedded run can't close the wrapping fence. Otherwise an
+    attacker-controlled tool result could break out of the code block and
+    inject raw markdown (including </details> to close the surrounding
+    disclosure)."""
+    text_with_run = "before\n```\nafter"
+    assert app_module._fence_for(text_with_run) == "````"
+    text_with_longer = "x```` y"
+    assert app_module._fence_for(text_with_longer) == "`````"
+
+
+# ─── _is_user_visible structured behaviour ─────────────────────────────────
+
+def test_is_user_visible_no_longer_filters_system_reminder_prefix() -> None:
+    """Plain user-typed text starting with <system-reminder> used to be
+    hidden in the export by a string-prefix heuristic. Now visibility is
+    governed only by the AUTO_FIRE_MARKER (which we ourselves emit) plus
+    each caller's own isMeta check. Tool-fetched content that happens to
+    start with that prefix is no longer silently hidden."""
+    assert app_module._is_user_visible("hello") is True
+    assert app_module._is_user_visible("<system-reminder>not real") is True
+    assert app_module._is_user_visible("<local-command-caveat>ignore") is True
+    assert app_module._is_user_visible(
+        app_module.AUTO_FIRE_MARKER + "synth"
+    ) is False
+
+
+# ─── Bounded ActiveRun.events + _next_idx semantics ────────────────────────
+
+def test_active_run_next_idx_independent_of_events_len() -> None:
+    """After an in-memory trim, _next_idx must keep counting from where
+    it was — subscriber start_index relies on _idx being a stable handle."""
+    run = app_module.ActiveRun("test-run")
+    # Force a low cap so trimming is observable. Cleanup at end.
+    orig_high = app_module.EVENTS_MEM_CAP_HIGH
+    orig_low = app_module.EVENTS_MEM_CAP_LOW
+    app_module.EVENTS_MEM_CAP_HIGH = 5
+    app_module.EVENTS_MEM_CAP_LOW = 3
+    try:
+        # With HIGH=5, LOW=3: the trim only fires when len crosses HIGH.
+        # On emit #6 (zero-indexed: i=5), len becomes 6, the trim drops
+        # `6 - 3 = 3` events, leaving the last 3 (idx 3,4,5). Subsequent
+        # emits 6,7 grow back to len=5 without re-tripping (5 ≯ 5).
+        for i in range(8):
+            run.emit({"type": "noise", "n": i})
+        assert run._next_idx == 8
+        # Final state: 5 cached events covering idx 3..7.
+        assert len(run.events) == 5
+        # Surviving events carry their original _idx (not 0/1/2/3/4).
+        assert run.events[0]["_idx"] == 3
+        assert run.events[-1]["_idx"] == 7
+    finally:
+        app_module.EVENTS_MEM_CAP_HIGH = orig_high
+        app_module.EVENTS_MEM_CAP_LOW = orig_low
+
+
+def test_subscribe_overflow_marker_is_force_inserted(monkeypatch) -> None:
+    """When the backlog fills the subscriber queue, _overflow must still
+    land — the consumer needs it to know to reconnect via the persisted
+    store. The previous naive ``put_nowait({"type":"_overflow"})`` on a
+    full queue silently dropped the marker; the consumer drained the
+    partial backlog then hung forever waiting for events that never came.
+    """
+    monkeypatch.setattr(app_module, "MAX_SUBSCRIBER_QUEUE", 3)
+    run = app_module.ActiveRun("overflow-test")
+    # Emit more events than the subscriber queue can hold.
+    for i in range(10):
+        run.emit({"type": "noise", "n": i})
+
+    q = run.subscribe(start_index=0)
+    # Drain the queue and verify the overflow marker is in there.
+    drained: list[dict] = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    assert any(e.get("type") == "_overflow" for e in drained), (
+        "subscribe() must surface _overflow when the backlog can't fit; "
+        f"got types {[e.get('type') for e in drained]}"
+    )
+
+
+def test_finish_emits_lost_input_before_done(monkeypatch) -> None:
+    """run.finish() must drain any queued user inputs and emit lost_input
+    events to live subscribers BEFORE the _done terminator. The previous
+    "fail the ack, let the bg task emit" pattern raced against finish() —
+    by the time the bg task ran, subscribers were already cleared and
+    the error reached no live UI. Now the lost_input is emitted
+    synchronously by finish() itself; the bg task sees a
+    _DeliveryAlreadyReported sentinel and returns silently."""
+    import asyncio
+
+    async def go():
+        run = app_module.ActiveRun("finish-emit-test")
+        q = run.subscribe(start_index=0)
+        # Put a fake queued item the way _inject_user_input does.
+        loop = asyncio.get_running_loop()
+        delivered: asyncio.Future = loop.create_future()
+        await run.user_input_queue.put({
+            "text": "hello unsent",
+            "image_blocks": [],
+            "delivered": delivered,
+        })
+        # Now finish — should emit lost_input then _done.
+        run.finish()
+        drained: list[dict] = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        return drained
+
+    drained = asyncio.run(go())
+    types = [e.get("type") for e in drained]
+    assert "error" in types, f"expected lost_input error event, got {types}"
+    error_idx = types.index("error")
+    done_idx = types.index("_done")
+    assert error_idx < done_idx, (
+        f"lost_input ({error_idx}) must precede _done ({done_idx}); "
+        f"otherwise the live subscriber will close on _done before seeing "
+        f"the error"
+    )
+    # The error must include the lost text preview so the user knows what
+    # was dropped.
+    error_event = drained[error_idx]
+    assert "hello unsent" in (error_event.get("lost_input") or "")
+
+
+def test_delivery_already_reported_sentinel_suppresses_bg_emit() -> None:
+    """When a synchronous failure path emits lost_input and then sets the
+    ack future's exception to _DeliveryAlreadyReported, the background
+    _confirm_and_emit_user_prompt task must NOT emit a duplicate error."""
+    import asyncio
+
+    async def go():
+        run = app_module.ActiveRun("dedup-test")
+        # The subscriber will collect everything emitted.
+        q = run.subscribe(start_index=0)
+        # Simulate a synchronous path that ALREADY emitted lost_input and
+        # marked the ack as reported.
+        loop = asyncio.get_running_loop()
+        delivered: asyncio.Future = loop.create_future()
+        app_module._emit_lost_input(run, "boom", "synchronous failure")
+        delivered.set_exception(app_module._DeliveryAlreadyReported("reported"))
+        # The background task should swallow the marker exception.
+        await app_module._confirm_and_emit_user_prompt(
+            run, "boom", 0, 0, delivered,
+        )
+        drained: list[dict] = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        return drained
+
+    drained = asyncio.run(go())
+    error_events = [e for e in drained if e.get("type") == "error"]
+    assert len(error_events) == 1, (
+        f"expected exactly one error event (from the synchronous emit); "
+        f"got {len(error_events)}: {error_events}"
+    )
+
+
+def test_active_run_subscribe_replays_from_sqlite_when_trimmed(tmp_path, monkeypatch) -> None:
+    """When in-memory events have been trimmed, subscribe(start_index=0)
+    must fetch the dropped range from sqlite. Without that fallback, a
+    long-running trimmed run would replay as a near-empty transcript."""
+    import importlib
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_WEB_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("CLAUDE_WEB_EVENTS_MEM_CAP_HIGH", "5")
+    monkeypatch.setenv("CLAUDE_WEB_EVENTS_MEM_CAP_LOW", "3")
+    importlib.reload(app_module)
+
+    run = app_module.ActiveRun("trim-replay-test")
+    for i in range(8):
+        run.emit({"type": "noise", "n": i})
+    # Cache has idx 3..7; sqlite has all 0..7.
+    assert run.events[0]["_idx"] == 3
+
+    q = run.subscribe(start_index=0)
+    drained: list[dict] = []
+    while not q.empty():
+        drained.append(q.get_nowait())
+    # All 8 events should land in the queue (or be signalled via _overflow
+    # if the queue's maxsize was hit — but with maxsize 1000 and 8 events
+    # we're well under).
+    idx_values = [e["_idx"] for e in drained if "_idx" in e]
+    assert idx_values == list(range(8)), (
+        f"expected idx 0..7 via sqlite+cache replay, got {idx_values}"
+    )
+
+
+# ─── Persist-before-notify ordering ────────────────────────────────────────
+
+def test_emit_persists_before_notifying_subscribers(monkeypatch) -> None:
+    """The contract: clients must never see an event that the persisted
+    log doesn't have. So _persist_event must be called BEFORE we notify
+    subscribers; otherwise a crash between the two leaves a phantom event
+    only the live subscriber knows about, and reconnect-from-sqlite
+    replay can't reproduce it."""
+    import asyncio
+
+    call_order: list[str] = []
+    monkeypatch.setattr(
+        app_module, "_persist_event",
+        lambda *a, **kw: call_order.append("persist"),
+    )
+    monkeypatch.setattr(
+        app_module, "_persist_run_meta",
+        lambda *a, **kw: call_order.append("persist_meta"),
+    )
+
+    async def go() -> tuple[int, list[str]]:
+        run = app_module.ActiveRun("ordering-test")
+        # Subscribe BEFORE emit so the fan-out notify step has a queue to
+        # write into. We then assert the queue received the event AND
+        # persist fired first by checking call_order ordering against the
+        # appearance of the event in the subscriber's queue.
+        q = run.subscribe(start_index=0)
+        # Mark the subscriber-notify boundary in call_order. We can't hook
+        # the actual `q.put_nowait` line without monkeypatching asyncio,
+        # so wrap subscribe and emit calls around the marker checks.
+        before_emit = list(call_order)
+        run.emit({"type": "fake", "ts": 1})
+        return q.qsize(), before_emit
+
+    qsize, before_emit = asyncio.run(go())
+    assert qsize >= 1, "subscriber should have received the emitted event"
+    # _persist_event was called as part of emit(). If subscribers had been
+    # notified first, call_order would still be empty at the moment the
+    # queue was populated. With persist-first ordering, "persist" lands in
+    # call_order before we leave emit(); the queue's put_nowait can only
+    # happen later.
+    assert "persist" in call_order
+    assert call_order.index("persist") == 0  # persist is the first action

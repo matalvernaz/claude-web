@@ -232,7 +232,7 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _safe_id(value: str) -> str:
-    if not _ID_RE.match(value or ""):
+    if not _ID_RE.fullmatch(value or ""):
         raise HTTPException(400, "bad id")
     return value
 
@@ -258,6 +258,21 @@ NO_SESSION_ALLOWLIST_TOOLS: set[str] = set(
 # Active subscribers should never approach this — events are bytes on the wire
 # the moment they're queued.
 MAX_SUBSCRIBER_QUEUE = int(os.getenv("CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE", "1000"))
+
+# Soft cap on in-memory ActiveRun.events. Sized to comfortably hold the entire
+# event stream of a normal conversation (≈500 events) while putting a ceiling
+# on a runaway one (long overnight refactor, monitor task spitting hundreds
+# of progress events). Above HIGH we trim down to LOW; trimmed events still
+# live in sqlite and subscribers requesting an out-of-cache start_index pick
+# them up from there. Both env-tunable so a deployment that wants to keep
+# everything in RAM can raise the bar.
+EVENTS_MEM_CAP_HIGH = int(os.getenv("CLAUDE_WEB_EVENTS_MEM_CAP_HIGH", "10000"))
+EVENTS_MEM_CAP_LOW = int(os.getenv("CLAUDE_WEB_EVENTS_MEM_CAP_LOW", "8000"))
+if EVENTS_MEM_CAP_LOW >= EVENTS_MEM_CAP_HIGH:
+    raise RuntimeError(
+        "CLAUDE_WEB_EVENTS_MEM_CAP_LOW must be strictly less than "
+        "CLAUDE_WEB_EVENTS_MEM_CAP_HIGH"
+    )
 
 # Maximum bytes we'll buffer in memory for a single uploaded image. Smaller
 # than MAX_IMAGE_BYTES is fine — we stream and abort when the limit is hit
@@ -465,15 +480,31 @@ def _extract_text(msg) -> Optional[str]:
 
 
 def _is_user_visible(text: str) -> bool:
-    return not (
-        text.startswith("<local-command-caveat>")
-        or text.startswith("<command-name>")
-        or text.startswith("<system-reminder>")
-        # Auto-fire synth messages aren't user input. The live UI hides them
-        # via the auto_fire event; this filter keeps the export and resumed
-        # transcript from mis-attributing them to the human.
-        or text.startswith(AUTO_FIRE_MARKER)
-    )
+    """Should this text appear in the user-facing transcript / export?
+
+    Server-side ``AUTO_FIRE_MARKER`` messages (our own synth injections)
+    are always hidden — they aren't user input even though they ride the
+    user-message channel into the CLI.
+
+    The previous version ALSO filtered ``<local-command-caveat>``,
+    ``<command-name>``, and ``<system-reminder>`` prefixes. Two problems
+    with that:
+
+      1. Those tags are emitted by the bundled CLI itself as ``isMeta``
+         user messages, and every caller of this function already
+         filters ``obj.get("isMeta")``. The prefix check was redundant
+         second-line-of-defence at best.
+      2. A tool result containing fetched-content that happens to start
+         with one of those tags (e.g. Claude fetches a webpage that uses
+         ``<system-reminder>`` as literal text) would be hidden from the
+         export. Worse, an attacker controlling fetched content could
+         exploit it to hide synthetic-looking tool actions from the user.
+
+    Visibility is now derived from server-controlled metadata
+    (``AUTO_FIRE_MARKER`` is the one prefix we ourselves emit) plus
+    each caller's ``isMeta`` check.
+    """
+    return not text.startswith(AUTO_FIRE_MARKER)
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict]:
@@ -526,7 +557,7 @@ def session_title(session_id: str, cwd: Optional[Path] = None) -> Optional[str]:
     every configured project is searched. Same defence-in-depth as
     ``_find_session_path``: refuse to interpret a malformed session id.
     """
-    if not _ID_RE.match(session_id or ""):
+    if not _ID_RE.fullmatch(session_id or ""):
         return None
     candidates = [cwd] if cwd is not None else PROJECTS
     for project in candidates:
@@ -599,7 +630,7 @@ def _find_session_path(session_id: str, project_key: str = "") -> Optional[Path]
     that forgets to sanitise — a ``../../etc/passwd``-shaped session id
     would otherwise resolve a real-but-out-of-bounds ``.jsonl`` path.
     """
-    if not _ID_RE.match(session_id or ""):
+    if not _ID_RE.fullmatch(session_id or ""):
         return None
     if project_key:
         cwd = _resolve_project(project_key)
@@ -718,6 +749,27 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
 # TOOL_RESULT_PREVIEW, so they don't need a second cap.
 EXPORT_INPUT_MAX_CHARS = 4000
 
+# Match runs of backticks; used by _fence_for to pick a fence that can't
+# be closed by anything inside the wrapped content. CommonMark requires the
+# closing fence to be at least as long as the opening fence, so opening with
+# (longest_backtick_run + 1) backticks is sufficient.
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _fence_for(text: str) -> str:
+    """Pick a backtick code-fence whose length exceeds every backtick run
+    inside ``text``. A tool result containing a literal ```` ``` ```` would
+    otherwise close the wrapping fence and let the rest of the result
+    render as raw markdown — meaning a ``</details>`` tag inside the
+    result could close the surrounding disclosure block, breaking the
+    export structure or letting tool-controlled content forge UI sections.
+    """
+    longest = max(
+        (len(m.group(0)) for m in _BACKTICK_RUN_RE.finditer(text or "")),
+        default=0,
+    )
+    return "`" * max(3, longest + 1)
+
 
 def _truncate_for_export(text: str, limit: int) -> str:
     if len(text) <= limit:
@@ -817,14 +869,21 @@ def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]
                         out.append(f"+ {ln}")
                     out.append("```")
                 else:  # Write
-                    content = inp.get("content") or ""
-                    out.append("```")
-                    out.append(_truncate_for_export(content, EXPORT_INPUT_MAX_CHARS))
-                    out.append("```")
+                    content = _truncate_for_export(
+                        inp.get("content") or "", EXPORT_INPUT_MAX_CHARS,
+                    )
+                    fence = _fence_for(content)
+                    out.append(fence)
+                    out.append(content)
+                    out.append(fence)
             elif name == "Bash" and isinstance(inp, dict) and inp.get("command"):
-                out.append("```sh")
-                out.append(_truncate_for_export(str(inp["command"]), EXPORT_INPUT_MAX_CHARS))
-                out.append("```")
+                cmd = _truncate_for_export(
+                    str(inp["command"]), EXPORT_INPUT_MAX_CHARS,
+                )
+                fence = _fence_for(cmd)
+                out.append(fence + "sh")
+                out.append(cmd)
+                out.append(fence)
             # No `elif summary:` body — for Read/Grep/WebFetch/etc the path
             # or pattern already lives in the <summary> line, so a duplicate
             # body just adds noise.
@@ -836,12 +895,13 @@ def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]
             if not text:
                 continue
             mark = "❌" if m.get("is_error") else "↩️"
+            fence = _fence_for(text)
             out.append("<details>")
             out.append(f"<summary>{mark} Result</summary>")
             out.append("")
-            out.append("```")
+            out.append(fence)
             out.append(text)
-            out.append("```")
+            out.append(fence)
             out.append("")
             out.append("</details>")
             out.append("")
@@ -1332,6 +1392,40 @@ def _persist_event(run_id: str, idx: int, event: dict) -> None:
         logging.getLogger("claude-web").warning("persist_event failed: %s", e)
 
 
+def _fetch_persisted_events_range(
+    run_id: str, start_idx: int, end_idx: Optional[int] = None,
+) -> Iterable[dict]:
+    """Yield persisted events for a run with idx in [start_idx, end_idx).
+
+    Used by ActiveRun.subscribe() when an in-memory trim has dropped events
+    the subscriber wants to replay — the cache holds the most-recent slice,
+    sqlite holds everything. end_idx=None means "to the latest persisted".
+    Decode errors yield no row rather than aborting the iteration.
+    """
+    try:
+        if end_idx is None:
+            cur = _state_db().execute(
+                "SELECT payload FROM events WHERE run_id = ? AND idx >= ? "
+                "ORDER BY idx",
+                (run_id, start_idx),
+            )
+        else:
+            cur = _state_db().execute(
+                "SELECT payload FROM events WHERE run_id = ? AND idx >= ? "
+                "AND idx < ? ORDER BY idx",
+                (run_id, start_idx, end_idx),
+            )
+        for (payload,) in cur:
+            try:
+                yield json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "fetch_persisted_events_range failed: %s", e,
+        )
+
+
 def _purge_old_persisted(now: float) -> None:
     cutoff = now - PERSIST_RETENTION_SECONDS
     try:
@@ -1375,7 +1469,7 @@ def _purge_old_uploads(now: float) -> None:
     for entry in entries:
         if not entry.is_dir():
             continue
-        if not _ID_RE.match(entry.name):
+        if not _ID_RE.fullmatch(entry.name):
             continue
         try:
             if entry.stat().st_mtime >= cutoff:
@@ -1487,6 +1581,15 @@ def _restore_persisted_runs() -> None:
             interrupted += 1
         run.done = True
         run.finished_at = finished_at or now
+        # Restored events were appended to run.events directly (bypassing
+        # emit()), so the per-run idx counter hasn't been bumped. Sync it
+        # to (max _idx + 1) so any future emit() — unlikely, since
+        # done=True, but possible if a later code path appends a synthetic
+        # event to a hydrated run — picks the next free slot rather than
+        # colliding with a restored idx.
+        run._next_idx = max(
+            (evt.get("_idx", 0) for evt in run.events), default=-1,
+        ) + 1
         ACTIVE_RUNS[run_id] = run
         if was_killed:
             _persist_run_meta(run)
@@ -1522,6 +1625,11 @@ class ActiveRun:
         # user's current toggle and respawns the run when they differ.
         self.account_slot = account_slot
         self.events: list[dict] = []
+        # Monotonic per-run event counter, distinct from len(self.events).
+        # Necessary so an in-memory trim (when self.events exceeds
+        # EVENTS_MEM_CAP_HIGH) doesn't restart _idx from zero — late
+        # subscribers and replay paths rely on _idx as a stable handle.
+        self._next_idx: int = 0
         self.subscribers: set[asyncio.Queue] = set()
         self.done = False
         self.session_id: Optional[str] = None
@@ -1561,13 +1669,16 @@ class ActiveRun:
         self.client_write_lock: asyncio.Lock = asyncio.Lock()
 
     def emit(self, event: dict) -> None:
-        self.events.append(event)
-        idx = len(self.events) - 1
-        # Tag with monotonic per-run index so the browser can dedupe if the
-        # same event reaches its DOM twice (e.g. two open SSE subscribers
-        # against this run, or a stream resume that replays). Cheaper and
-        # more reliable than client-side content hashing.
+        # Tag with a monotonic per-run index so the browser can dedupe an
+        # event reaching the DOM twice (overlapping subscribers, replay
+        # races). _next_idx is independent of len(self.events) so an
+        # in-memory trim (see below) doesn't restart numbering — sqlite
+        # holds every event by its original idx, and subscribers use
+        # _idx as a stable handle to ask for "everything after N".
+        idx = self._next_idx
+        self._next_idx += 1
         event["_idx"] = idx
+
         meta_changed = False
         if event.get("type") == "system" and event.get("subtype") == "init":
             sid = event.get("session_id")
@@ -1587,10 +1698,38 @@ class ActiveRun:
         if event.get("type") == "run_started":
             meta_changed = True
         self.last_activity = time.time()
-        # Subscriber queues are bounded (MAX_SUBSCRIBER_QUEUE) — a slow client
-        # that lets its queue fill up gets disconnected rather than growing
-        # the run's memory unbounded. The browser will fall back to /api/
-        # chat/stream/<run_id> + the persisted event log to catch up.
+
+        # Persist FIRST, then notify subscribers. The previous "notify, then
+        # persist" order was an availability/durability split: a process
+        # crash between the put_nowait fan-out and _persist_event would let
+        # clients see an event that the persisted store never recorded —
+        # subsequent reconnects (which replay from sqlite) would lack it,
+        # creating impossible UI states (e.g. UI shows the `_done` arrived,
+        # but replay never marks the run finished). Swapping the order
+        # trades a tiny latency hit (one sqlite execute before the queue
+        # fan-out) for a clean replayability contract.
+        _persist_event(self.run_id, idx, event)
+        if meta_changed:
+            _persist_run_meta(self)
+
+        # Append to in-memory cache, then trim if we're over the soft cap.
+        # The cache is for fast replay of the most-recent N events; older
+        # events still live in sqlite, and subscribe() will read them back
+        # if a caller asks for a start_index below what we still hold.
+        self.events.append(event)
+        if len(self.events) > EVENTS_MEM_CAP_HIGH:
+            drop = len(self.events) - EVENTS_MEM_CAP_LOW
+            del self.events[:drop]
+            log.info(
+                "run %s in-memory events trimmed (was %d, kept last %d, "
+                "earlier events still queryable via sqlite)",
+                self.run_id, EVENTS_MEM_CAP_HIGH, EVENTS_MEM_CAP_LOW,
+            )
+
+        # Subscriber queues are bounded (MAX_SUBSCRIBER_QUEUE) — a slow
+        # client that lets its queue fill up gets disconnected rather than
+        # growing the run's memory unbounded. The browser handles _overflow
+        # by reconnecting via /api/chat/stream/<run_id> + the persisted log.
         for q in list(self.subscribers):
             try:
                 q.put_nowait(event)
@@ -1600,13 +1739,6 @@ class ActiveRun:
                     "dropping slow SSE subscriber for run %s (queue at %d)",
                     self.run_id, q.qsize(),
                 )
-                # The queue is full by definition (that's why put_nowait
-                # raised). Evict one buffered event to make room for the
-                # overflow signal — without this, the consumer reads the
-                # backlog, blocks on the next get(), and never learns that
-                # it was dropped. The frontend handles _overflow by
-                # reconnecting via /api/chat/stream/<run_id> + the
-                # persisted store, so the dropped event is recovered there.
                 try:
                     q.get_nowait()
                 except asyncio.QueueEmpty:
@@ -1615,46 +1747,93 @@ class ActiveRun:
                     q.put_nowait({"type": "_overflow"})
                 except asyncio.QueueFull:
                     pass
-        # Persist after fan-out so a slow disk write never blocks the live
-        # browser update. Failures are logged and swallowed.
-        _persist_event(self.run_id, idx, event)
-        if meta_changed:
-            _persist_run_meta(self)
 
     def subscribe(self, start_index: int = 0) -> asyncio.Queue:
-        """Subscribe to events from `start_index` onward.
+        """Subscribe to events from `start_index` (an event _idx) onward.
 
         Use 0 for "give me everything from the start" (page reload). Use
-        len(events)-N for "give me only the newest N events" — used when a
-        follow-up POST hits an already-running long-lived run and the
-        browser already has the older events rendered.
+        ``self._next_idx`` (the next idx that will be emitted) for "only
+        events I'm about to emit" — used when a follow-up POST hits an
+        already-running long-lived run and the browser has already
+        rendered the older events.
 
-        Queue depth is capped at MAX_SUBSCRIBER_QUEUE; a slow subscriber that
-        falls behind will be dropped and emit() sends "_overflow" so the
-        client can reconnect cleanly via /api/chat/stream/<run_id>.
+        Backlog comes from in-memory ``self.events`` when the requested
+        range lies inside the cache, and from sqlite when it falls below
+        the oldest kept event (after an in-memory trim). Without the
+        sqlite fallback, a long-running run that had been trimmed would
+        replay as a near-empty transcript on reconnect.
+
+        Queue depth is capped at MAX_SUBSCRIBER_QUEUE; a slow subscriber
+        that falls behind during live tail will be dropped and emit() sends
+        _overflow so the client reconnects via /api/chat/stream/<run_id>.
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=MAX_SUBSCRIBER_QUEUE)
-        # The replay can exceed maxsize for an already-finished run with a
-        # huge event log. Use unbounded put for the initial drain — once
-        # tailing live, subsequent put_nowait calls in emit() will respect
-        # the cap.
-        backlog = self.events[start_index:]
-        for e in backlog:
+
+        def _put_terminal(marker: dict) -> None:
+            """Force a terminal marker (_overflow / _done) into the queue,
+            making room by evicting the oldest buffered event if needed.
+
+            Without the evict-first step, a queue that just hit QueueFull
+            on a backlog event would silently drop the terminal marker too —
+            the consumer drains the partial backlog and then hangs forever
+            waiting for events that will never arrive.
+            """
             try:
-                q.put_nowait(e)
-            except asyncio.QueueFull:
-                # Replay too large to fit; signal the consumer so it knows
-                # to fetch the rest via the persisted store.
-                try:
-                    q.put_nowait({"type": "_overflow"})
-                except asyncio.QueueFull:
-                    pass
-                break
-        if self.done:
-            try:
-                q.put_nowait({"type": "_done"})
+                q.put_nowait(marker)
+                return
             except asyncio.QueueFull:
                 pass
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(marker)
+            except asyncio.QueueFull:
+                # Should be impossible after a get on a maxsize>0 queue,
+                # but stay defensive — losing _done is preferable to a
+                # crash here.
+                pass
+
+        def _put_or_overflow(evt: dict) -> bool:
+            """Append evt; on QueueFull, signal overflow (forced) and stop.
+            Returns False if the consumer should fetch via the persisted
+            store."""
+            try:
+                q.put_nowait(evt)
+                return True
+            except asyncio.QueueFull:
+                _put_terminal({"type": "_overflow"})
+                return False
+
+        # Range partition: anything below the oldest kept event goes via
+        # sqlite, the remainder via self.events. Two edge cases:
+        #   - start_index >= self._next_idx: nothing to replay yet.
+        #   - self.events is empty: either no events yet (_next_idx==0)
+        #     or everything got trimmed — let sqlite handle it.
+        in_memory_low = self.events[0]["_idx"] if self.events else self._next_idx
+        if start_index < in_memory_low:
+            # Pull the gap from sqlite. end_idx is exclusive of in_memory_low
+            # so we don't double-emit the first kept event.
+            for evt in _fetch_persisted_events_range(
+                self.run_id, start_index, in_memory_low,
+            ):
+                if not _put_or_overflow(evt):
+                    if self.done:
+                        _put_terminal({"type": "_done"})
+                    return q
+            tail_start = 0
+        else:
+            tail_start = max(0, start_index - in_memory_low)
+
+        for evt in self.events[tail_start:]:
+            if not _put_or_overflow(evt):
+                if self.done:
+                    _put_terminal({"type": "_done"})
+                return q
+
+        if self.done:
+            _put_terminal({"type": "_done"})
         else:
             self.subscribers.add(q)
         return q
@@ -1663,9 +1842,37 @@ class ActiveRun:
         self.subscribers.discard(q)
 
     def finish(self) -> None:
-        self.done = True
         self.finished_at = time.time()
         self.last_activity = self.finished_at
+        # Drain queued user inputs and emit a synchronous lost_input event
+        # for each BEFORE we set self.done / send _done. The previous
+        # version only set the ack's exception, deferring the error emit to
+        # the background _confirm_and_emit_user_prompt task — but by the
+        # time that task ran, subscribers had already been cleared and the
+        # error reached no live UI. Emitting here means the live SSE stream
+        # sees the lost_input as a regular event before its terminator,
+        # which keeps the contract "user sees what happened to their
+        # message".
+        #
+        # done is flipped AFTER the drain so emit() still routes to live
+        # subscribers (rather than skipping the fan-out as a finished run
+        # would).
+        while True:
+            try:
+                stray = self.user_input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            _emit_lost_input(
+                self,
+                stray.get("text") or "",
+                "the run ended before Claude received it",
+            )
+            ack: Optional[asyncio.Future] = stray.get("delivered")
+            if ack is not None and not ack.done():
+                ack.set_exception(_DeliveryAlreadyReported(
+                    "run finished before delivery"
+                ))
+        self.done = True
         for q in list(self.subscribers):
             try:
                 q.put_nowait({"type": "_done"})
@@ -1797,27 +2004,155 @@ async def _send_to_client(client, text: str, blocks: list[dict]) -> None:
         await client.query(text or "")
 
 
-async def _inject_user_input(run: ActiveRun, text: str, blocks: list[dict]) -> bool:
+# How long the background _confirm_and_emit_user_prompt task waits for the
+# driver to confirm delivery before it gives up and emits a lost_input
+# error. Sized larger than a typical long-running tool turn but shorter than
+# PERSIST_RETENTION_SECONDS, so a run that gets wedged surfaces the failure
+# while there's still a UI to receive it.
+USER_INPUT_DELIVERY_TIMEOUT = float(
+    os.getenv("CLAUDE_WEB_USER_INPUT_DELIVERY_TIMEOUT", "1800"),
+)
+
+
+class _DeliveryAlreadyReported(RuntimeError):
+    """Marker on a delivery future's exception slot saying "the failure has
+    already been emitted to subscribers — don't double-emit."
+
+    The driver's failure paths (CLI exited mid-wait, _send_user_message
+    raised, run.finish() drained the queue) emit lost_input synchronously
+    so the error lands BEFORE the _done marker the subscriber will use to
+    decide it's safe to disconnect. They then `set_exception` the ack with
+    this sentinel; the background ``_confirm_and_emit_user_prompt`` task
+    recognises it and returns silently.
+
+    Without this signal, the background task would emit a *second* error
+    event after _done, by which time live subscribers have already been
+    cleared and the event reaches no one.
+    """
+
+
+def _emit_lost_input(run: "ActiveRun", text: str, reason: str) -> None:
+    """Emit a structured lost_input error event for an undelivered user
+    message. Single source of formatting + truncation so the error looks
+    the same regardless of which failure path fired it."""
+    preview = text[:200] + ("…" if len(text) > 200 else "")
+    run.emit({
+        "type": "error",
+        "message": f"Your message wasn't delivered: {reason}",
+        "lost_input": preview,
+    })
+
+
+async def _confirm_and_emit_user_prompt(
+    run: "ActiveRun",
+    text: str,
+    image_count: int,
+    file_count: int,
+    delivered: asyncio.Future,
+) -> None:
+    """Wait for the driver to acknowledge delivery of an injected user
+    message, then emit the user_prompt event. On timeout, emit an error
+    event with a preview. On synchronous-failure paths (driver-side
+    delivery failures, run finish drain) the failure is already emitted
+    by the synchronous caller and the ack carries a
+    ``_DeliveryAlreadyReported`` sentinel — this task then returns
+    silently so the subscriber sees only one error.
+    """
+    preview = text[:200] + ("…" if len(text) > 200 else "")
+    try:
+        await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+    except asyncio.CancelledError:
+        # App shutdown cancelled this task. Don't synthesise an error
+        # event; just propagate so the loop can tear down cleanly.
+        raise
+    except asyncio.TimeoutError:
+        _emit_lost_input(
+            run, text,
+            "the run ended or stalled before Claude received it",
+        )
+        log.warning(
+            "user input delivery timed out for run %s (preview=%r)",
+            run.run_id, preview,
+        )
+        return
+    except _DeliveryAlreadyReported:
+        # The synchronous failure path already emitted lost_input ahead
+        # of _done; nothing to do here.
+        return
+    except Exception as exc:
+        _emit_lost_input(run, text, f"{type(exc).__name__}: {exc}")
+        log.warning(
+            "user input delivery failed for run %s: %s (preview=%r)",
+            run.run_id, exc, preview,
+        )
+        return
+    # Delivered — emit user_prompt to subscribers. This is the only place
+    # user_prompt is emitted for queued (i.e., non-initial) input; the
+    # initial query in api_chat's new-run path emits its own prompt event
+    # directly because that message is sent synchronously before the
+    # driver enters its wait loop.
+    run.emit({
+        "type": "user_prompt",
+        "text": text,
+        "image_count": image_count,
+        "file_count": file_count,
+    })
+
+
+async def _inject_user_input(
+    run: ActiveRun,
+    text: str,
+    blocks: list[dict],
+    image_count: int,
+    file_count: int,
+) -> bool:
     """Queue user input for the driver to deliver to the CLI.
 
-    Originally this also wrote directly to ``client.query()`` from the HTTP
-    handler when the driver was running, in pursuit of "binary-style
-    steerability" — push input mid-turn and let the bundled CLI's
-    concurrent-query queue handle it. In practice, writing to stdin while
-    the CLI was still generating a turn caused the message to be silently
-    discarded — bytes landed in the OS pipe but the CLI's state machine
-    wasn't polling stdin for new turns, so it consumed and dropped them.
-    Symptom (reported by user): queued message after a long task gets
-    "Accepted" 202 from the server but no Claude response.
+    Returns False fast if the run is already finished (caller should
+    fall back to opening a fresh run); True if the item was enqueued —
+    a background task will emit either ``user_prompt`` (on delivery
+    success) or an ``error`` event with a ``lost_input`` preview (on
+    timeout, cancellation, or driver-side failure).
 
-    The fix is to always enqueue. The driver only pops from this queue
-    when ``between_turns`` is True (i.e., the CLI is idle and ready),
-    serializing every write through one writer. Returns ``True`` because
-    queue.put on an unbounded queue can't fail; kept the bool return for
-    call-site compatibility.
+    Originally this also wrote directly to ``client.query()`` from the
+    HTTP handler when the driver was running, in pursuit of
+    "binary-style steerability". In practice writing to stdin while the
+    CLI was still generating a turn caused the message to be silently
+    discarded. The fix is to always enqueue; the driver pops only when
+    between turns, serializing every write through one writer.
     """
-    await run.user_input_queue.put({"text": text, "image_blocks": blocks})
+    if run.done:
+        return False
+    loop = asyncio.get_running_loop()
+    delivered: asyncio.Future = loop.create_future()
+    await run.user_input_queue.put({
+        "text": text,
+        "image_blocks": blocks,
+        "delivered": delivered,
+    })
+    task = asyncio.create_task(
+        _confirm_and_emit_user_prompt(
+            run, text, image_count, file_count, delivered,
+        )
+    )
+    # Log unexpected exceptions instead of letting them surface as the
+    # generic "Task exception was never retrieved" warning at GC time.
+    # _confirm_and_emit_user_prompt catches every documented failure
+    # mode already; this is a backstop for run.emit() itself blowing up
+    # (sqlite hard failure, etc.).
+    task.add_done_callback(_log_task_exception)
     return True
+
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.exception(
+            "background task %s raised: %s",
+            task.get_name(), exc, exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 # ─── HTTP routes ──────────────────────────────────────────────────────────────
@@ -2695,8 +3030,9 @@ async def api_chat(
             effective = _file_attachment_prefix(file_metas) + message
             # Subscribe BEFORE we emit the new user_prompt so the new subscriber
             # only sees events from this turn forward, not the entire prior
-            # history that the browser already rendered.
-            start_index = len(existing.events)
+            # history that the browser already rendered. _next_idx is the
+            # event index emit() will assign next, so anything ≥ that is "new".
+            start_index = existing._next_idx
             # Pending notifications get superseded by explicit user input —
             # the user is now driving, no need to auto-fire. Reset the chain
             # counter so the user gets a fresh budget if their reply itself
@@ -2704,17 +3040,37 @@ async def api_chat(
             existing.pending_notifications.clear()
             existing.notification_grace_started_at = None
             existing.consecutive_auto_fires = 0
-            # Only persist the user_prompt event AFTER we know the input
-            # actually reached the CLI — otherwise a broken pipe would leave
-            # the transcript saying "you said X" when Claude never saw it.
-            delivered = await _inject_user_input(existing, effective, image_blocks)
-            if delivered:
-                existing.emit({
-                    "type": "user_prompt",
-                    "text": message,
-                    "image_count": len(image_blocks),
-                    "file_count": len(file_metas),
-                })
+            # The user_prompt event is emitted by the background task spawned
+            # inside _inject_user_input, only after the driver confirms it
+            # wrote the message to the CLI. That keeps the "you said X" line
+            # from appearing in the transcript when the CLI exits between
+            # our enqueue and the driver's pickup — instead, an error event
+            # with a preview surfaces what was lost.
+            if not await _inject_user_input(
+                existing, effective, image_blocks,
+                image_count=len(image_blocks),
+                file_count=len(file_metas),
+            ):
+                # Race: the driver finished between our _existing_run_for_session
+                # lookup and the inject. The session JSONL on disk is intact,
+                # so the client can hit /api/chat again with the same
+                # session_id and we'll spawn a fresh run that resumes the
+                # conversation. We can't fall through here because the
+                # uploaded multipart bodies have already been streamed and
+                # written into UPLOADS_ROOT/existing.run_id/ — a second
+                # save attempt against UPLOADS_ROOT/<new run_id>/ would
+                # read empty from the already-drained UploadFile objects.
+                return JSONResponse(
+                    {
+                        "error": "run_finished",
+                        "detail": (
+                            "The previous run finished before your message "
+                            "could be queued. Submit again to start a fresh "
+                            "run that resumes this session."
+                        ),
+                    },
+                    status_code=409,
+                )
             return _stream_run_response(existing, start_index=start_index)
 
         sid_in = session_id or None
@@ -2954,12 +3310,32 @@ async def api_chat(
             except Exception as exc:
                 # Terminal sentinels must enqueue without suspending so that
                 # _PumpFailed and pump_done land back-to-back in the queue.
-                # The driver harvests both in one wait tick; awaiting put()
-                # here is harmless today (queue is unbounded) but would
-                # deadlock if the queue ever grew a maxsize.
-                msg_queue.put_nowait(_PumpFailed(exc, traceback.format_exc()))
+                # The driver harvests both in one wait tick. The queue is
+                # unbounded today so QueueFull can't actually fire here;
+                # the swallow is defensive in case a future change adds
+                # maxsize — without it, QueueFull would mask the original
+                # SDK exception (or CancelledError) propagating out of the
+                # try block, leaving the run with no error event at all.
+                try:
+                    msg_queue.put_nowait(
+                        _PumpFailed(exc, traceback.format_exc()),
+                    )
+                except asyncio.QueueFull:
+                    log.exception(
+                        "could not enqueue _PumpFailed for run %s — "
+                        "msg_queue is bounded and full",
+                        run.run_id,
+                    )
             finally:
-                msg_queue.put_nowait(pump_done)
+                # Same defence on the always-fires terminal.
+                try:
+                    msg_queue.put_nowait(pump_done)
+                except asyncio.QueueFull:
+                    log.warning(
+                        "could not enqueue pump_done for run %s — driver "
+                        "may not unwind cleanly",
+                        run.run_id,
+                    )
 
         try:
             async with ClaudeSDKClient(options=options) as client:
@@ -3100,30 +3476,33 @@ async def api_chat(
                                 })
                                 terminal_kind = "pump_failed"
                             if terminal_kind is not None:
+                                # Emit lost_input SYNCHRONOUSLY here, then
+                                # mark the ack as already-reported so the
+                                # background _confirm_and_emit task doesn't
+                                # double-emit. The previous "just fail the
+                                # ack, let the bg task emit" pattern raced
+                                # against run.finish() — by the time the bg
+                                # task ran, subscribers had been cleared and
+                                # the error reached no UI. Doing it here
+                                # keeps the lost_input visible to the live
+                                # SSE stream before _done lands.
                                 if popped_user_item is not None:
-                                    # The user's message rode the same wait
-                                    # tick as the terminal — there's no CLI
-                                    # left to deliver it to. Surface as an
-                                    # error event so the UI knows to retry
-                                    # in a new run instead of leaving the
-                                    # user staring at an unanswered prompt.
-                                    text = popped_user_item.get("text") or ""
-                                    preview = text[:200] + ("…" if len(text) > 200 else "")
-                                    run.emit({
-                                        "type": "error",
-                                        "message": (
-                                            "Your message arrived just as the "
-                                            "Claude Code subprocess exited; it "
-                                            "wasn't delivered. Re-send it in a "
-                                            "new chat or after the run resumes."
-                                        ),
-                                        "lost_input": preview,
-                                    })
-                                    log.warning(
-                                        "driver lost queued user input on %s "
-                                        "(reason=%s, preview=%r)",
-                                        run.run_id, terminal_kind, preview,
+                                    _emit_lost_input(
+                                        run,
+                                        popped_user_item.get("text") or "",
+                                        f"CLI exited mid-wait ({terminal_kind})",
                                     )
+                                    ack = popped_user_item.get("delivered")
+                                    if ack is not None and not ack.done():
+                                        ack.set_exception(
+                                            _DeliveryAlreadyReported(
+                                                f"CLI exited ({terminal_kind})"
+                                            )
+                                        )
+                                # The driver's outer finally calls
+                                # run.finish(), which drains the rest of
+                                # user_input_queue and emits lost_input
+                                # for any acks still pending there too.
                                 break
                             run.last_activity = time.time()
                             last_cli_activity = time.monotonic()
@@ -3227,11 +3606,38 @@ async def api_chat(
                         if popped_user_item is not None:
                             item = popped_user_item
                             run.consecutive_auto_fires = 0
-                            await _send_user_message(
-                                client,
-                                item.get("text") or "",
-                                item.get("image_blocks") or [],
-                            )
+                            ack: Optional[asyncio.Future] = item.get("delivered")
+                            try:
+                                await _send_user_message(
+                                    client,
+                                    item.get("text") or "",
+                                    item.get("image_blocks") or [],
+                                )
+                            except BaseException as exc:
+                                # Synchronous emit ahead of the re-raise so
+                                # the live SSE stream sees lost_input before
+                                # run.finish() lands _done. CancelledError
+                                # also rides this path — if a Stop click
+                                # cancelled the driver mid-write, the user's
+                                # input was already half-sent so they
+                                # deserve to see the failure.
+                                if not isinstance(exc, asyncio.CancelledError):
+                                    _emit_lost_input(
+                                        run, item.get("text") or "",
+                                        f"{type(exc).__name__}: {exc}",
+                                    )
+                                if ack is not None and not ack.done():
+                                    ack.set_exception(
+                                        _DeliveryAlreadyReported(
+                                            "_send_user_message failed"
+                                        )
+                                        if not isinstance(exc, asyncio.CancelledError)
+                                        else exc
+                                    )
+                                raise
+                            else:
+                                if ack is not None and not ack.done():
+                                    ack.set_result(None)
                             last_cli_activity = time.monotonic()
                             # The send writes to the CLI's stdin, so the CLI
                             # is now mid-turn regardless of what msg_get just
@@ -3369,19 +3775,18 @@ async def api_chat_send(
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0
-    delivered = await _inject_user_input(run, effective, image_blocks)
-    if delivered:
-        run.emit({
-            "type": "user_prompt",
-            "text": message,
-            "image_count": len(image_blocks),
-            "file_count": len(file_metas),
-        })
-    else:
-        # Surface the failure as a 502 so the frontend can fall back to
-        # opening a fresh run instead of believing the message was queued.
+    # user_prompt emit is now driven by the background ack task inside
+    # _inject_user_input — it only fires after the driver confirms write
+    # to the CLI. Pre-ack the message was sometimes echoed to the user
+    # before the CLI exited and silently dropped it.
+    if not await _inject_user_input(
+        run, effective, image_blocks,
+        image_count=len(image_blocks),
+        file_count=len(file_metas),
+    ):
+        # Race: driver finished between the ACTIVE_RUNS lookup and inject.
         return JSONResponse(
-            {"ok": False, "error": "delivery_failed"}, status_code=502,
+            {"ok": False, "error": "run_finished"}, status_code=409,
         )
     return JSONResponse({"ok": True}, status_code=202)
 
