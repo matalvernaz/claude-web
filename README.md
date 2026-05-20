@@ -111,6 +111,18 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `SAFE_TOOLS` | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
 | `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
 
+#### Identity passed to the CLI
+
+Every spawned Claude CLI subprocess receives three env vars describing the signed-in user, so hooks and `CLAUDE.md` personalities can address people by name:
+
+| Variable | Source | Value when `AUTH_MODE=none` |
+|---|---|---|
+| `CLAUDE_WEB_USER_SUB` | OIDC `sub` claim | `""` (empty) |
+| `CLAUDE_WEB_USER_EMAIL` | OIDC `email` claim | `""` |
+| `CLAUDE_WEB_USER_NAME` | OIDC `name` (or `preferred_username`) | `""` |
+
+The schema is stable — keys are always set, only their values are empty when there's no real identity. A typical use is a `SessionStart` hook in `$CLAUDE_HOME/settings.json` that emits an `additionalContext` line like *"Signed-in user: Jocelyn Smith <jocelyn@cobd.ca>"*, which the model then reads at the start of every session.
+
 ### Multi-user
 
 | Variable | Default | Notes |
