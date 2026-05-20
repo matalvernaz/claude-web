@@ -40,6 +40,20 @@ Each OIDC user can register, label, sign in to, switch between, and delete their
 - **API**: `/api/account/credentials` (GET list / POST create / PATCH rename / DELETE) plus per-cred `/oauth/start`, `/oauth/code`, `/oauth/cancel`, `/apikey`, `/signout`, `/status`. All scoped to the caller's OIDC sub — rows owned by other users return **404, not 403**.
 - **Env**: `CLAUDE_WEB_PERSONAL_HOMES_DIR` (default `~/.claude-homes`), `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` (default `"Shared"`).
 
+### Identity passed to the spawned CLI
+
+Every CLI subprocess started by claude-web receives three identity env vars from `_identity_env_for(user)` (called by `_resolve_account_for_run`), so `SessionStart` hooks and `CLAUDE.md` personalities can address the signed-in user by name without claude-web touching the model context itself:
+
+| Variable | OIDC claim | `AUTH_MODE=none` value |
+| --- | --- | --- |
+| `CLAUDE_WEB_USER_SUB` | `sub` | `""` |
+| `CLAUDE_WEB_USER_EMAIL` | `email` | `""` |
+| `CLAUDE_WEB_USER_NAME` | `name` or `preferred_username` | `""` |
+
+Schema is stable — keys are always set; only values go empty in the anonymous path. Hooks can rely on `os.environ["CLAUDE_WEB_USER_EMAIL"]` existing. The SDK's transport merges `ClaudeAgentOptions.env` over inherited process env (see `claude_agent_sdk/_internal/transport/subprocess_cli.py`), so adding these keys to the shared-slot env dict (which used to be empty) doesn't disturb `PATH`/`HOME`/etc.
+
+Tests in `tests/test_app_helpers.py` (`test_identity_env_for_*`, `test_resolve_account_for_run_shared_carries_identity`) lock down the schema and the shared-slot guarantee that `CLAUDE_CONFIG_DIR` is **not** set (so the spawned CLI uses the shared `CLAUDE_HOME`, not a personal one).
+
 ### Setup gate
 
 `CLAUDE_WEB_ENABLE_SETUP=true|false|auto` (default `auto`). The `/setup` page (subprocess-driven `claude auth login` flow, or pasted API key) auto-locks once shared credentials exist. To re-auth shared: flip the env var to `true` and restart, or shell in and run `claude auth login`. **Per-user creds bypass this gate** — every user can always manage their own credentials at `/account`.
