@@ -3860,6 +3860,24 @@ async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
     return {"ok": True}
 
 
+def _denial_dict(d) -> dict:
+    """Normalise one ResultMessage.permission_denials entry to a dict.
+
+    The agent SDK has shipped this field as both a typed object (with
+    ``.tool_name`` / ``.tool_input`` attributes) and a plain dict across
+    versions. Reading attributes directly crashed the driver mid-turn with
+    ``AttributeError: 'dict' object has no attribute 'tool_name'`` on the
+    dict shape, which closed the CLI subprocess's stdin and surfaced to the
+    UI as "input stream ended..." Both forms are now handled.
+    """
+    if isinstance(d, dict):
+        return {"tool_name": d.get("tool_name"), "tool_input": d.get("tool_input")}
+    return {
+        "tool_name": getattr(d, "tool_name", None),
+        "tool_input": getattr(d, "tool_input", None),
+    }
+
+
 def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
     """Translate one SDK message into one or more SSE-payload dicts.
 
@@ -3974,10 +3992,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "output_tokens": usage.get("output_tokens"),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-            "permission_denials": [
-                {"tool_name": d.tool_name, "tool_input": d.tool_input}
-                for d in (msg.permission_denials or [])
-            ],
+            "permission_denials": [_denial_dict(d) for d in (msg.permission_denials or [])],
         }]
     return []
 
