@@ -20,6 +20,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 import traceback
 import unicodedata
@@ -57,6 +59,22 @@ import auth
 import setup_flow
 
 log = logging.getLogger("claude-web")
+
+# Optional dependency: the ``roundtable`` package (multi-AI threaded debates)
+# is installed as an editable dependency when the operator wants the
+# /roundtable view. Other deployments don't need it — the routes degrade
+# to a 503 with a clear "not installed" message and the nav entry hides.
+# We import lazily-friendly so the failure surface is a runtime check, not
+# an import-time crash. The same SQLite store at ``~/.claude-roundtable/``
+# is shared with the standalone roundtable-mcp stdio server, so threads
+# created via MCP are immediately visible here and vice versa.
+try:
+    from roundtable import core as roundtable_core  # type: ignore
+    ROUNDTABLE_AVAILABLE = True
+except Exception as _rt_exc:  # pragma: no cover — optional dependency
+    roundtable_core = None  # type: ignore[assignment]
+    ROUNDTABLE_AVAILABLE = False
+    log.info("roundtable not installed (%s); /roundtable disabled", _rt_exc)
 
 
 def _sanitize_project_key(cwd: Path) -> str:
@@ -996,6 +1014,25 @@ def _state_db() -> sqlite3.Connection:
         )""")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_credential_sub ON user_credential(user_sub)"
+        )
+        # Roundtable thread → project binding. The roundtable library itself
+        # is project-agnostic (its SQLite store at ~/.claude-roundtable/ has
+        # no notion of claude-web projects). This claude-web-side table maps
+        # each roundtable thread_id to the project_key it was created under,
+        # so file artifacts resolve unambiguously, the thread list can be
+        # scoped to one project, and "Apply" buttons in step 4 know which
+        # file tree to patch. Threads without a row here (e.g. created via
+        # the MCP server outside claude-web) are treated as unbound and
+        # surface under "All threads".
+        conn.execute("""CREATE TABLE IF NOT EXISTS roundtable_thread_project (
+            thread_id INTEGER PRIMARY KEY,
+            project_key TEXT NOT NULL,
+            created_by TEXT,
+            created_at REAL NOT NULL
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rtp_project "
+            "ON roundtable_thread_project(project_key)"
         )
         _migrate_user_account_legacy(conn)
         _STATE_DB = conn
@@ -4272,6 +4309,1017 @@ async def api_setup_signout(user: dict = Depends(auth.require_user)):
     _require_setup_access(user)
     await setup_flow.sign_out()
     return {"configured": setup_flow.is_configured()}
+
+
+def _require_roundtable() -> Any:
+    """503 if the roundtable package isn't installed in this deployment."""
+    if not ROUNDTABLE_AVAILABLE or roundtable_core is None:
+        raise HTTPException(
+            503,
+            "Roundtable feature isn't enabled in this deployment. "
+            "Install with: pip install -e /path/to/roundtable-mcp",
+        )
+    return roundtable_core
+
+
+def _roundtable_set_project(thread_id: int, project_key: str, user_sub: str) -> None:
+    """Bind a roundtable thread to a claude-web project. REPLACE so a fork
+    or re-bind overwrites — there's only one project per thread by design."""
+    _state_db().execute(
+        "INSERT OR REPLACE INTO roundtable_thread_project"
+        "(thread_id, project_key, created_by, created_at) VALUES(?, ?, ?, ?)",
+        (int(thread_id), project_key, user_sub, time.time()),
+    )
+
+
+def _roundtable_get_project(thread_id: int) -> Optional[str]:
+    """Return the project_key bound to a thread, or None if unbound."""
+    row = _state_db().execute(
+        "SELECT project_key FROM roundtable_thread_project WHERE thread_id = ?",
+        (int(thread_id),),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _roundtable_threads_for_project(project_key: str) -> set[int]:
+    """All thread ids bound to a given project."""
+    rows = _state_db().execute(
+        "SELECT thread_id FROM roundtable_thread_project WHERE project_key = ?",
+        (project_key,),
+    ).fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def _resolve_project_path(project_key: str) -> Path:
+    """Map a project_key to its absolute Path.
+
+    Just a thin alias for ``_resolve_project`` so the roundtable code
+    reads consistently; the underlying helper already raises a clean
+    HTTPException(400, 'unknown project') for missing keys.
+    """
+    return _resolve_project(project_key)
+
+
+def _format_thread_summary(t: dict) -> dict:
+    """Trim the roundtable_list payload to fields the browser actually uses.
+
+    The library returns timestamps as float seconds (Python's time.time()).
+    The browser side wants ISO-8601 strings for accessible date rendering
+    via <time datetime=...>. Conversion here keeps the JS simple.
+    """
+    def _iso(ts: Optional[float]) -> Optional[str]:
+        if ts is None:
+            return None
+        return datetime.datetime.fromtimestamp(
+            float(ts), tz=datetime.timezone.utc,
+        ).isoformat()
+
+    return {
+        "thread_id": t["thread_id"],
+        "topic": t["topic"],
+        "participants": t.get("participants") or [],
+        "created_at": _iso(t.get("created_at")),
+        "closed_at": _iso(t.get("closed_at")),
+        "last_activity": _iso(t.get("last_activity")),
+        "messages": t.get("messages") or 0,
+        "open": t.get("closed_at") is None,
+    }
+
+
+@app.get("/roundtable")
+async def roundtable_page(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Read-only browser view of the multi-AI roundtable threads.
+
+    Shares the SQLite store at ``~/.claude-roundtable/state.db`` with the
+    standalone MCP server, so a debate started in Claude Code via MCP
+    tools is reachable here and vice versa. This first cut is read-only;
+    creation, parallel asks, and patch-apply land in a follow-up.
+    """
+    if not setup_flow.is_configured():
+        return RedirectResponse(url="/setup", status_code=302)
+    if not ROUNDTABLE_AVAILABLE:
+        # Feature graceful-degrades: render the page with a clear "not
+        # installed" message rather than 404'ing, so the operator knows
+        # what to install.
+        response = templates.TemplateResponse(
+            request, "roundtable.html", {
+                "user": user,
+                "site_title": SITE_TITLE,
+                "available": False,
+            },
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    projects = [
+        {"key": _sanitize_project_key(p), "path": str(p), "name": p.name or str(p)}
+        for p in PROJECTS
+    ]
+    participants_info = roundtable_core.roundtable_participants()
+    participants = [
+        {
+            "key": name,
+            "label": info["label"],
+            "provider": info["provider"],
+            "available": info["available"],
+        }
+        for name, info in participants_info.items()
+    ]
+    response = templates.TemplateResponse(
+        request, "roundtable.html", {
+            "user": user,
+            "site_title": SITE_TITLE,
+            "available": True,
+            "projects": projects,
+            "default_project": _sanitize_project_key(DEFAULT_CWD),
+            "participants": participants,
+            "participants_json": json.dumps(participants),
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/roundtable/threads")
+async def api_roundtable_threads(
+    open_only: bool = True, limit: int = 100, project: str = "",
+    user: dict = Depends(auth.require_user),
+):
+    """List roundtable threads (most-recent activity first).
+
+    Optional ``project`` filters to threads bound to the given project_key
+    via the ``roundtable_thread_project`` table. ``project="__unbound__"``
+    returns threads with no binding (legacy / MCP-created outside the
+    webapp). Empty means no project filter — return everything.
+    """
+    rt = _require_roundtable()
+    limit = max(1, min(int(limit), 500))
+    threads = await asyncio.to_thread(
+        rt.roundtable_list, open_only=open_only, limit=limit,
+    )
+    bound_map: dict[int, Optional[str]] = {
+        int(t["thread_id"]): _roundtable_get_project(int(t["thread_id"]))
+        for t in threads
+    }
+    if project:
+        if project == "__unbound__":
+            threads = [t for t in threads if bound_map[int(t["thread_id"])] is None]
+        else:
+            threads = [t for t in threads if bound_map[int(t["thread_id"])] == project]
+
+    out = []
+    for t in threads:
+        summary = _format_thread_summary(t)
+        summary["project_key"] = bound_map.get(int(t["thread_id"]))
+        out.append(summary)
+    return {"threads": out}
+
+
+@app.post("/api/roundtable/threads")
+async def api_roundtable_create(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Create a new roundtable thread, optionally bound to a project.
+
+    Body: ``{"topic": str, "participants": [str], "house_rules": str,
+    "project_key": str}``. project_key is optional but recommended — it's
+    what makes file-attach + apply-diff work cleanly later.
+    """
+    rt = _require_roundtable()
+    body = await request.json()
+    topic = (body.get("topic") or "").strip()
+    if not topic:
+        raise HTTPException(400, "topic is required")
+    participants = body.get("participants") or []
+    if not isinstance(participants, list):
+        raise HTTPException(400, "participants must be a list of strings")
+    house_rules = body.get("house_rules") or ""
+    project_key = (body.get("project_key") or "").strip() or None
+    if project_key:
+        _resolve_project_path(project_key)  # validates existence
+
+    try:
+        created = await asyncio.to_thread(
+            rt.roundtable_create,
+            topic=topic, participants=participants, house_rules=house_rules,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if project_key:
+        _roundtable_set_project(
+            created["thread_id"], project_key, user.get("sub", "anonymous"),
+        )
+    return {
+        **created,
+        "project_key": project_key,
+    }
+
+
+@app.get("/api/roundtable/threads/{thread_id}")
+async def api_roundtable_thread_detail(
+    thread_id: int, user: dict = Depends(auth.require_user),
+):
+    """Fetch a single thread's full transcript as structured messages.
+
+    Returns the raw message list rather than the formatted string from
+    ``roundtable_history`` so the browser can render each turn with its
+    own ARIA role and semantic markup — important for the screen-reader
+    workflow this app is designed around.
+    """
+    rt = _require_roundtable()
+    # _thread_row + _thread_messages are private library helpers; we use
+    # them here because roundtable_history returns a pre-rendered string
+    # that's lossy for structured UI. If/when the library grows a public
+    # structured-detail op, switch to that.
+    thread = await asyncio.to_thread(rt._thread_row, thread_id)
+    if thread is None:
+        raise HTTPException(404, f"No such thread: {thread_id}")
+    messages = await asyncio.to_thread(rt._thread_messages, thread_id)
+    summary = _format_thread_summary({
+        **thread,
+        "thread_id": thread["id"],
+        # roundtable_list returns last_activity via SQL aggregation;
+        # for the detail endpoint we approximate with the newest
+        # message ts (or created_at if no messages).
+        "last_activity": (
+            messages[-1]["ts"] if messages else thread.get("created_at")
+        ),
+        "messages": len(messages),
+    })
+    summary["project_key"] = _roundtable_get_project(thread_id)
+    return {
+        "thread": summary,
+        "messages": [
+            {
+                "idx": m["idx"],
+                "speaker": m["speaker"],
+                "content": m["content"],
+                "ts": datetime.datetime.fromtimestamp(
+                    float(m["ts"]), tz=datetime.timezone.utc,
+                ).isoformat(),
+            }
+            for m in messages
+        ],
+    }
+
+
+@app.post("/api/roundtable/threads/{thread_id}/post")
+async def api_roundtable_post(
+    thread_id: int, request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Append an orchestrator (or human) turn to the thread.
+
+    Body: ``{"content": str, "speaker": str}``. Speaker defaults to
+    ``"orchestrator"``; reserved AI labels are blocked by the core layer.
+    """
+    rt = _require_roundtable()
+    body = await request.json()
+    content = body.get("content") or ""
+    if not content.strip():
+        raise HTTPException(400, "content is required")
+    speaker = (body.get("speaker") or "orchestrator").strip() or "orchestrator"
+    try:
+        result = await asyncio.to_thread(
+            rt.roundtable_post,
+            thread_id=thread_id, content=content, speaker=speaker,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
+
+
+@app.post("/api/roundtable/threads/{thread_id}/ask")
+async def api_roundtable_ask(
+    thread_id: int, request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Route a single turn to a named participant (blocking).
+
+    Provider calls can take 10-30 s. The browser fires this and shows a
+    busy state; the server awaits ``roundtable_ask`` on a worker thread
+    so the event loop stays responsive for other requests.
+
+    Body: ``{"participant": str, "prompt": str, "effort": str,
+    "web_search": bool}``. Returns ``{"response": str}`` on success.
+    """
+    rt = _require_roundtable()
+    body = await request.json()
+    participant = (body.get("participant") or "").strip()
+    if not participant:
+        raise HTTPException(400, "participant is required")
+    prompt = body.get("prompt") or ""
+    effort = (body.get("effort") or "").strip()
+    web_search = bool(body.get("web_search"))
+    try:
+        response = await asyncio.to_thread(
+            rt.roundtable_ask,
+            thread_id=thread_id, participant=participant,
+            prompt=prompt, effort=effort, web_search=web_search,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        # Closed thread, missing key, etc. — surface as 409 so the
+        # client knows it's a state issue, not a transport failure.
+        raise HTTPException(409, str(exc)) from exc
+    return {"response": response}
+
+
+@app.post("/api/roundtable/threads/{thread_id}/ask_parallel")
+async def api_roundtable_ask_parallel(
+    thread_id: int, request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Fire multiple participants in parallel against the same transcript
+    snapshot. The killer roundtable feature: independent reads, no
+    sequential-bias anchoring between participants.
+
+    Body: ``{"participants": [str], "prompt": str, "effort": str,
+    "web_search": bool}``. Returns
+    ``{"responses": {name: text}, "errors": {name: "Type: msg"}}``.
+    """
+    rt = _require_roundtable()
+    body = await request.json()
+    participants = body.get("participants") or []
+    if not participants or not isinstance(participants, list):
+        raise HTTPException(400, "participants must be a non-empty list")
+    prompt = body.get("prompt") or ""
+    effort = (body.get("effort") or "").strip()
+    web_search = bool(body.get("web_search"))
+    try:
+        result = await asyncio.to_thread(
+            rt.roundtable_ask_parallel,
+            thread_id=thread_id, participants=participants,
+            prompt=prompt, effort=effort, web_search=web_search,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return result
+
+
+# Cap on how much of a file we'll attach as an artifact. The roundtable
+# library has its own per-call PROMPT_CHAR_CAP so a runaway paste won't
+# break the model context — but refusing oversized uploads at the API
+# boundary gives a cleaner error than letting the transcript silently
+# truncate a 2 MB file paste.
+_ROUNDTABLE_ATTACH_MAX_BYTES = int(
+    os.environ.get("CLAUDE_WEB_ROUNDTABLE_ATTACH_MAX_BYTES", "1048576")
+)
+
+
+@app.post("/api/roundtable/threads/{thread_id}/artifact")
+async def api_roundtable_attach(
+    thread_id: int, request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Read a file from the bound project and post it as an artifact.
+
+    Body: ``{"path": "relative/or/absolute", "name": "optional override"}``.
+    If the path is relative, it's resolved against the project the thread
+    is bound to; if absolute, it must still be inside that project's tree
+    (no arbitrary host-fs reads). Unbound threads accept absolute paths
+    inside any configured project. The artifact name defaults to the
+    file's basename so participants see a sensible identifier.
+    """
+    rt = _require_roundtable()
+    body = await request.json()
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        raise HTTPException(400, "path is required")
+    name_override = (body.get("name") or "").strip()
+
+    project_key = _roundtable_get_project(thread_id)
+    if project_key:
+        project_root = _resolve_project_path(project_key)
+    else:
+        project_root = None
+
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        if project_root is None:
+            raise HTTPException(
+                400,
+                "Thread isn't bound to a project; supply an absolute path "
+                "(must still live inside a configured project).",
+            )
+        candidate = (project_root / candidate)
+    candidate = candidate.resolve()
+
+    # Path traversal guard: candidate must live under SOME configured
+    # project root. For bound threads, restrict to that one project.
+    if project_root is not None:
+        try:
+            candidate.relative_to(project_root.resolve())
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                f"Path {raw_path!r} is outside the bound project "
+                f"({project_key}).",
+            ) from exc
+    else:
+        allowed_roots = [p.resolve() for p in _configured_projects()]
+        inside_any = any(
+            str(candidate).startswith(str(r) + os.sep) or candidate == r
+            for r in allowed_roots
+        )
+        if not inside_any:
+            raise HTTPException(
+                400,
+                "Path is outside every configured project root.",
+            )
+
+    if not candidate.is_file():
+        raise HTTPException(404, f"No such file: {raw_path}")
+    try:
+        size = candidate.stat().st_size
+    except OSError as exc:
+        raise HTTPException(500, f"stat failed: {exc}") from exc
+    if size > _ROUNDTABLE_ATTACH_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"File is {size} bytes; max attachable is "
+            f"{_ROUNDTABLE_ATTACH_MAX_BYTES}.",
+        )
+
+    try:
+        content = await asyncio.to_thread(
+            candidate.read_text, encoding="utf-8", errors="strict",
+        )
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            415,
+            f"File isn't UTF-8 text: {exc}. Binary attachments aren't "
+            f"supported yet.",
+        ) from exc
+
+    artifact_name = name_override or candidate.name
+    try:
+        result = await asyncio.to_thread(
+            rt.roundtable_set_artifact,
+            thread_id=thread_id, name=artifact_name, content=content,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        **result,
+        "source_path": str(candidate),
+        "bytes": size,
+    }
+
+
+@app.post("/api/roundtable/threads/{thread_id}/close")
+async def api_roundtable_close(
+    thread_id: int, user: dict = Depends(auth.require_user),
+):
+    """Soft-close a thread. History stays queryable; ask/post refuse."""
+    rt = _require_roundtable()
+    try:
+        result = await asyncio.to_thread(rt.roundtable_close, thread_id=thread_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return result
+
+
+# Default panel composition for the assistant view. Picked so the cost
+# story is "two paid providers diverse enough to disagree, plus Claude
+# as the free synthesizer via the subscription CLI." Override per-request
+# via the form's `participants` and `synthesizer` fields. If a default
+# isn't available (no API key for that provider), it's silently dropped
+# at request time — the orchestrator never tries to call a participant
+# that can't answer.
+_ASSISTANT_DEFAULT_PANEL = ["gemini-pro", "gpt-5"]
+_ASSISTANT_DEFAULT_SYNTHESIZER = "claude-opus"
+
+# How much of the prompt to keep when deriving the auto-generated thread
+# topic from the first user turn. Topics longer than this get squashed
+# into a single-line preview.
+_ASSISTANT_TOPIC_PREVIEW_CHARS = 80
+
+# Per-assistant-call file upload cap (per file). Larger than the
+# attach-endpoint cap on purpose — uploaded files in the conversation
+# flow are often whole source files, but we still refuse multi-MB blobs
+# so a stray binary upload doesn't try to become a roundtable artifact.
+_ASSISTANT_UPLOAD_MAX_BYTES = int(
+    os.environ.get("CLAUDE_WEB_ROUNDTABLE_ASSISTANT_MAX_BYTES", "2097152")
+)
+
+
+def _assistant_synth_prompt(
+    panel: list[str], synthesizer_label: str, has_artifacts: bool,
+) -> str:
+    """Orchestrator note posted to the thread right before the synthesizer
+    is asked. Tells the synthesizer how to digest the panel's responses
+    into a single answer for the user.
+
+    We embed the panel labels so the synthesizer can name them when it
+    wants to attribute a point — but we tell it to synthesize, not
+    restate, so the user gets a coherent answer rather than three
+    reviewers summarised in sequence.
+
+    When the thread has any code artifact attached (``has_artifacts`` is
+    True), we also ask the synthesizer to end with one or more unified
+    diffs inside ``‍`diff`` fences — the in-browser "Apply" button
+    parses those out an' patches the file with the user's consent. The
+    fence header MUST include the artifact's filename so the apply path
+    knows which file to target.
+    """
+    panel_label_list = ", ".join(panel) if panel else "(no panel participants)"
+    base = (
+        f"You are {synthesizer_label}, acting as the user's assistant. "
+        f"The panel ({panel_label_list}) has just answered the user's most "
+        f"recent question. Your job is to synthesize ONE response the user "
+        f"can act on:\n"
+        f"- Answer the user's question directly first; this is the lede.\n"
+        f"- Flag any meaningful disagreement between the panel briefly — "
+        f"don't restate each panelist's whole reply.\n"
+        f"- If concrete next steps fall out naturally, include them.\n"
+        f"- Plain prose by default; use bullets only when the panel's "
+        f"recommendations genuinely form a list.\n"
+        f"- If the panel reached no clear consensus, say so honestly and "
+        f"name the specific question that would resolve it.\n"
+        f"- Address the user directly. Don't write as if you were "
+        f"observing the panel from outside; you ARE the panel's chosen "
+        f"spokesperson."
+    )
+    if has_artifacts:
+        base += (
+            "\n\nIf — and only if — the user is asking for a code change to "
+            "one of the attached artifacts AND the panel has reached enough "
+            "agreement to commit to a specific fix, end your answer with one "
+            "or more unified diffs in ```diff fences. The fence header line "
+            "MUST be exactly ```diff filename.ext (no other text on that "
+            "line). Use realistic file-relative paths. If yer not "
+            "sufficiently confident or the user just asked a question, do "
+            "NOT include a diff — explain in prose instead. The user will "
+            "click an 'Apply' button to commit a diff; do not write code "
+            "they should paste manually if a diff is more useful."
+        )
+    return base
+
+
+# Match a fenced diff block whose opening fence carries a filename:
+#     ```diff path/to/file.py
+#     @@ -1,3 +1,4 @@
+#     ...
+#     ```
+# Capture group 1 is the filename (trimmed), group 2 is the diff body.
+# The body may itself contain triple-backtick variants in lower-level
+# fenced blocks (rare in diffs), so we match non-greedily up to the
+# closing ``` at start-of-line.
+_DIFF_FENCE_RE = re.compile(
+    r"^```diff\s+([^\n]+?)\s*\n(.*?)\n```",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _extract_patches(synthesis: str) -> list[dict]:
+    """Pull every ``‍`diff filename`` block out of a synthesis string.
+
+    Returns a list of ``{"target": filename, "diff": body}`` dicts in the
+    order they appear. Returns an empty list if the synthesis contains no
+    apply-able diffs. The caller is responsible for validating that
+    ``target`` is a legal path (inside the bound project, no traversal).
+    """
+    out: list[dict] = []
+    for m in _DIFF_FENCE_RE.finditer(synthesis or ""):
+        target = m.group(1).strip()
+        body = m.group(2)
+        if not target or not body.strip():
+            continue
+        # Reject obviously bogus targets at parse time — saves the apply
+        # endpoint from having to refuse them later. Absolute paths and
+        # parent-references are rejected; the apply endpoint resolves the
+        # rest against the thread's bound project.
+        if target.startswith("/") or ".." in Path(target).parts:
+            continue
+        out.append({"target": target, "diff": body})
+    return out
+
+
+def _sse(event: str, data: dict) -> bytes:
+    """Render a Server-Sent Events frame the browser EventSource-style
+    reader expects. Empty trailing line is the SSE record terminator."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+@app.post("/api/roundtable/assistant")
+async def api_roundtable_assistant(
+    request: Request,
+    prompt: str = Form(...),
+    project_key: str = Form(""),
+    thread_id: Optional[int] = Form(None),
+    participants_csv: str = Form(""),
+    effort: str = Form("medium"),
+    synthesizer: str = Form(""),
+    web_search: bool = Form(False),
+    files: list[UploadFile] = File(default=[]),
+    user: dict = Depends(auth.require_user),
+):
+    """Stream the 'ask the panel' flow as Server-Sent Events.
+
+    Returns ``text/event-stream`` with these events in order:
+        created       — thread_id resolved (new or existing)
+        attached      — file uploads turned into artifacts (zero or more)
+        prompt_posted — user's turn committed to the transcript
+        panel_start   — parallel ask kicking off, lists participants
+        panel_done    — parallel ask returned with per-participant sizes
+        synth_start   — synthesizer ask kicking off
+        done          — final synthesis + extracted patches + full payload
+        error         — fatal failure at any step
+
+    The blocking provider calls (panel parallel ask, synth ask) still
+    take 10-30s each; SSE just gives the browser meaningful checkpoints
+    instead of a single 30-50s opaque wait. Real per-token streaming
+    inside the synthesizer turn is a follow-up — would need streaming
+    support in roundtable.core.
+
+    Inputs match the prior JSON endpoint: prompt + optional thread_id +
+    project_key + file uploads + per-call participants_csv / effort /
+    synthesizer overrides.
+    """
+    rt = _require_roundtable()
+    prompt_str = (prompt or "").strip()
+    if not prompt_str:
+        raise HTTPException(400, "prompt is required")
+
+    # Resolve participants up front so we can fail fast (HTTPException)
+    # before opening the SSE response — easier to debug than an SSE
+    # error frame.
+    panel_keys_in = [
+        p.strip() for p in (participants_csv or "").split(",") if p.strip()
+    ] or list(_ASSISTANT_DEFAULT_PANEL)
+    panel: list[str] = []
+    panel_unavailable: list[str] = []
+    for key in panel_keys_in:
+        try:
+            rt._resolve_participant(key)
+        except (ValueError, RuntimeError):
+            panel_unavailable.append(key)
+            continue
+        panel.append(key)
+
+    synth_key = (synthesizer or _ASSISTANT_DEFAULT_SYNTHESIZER).strip()
+    try:
+        synth_info = rt._resolve_participant(synth_key)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            503,
+            f"Synthesizer participant {synth_key!r} unavailable: {exc}",
+        ) from exc
+
+    if synth_key in panel:
+        panel = [p for p in panel if p != synth_key]
+
+    # Pre-read file uploads — once we've started the SSE response we
+    # can't easily return a clean 400 for an oversized/binary file, so
+    # we do the validation here and stash the decoded content for the
+    # generator to commit at the appropriate event.
+    pending_artifacts: list[tuple[str, str, int]] = []  # (name, content, bytes)
+    for upload in files or []:
+        if not upload or not upload.filename:
+            continue
+        data = await _read_with_cap(upload, _ASSISTANT_UPLOAD_MAX_BYTES)
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                415,
+                f"Uploaded file {upload.filename!r} isn't UTF-8 text "
+                f"({exc}). Binary uploads aren't supported in the "
+                f"roundtable assistant yet.",
+            ) from exc
+        pending_artifacts.append((Path(upload.filename).name, content, len(data)))
+
+    # Resolve / create the thread up front so 'created' is the very
+    # first event yer browser sees.
+    project_key_norm = (project_key or "").strip() or None
+    if thread_id is not None:
+        existing = await asyncio.to_thread(rt._thread_row, int(thread_id))
+        if existing is None:
+            raise HTTPException(404, f"No such thread: {thread_id}")
+        if existing.get("closed_at"):
+            raise HTTPException(
+                409,
+                f"Thread {thread_id} is closed; start a new conversation.",
+            )
+        tid = int(thread_id)
+        thread_was_new = False
+    else:
+        topic_preview = prompt_str[:_ASSISTANT_TOPIC_PREVIEW_CHARS].splitlines()[0] or "(assistant)"
+        if len(prompt_str) > _ASSISTANT_TOPIC_PREVIEW_CHARS:
+            topic_preview += "…"
+        registered = [synth_key, *panel]
+        try:
+            created = await asyncio.to_thread(
+                rt.roundtable_create,
+                topic=topic_preview,
+                participants=registered,
+                house_rules="",
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        tid = int(created["thread_id"])
+        if project_key_norm:
+            _resolve_project_path(project_key_norm)
+            _roundtable_set_project(tid, project_key_norm, user.get("sub", "anonymous"))
+        thread_was_new = True
+
+    speaker_label = "matt"
+    user_name = (user.get("name") or "").strip()
+    if user_name:
+        first_token = user_name.split()[0]
+        if first_token.isalnum() and len(first_token) <= 24:
+            speaker_label = first_token.lower()
+
+    effort_norm = (effort or "medium")
+
+    async def event_stream():
+        # First: tell the browser which thread we're on. Then attach the
+        # uploads (one event per artifact so the UI can show progress).
+        # Then post the user prompt, then fire the panel + synth.
+        try:
+            yield _sse("created", {
+                "thread_id": tid,
+                "project_key": _roundtable_get_project(tid),
+                "thread_was_new": thread_was_new,
+            })
+
+            attached: list[dict] = []
+            for safe_name, content, byte_count in pending_artifacts:
+                try:
+                    art = await asyncio.to_thread(
+                        rt.roundtable_set_artifact,
+                        thread_id=tid, name=safe_name, content=content,
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    yield _sse("error", {"message": f"attach {safe_name!r}: {exc}"})
+                    return
+                attached.append({
+                    "name": art["name"],
+                    "version": art["version"],
+                    "bytes": byte_count,
+                    "diff_omitted": art.get("diff_omitted", False),
+                })
+                yield _sse("attached", attached[-1])
+
+            await asyncio.to_thread(
+                rt.roundtable_post,
+                thread_id=tid, content=prompt_str, speaker=speaker_label,
+            )
+            yield _sse("prompt_posted", {"speaker": speaker_label})
+
+            panel_result: dict = {"responses": {}, "errors": {}}
+            if panel:
+                yield _sse("panel_start", {
+                    "participants": [
+                        {"key": k, "label": rt.PARTICIPANTS[k]["label"]}
+                        for k in panel
+                    ],
+                    "effort": effort_norm,
+                    "web_search": web_search,
+                })
+                try:
+                    panel_result = await asyncio.to_thread(
+                        rt.roundtable_ask_parallel,
+                        thread_id=tid, participants=panel,
+                        prompt="", effort=effort_norm,
+                        web_search=web_search,
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    yield _sse("error", {"message": f"panel: {exc}"})
+                    return
+                yield _sse("panel_done", {
+                    "responses": {
+                        k: {"chars": len(v)}
+                        for k, v in panel_result.get("responses", {}).items()
+                    },
+                    "errors": panel_result.get("errors", {}),
+                    "unavailable": panel_unavailable,
+                })
+
+            # Synthesizer step. The framing post is committed so the
+            # transcript shows exactly what produced the synthesis.
+            has_artifacts = bool(attached) or any(
+                rt._latest_artifact_version(tid, name) > 0
+                for (name, _, _) in pending_artifacts
+            )
+            # Also check pre-existing artifacts on a continued thread.
+            if not has_artifacts and not thread_was_new:
+                # Cheap check: any artifact rows for this thread at all?
+                has_artifacts = bool(
+                    rt._conn().execute(
+                        "SELECT 1 FROM artifacts WHERE thread_id = ? LIMIT 1",
+                        (tid,),
+                    ).fetchone()
+                )
+            synth_framing = _assistant_synth_prompt(
+                panel, synth_info["label"], has_artifacts,
+            )
+            await asyncio.to_thread(
+                rt.roundtable_post,
+                thread_id=tid, content=synth_framing, speaker="orchestrator",
+            )
+            yield _sse("synth_start", {
+                "synthesizer": {"key": synth_key, "label": synth_info["label"]},
+            })
+
+            try:
+                synthesis = await asyncio.to_thread(
+                    rt.roundtable_ask,
+                    thread_id=tid, participant=synth_key, prompt="",
+                    effort=effort_norm, web_search=web_search,
+                )
+            except (ValueError, RuntimeError) as exc:
+                yield _sse("error", {"message": f"synth: {exc}"})
+                return
+
+            patches = _extract_patches(synthesis)
+            yield _sse("done", {
+                "thread_id": tid,
+                "project_key": _roundtable_get_project(tid),
+                "synthesis": synthesis,
+                "synthesizer": {
+                    "key": synth_key,
+                    "label": synth_info["label"],
+                },
+                "panel": [
+                    {"key": k, "label": rt.PARTICIPANTS[k]["label"]}
+                    for k in panel
+                ],
+                "panel_responses": panel_result.get("responses", {}),
+                "panel_errors": panel_result.get("errors", {}),
+                "panel_unavailable": panel_unavailable,
+                "attached": attached,
+                "patches": patches,
+            })
+        except Exception as exc:  # noqa: BLE001 — last-resort SSE error reporting
+            log.exception("roundtable assistant stream failed")
+            yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
+
+
+# Per-file backup suffix when applying patches; the user gets the
+# original back if they want by renaming this file.
+_PATCH_BACKUP_SUFFIX = ".rt-orig"
+
+
+@app.post("/api/roundtable/assistant/apply")
+async def api_roundtable_apply(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Apply a unified diff from a synthesis turn to a project file.
+
+    Body: ``{"thread_id": int, "target": "relative/path.py", "diff": "..."}``.
+
+    Safety rails:
+      - Target path must resolve inside the bound project (or, for
+        unbound threads, inside ANY configured project root).
+      - ``patch --dry-run`` runs first; if it fails, no write happens.
+      - The original file is renamed to ``<target>.rt-orig`` before the
+        patch is applied, so the user can revert without diff-math.
+        Re-applying overwrites any previous backup — only one rollback
+        slot per file at a time.
+    """
+    body = await request.json()
+    thread_id = body.get("thread_id")
+    target = (body.get("target") or "").strip()
+    diff_text = body.get("diff") or ""
+    if not isinstance(thread_id, int):
+        raise HTTPException(400, "thread_id (int) is required")
+    if not target:
+        raise HTTPException(400, "target path is required")
+    if not diff_text.strip():
+        raise HTTPException(400, "diff body is required")
+    if target.startswith("/") or ".." in Path(target).parts:
+        raise HTTPException(400, "target path must be relative and inside a configured project")
+
+    # Resolve target to an absolute path. Bound thread = restrict to its
+    # project; unbound = allow inside any configured project root.
+    project_key = _roundtable_get_project(thread_id)
+    if project_key:
+        project_root = _resolve_project_path(project_key)
+        candidate = (project_root / target).resolve()
+        try:
+            candidate.relative_to(project_root.resolve())
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                f"target {target!r} is outside the bound project ({project_key}).",
+            ) from exc
+    else:
+        candidate = Path(target).expanduser().resolve()
+        allowed_roots = [p.resolve() for p in _configured_projects()]
+        inside = any(
+            str(candidate).startswith(str(r) + os.sep) or candidate == r
+            for r in allowed_roots
+        )
+        if not inside:
+            raise HTTPException(
+                400,
+                "target path is outside every configured project root.",
+            )
+
+    if not candidate.is_file():
+        raise HTTPException(404, f"target file does not exist: {target}")
+
+    # Write the diff to a temp file. We use `patch` rather than a pure-
+    # Python apply because GNU patch is robust to fuzz, mixed line
+    # endings, slightly stale hunks, etc. — every edge case I'd
+    # otherwise reinvent badly.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".patch", delete=False, encoding="utf-8",
+    ) as tf:
+        tf.write(diff_text)
+        if not diff_text.endswith("\n"):
+            tf.write("\n")
+        patch_path = tf.name
+
+    try:
+        # Dry-run first — patch's --dry-run validates the hunks would
+        # apply cleanly without mutating the file. If it fails the user
+        # gets the stderr verbatim.
+        dry = await asyncio.to_thread(
+            subprocess.run,
+            ["patch", "--dry-run", "--silent", "-p0", str(candidate), "-i", patch_path],
+            capture_output=True, text=True,
+        )
+        if dry.returncode != 0:
+            # Try -p1 (strips one leading path component) — synthesizers
+            # often produce a/foo.py b/foo.py style headers.
+            dry = await asyncio.to_thread(
+                subprocess.run,
+                ["patch", "--dry-run", "--silent", "-p1", "-d", str(candidate.parent), "-i", patch_path],
+                capture_output=True, text=True,
+            )
+            if dry.returncode != 0:
+                raise HTTPException(
+                    422,
+                    f"diff doesn't apply cleanly. patch said: "
+                    f"{(dry.stderr or dry.stdout)[-1000:]}",
+                )
+            strip_level = 1
+        else:
+            strip_level = 0
+
+        # Back up the original. Same suffix every time — only one slot,
+        # second apply on the same file overwrites it.
+        backup_path = candidate.with_name(candidate.name + _PATCH_BACKUP_SUFFIX)
+        backup_path.write_bytes(candidate.read_bytes())
+
+        # Real apply.
+        if strip_level == 0:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["patch", "--silent", "-p0", str(candidate), "-i", patch_path],
+                capture_output=True, text=True,
+            )
+        else:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["patch", "--silent", "-p1", "-d", str(candidate.parent), "-i", patch_path],
+                capture_output=True, text=True,
+            )
+
+        if result.returncode != 0:
+            # Restore from backup so we don't leave the file in a half-
+            # applied state. patch normally doesn't leave a mess on
+            # failure but a corrupted backup file would be worse.
+            candidate.write_bytes(backup_path.read_bytes())
+            raise HTTPException(
+                500,
+                f"patch failed unexpectedly after dry-run succeeded: "
+                f"{(result.stderr or result.stdout)[-1000:]}",
+            )
+    finally:
+        os.unlink(patch_path)
+
+    return {
+        "applied": True,
+        "target": str(candidate),
+        "backup": str(backup_path),
+        "strip_level": strip_level,
+    }
+
+
+@app.get("/api/roundtable/participants")
+async def api_roundtable_participants(
+    user: dict = Depends(auth.require_user),
+):
+    """List registered AI participants and whether they're available
+    in this deployment (API key set or CLI on PATH, per transport mode)."""
+    rt = _require_roundtable()
+    return await asyncio.to_thread(rt.roundtable_participants)
 
 
 @app.get("/healthz")

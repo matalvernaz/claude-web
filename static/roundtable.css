@@ -1,0 +1,750 @@
+/* Roundtable view — two-column on wide screens, stacked on narrow.
+   Inherits palette + base layout from style.css. */
+
+.roundtable {
+  display: grid;
+  grid-template-columns: minmax(280px, 24rem) 1fr;
+  gap: 1rem;
+  padding: 1rem;
+  max-width: 100rem;
+  margin: 0 auto;
+  align-items: start;
+}
+
+@media (max-width: 800px) {
+  .roundtable {
+    grid-template-columns: 1fr;
+  }
+}
+
+.thread-list-panel,
+.thread-detail-panel {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+}
+
+.thread-list-header h2,
+.thread-detail-panel h2 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.thread-list-controls {
+  margin: 0.25rem 0 0.75rem 0;
+  color: #aaa;
+  font-size: 0.9rem;
+}
+
+#thread-list-status {
+  margin: 0 0 0.5rem 0;
+  color: #aaa;
+  font-size: 0.85rem;
+}
+
+.thread-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+.thread-item {
+  margin: 0 0 0.5rem 0;
+}
+
+.thread-item-button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  font: inherit;
+}
+
+.thread-item-button:hover {
+  border-color: var(--accent);
+}
+
+.thread-item-button:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.thread-item-button[aria-current="true"] {
+  border-color: var(--accent);
+  background: rgba(122, 162, 247, 0.08);
+}
+
+.thread-item-closed .thread-item-button {
+  opacity: 0.65;
+}
+
+.thread-item-topic {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+  word-break: break-word;
+}
+
+.thread-item-meta,
+.thread-item-time {
+  display: block;
+  color: #aaa;
+  font-size: 0.8rem;
+}
+
+.thread-detail-panel {
+  min-height: 16rem;
+}
+
+.thread-detail-empty {
+  color: #aaa;
+  font-style: italic;
+}
+
+#thread-detail-heading:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.thread-detail-meta {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.thread-detail-meta h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.thread-detail-stats {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.thread-detail-stats dt {
+  color: #888;
+  font-weight: 600;
+}
+
+.thread-detail-stats dd {
+  margin: 0;
+  color: var(--fg);
+  word-break: break-word;
+}
+
+.thread-messages {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.thread-message {
+  margin: 0 0 1rem 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.thread-message-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.thread-message-speaker {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* Differentiate speaker categories so a quick eye-scan can identify who
+   said what. Screen-reader users get this via the speaker name itself. */
+.thread-message[data-speaker="orchestrator"] .thread-message-speaker {
+  color: var(--user);
+}
+.thread-message[data-speaker="system"] .thread-message-speaker {
+  color: #888;
+  font-style: italic;
+}
+
+.thread-message-time {
+  color: #888;
+}
+
+.thread-message-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.95rem;
+  color: var(--fg);
+}
+
+.roundtable-unavailable {
+  max-width: 50rem;
+  margin: 2rem auto;
+  padding: 1rem;
+}
+
+.roundtable-unavailable section {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.5rem;
+}
+
+.roundtable-toolbar {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+.roundtable-toolbar select,
+.roundtable-toolbar input {
+  font: inherit;
+}
+
+.roundtable-toolbar button {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+
+.roundtable-toolbar button:focus {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+.thread-actions {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.thread-actions h4 {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #aaa;
+}
+
+.action-block {
+  margin: 0.25rem 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.action-block summary {
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  font-weight: 600;
+}
+
+.action-block summary:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.action-block[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.action-form {
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.action-form-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  flex-wrap: wrap;
+}
+
+.action-form-row label {
+  flex: 0 0 auto;
+  min-width: 6rem;
+}
+
+.action-form-row input[type="text"],
+.action-form-row select {
+  flex: 1;
+  min-width: 8rem;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.3rem 0.5rem;
+  font: inherit;
+}
+
+.action-form textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.4rem 0.6rem;
+  font: inherit;
+  font-family: var(--mono, monospace);
+  font-size: 0.9rem;
+}
+
+.action-form button {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+
+.action-form button[disabled],
+.roundtable-toolbar button[disabled] {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.action-form .btn-danger {
+  background: #d96868;
+  border-color: #d96868;
+  color: #fff;
+}
+
+.participant-checklist {
+  list-style: none;
+  padding: 0;
+  margin: 0.25rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.participant-checklist li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.participant-checklist input[disabled] + label {
+  color: #888;
+}
+
+dialog#new-thread-dialog {
+  width: min(90vw, 38rem);
+  max-height: 85vh;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.25rem;
+}
+
+dialog#new-thread-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+dialog#new-thread-dialog h2 {
+  margin: 0 0 0.75rem 0;
+}
+
+dialog#new-thread-dialog input[type="text"],
+dialog#new-thread-dialog select,
+dialog#new-thread-dialog textarea {
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+  width: 100%;
+}
+
+dialog#new-thread-dialog textarea {
+  font-family: var(--mono, monospace);
+  font-size: 0.9rem;
+  min-height: 5rem;
+}
+
+dialog#new-thread-dialog fieldset {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin: 0.5rem 0;
+}
+
+dialog#new-thread-dialog button {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+
+/* ── Assistant (chat) view ───────────────────────────────────────── */
+
+/* Mode toggles: hide advanced surface in assistant mode and vice
+   versa. Body class gets flipped by the JS controller. */
+body.mode-assistant .advanced-only { display: none; }
+body.mode-advanced .assistant       { display: none; }
+
+.assistant {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 4rem);
+  max-width: 70rem;
+  margin: 0 auto;
+  padding: 1rem;
+  gap: 1rem;
+}
+
+.assistant-history {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.assistant-empty {
+  color: #aaa;
+  font-style: italic;
+  margin: 0;
+}
+
+.asst-turn {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.asst-turn-user { border-left: 3px solid var(--user); }
+.asst-turn-assistant { border-left: 3px solid var(--accent); }
+
+.asst-turn-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.asst-turn-speaker {
+  font-weight: 700;
+}
+
+.asst-turn-user .asst-turn-speaker { color: var(--user); }
+.asst-turn-assistant .asst-turn-speaker { color: var(--accent); }
+
+.asst-turn-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.asst-turn-attached {
+  margin: 0.5rem 0 0 0;
+  font-size: 0.8rem;
+  color: #aaa;
+  font-style: italic;
+}
+
+.asst-turn-pending {
+  border-left-color: #888;
+}
+
+.asst-turn-progress {
+  margin: 0.5rem 0 0 0;
+  color: var(--accent);
+  font-style: italic;
+  font-size: 0.9rem;
+}
+
+/* Markdown-rendered synthesis body. The default <pre> styling from
+   .asst-turn-body still applies to fallback paths; this overrides for
+   the marked+purify-rendered surface. */
+.asst-turn-md {
+  font-family: inherit;
+  white-space: normal;
+}
+
+.asst-turn-md p,
+.asst-turn-md ul,
+.asst-turn-md ol {
+  margin: 0.5em 0;
+}
+
+.asst-turn-md h1,
+.asst-turn-md h2,
+.asst-turn-md h3 {
+  margin: 0.8em 0 0.4em 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.asst-turn-md code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0 0.25em;
+  border-radius: 2px;
+  font-family: var(--mono, monospace);
+  font-size: 0.92em;
+}
+
+.asst-turn-md pre {
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.6rem 0.8rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+
+.asst-turn-md pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.asst-turn-md blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 0.75rem;
+  margin: 0.5em 0;
+  color: #ccc;
+}
+
+.asst-turn-md a {
+  color: var(--accent);
+}
+
+/* Apply-patch buttons appear under the synthesis body. */
+.asst-patches {
+  margin: 0.75rem 0 0.5rem 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(122, 162, 247, 0.06);
+}
+
+.asst-patches h4 {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+
+.asst-patch-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.3rem 0;
+  flex-wrap: wrap;
+}
+
+.asst-patch-target {
+  font-family: var(--mono, monospace);
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+.asst-apply-btn {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0.25rem 0.8rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.asst-apply-btn[disabled] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.asst-patch-status {
+  font-size: 0.8rem;
+  color: #aaa;
+}
+
+.asst-debate-expander {
+  margin-top: 0.75rem;
+  border-top: 1px dashed var(--border);
+  padding-top: 0.5rem;
+}
+
+.asst-debate-expander summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #aaa;
+}
+
+.asst-panel-reply,
+.asst-panel-error {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.asst-panel-error {
+  color: #d96868;
+}
+
+.asst-audit-link {
+  margin: 0.5rem 0 0 0;
+  font-size: 0.8rem;
+}
+
+.asst-audit-link a {
+  color: var(--accent);
+}
+
+.assistant-input-bar {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#assistant-input {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.assistant-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.assistant-file-picker {
+  cursor: pointer;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.assistant-file-picker input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0,0,0,0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.assistant-file-picker:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.assistant-file-list {
+  color: #aaa;
+  font-size: 0.85rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.assistant-advanced-knobs {
+  margin-left: auto;
+}
+
+.assistant-advanced-knobs summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #aaa;
+}
+
+.assistant-advanced-knobs .action-form-row {
+  margin: 0.3rem 0;
+}
+
+#assistant-submit {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.5rem 1.1rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#assistant-submit[disabled] { opacity: 0.6; cursor: wait; }
+
+.assistant-status {
+  margin: 0;
+  color: var(--accent);
+  font-size: 0.9rem;
+  min-height: 1.2em;
+}
+
+#toggle-advanced[aria-pressed="true"] {
+  background: var(--accent);
+  color: #000;
+}
+
+.roundtable-unavailable code {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0 0.25rem;
+  border-radius: 3px;
+}
+
+.roundtable-unavailable pre {
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.75rem;
+  border-radius: 4px;
+  overflow-x: auto;
+}

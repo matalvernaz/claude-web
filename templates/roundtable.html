@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Roundtable — {{ site_title }}</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/roundtable.css?v={{ asset_version('roundtable.css') }}">
+</head>
+<body class="mode-assistant">
+  <div class="skip-links">
+    <a class="skip" href="#assistant-history">Skip to conversation</a>
+    <a class="skip" href="#assistant-input">Skip to input</a>
+    <a class="skip" href="#announcer">Skip to announcements</a>
+  </div>
+
+  <header>
+    <h1>Roundtable</h1>
+    <div class="header-actions">
+      <a href="/">Back to chat</a>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  {% if not available %}
+    <main class="roundtable-unavailable">
+      <section aria-labelledby="unavailable-heading">
+        <h2 id="unavailable-heading">Roundtable isn't enabled in this deployment</h2>
+        <p>
+          The <code>roundtable</code> Python package needs to be installed
+          alongside claude-web. From the claude-web venv:
+        </p>
+        <pre><code>pip install -e /path/to/roundtable-mcp</code></pre>
+        <p>
+          Roundtable is a multi-AI threaded-conversation library. When
+          installed it shares the SQLite store at
+          <code>~/.claude-roundtable/state.db</code> with the standalone
+          MCP server, so debates started in Claude Code are visible here
+          and vice versa.
+        </p>
+      </section>
+    </main>
+  {% else %}
+    {# Single sr-only live region for milestone announcements. The
+       conversation history itself is NOT a live region — see the comment
+       on #assistant-history below. aria-atomic="true" matches the main
+       chat UI's announcer pattern so NVDA reads the whole new text on
+       every update instead of trying to diff. #}
+    <div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <nav class="roundtable-toolbar" aria-label="Roundtable controls">
+      <label class="header-select" for="project-filter">
+        <span class="sr-only">Project context</span>
+        <select id="project-filter" aria-label="Project context">
+          <option value="">No project (free-form)</option>
+          {% for p in projects %}
+            <option value="{{ p.key }}" {% if p.key == default_project %}selected{% endif %}>{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <button type="button" id="new-conv-btn">New conversation</button>
+
+      <button type="button" id="toggle-advanced" aria-pressed="false">
+        Advanced view
+      </button>
+
+      <label class="checkbox-row advanced-only">
+        <input type="checkbox" id="show-closed">
+        Show closed threads
+      </label>
+    </nav>
+
+    {# ─── ASSISTANT VIEW (default) ─────────────────────────────────── #}
+    <main class="assistant" id="assistant-pane">
+      {# NO aria-live here. Marking the whole conversation region as live
+         caused NVDA to re-announce huge chunks on every DOM mutation,
+         which is exactly what the main chat UI avoids. Milestone
+         announcements ("Panel working: …", "Synthesis arrived") go
+         through the sr-only #announcer above; the user navigates the
+         conversation itself via H-key heading navigation (each turn
+         carries an h3 speaker label) and via the skip-link. #}
+      <section
+        id="assistant-history"
+        class="assistant-history"
+        aria-labelledby="assistant-history-heading"
+      >
+        <h2 id="assistant-history-heading" class="sr-only">Conversation</h2>
+        <p id="assistant-empty" class="assistant-empty">
+          Ask the panel a question or upload a file below. Two paid
+          participants will read independently; Claude Opus will read
+          their replies and synthesize one answer for yeh. Continue the
+          conversation to refine — the panel sees prior turns.
+        </p>
+      </section>
+
+      <form
+        id="assistant-form"
+        class="assistant-input-bar"
+        aria-labelledby="assistant-input-heading"
+        enctype="multipart/form-data"
+      >
+        <h2 id="assistant-input-heading" class="sr-only">Ask the panel</h2>
+
+        <label for="assistant-input" class="sr-only">Your message</label>
+        <textarea
+          id="assistant-input"
+          name="prompt"
+          required
+          rows="4"
+          placeholder="Ask anything. Paste a code snippet, describe what's broken, or upload a file below."></textarea>
+
+        <div class="assistant-input-row">
+          <label class="assistant-file-picker">
+            <input
+              type="file"
+              id="assistant-file"
+              name="files"
+              multiple
+              aria-label="Attach files (UTF-8 text only, max 2MB each)"
+            >
+            <span>Attach files</span>
+          </label>
+          <span id="assistant-file-list" class="assistant-file-list" aria-live="polite"></span>
+
+          <details class="assistant-advanced-knobs">
+            <summary>Override panel</summary>
+            <p class="hint">
+              By default: <code>gemini-pro</code> + <code>gpt-5</code> as
+              the paid panel, <code>claude-opus</code> as the synthesizer.
+              Override below to use a different lineup.
+            </p>
+            <p class="action-form-row">
+              <label for="override-participants">Panel</label>
+              <input type="text" id="override-participants"
+                placeholder="e.g. gemini-pro,gpt-5-mini" autocomplete="off">
+            </p>
+            <p class="action-form-row">
+              <label for="override-synthesizer">Synthesizer</label>
+              <select id="override-synthesizer">
+                <option value="">claude-opus (default)</option>
+                <option value="claude-sonnet">claude-sonnet (faster)</option>
+                <option value="claude-opus">claude-opus</option>
+              </select>
+            </p>
+            <p class="action-form-row">
+              <label for="override-effort">Effort</label>
+              <select id="override-effort">
+                <option value="">Provider default</option>
+                <option value="low">Low (fastest)</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High (best reasoning)</option>
+              </select>
+            </p>
+            <p class="action-form-row">
+              <label for="override-web-search">
+                <input type="checkbox" id="override-web-search">
+                Allow web search (Google grounding / OpenAI / Anthropic
+                hosted web_search) — turn on when the answer needs current
+                information.
+              </label>
+            </p>
+          </details>
+
+          <button type="submit" id="assistant-submit">Ask the panel</button>
+        </div>
+
+        <p id="assistant-status" class="assistant-status" role="status" aria-live="polite"></p>
+        <p id="assistant-error" class="setup-error" role="alert" hidden></p>
+      </form>
+    </main>
+
+    {# ─── ADVANCED VIEW (thread browser + manual driving) ──────────── #}
+    <main class="roundtable advanced-only" id="advanced-pane" hidden>
+      <section
+        id="thread-list-panel"
+        class="thread-list-panel"
+        aria-labelledby="thread-list-heading"
+      >
+        <h2 id="thread-list-heading">Threads</h2>
+        <p id="thread-list-status" role="status" aria-live="polite">Loading…</p>
+        <ol id="thread-list" class="thread-list" aria-labelledby="thread-list-heading"></ol>
+      </section>
+
+      <section
+        id="thread-detail-panel"
+        class="thread-detail-panel"
+        aria-labelledby="thread-detail-heading"
+      >
+        <h2 id="thread-detail-heading" tabindex="-1">Transcript</h2>
+        <p id="thread-detail-empty" class="thread-detail-empty">
+          Select a thread to inspect, or use the assistant view to create one.
+        </p>
+
+        <article id="thread-detail" hidden>
+          <header class="thread-detail-meta">
+            <h3 id="thread-detail-topic"></h3>
+            <dl class="thread-detail-stats">
+              <dt>Project</dt><dd id="thread-detail-project">—</dd>
+              <dt>Participants</dt><dd id="thread-detail-participants">—</dd>
+              <dt>Messages</dt><dd id="thread-detail-count">—</dd>
+              <dt>Created</dt><dd><time id="thread-detail-created" datetime=""></time></dd>
+              <dt>Last activity</dt><dd><time id="thread-detail-activity" datetime=""></time></dd>
+              <dt>Status</dt><dd id="thread-detail-status">—</dd>
+            </dl>
+          </header>
+
+          <section id="thread-actions" class="thread-actions" aria-labelledby="thread-actions-heading">
+            <h4 id="thread-actions-heading">Manual actions</h4>
+
+            <details class="action-block" id="post-action">
+              <summary>Post a note (orchestrator turn)</summary>
+              <form id="post-form" class="action-form">
+                <label for="post-content" class="sr-only">Message content</label>
+                <textarea id="post-content" required rows="4"
+                  placeholder="Add a note, framing, or human clarification…"></textarea>
+                <p class="action-form-row"><button type="submit">Post</button></p>
+              </form>
+            </details>
+
+            <details class="action-block" id="ask-action">
+              <summary>Ask one participant</summary>
+              <form id="ask-form" class="action-form">
+                <p class="action-form-row">
+                  <label for="ask-participant">Participant</label>
+                  <select id="ask-participant" required></select>
+                </p>
+                <p class="action-form-row">
+                  <label for="ask-effort">Effort</label>
+                  <select id="ask-effort">
+                    <option value="">Provider default</option>
+                    <option value="low">Low</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </p>
+                <p class="action-form-row">
+                  <label for="ask-web-search">
+                    <input type="checkbox" id="ask-web-search">
+                    Allow web search
+                  </label>
+                </p>
+                <label for="ask-prompt" class="sr-only">Optional steering prompt</label>
+                <textarea id="ask-prompt" rows="3" placeholder="Optional steering prompt"></textarea>
+                <p class="action-form-row"><button type="submit">Ask</button></p>
+              </form>
+            </details>
+
+            <details class="action-block" id="ask-parallel-action">
+              <summary>Ask multiple participants in parallel</summary>
+              <form id="ask-parallel-form" class="action-form">
+                <fieldset>
+                  <legend>Participants</legend>
+                  <ul class="participant-checklist" id="ask-parallel-checklist"></ul>
+                </fieldset>
+                <p class="action-form-row">
+                  <label for="ask-parallel-effort">Effort</label>
+                  <select id="ask-parallel-effort">
+                    <option value="">Provider default</option>
+                    <option value="low">Low</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </p>
+                <p class="action-form-row">
+                  <label for="ask-parallel-web-search">
+                    <input type="checkbox" id="ask-parallel-web-search">
+                    Allow web search
+                  </label>
+                </p>
+                <label for="ask-parallel-prompt" class="sr-only">Prompt</label>
+                <textarea id="ask-parallel-prompt" rows="3" placeholder="Prompt for all picked participants"></textarea>
+                <p class="action-form-row"><button type="submit">Ask all picked</button></p>
+              </form>
+            </details>
+
+            <details class="action-block" id="attach-action">
+              <summary>Attach a file as an artifact</summary>
+              <p class="hint" id="attach-hint"></p>
+              <form id="attach-form" class="action-form">
+                <p class="action-form-row">
+                  <label for="attach-path">Path</label>
+                  <input type="text" id="attach-path" required autocomplete="off">
+                </p>
+                <p class="action-form-row">
+                  <label for="attach-name">Artifact name (optional)</label>
+                  <input type="text" id="attach-name" autocomplete="off">
+                </p>
+                <p class="action-form-row"><button type="submit">Attach</button></p>
+              </form>
+            </details>
+
+            <details class="action-block" id="close-action">
+              <summary>Close this thread</summary>
+              <p class="action-form-row">
+                <button type="button" id="close-thread-btn" class="btn-danger">Close thread</button>
+              </p>
+            </details>
+          </section>
+
+          <ol id="thread-messages" class="thread-messages" aria-label="Transcript messages"></ol>
+        </article>
+
+        <p id="thread-detail-error" class="setup-error" role="alert" hidden></p>
+      </section>
+    </main>
+
+    <script id="participants-json" type="application/json">{{ participants_json|safe }}</script>
+  {% endif %}
+
+  {# marked + purify are already shipped for the main chat; reuse them
+     so synthesis bodies render as markdown (code fences, headings, lists)
+     while AI content is sanitized before insertion. #}
+  <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
+  <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
+  <script src="/static/roundtable.js?v={{ asset_version('roundtable.js') }}"></script>
+</body>
+</html>
