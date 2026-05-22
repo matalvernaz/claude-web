@@ -396,6 +396,132 @@
     }
   }
 
+  // Render a permission-request card inside the live assistant article.
+  // Mirrors the main chat's renderPermissionCard pattern but scoped to
+  // the roundtable's per-turn article so the prompt appears next to the
+  // panel/synth that asked for it. Posts to the SAME /api/permission/
+  // endpoint the main chat uses — server-side PENDING is shared.
+  function renderRoundtablePermissionCard(req, hostArticle, progress) {
+    const card = document.createElement("article");
+    card.className = "rt-permission";
+    card.setAttribute("role", "alertdialog");
+    card.setAttribute("aria-modal", "false");
+    if (req.id) card.dataset.requestId = req.id;
+    card.dataset.state = "pending";
+
+    const headingId = `rt-perm-heading-${req.id || Math.random().toString(36).slice(2)}`;
+    const detailId = `rt-perm-detail-${req.id || Math.random().toString(36).slice(2)}`;
+    const heading = document.createElement("h4");
+    heading.id = headingId;
+    heading.className = "rt-permission-heading";
+    const who = req.participant_label || "A panelist";
+    heading.textContent = `${who} wants to use ${req.tool}`;
+    card.appendChild(heading);
+    card.setAttribute("aria-labelledby", headingId);
+    card.setAttribute("aria-describedby", detailId);
+
+    const detail = document.createElement("div");
+    detail.id = detailId;
+    detail.className = "rt-permission-detail";
+    const pre = document.createElement("pre");
+    pre.className = "rt-permission-input";
+    // Read/Grep/Glob inputs are small JSON dicts — no special-casing
+    // needed (the main chat has Bash/Edit/Write rendering because those
+    // tools aren't in the roundtable allowlist for Layer 1).
+    pre.textContent = JSON.stringify(req.input || {}, null, 2);
+    detail.appendChild(pre);
+    card.appendChild(detail);
+
+    const actions = document.createElement("div");
+    actions.className = "rt-permission-actions";
+    const allowSessionSupported = req.allow_session_supported !== false;
+    const sig = req.signature ? ` "${(req.signature.length > 30 ? req.signature.slice(0, 27) + "…" : req.signature)}"` : "";
+
+    const buttons = [
+      { decision: "deny", label: "Deny" },
+      { decision: "allow", label: "Allow once" },
+    ];
+    if (allowSessionSupported) {
+      buttons.push({ decision: "allow_session", label: `Allow this turn${sig}` });
+    }
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = b.label;
+      btn.className = `rt-permission-btn rt-permission-${b.decision}`;
+      btn.addEventListener("click", () => decideRoundtablePermission(req.id, b.decision, card));
+      actions.appendChild(btn);
+    }
+    card.appendChild(actions);
+
+    if (progress && progress.parentNode === hostArticle) {
+      hostArticle.insertBefore(card, progress);
+    } else {
+      hostArticle.appendChild(card);
+    }
+    card.scrollIntoView({ block: "nearest" });
+
+    // Esc denies; nothing is bound to Enter (so the focused-button
+    // default — Deny — isn't accidentally overridden into an Allow).
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        decideRoundtablePermission(req.id, "deny", card);
+      }
+    });
+
+    // Focus Deny by default — every permission request asks the user to
+    // make an active choice, and "approve by inertia" is the wrong default.
+    const denyBtn = actions.querySelector(".rt-permission-deny");
+    if (denyBtn) denyBtn.focus();
+    return card;
+  }
+
+  async function decideRoundtablePermission(requestId, decision, card) {
+    if (!card || card.dataset.state !== "pending") return;
+    card.dataset.state = "deciding";
+    card.querySelectorAll("button").forEach(b => (b.disabled = true));
+    try {
+      const fd = new FormData();
+      fd.append("decision", decision);
+      const r = await fetch(`/api/permission/${encodeURIComponent(requestId)}`, {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      card.dataset.state = "resolved";
+      const labels = { allow: "Allowed", allow_session: "Allowed (this turn)", deny: "Denied" };
+      const note = document.createElement("p");
+      note.className = "rt-permission-resolved";
+      const heading = card.querySelector(".rt-permission-heading")?.textContent || "tool";
+      note.textContent = `${labels[decision] || decision} — ${heading}`;
+      card.replaceWith(note);
+      announce(`${labels[decision] || decision} ${heading}.`);
+    } catch (err) {
+      card.dataset.state = "pending";
+      card.querySelectorAll("button").forEach(b => (b.disabled = false));
+      const errLine = document.createElement("p");
+      errLine.className = "rt-permission-error";
+      errLine.textContent = `Decision failed: ${err.message}`;
+      card.appendChild(errLine);
+      announce(`Decision failed: ${err.message}`);
+    }
+  }
+
+  function markRoundtablePermissionTimedOut(requestId, hostArticle, timeoutSeconds) {
+    const cards = hostArticle.querySelectorAll("article.rt-permission");
+    const card = [...cards].find(el => el.dataset.requestId === String(requestId));
+    if (!card || card.dataset.state === "resolved") return;
+    card.dataset.state = "timed_out";
+    card.querySelectorAll("button").forEach(b => (b.disabled = true));
+    const note = document.createElement("p");
+    note.className = "rt-permission-error";
+    note.textContent = `Timed out after ${timeoutSeconds || "?"}s — treated as denied.`;
+    card.appendChild(note);
+    announce("Permission request timed out.");
+  }
+
   // Parse a chunk of an SSE stream and dispatch events.
   // SSE format: each event is `event: NAME\ndata: JSON\n\n`. We buffer
   // across reads since chunks can split mid-frame.
@@ -533,6 +659,15 @@
             (data.patches && data.patches.length ? `, ${data.patches.length} patches suggested` : "") +
             `).`,
           );
+          break;
+        case "permission_request":
+          progress.textContent = `${data.participant_label || "Panelist"} wants to use ${data.tool}. Awaiting your decision…`;
+          announce(`${data.participant_label || "A panelist"} wants to use ${data.tool}. Decide allow or deny.`);
+          renderRoundtablePermissionCard(data, asstArticle, progress);
+          break;
+        case "permission_timeout":
+          markRoundtablePermissionTimedOut(data.id, asstArticle, data.timeout_seconds);
+          progress.textContent = `Permission request for ${data.tool || "tool"} timed out.`;
           break;
         case "error":
           progress.textContent = `Error: ${data.message}`;

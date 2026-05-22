@@ -748,3 +748,93 @@ body.mode-advanced .assistant       { display: none; }
   border-radius: 4px;
   overflow-x: auto;
 }
+
+/* Permission-request card rendered inline in an assistant turn while a
+   panelist or the synthesizer wants to use a tool. Mirrors the main
+   chat's .msg.permission look but scoped to the roundtable. */
+.rt-permission {
+  margin: 0.6rem 0;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--accent);
+  border-left-width: 4px;
+  border-radius: 4px;
+  background: rgba(122, 162, 247, 0.08);
+}
+
+.rt-permission-heading {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.rt-permission-detail {
+  margin-bottom: 0.5rem;
+}
+
+.rt-permission-input {
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 3px;
+  padding: 0.4rem 0.6rem;
+  margin: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: var(--mono, monospace);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rt-permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.rt-permission-btn {
+  padding: 0.35rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.rt-permission-btn:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.rt-permission-btn[disabled] {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.rt-permission-deny {
+  border-color: #c25450;
+  color: #ff9a96;
+}
+
+.rt-permission-allow {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.rt-permission-allow_session {
+  border-color: #888;
+  color: #ddd;
+}
+
+.rt-permission-resolved {
+  margin: 0.4rem 0;
+  font-size: 0.9rem;
+  color: #ccc;
+  font-style: italic;
+}
+
+.rt-permission-error {
+  margin: 0.3rem 0 0 0;
+  color: #ff9a96;
+  font-size: 0.85rem;
+}

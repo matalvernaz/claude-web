@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures as cf_futures
 import contextlib
 import datetime
 import json
@@ -4908,6 +4909,113 @@ def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
 
+def _make_roundtable_permission_callback(
+    event_queue: asyncio.Queue,
+    main_loop: asyncio.AbstractEventLoop,
+    user_sub: str,
+    session_allowlist: set,
+):
+    """Adapt roundtable.core's sync permission_callback signature onto the
+    existing PENDING + SSE plumbing that the main chat already uses.
+
+    Roundtable invokes this callback from inside an ``asyncio.run()`` event
+    loop on a worker thread (spawned by ``asyncio.to_thread`` around the
+    blocking ``roundtable_ask`` call). To resolve a permission we must
+    hop back to the request's main loop — that's where the ``PENDING``
+    Future lives and where the SSE event_queue is being drained. We use
+    ``run_coroutine_threadsafe`` for the cross-loop bridge and block the
+    worker thread on the returned concurrent.futures.Future.
+
+    The semantics mirror the main chat's ``can_use_tool``: SAFE_TOOLS
+    auto-approve; per-session allowlist short-circuits previously-allowed
+    (tool, signature) pairs; NO_SESSION_ALLOWLIST_TOOLS (currently
+    ``Bash``) refuse to remember and always re-prompt; timeout defaults
+    to deny. The session_allowlist is per-request (one assistant turn),
+    not per-thread — keeping it that way avoids the trust-extension
+    problem where a user OKs a Read once and the agent silently reads
+    fifty more files in a future turn.
+    """
+    async def _ask_on_main(participant_label: str, tool_name: str, tool_input: dict) -> str:
+        if tool_name in SAFE_TOOLS:
+            return "allow"
+        sig = _tool_signature(tool_name, tool_input)
+        allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
+        if allow_session_supported and (tool_name, sig) in session_allowlist:
+            return "allow"
+
+        request_id = str(uuid_mod.uuid4())
+        fut: asyncio.Future = main_loop.create_future()
+        PENDING[request_id] = {"future": fut, "owner_sub": user_sub}
+        try:
+            await event_queue.put(("permission_request", {
+                "id": request_id,
+                "tool": tool_name,
+                "input": tool_input,
+                "signature": sig,
+                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                "allow_session_supported": allow_session_supported,
+                "participant_label": participant_label,
+                "source": "roundtable",
+            }))
+            try:
+                decision = await asyncio.wait_for(
+                    fut, timeout=PERMISSION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                log.info(
+                    "perm timeout (roundtable) tool=%s sig=%r participant=%s "
+                    "owner=%s after=%ss",
+                    tool_name, sig, participant_label, user_sub,
+                    PERMISSION_TIMEOUT_SECONDS,
+                )
+                await event_queue.put(("permission_timeout", {
+                    "id": request_id,
+                    "tool": tool_name,
+                    "participant_label": participant_label,
+                }))
+                return "deny"
+        finally:
+            PENDING.pop(request_id, None)
+
+        d = decision.get("decision", "deny")
+        log.info(
+            "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
+            d, tool_name, sig, participant_label, user_sub,
+        )
+        if d == "allow_session" and allow_session_supported:
+            session_allowlist.add((tool_name, sig))
+            return "allow"
+        if d == "allow_session":
+            # Same defense-in-depth as the main can_use_tool: refuse to
+            # remember an unsupported pair; downgrade to one-shot allow.
+            return "allow"
+        return d  # "allow" or "deny"
+
+    def callback_sync(participant_label: str, tool_name: str, tool_input: dict) -> str:
+        try:
+            cf = asyncio.run_coroutine_threadsafe(
+                _ask_on_main(participant_label, tool_name, tool_input),
+                main_loop,
+            )
+        except RuntimeError:
+            # Main loop has stopped (client disconnected mid-turn). Deny
+            # is the only safe answer — we no longer have a UI to ask.
+            return "deny"
+        try:
+            return cf.result(timeout=PERMISSION_TIMEOUT_SECONDS + 30)
+        except cf_futures.TimeoutError:
+            cf.cancel()
+            return "deny"
+        except Exception as exc:  # noqa: BLE001 — bridge-side failures → deny
+            log.warning(
+                "roundtable permission_callback bridge raised %s: %s "
+                "(denying)", type(exc).__name__, exc,
+            )
+            return "deny"
+
+    return callback_sync
+
+
 @app.post("/api/roundtable/assistant")
 async def api_roundtable_assistant(
     request: Request,
@@ -5039,128 +5147,187 @@ async def api_roundtable_assistant(
 
     effort_norm = (effort or "medium")
 
-    async def event_stream():
-        # First: tell the browser which thread we're on. Then attach the
-        # uploads (one event per artifact so the UI can show progress).
-        # Then post the user prompt, then fire the panel + synth.
+    # Resolve the bound project root once (used both for tool-use
+    # sandboxing and the apply-diff path). For an unbound thread or a
+    # missing project_key, tool use is implicitly disabled — the panel /
+    # synth fall back to the existing zero-tools subprocess path.
+    bound_project_key_initial = _roundtable_get_project(tid)
+    bound_project_root: Optional[Path] = None
+    if bound_project_key_initial:
         try:
-            yield _sse("created", {
-                "thread_id": tid,
-                "project_key": _roundtable_get_project(tid),
-                "thread_was_new": thread_was_new,
-            })
+            bound_project_root = _resolve_project_path(bound_project_key_initial)
+        except HTTPException:
+            bound_project_root = None
 
-            attached: list[dict] = []
-            for safe_name, content, byte_count in pending_artifacts:
+    async def event_stream():
+        # Producer-task + queue: the producer runs the existing
+        # create/attach/post/panel/synth sequence and emits SSE events
+        # via the queue. The outer generator just relays. This shape
+        # lets the permission_callback (running on a worker thread
+        # during a blocking provider call) put `permission_request`
+        # events onto the same queue without fighting the generator's
+        # yield flow.
+        event_queue: asyncio.Queue = asyncio.Queue()
+        main_loop = asyncio.get_running_loop()
+        session_allowlist: set = set()
+        user_sub = user.get("sub") or "anonymous"
+
+        tool_use_context = None
+        if bound_project_root is not None and hasattr(rt, "ToolUseContext"):
+            permission_cb = _make_roundtable_permission_callback(
+                event_queue, main_loop, user_sub, session_allowlist,
+            )
+            tool_use_context = rt.ToolUseContext(
+                permission_callback=permission_cb,
+                working_directory=str(bound_project_root),
+            )
+
+        DONE_SENTINEL = object()
+
+        async def producer():
+            try:
+                await event_queue.put(("created", {
+                    "thread_id": tid,
+                    "project_key": _roundtable_get_project(tid),
+                    "thread_was_new": thread_was_new,
+                    "tools_enabled": tool_use_context is not None,
+                }))
+
+                attached: list[dict] = []
+                for safe_name, content, byte_count in pending_artifacts:
+                    try:
+                        art = await asyncio.to_thread(
+                            rt.roundtable_set_artifact,
+                            thread_id=tid, name=safe_name, content=content,
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        await event_queue.put(
+                            ("error", {"message": f"attach {safe_name!r}: {exc}"}),
+                        )
+                        return
+                    attached.append({
+                        "name": art["name"],
+                        "version": art["version"],
+                        "bytes": byte_count,
+                        "diff_omitted": art.get("diff_omitted", False),
+                    })
+                    await event_queue.put(("attached", attached[-1]))
+
+                await asyncio.to_thread(
+                    rt.roundtable_post,
+                    thread_id=tid, content=prompt_str, speaker=speaker_label,
+                )
+                await event_queue.put(("prompt_posted", {"speaker": speaker_label}))
+
+                panel_result: dict = {"responses": {}, "errors": {}}
+                if panel:
+                    await event_queue.put(("panel_start", {
+                        "participants": [
+                            {"key": k, "label": rt.PARTICIPANTS[k]["label"]}
+                            for k in panel
+                        ],
+                        "effort": effort_norm,
+                        "web_search": web_search,
+                    }))
+                    try:
+                        panel_result = await asyncio.to_thread(
+                            rt.roundtable_ask_parallel,
+                            thread_id=tid, participants=panel,
+                            prompt="", effort=effort_norm,
+                            web_search=web_search,
+                            tool_use_context=tool_use_context,
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        await event_queue.put(("error", {"message": f"panel: {exc}"}))
+                        return
+                    await event_queue.put(("panel_done", {
+                        "responses": {
+                            k: {"chars": len(v)}
+                            for k, v in panel_result.get("responses", {}).items()
+                        },
+                        "errors": panel_result.get("errors", {}),
+                        "unavailable": panel_unavailable,
+                    }))
+
+                # Synthesizer step. The framing post is committed so the
+                # transcript shows exactly what produced the synthesis.
+                has_artifacts = bool(attached) or any(
+                    rt._latest_artifact_version(tid, name) > 0
+                    for (name, _, _) in pending_artifacts
+                )
+                # Also check pre-existing artifacts on a continued thread.
+                if not has_artifacts and not thread_was_new:
+                    # Cheap check: any artifact rows for this thread at all?
+                    has_artifacts = bool(
+                        rt._conn().execute(
+                            "SELECT 1 FROM artifacts WHERE thread_id = ? LIMIT 1",
+                            (tid,),
+                        ).fetchone()
+                    )
+                synth_framing = _assistant_synth_prompt(
+                    panel, synth_info["label"], has_artifacts,
+                )
+                await asyncio.to_thread(
+                    rt.roundtable_post,
+                    thread_id=tid, content=synth_framing, speaker="orchestrator",
+                )
+                await event_queue.put(("synth_start", {
+                    "synthesizer": {"key": synth_key, "label": synth_info["label"]},
+                }))
+
                 try:
-                    art = await asyncio.to_thread(
-                        rt.roundtable_set_artifact,
-                        thread_id=tid, name=safe_name, content=content,
+                    synthesis = await asyncio.to_thread(
+                        rt.roundtable_ask,
+                        thread_id=tid, participant=synth_key, prompt="",
+                        effort=effort_norm, web_search=web_search,
+                        tool_use_context=tool_use_context,
                     )
                 except (ValueError, RuntimeError) as exc:
-                    yield _sse("error", {"message": f"attach {safe_name!r}: {exc}"})
+                    await event_queue.put(("error", {"message": f"synth: {exc}"}))
                     return
-                attached.append({
-                    "name": art["name"],
-                    "version": art["version"],
-                    "bytes": byte_count,
-                    "diff_omitted": art.get("diff_omitted", False),
-                })
-                yield _sse("attached", attached[-1])
 
-            await asyncio.to_thread(
-                rt.roundtable_post,
-                thread_id=tid, content=prompt_str, speaker=speaker_label,
-            )
-            yield _sse("prompt_posted", {"speaker": speaker_label})
-
-            panel_result: dict = {"responses": {}, "errors": {}}
-            if panel:
-                yield _sse("panel_start", {
-                    "participants": [
+                patches = _extract_patches(synthesis)
+                await event_queue.put(("done", {
+                    "thread_id": tid,
+                    "project_key": _roundtable_get_project(tid),
+                    "synthesis": synthesis,
+                    "synthesizer": {
+                        "key": synth_key,
+                        "label": synth_info["label"],
+                    },
+                    "panel": [
                         {"key": k, "label": rt.PARTICIPANTS[k]["label"]}
                         for k in panel
                     ],
-                    "effort": effort_norm,
-                    "web_search": web_search,
-                })
+                    "panel_responses": panel_result.get("responses", {}),
+                    "panel_errors": panel_result.get("errors", {}),
+                    "panel_unavailable": panel_unavailable,
+                    "attached": attached,
+                    "patches": patches,
+                }))
+            except Exception as exc:  # noqa: BLE001 — last-resort SSE error
+                log.exception("roundtable assistant stream failed")
+                await event_queue.put(
+                    ("error", {"message": f"{type(exc).__name__}: {exc}"}),
+                )
+            finally:
+                await event_queue.put(DONE_SENTINEL)
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await event_queue.get()
+                if item is DONE_SENTINEL:
+                    break
+                event_name, data = item
+                yield _sse(event_name, data)
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
                 try:
-                    panel_result = await asyncio.to_thread(
-                        rt.roundtable_ask_parallel,
-                        thread_id=tid, participants=panel,
-                        prompt="", effort=effort_norm,
-                        web_search=web_search,
-                    )
-                except (ValueError, RuntimeError) as exc:
-                    yield _sse("error", {"message": f"panel: {exc}"})
-                    return
-                yield _sse("panel_done", {
-                    "responses": {
-                        k: {"chars": len(v)}
-                        for k, v in panel_result.get("responses", {}).items()
-                    },
-                    "errors": panel_result.get("errors", {}),
-                    "unavailable": panel_unavailable,
-                })
-
-            # Synthesizer step. The framing post is committed so the
-            # transcript shows exactly what produced the synthesis.
-            has_artifacts = bool(attached) or any(
-                rt._latest_artifact_version(tid, name) > 0
-                for (name, _, _) in pending_artifacts
-            )
-            # Also check pre-existing artifacts on a continued thread.
-            if not has_artifacts and not thread_was_new:
-                # Cheap check: any artifact rows for this thread at all?
-                has_artifacts = bool(
-                    rt._conn().execute(
-                        "SELECT 1 FROM artifacts WHERE thread_id = ? LIMIT 1",
-                        (tid,),
-                    ).fetchone()
-                )
-            synth_framing = _assistant_synth_prompt(
-                panel, synth_info["label"], has_artifacts,
-            )
-            await asyncio.to_thread(
-                rt.roundtable_post,
-                thread_id=tid, content=synth_framing, speaker="orchestrator",
-            )
-            yield _sse("synth_start", {
-                "synthesizer": {"key": synth_key, "label": synth_info["label"]},
-            })
-
-            try:
-                synthesis = await asyncio.to_thread(
-                    rt.roundtable_ask,
-                    thread_id=tid, participant=synth_key, prompt="",
-                    effort=effort_norm, web_search=web_search,
-                )
-            except (ValueError, RuntimeError) as exc:
-                yield _sse("error", {"message": f"synth: {exc}"})
-                return
-
-            patches = _extract_patches(synthesis)
-            yield _sse("done", {
-                "thread_id": tid,
-                "project_key": _roundtable_get_project(tid),
-                "synthesis": synthesis,
-                "synthesizer": {
-                    "key": synth_key,
-                    "label": synth_info["label"],
-                },
-                "panel": [
-                    {"key": k, "label": rt.PARTICIPANTS[k]["label"]}
-                    for k in panel
-                ],
-                "panel_responses": panel_result.get("responses", {}),
-                "panel_errors": panel_result.get("errors", {}),
-                "panel_unavailable": panel_unavailable,
-                "attached": attached,
-                "patches": patches,
-            })
-        except Exception as exc:  # noqa: BLE001 — last-resort SSE error reporting
-            log.exception("roundtable assistant stream failed")
-            yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+                    await producer_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(
         event_stream(),
