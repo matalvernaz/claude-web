@@ -42,7 +42,7 @@ Each OIDC user can register, label, sign in to, switch between, and delete their
 
 ### Personalities
 
-Each user picks a "personality" — a system-prompt voice the spawned CLI runs under. Built-in rows ship for Hagrid and Software Architect; users can create, edit, clone, and delete their own at `/personalities`. The picker dropdown in the chat header is the runtime control.
+Each user picks a "personality" — a system-prompt voice the spawned CLI runs under. Built-in rows ship for Hagrid, Software Architect, and Dobby; users can create, edit, clone, and delete their own at `/personalities`. The picker dropdown in the chat header is the runtime control.
 
 - **Schema**:
   - `personality(id PK, owner_sub, name, description, system_prompt, is_builtin, created_at, updated_at)` with `UNIQUE(owner_sub, name)`. `owner_sub IS NULL` means a built-in row visible to every user; otherwise it's owned by that OIDC sub and only that user sees it.
