@@ -1114,27 +1114,17 @@ def _migrate_user_account_legacy(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE user_account_legacy")
 
 
-# Override directive used in built-in personalities so the picker beats
-# everything else competing to shape voice: the auto-memory persona file,
-# the conversation history from earlier turns under a different persona,
-# and Claude's default conversational defaults. User-created rows store
-# whatever the user types; they can copy this pattern verbatim if they
-# want the same effect.
-PERSONALITY_OVERRIDE_PREFIX = """You are operating within claude-web with a deliberately selected persona. Apply the persona defined below to EVERY response in this conversation from this point forward — including responses where the topic is technical, where you are answering a follow-up, or where prior turns of this conversation established a different voice.
-
-The following sources do NOT determine your voice and are EXPLICITLY SUPERSEDED by the persona below:
-
-1. Persona or character instructions found in MEMORY.md, auto-memory feedback files, or other system context loaded by the claude_code preset.
-2. Voice, dialect, persona, or mannerisms established by your earlier turns in this conversation. You may have been a different character before; that's done. Switch now, fully, and don't drift back.
-3. Default conversational defaults: validation phrases ("Great question", "Excellent point"), hedge openers ("I'd be happy to..."), customer-service closers ("Let me know if you need anything else").
-
-If you notice yourself drifting toward an earlier voice or a default Claude voice mid-response, stop, reset, and continue in the persona below. Voice consistency within a single response matters as much as persona accuracy across the conversation.
-
-The persona for the remainder of this conversation is:
-
----
-
-"""
+# Name of the auto-memory file claude-web rewrites to mirror the active
+# personality, plus the MEMORY.md entry it advertises itself with. The
+# claude_code preset reads MEMORY.md as the index, then loads each file it
+# references — by writing this file with the active personality's content,
+# we make the picker the single canonical source of persona for both
+# claude-web and any terminal `claude` session pointing at the same home.
+ACTIVE_PERSONALITY_FILE_NAME = "active_personality.md"
+ACTIVE_PERSONALITY_MEMORY_LINE = (
+    f"- [{ACTIVE_PERSONALITY_FILE_NAME}]({ACTIVE_PERSONALITY_FILE_NAME}) — "
+    "Currently selected personality (managed by claude-web)"
+)
 
 
 _BUILTIN_ARCHITECT_PROMPT = """<persona name="Software Architect">
@@ -1327,7 +1317,7 @@ Response shape:
 >
 > Result on your system: argv shows the new persona. Confirmed: weight imbalance.
 >
-> Fix path: (1) strengthen `PERSONALITY_OVERRIDE_PREFIX` in `app.py` to explicitly nullify conversation-history voice; (2) deepen the Architect personality content to match the auto-memory persona's depth.
+> Fix path: write the active personality's content directly to the auto-memory mirror file (`active_personality.md`) so the picker becomes the canonical persona source, eliminating the competing signal entirely instead of trying to override it.
 
 **Pattern 2 — feature request:**
 
@@ -1360,53 +1350,104 @@ Response shape:
 </persona>"""
 
 
+_FRONTMATTER_RE = re.compile(r"^---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Drop a leading YAML frontmatter block if present.
+
+    Memory files like ``feedback_persona.md`` start with a ``---\\n...\\n---``
+    block carrying name/description/type metadata. The picker re-applies
+    frontmatter from the row's own ``name``/``description`` when it writes
+    the mirror file, so storing the body without frontmatter keeps the DB
+    content from drifting out of sync with the row's metadata over edits.
+    """
+    return _FRONTMATTER_RE.sub("", text or "", count=1)
+
+
+def _read_canonical_hagrid_body() -> str:
+    """Best-effort one-time backfill source for the built-in Hagrid row.
+
+    Reads ``$CLAUDE_HOME/projects/<DEFAULT_CWD>/memory/feedback_persona.md``
+    (the auto-memory location Hagrid has historically lived in) and returns
+    the body with the YAML frontmatter stripped. Returns ``""`` if the file
+    is missing or unreadable — in that case the seeded Hagrid row stays
+    empty and the user can fill it via the editor.
+    """
+    candidate = (
+        CLAUDE_HOME / "projects" / _sanitize_project_key(DEFAULT_CWD)
+        / "memory" / "feedback_persona.md"
+    )
+    try:
+        return _strip_frontmatter(candidate.read_text())
+    except (OSError, FileNotFoundError):
+        return ""
+
+
 def _seed_personalities(conn: sqlite3.Connection) -> None:
     """Upsert built-in personalities on every startup.
 
-    Hagrid keeps an empty system_prompt — that's the "pass through" signal,
-    so whatever persona currently lives in MEMORY.md applies. Replace with
-    a non-empty value in the UI and it switches to an explicit override.
-    Software Architect ships with the full prompt + override prefix so the
-    voice swap actually lands even though the Hagrid persona is also in
-    auto-memory.
+    Hagrid's body is backfilled from the host's existing
+    ``feedback_persona.md`` if its DB row is empty — that file used to be
+    the canonical Hagrid persona, and copying it into the row preserves
+    every nuance the user had refined there. Subsequent startups skip the
+    re-read (existing non-empty content wins) so user edits via the UI
+    stick.
 
-    Upsert (not skip-if-empty) so future edits to PERSONALITY_OVERRIDE_PREFIX
-    or _BUILTIN_ARCHITECT_PROMPT take effect on the next restart. User-owned
-    rows (owner_sub IS NOT NULL) are never touched — the unique index is on
-    (owner_sub, name), so a user's "Software Architect" clone in their own
-    namespace stays distinct from the built-in.
+    Upsert (not skip-if-empty) so future edits to ``_BUILTIN_ARCHITECT_PROMPT``
+    take effect on the next restart. User-owned rows (owner_sub IS NOT
+    NULL) are never touched — the unique index is on (owner_sub, name), so
+    a user's "Software Architect" clone in their own namespace stays
+    distinct from the built-in.
     """
     now = time.time()
+    # Pull the existing Hagrid body off disk if we can — used only when the
+    # current DB row is empty (first seed after the path-3 migration).
+    hagrid_backfill = _read_canonical_hagrid_body()
+    existing_hagrid = conn.execute(
+        "SELECT system_prompt FROM personality "
+        "WHERE owner_sub IS NULL AND name = 'Hagrid'"
+    ).fetchone()
+    hagrid_prompt = (
+        existing_hagrid[0] if (existing_hagrid and existing_hagrid[0])
+        else hagrid_backfill
+    )
     seeds = [
         (
             "Hagrid",
-            "Rubeus Hagrid (Harry Potter) — uses the persona currently "
-            "defined in your auto-memory. Leave the system prompt blank to "
-            "keep deferring to that file; fill it in to override.",
-            "",
+            "Rubeus Hagrid (Harry Potter) — warm, gruff, West-Country "
+            "dialect, full characterisation across technical talk.",
+            hagrid_prompt,
         ),
         (
             "Software Architect",
             "Senior architect — hypothesis-first debugging, minimal-invasive "
             "edits, scope-aware feature work.",
-            PERSONALITY_OVERRIDE_PREFIX + _BUILTIN_ARCHITECT_PROMPT,
+            _BUILTIN_ARCHITECT_PROMPT,
         ),
     ]
     # SQLite's UNIQUE index treats NULL as distinct from every other NULL,
     # so we can't lean on ON CONFLICT(owner_sub, name) to detect the existing
     # built-in row. Explicit SELECT-then-UPDATE-or-INSERT keeps the row id
     # stable across restarts so user_personality.personality_id pointers
-    # don't dangle when content gets refreshed.
+    # don't dangle when content gets refreshed. Hagrid's content path is
+    # special-cased above: only overwritten when the row is empty, so manual
+    # edits in the UI survive subsequent restarts.
     for name, description, prompt in seeds:
         row = conn.execute(
-            "SELECT id FROM personality WHERE owner_sub IS NULL AND name = ?",
+            "SELECT id, system_prompt FROM personality "
+            "WHERE owner_sub IS NULL AND name = ?",
             (name,),
         ).fetchone()
         if row:
+            # Hagrid: never clobber an existing non-empty body. Architect
+            # and any future built-ins: keep tracking the constant.
+            keep_existing = (name == "Hagrid" and row[1])
+            new_prompt = row[1] if keep_existing else prompt
             conn.execute(
                 "UPDATE personality SET description = ?, system_prompt = ?, "
                 "is_builtin = 1, updated_at = ? WHERE id = ?",
-                (description, prompt, now, row[0]),
+                (description, new_prompt, now, row[0]),
             )
         else:
             conn.execute(
@@ -1864,6 +1905,119 @@ def _personalities_payload(user: dict) -> dict:
         "personalities": rows,
         "active": active,
     }
+
+
+# ─── active-personality auto-memory mirror ─────────────────────────────────
+#
+# claude-web writes the active personality's content to
+# ``$CLAUDE_HOME/projects/<DEFAULT_CWD>/memory/active_personality.md`` and
+# advertises it in ``MEMORY.md`` so the claude_code preset loads it as a
+# first-class feedback file — same weight any other auto-memory entry
+# carries. This is what makes the picker the canonical source of voice
+# instead of an append fighting against a more deeply-loaded persona file.
+#
+# Multi-user caveat: the mirror file sits in a single shared location, so
+# when two users have different picks they race for last-write-wins. For
+# the single-user-with-multiple-personalities case this is fine; multi-user
+# parity needs a per-user CLAUDE_HOME (the symlink-farm idea we shelved).
+
+
+def _active_persona_mirror_path() -> Path:
+    return (
+        CLAUDE_HOME / "projects" / _sanitize_project_key(DEFAULT_CWD)
+        / "memory" / ACTIVE_PERSONALITY_FILE_NAME
+    )
+
+
+def _memory_index_path() -> Path:
+    return (
+        CLAUDE_HOME / "projects" / _sanitize_project_key(DEFAULT_CWD)
+        / "memory" / "MEMORY.md"
+    )
+
+
+def _format_persona_mirror(personality: dict) -> str:
+    """Wrap the personality body in the YAML frontmatter the auto-memory
+    loader expects on a feedback file. Body is stripped of any existing
+    frontmatter so backfilled-from-disk Hagrid content doesn't double-wrap.
+    """
+    body = _strip_frontmatter(personality.get("system_prompt") or "")
+    name = (personality.get("name") or "Active personality").replace("\n", " ")
+    description = (personality.get("description") or "").replace("\n", " ")
+    return (
+        "---\n"
+        f"name: {name}\n"
+        f"description: {description}\n"
+        "type: feedback\n"
+        "---\n"
+        f"{body}\n"
+    )
+
+
+def _write_active_persona_mirror(user: Optional[dict]) -> None:
+    """Sync the auto-memory mirror file to the caller's active personality.
+
+    Best-effort: any IO failure logs a warning and returns. The picker
+    still records the choice in the DB even if disk writes fail, so the
+    in-claude-web append path keeps working.
+    """
+    path = _active_persona_mirror_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("mirror: parent mkdir failed at %s: %s", path, e)
+        return
+    sub = (user or {}).get("sub") if user else None
+    pid = _user_active_personality_id(sub)
+    row = _get_personality(pid, sub) if pid is not None else None
+    if not row or not (row.get("system_prompt") or "").strip():
+        # Empty / missing personality: clear the mirror so the loader
+        # doesn't keep serving a stale body.
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("mirror: unlink %s failed: %s", path, e)
+        return
+    try:
+        path.write_text(_format_persona_mirror(row))
+    except OSError as e:
+        log.warning("mirror: write %s failed: %s", path, e)
+
+
+def _ensure_memory_index_references_mirror() -> None:
+    """Make sure MEMORY.md indexes the mirror file (once, idempotent).
+
+    Also strips the legacy ``feedback_persona.md`` line — that file is no
+    longer the canonical persona source under the path-3 architecture, and
+    leaving it in the index would re-introduce the competing-signal problem
+    we're solving. The file itself stays on disk untouched; only the
+    MEMORY.md reference is removed.
+    """
+    index = _memory_index_path()
+    try:
+        text = index.read_text()
+    except (OSError, FileNotFoundError):
+        return
+    original = text
+    # Drop any line that references feedback_persona.md (whatever flavour
+    # of bullet/wording the user has there).
+    cleaned_lines = [
+        line for line in text.splitlines()
+        if "feedback_persona.md" not in line
+    ]
+    text = "\n".join(cleaned_lines)
+    # Append the mirror reference if it's not already there.
+    if ACTIVE_PERSONALITY_FILE_NAME not in text:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += ACTIVE_PERSONALITY_MEMORY_LINE + "\n"
+    if text != original:
+        try:
+            index.write_text(text)
+        except OSError as e:
+            log.warning("mirror: rewrite MEMORY.md %s failed: %s", index, e)
 
 
 def _safe_sub(user_sub: str) -> str:
@@ -3381,13 +3535,18 @@ async def api_personalities_update(
 ):
     sub = user.get("sub")
     body = await request.json()
-    return _update_personality(
+    updated = _update_personality(
         sub,
         personality_id,
         body.get("name") or "",
         body.get("description") or "",
         body.get("system_prompt") or "",
     )
+    # If the user just edited their *active* personality, the mirror file is
+    # stale — refresh so the next CLI spawn loads the new content.
+    if _user_active_personality_id(sub) == personality_id:
+        _write_active_persona_mirror(user)
+    return updated
 
 
 @app.delete("/api/personalities/{personality_id}")
@@ -3396,7 +3555,15 @@ async def api_personalities_delete(
     user: dict = Depends(auth.require_user),
 ):
     sub = user.get("sub")
+    was_active = _user_active_personality_id(sub) == personality_id
     _delete_personality(sub, personality_id)
+    # _delete_personality drops the user_personality pointer if it matched
+    # the deleted row; the next _user_active_personality_id falls back to
+    # the default built-in. Refresh the mirror so the auto-memory file
+    # tracks that fallback instead of pointing at content that no longer
+    # exists.
+    if was_active:
+        _write_active_persona_mirror(user)
     return _personalities_payload(user)
 
 
@@ -3444,6 +3611,11 @@ async def api_personalities_set_active(
 ):
     sub = user.get("sub")
     _set_user_active_personality(sub, personality_id)
+    # Mirror the new pick to disk BEFORE cancelling the existing run: the
+    # in-flight CLI is going to die, and the next message will spawn a
+    # fresh one that loads auto-memory from the mirror file. Writing first
+    # closes the race where the new spawn could read a stale mirror.
+    _write_active_persona_mirror(user)
     cancelled = _cancel_runs_for_personality_swap(sub, personality_id)
     payload = _personalities_payload(user)
     payload["cancelled_runs"] = cancelled
@@ -6248,3 +6420,47 @@ async def api_roundtable_participants(
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+# ─── module-level startup tasks ────────────────────────────────────────────
+#
+# Runs at import time on every uvicorn worker. Forces the DB to initialise
+# (so the schema + seed/backfill land before the first request), patches
+# MEMORY.md so it references the active-personality mirror file, and writes
+# that mirror to reflect the most recently active personality. Wrapped in
+# try/except so a write failure (read-only fs, etc.) logs a warning instead
+# of bricking startup — the in-claude-web append path keeps working
+# regardless.
+
+
+def _startup_sync_active_persona() -> None:
+    try:
+        _state_db()
+    except Exception as e:
+        log.warning("startup: _state_db init failed: %s", e)
+        return
+    try:
+        _ensure_memory_index_references_mirror()
+    except Exception as e:
+        log.warning("startup: MEMORY.md sync failed: %s", e)
+    # Pick the most-recently-active personality across all users to seed the
+    # mirror. Single-user-with-multiple-personalities (the supported case)
+    # gets the right content; multi-user gets last-writer-wins with no race
+    # at startup, then per-user picker actions take over from there.
+    sub: Optional[str] = None
+    try:
+        row = _state_db().execute(
+            "SELECT user_sub FROM user_personality "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            sub = row[0]
+    except sqlite3.Error as e:
+        log.warning("startup: user_personality lookup failed: %s", e)
+    try:
+        _write_active_persona_mirror({"sub": sub} if sub else None)
+    except Exception as e:
+        log.warning("startup: mirror write failed: %s", e)
+
+
+_startup_sync_active_persona()
