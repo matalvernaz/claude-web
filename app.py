@@ -3400,6 +3400,43 @@ async def api_personalities_delete(
     return _personalities_payload(user)
 
 
+def _cancel_runs_for_personality_swap(
+    user_sub: str, new_personality_id: Optional[int],
+) -> int:
+    """Tear down any live runs owned by ``user_sub`` whose CLI subprocess was
+    spawned under a different personality, so the next message — whether it
+    lands on /api/chat or /api/chat/send/{run_id} — is forced to spawn a
+    fresh CLI under the new personality's append.
+
+    Returns the number of runs cancelled (for logging / response payload).
+
+    Why this exists: the personality respawn check lives in /api/chat, which
+    is only hit on turn-start. Once a long-lived conversation is alive,
+    follow-up user messages go through /api/chat/send/{run_id} (mid-turn
+    injection), which feeds straight into the existing CLI's stdin without
+    re-checking the active personality. Cancelling here closes that gap.
+    """
+    if not user_sub:
+        return 0
+    # Snapshot first — task.cancel() triggers the run's cleanup which mutates
+    # ACTIVE_RUNS_BY_SESSION, and iterating a dict while it's mutated raises.
+    candidates = [
+        r for r in list(ACTIVE_RUNS_BY_SESSION.values())
+        if r.owner_sub == user_sub
+        and r.personality_id != new_personality_id
+        and not r.done
+    ]
+    for run in candidates:
+        log.info(
+            "personality-swap cancel run=%s session=%s %s→%s",
+            run.run_id, run.session_id,
+            run.personality_id, new_personality_id,
+        )
+        if run.task and not run.task.done():
+            run.task.cancel()
+    return len(candidates)
+
+
 @app.post("/api/personalities/active")
 async def api_personalities_set_active(
     personality_id: int = Form(...),
@@ -3407,7 +3444,10 @@ async def api_personalities_set_active(
 ):
     sub = user.get("sub")
     _set_user_active_personality(sub, personality_id)
-    return _personalities_payload(user)
+    cancelled = _cancel_runs_for_personality_swap(sub, personality_id)
+    payload = _personalities_payload(user)
+    payload["cancelled_runs"] = cancelled
+    return payload
 
 
 def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
