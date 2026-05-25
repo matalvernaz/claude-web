@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your personalities — claude-web</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Your personalities</h1>
+    <div class="header-actions">
+      <a href="/">Back to chat</a>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="setup">
+    <p class="setup-intro">
+      Personalities are system-prompt voices Claude uses when you chat.
+      The picker in the header switches between them. Built-in personalities
+      are read-only; clone or add new ones to customise. An empty system
+      prompt leaves auto-memory's persona alone — useful when your
+      auto-memory already defines a character you want to keep.
+    </p>
+
+    <section aria-labelledby="list-heading" class="setup-card">
+      <h2 id="list-heading">Personalities</h2>
+      <ul id="personality-list" class="cred-list" aria-live="polite">
+        {% for p in personalities_payload.personalities %}
+          <li class="cred-item personality-item"
+              data-personality-id="{{ p.id }}"
+              data-name="{{ p.name }}"
+              data-description="{{ p.description }}"
+              data-is-builtin="{{ '1' if p.is_builtin else '0' }}"
+              data-is-owned="{{ '1' if p.is_owned else '0' }}">
+            <span class="cred-label">
+              {{ p.name }}
+              {% if p.is_builtin %}<span class="badge">built-in</span>{% endif %}
+              {% if p.id == personalities_payload.active %}<span class="badge badge-active">active</span>{% endif %}
+            </span>
+            <span class="cred-meta">{{ p.description or '—' }}</span>
+            <span class="cred-actions">
+              {% if p.id != personalities_payload.active %}
+                <button type="button" class="personality-activate" data-personality-id="{{ p.id }}">Use this</button>
+              {% endif %}
+              <button type="button" class="personality-view" data-personality-id="{{ p.id }}">View</button>
+              {% if p.is_owned %}
+                <button type="button" class="personality-edit" data-personality-id="{{ p.id }}">Edit</button>
+                <button type="button" class="personality-delete" data-personality-id="{{ p.id }}">Remove</button>
+              {% else %}
+                <button type="button" class="personality-clone" data-personality-id="{{ p.id }}">Clone</button>
+              {% endif %}
+            </span>
+            <pre class="personality-prompt" hidden></pre>
+          </li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section id="editor-section" aria-labelledby="editor-heading" class="setup-card" hidden>
+      <h2 id="editor-heading"><span id="editor-mode">Add</span> personality</h2>
+      <form id="editor-form">
+        <input type="hidden" id="editor-id" value="">
+        <p>
+          <label for="editor-name">Name</label><br>
+          <input type="text" id="editor-name" name="name" maxlength="60" required autocomplete="off">
+        </p>
+        <p>
+          <label for="editor-description">Description <span class="hint">(short, shown in the picker)</span></label><br>
+          <input type="text" id="editor-description" name="description" maxlength="200" autocomplete="off">
+        </p>
+        <p>
+          <label for="editor-prompt">System prompt <span class="hint">(leave blank to defer to auto-memory)</span></label><br>
+          <textarea id="editor-prompt" name="system_prompt" rows="14"></textarea>
+        </p>
+        <p>
+          <button type="submit" id="editor-save">Save</button>
+          <button type="button" id="editor-cancel">Cancel</button>
+        </p>
+        <p id="editor-error" class="setup-error" role="alert" hidden></p>
+        <p id="editor-status" role="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <p>
+      <button type="button" id="add-new">Add a new personality</button>
+    </p>
+  </main>
+
+  <script type="application/json" id="personalities-data">{{ personalities_payload | tojson | safe }}</script>
+  <script src="/static/personalities.js?v={{ asset_version('personalities.js') }}"></script>
+</body>
+</html>

@@ -39,6 +39,15 @@
         </select>
       </label>
       <a href="/account" class="header-link" aria-label="Manage your Claude accounts">Manage accounts</a>
+      <label class="header-select" for="personality-select">
+        <span class="sr-only">Personality</span>
+        <select id="personality-select" aria-label="Personality">
+          {% for p in personalities_payload.personalities %}
+            <option value="{{ p.id }}" {% if p.id == personalities_payload.active %}selected{% endif %}>{{ p.name }}{% if p.is_builtin %} (built-in){% endif %}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <a href="/personalities" class="header-link" aria-label="Manage your personalities">Manage personalities</a>
       <a href="/roundtable" class="header-link" aria-label="Multi-AI roundtable debates">Roundtable</a>
       {% if multi_project %}
         <label class="header-select" for="project-select">

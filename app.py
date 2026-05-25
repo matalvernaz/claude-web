@@ -1035,7 +1035,38 @@ def _state_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_rtp_project "
             "ON roundtable_thread_project(project_key)"
         )
+        # Personalities = system-prompt voices the user can flip between
+        # without touching auto-memory. Within claude-web the picked
+        # personality is the source of voice — its system_prompt is appended
+        # to the claude_code preset on each run. Built-in rows (owner_sub
+        # NULL, is_builtin=1) are seeded once and are visible to every user;
+        # user-owned rows are scoped to their creator. An empty system_prompt
+        # is a deliberate "pass through to auto-memory" signal — no append,
+        # whatever persona lives in MEMORY.md/feedback files applies.
+        conn.execute("""CREATE TABLE IF NOT EXISTS personality (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_sub TEXT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            system_prompt TEXT NOT NULL DEFAULT '',
+            is_builtin INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(owner_sub, name)
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personality_owner ON personality(owner_sub)"
+        )
+        # Per-user active personality. Falls back to the lowest-id built-in
+        # if absent. Stored separately from user_account so a persona switch
+        # doesn't accidentally clobber the credential slot.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_personality (
+            user_sub TEXT PRIMARY KEY,
+            personality_id INTEGER NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
         _migrate_user_account_legacy(conn)
+        _seed_personalities(conn)
         _STATE_DB = conn
     return _STATE_DB
 
@@ -1081,6 +1112,69 @@ def _migrate_user_account_legacy(conn: sqlite3.Connection) -> None:
             (sub, active, now),
         )
     conn.execute("DROP TABLE user_account_legacy")
+
+
+# Override directive used in built-in personalities so the picker beats the
+# auto-memory persona within claude-web. User-created rows store whatever
+# the user types; they can copy this pattern if they want the same effect.
+PERSONALITY_OVERRIDE_PREFIX = (
+    "You are operating within claude-web. The auto-memory system "
+    "(MEMORY.md and the feedback files it indexes) may contain persona or "
+    "character instructions — for the purposes of this conversation, those "
+    "persona instructions are SUPERSEDED by the persona defined below. "
+    "Apply the persona below; do not apply any other persona instructions "
+    "you find in memory.\n\n---\n\n"
+)
+
+
+_BUILTIN_ARCHITECT_PROMPT = """Role: You are an elite Software Architect and Senior Development Specialist. Your objective is to help me diagnose, debug, improve, and strategically expand a large, multi-file codebase.
+
+Directives: To assist effectively, avoid breaking existing functionality, and smoothly integrate new features, you must adhere strictly to the following protocol:
+
+- Understand Before Advising: Treat every provided snippet as part of a larger ecosystem. Do not assume the architecture. If you need to see a header file, a parent class, or a pipeline configuration to understand the full picture, explicitly ask for it. Do not hallucinate missing logic.
+- Scope-Aligned Feature Expansion: When tasked with adding a new feature, actively champion the build as long as it fits within the established project scope. Write modular, extensible code that naturally mimics my existing design patterns and naming conventions. If a requested feature requires introducing new heavy dependencies or fundamentally altering the core architecture, flag the risk and await approval before proceeding.
+- The Scientific Method (Debugging): When presented with an error or bug, do not immediately generate a massive block of code. First, state a clear hypothesis for the root cause before providing the fix.
+- Minimal Invasive Surgery (Modifications): For existing code, propose the most targeted, precise change possible. Do not rewrite, modernize, or refactor entire classes or scripts for purely stylistic reasons unless it is strictly necessary to support a new feature or I explicitly instruct you to.
+- Contextual Awareness: Always consider the memory management, object lifecycles, and concurrency models inherent to the language being used. Pay special attention to state changes in object-oriented environments and the overall robustness of the system.
+- Output Format: When providing code corrections or new modules, output only the relevant blocks with a few surrounding context lines so I know exactly where to paste them. Briefly explain the why behind the architecture of your solution."""
+
+
+def _seed_personalities(conn: sqlite3.Connection) -> None:
+    """Seed two built-in personalities the first time the table is empty.
+
+    Hagrid keeps an empty system_prompt — that's the "pass through" signal,
+    so whatever persona currently lives in MEMORY.md applies. Replace with
+    a non-empty value in the UI and it switches to an explicit override.
+    Software Architect ships with the full prompt + override prefix so the
+    voice swap actually lands even though the Hagrid persona is also in
+    auto-memory.
+    """
+    row = conn.execute("SELECT COUNT(*) FROM personality").fetchone()
+    if row and int(row[0]) > 0:
+        return
+    now = time.time()
+    seeds = [
+        (
+            "Hagrid",
+            "Rubeus Hagrid (Harry Potter) — uses the persona currently "
+            "defined in your auto-memory. Leave the system prompt blank to "
+            "keep deferring to that file; fill it in to override.",
+            "",
+        ),
+        (
+            "Software Architect",
+            "Senior architect — hypothesis-first debugging, minimal-invasive "
+            "edits, scope-aware feature work.",
+            PERSONALITY_OVERRIDE_PREFIX + _BUILTIN_ARCHITECT_PROMPT,
+        ),
+    ]
+    for name, description, prompt in seeds:
+        conn.execute(
+            "INSERT INTO personality(owner_sub, name, description, "
+            "system_prompt, is_builtin, created_at, updated_at) "
+            "VALUES(NULL, ?, ?, ?, 1, ?, ?)",
+            (name, description, prompt, now, now),
+        )
 
 
 def _personal_homes_root() -> Path:
@@ -1266,6 +1360,270 @@ def _delete_credential(user_sub: str, cred_id: int) -> None:
         shutil.rmtree(home, ignore_errors=True)
     if _user_active_slot(user_sub) == f"cred:{cred_id}":
         _set_user_active(user_sub, "shared")
+
+
+# ─── personality helpers ─────────────────────────────────────────────────────
+#
+# Personalities are system-prompt voices. Each user sees the built-in set
+# (owner_sub IS NULL) plus their own rows, and picks one as their "active"
+# personality. On run start, the active personality's system_prompt is fed
+# into the claude_code preset's `append` field.
+
+
+_PERSONALITY_NAME_MAX = 60
+_PERSONALITY_DESC_MAX = 200
+_PERSONALITY_PROMPT_MAX = 20000
+
+
+def _personality_visible_clause(user_sub: Optional[str]) -> tuple[str, tuple]:
+    """SQL fragment + params that scope SELECTs to rows the user can see:
+    every built-in (owner_sub IS NULL) plus their own rows."""
+    if user_sub:
+        return "(owner_sub IS NULL OR owner_sub = ?)", (user_sub,)
+    return "owner_sub IS NULL", ()
+
+
+def _personality_row_to_dict(row: tuple) -> dict:
+    pid, owner, name, description, prompt, is_builtin, created_at, updated_at = row
+    return {
+        "id": pid,
+        "owner_sub": owner,
+        "name": name,
+        "description": description or "",
+        "system_prompt": prompt or "",
+        "is_builtin": bool(is_builtin),
+        "is_owned": owner is not None,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _list_personalities(user_sub: Optional[str]) -> list[dict]:
+    clause, params = _personality_visible_clause(user_sub)
+    try:
+        rows = _state_db().execute(
+            "SELECT id, owner_sub, name, description, system_prompt, "
+            "is_builtin, created_at, updated_at FROM personality "
+            f"WHERE {clause} "
+            "ORDER BY is_builtin DESC, name COLLATE NOCASE",
+            params,
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [_personality_row_to_dict(r) for r in rows]
+
+
+def _get_personality(personality_id: int, user_sub: Optional[str]) -> Optional[dict]:
+    """Fetch one personality the caller is allowed to see (built-in or
+    their own). Other users' rows return None so probing for ids leaks
+    nothing."""
+    clause, params = _personality_visible_clause(user_sub)
+    try:
+        row = _state_db().execute(
+            "SELECT id, owner_sub, name, description, system_prompt, "
+            "is_builtin, created_at, updated_at FROM personality "
+            f"WHERE id = ? AND {clause}",
+            (personality_id, *params),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return _personality_row_to_dict(row) if row else None
+
+
+def _validate_personality_fields(
+    name: str, description: str, system_prompt: str,
+) -> tuple[str, str, str]:
+    name = (name or "").strip()
+    description = (description or "").strip()
+    system_prompt = system_prompt or ""
+    if not name:
+        raise HTTPException(400, "name is required")
+    if len(name) > _PERSONALITY_NAME_MAX:
+        raise HTTPException(
+            400, f"name too long (max {_PERSONALITY_NAME_MAX} chars)",
+        )
+    if len(description) > _PERSONALITY_DESC_MAX:
+        raise HTTPException(
+            400, f"description too long (max {_PERSONALITY_DESC_MAX} chars)",
+        )
+    if len(system_prompt) > _PERSONALITY_PROMPT_MAX:
+        raise HTTPException(
+            400, f"system prompt too long (max {_PERSONALITY_PROMPT_MAX} chars)",
+        )
+    return name, description, system_prompt
+
+
+def _create_personality(
+    user_sub: str, name: str, description: str, system_prompt: str,
+) -> dict:
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    name, description, system_prompt = _validate_personality_fields(
+        name, description, system_prompt,
+    )
+    now = time.time()
+    try:
+        cur = _state_db().execute(
+            "INSERT INTO personality(owner_sub, name, description, "
+            "system_prompt, is_builtin, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, 0, ?, ?)",
+            (user_sub, name, description, system_prompt, now, now),
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(
+            409, "you already have a personality with that name",
+        ) from e
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "create_personality failed: %s", e,
+        )
+        raise HTTPException(500, "could not create personality") from e
+    pid = int(cur.lastrowid)
+    return _get_personality(pid, user_sub) or {}
+
+
+def _update_personality(
+    user_sub: str, personality_id: int,
+    name: str, description: str, system_prompt: str,
+) -> dict:
+    """Owner-only edit. Built-ins are read-only to keep the seed pristine —
+    users who want to tweak the seed should clone it into a new row first."""
+    existing = _get_personality(personality_id, user_sub)
+    if not existing:
+        raise HTTPException(404, "no such personality")
+    if existing["is_builtin"] or existing.get("owner_sub") != user_sub:
+        raise HTTPException(
+            403, "built-in personalities are read-only; clone it instead",
+        )
+    name, description, system_prompt = _validate_personality_fields(
+        name, description, system_prompt,
+    )
+    now = time.time()
+    try:
+        _state_db().execute(
+            "UPDATE personality SET name = ?, description = ?, "
+            "system_prompt = ?, updated_at = ? "
+            "WHERE id = ? AND owner_sub = ?",
+            (name, description, system_prompt, now, personality_id, user_sub),
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(
+            409, "you already have a personality with that name",
+        ) from e
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "update_personality failed: %s", e,
+        )
+        raise HTTPException(500, "could not update personality") from e
+    return _get_personality(personality_id, user_sub) or {}
+
+
+def _delete_personality(user_sub: str, personality_id: int) -> None:
+    existing = _get_personality(personality_id, user_sub)
+    if not existing:
+        raise HTTPException(404, "no such personality")
+    if existing["is_builtin"] or existing.get("owner_sub") != user_sub:
+        raise HTTPException(403, "built-in personalities cannot be deleted")
+    try:
+        _state_db().execute(
+            "DELETE FROM personality WHERE id = ? AND owner_sub = ?",
+            (personality_id, user_sub),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "delete_personality failed: %s", e,
+        )
+        raise HTTPException(500, "could not delete personality") from e
+    # If this was the user's active personality, fall back to the default
+    # (lowest-id built-in). user_personality has no FK, so the row would
+    # otherwise dangle.
+    try:
+        _state_db().execute(
+            "DELETE FROM user_personality WHERE user_sub = ? "
+            "AND personality_id = ?",
+            (user_sub, personality_id),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _default_personality_id() -> Optional[int]:
+    """Lowest-id built-in. Used as the fallback when a user hasn't picked
+    one and as the on-delete fallback."""
+    try:
+        row = _state_db().execute(
+            "SELECT id FROM personality WHERE is_builtin = 1 "
+            "AND owner_sub IS NULL ORDER BY id LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row else None
+
+
+def _user_active_personality_id(user_sub: Optional[str]) -> Optional[int]:
+    if user_sub:
+        try:
+            row = _state_db().execute(
+                "SELECT personality_id FROM user_personality "
+                "WHERE user_sub = ?",
+                (user_sub,),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        if row:
+            # Only return it if the row still exists and the user can see
+            # it; otherwise fall through to the default. Guards against a
+            # stale pick after a personality is deleted.
+            pid = int(row[0])
+            if _get_personality(pid, user_sub):
+                return pid
+    return _default_personality_id()
+
+
+def _set_user_active_personality(user_sub: str, personality_id: int) -> None:
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    if not _get_personality(personality_id, user_sub):
+        raise HTTPException(404, "no such personality")
+    try:
+        _state_db().execute(
+            "INSERT INTO user_personality(user_sub, personality_id, updated_at) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(user_sub) DO UPDATE SET "
+            "personality_id = excluded.personality_id, "
+            "updated_at = excluded.updated_at",
+            (user_sub, personality_id, time.time()),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "set_user_active_personality failed: %s", e,
+        )
+        raise HTTPException(500, "could not set active personality") from e
+
+
+def _resolve_personality_for_run(user: dict) -> dict:
+    """Pick the personality to apply on a fresh run. Returns the full row
+    plus an `append` string ready to drop into ClaudeAgentOptions. Empty
+    `append` means "use whatever auto-memory provides" — the seeded Hagrid
+    row works this way."""
+    sub = (user or {}).get("sub")
+    pid = _user_active_personality_id(sub)
+    row = _get_personality(pid, sub) if pid is not None else None
+    return {
+        "id": pid,
+        "personality": row,
+        "append": (row or {}).get("system_prompt") or "",
+    }
+
+
+def _personalities_payload(user: dict) -> dict:
+    sub = (user or {}).get("sub")
+    rows = _list_personalities(sub)
+    active = _user_active_personality_id(sub)
+    return {
+        "personalities": rows,
+        "active": active,
+    }
 
 
 def _safe_sub(user_sub: str) -> str:
@@ -1673,7 +2031,8 @@ class ActiveRun:
     """
 
     def __init__(self, run_id: str, owner_sub: Optional[str] = None,
-                 account_slot: str = "shared"):
+                 account_slot: str = "shared",
+                 personality_id: Optional[int] = None):
         self.run_id = run_id
         self.owner_sub = owner_sub
         # Which credential slot this run's CLI subprocess was spawned with.
@@ -1681,6 +2040,10 @@ class ActiveRun:
         # the auth identity mid-run — api_chat compares this against the
         # user's current toggle and respawns the run when they differ.
         self.account_slot = account_slot
+        # Which personality the CLI was spawned with. The system_prompt
+        # is baked in at SDK init, so a mid-conversation personality flip
+        # has to respawn the run with the new append. Compared in api_chat.
+        self.personality_id = personality_id
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -2236,6 +2599,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             ]),
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
+            "personalities_payload": _personalities_payload(user),
             "site_title": SITE_TITLE,
         }
     )
@@ -2741,6 +3105,71 @@ async def api_credentials_signout(
     return {"configured": _credential_is_configured(sub, cred_id)}
 
 
+# ─── personality CRUD ─────────────────────────────────────────────────────────
+#
+# Each user sees built-in personalities (owner_sub NULL) plus their own rows
+# and picks one as "active". The active personality's system_prompt becomes
+# the `append` field passed to the claude_code preset on fresh runs.
+
+
+@app.get("/api/personalities")
+async def api_personalities_list(user: dict = Depends(auth.require_user)):
+    return _personalities_payload(user)
+
+
+@app.post("/api/personalities")
+async def api_personalities_create(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    sub = user.get("sub")
+    created = _create_personality(
+        sub,
+        body.get("name") or "",
+        body.get("description") or "",
+        body.get("system_prompt") or "",
+    )
+    return created
+
+
+@app.patch("/api/personalities/{personality_id}")
+async def api_personalities_update(
+    personality_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    body = await request.json()
+    return _update_personality(
+        sub,
+        personality_id,
+        body.get("name") or "",
+        body.get("description") or "",
+        body.get("system_prompt") or "",
+    )
+
+
+@app.delete("/api/personalities/{personality_id}")
+async def api_personalities_delete(
+    personality_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _delete_personality(sub, personality_id)
+    return _personalities_payload(user)
+
+
+@app.post("/api/personalities/active")
+async def api_personalities_set_active(
+    personality_id: int = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    _set_user_active_personality(sub, personality_id)
+    return _personalities_payload(user)
+
+
 def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
     """Subscribe to an ActiveRun and stream its events as SSE.
 
@@ -3065,6 +3494,8 @@ async def api_chat(
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
         account = _resolve_account_for_run(user)
+        personality_for_run = _resolve_personality_for_run(user)
+        active_personality_id = personality_for_run["id"]
         existing = _existing_run_for_session(session_id) if session_id else None
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
@@ -3076,6 +3507,20 @@ async def api_chat(
             log.info(
                 "account-toggle respawn session=%s run=%s %s→%s",
                 session_id, existing.run_id, existing.account_slot, account["slot"],
+            )
+            _require_owner(existing, user)
+            if existing.task and not existing.task.done():
+                existing.task.cancel()
+            existing = None
+        if existing is not None and existing.personality_id != active_personality_id:
+            # The system_prompt append is baked in at SDK init, so a
+            # personality change can't be applied to a live CLI — same
+            # respawn dance as account-toggle. resume=session_id keeps the
+            # transcript continuous.
+            log.info(
+                "personality-toggle respawn session=%s run=%s %s→%s",
+                session_id, existing.run_id,
+                existing.personality_id, active_personality_id,
             )
             _require_owner(existing, user)
             if existing.task and not existing.task.done():
@@ -3132,7 +3577,12 @@ async def api_chat(
 
         sid_in = session_id or None
         run_id = str(uuid_mod.uuid4())
-        run = ActiveRun(run_id, owner_sub=user.get("sub"), account_slot=account["slot"])
+        run = ActiveRun(
+            run_id,
+            owner_sub=user.get("sub"),
+            account_slot=account["slot"],
+            personality_id=active_personality_id,
+        )
         run.project_key = _sanitize_project_key(cwd)
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
@@ -3261,13 +3711,23 @@ async def api_chat(
         if len(stderr_buf) < 200:
             stderr_buf.append(line)
 
+    # Personality was resolved up-front so the existing-run respawn check
+    # could see it; reuse the resolved row here. Empty `append` (e.g. the
+    # seeded Hagrid row) leaves auto-memory's persona as the only signal;
+    # a non-empty value is concatenated onto the claude_code preset.
+    personality_append = personality_for_run["append"]
+    system_prompt_opt: dict[str, Any] = {
+        "type": "preset", "preset": "claude_code",
+    }
+    if personality_append:
+        system_prompt_opt["append"] = personality_append
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
         permission_mode="default",
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
-        system_prompt={"type": "preset", "preset": "claude_code"},
+        system_prompt=system_prompt_opt,
         # Default-None hides every installed skill from the model. "all"
         # mirrors the host-shell `claude` CLI so /security-review,
         # /init, /loop, /skill <name>, etc. actually run.
@@ -4203,6 +4663,22 @@ async def account_page(request: Request, user: dict = Depends(auth.require_user)
         request, "account.html", {
             "user": user,
             "account": _account_payload(user),
+            "site_title": SITE_TITLE,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/personalities")
+async def personalities_page(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Per-user personality (system-prompt voice) management."""
+    response = templates.TemplateResponse(
+        request, "personalities.html", {
+            "user": user,
+            "personalities_payload": _personalities_payload(user),
             "site_title": SITE_TITLE,
         },
     )

@@ -269,6 +269,43 @@
     });
   }
 
+  // Personality picker. The active personality's system_prompt is appended
+  // to the claude_code preset on the next run; switching mid-conversation
+  // causes api_chat to respawn the CLI (parallel to account-slot toggling)
+  // so the new voice takes effect immediately on the next message.
+  const personalitySelect = document.getElementById("personality-select");
+  if (personalitySelect) {
+    let lastPersonality = personalitySelect.value;
+    personalitySelect.addEventListener("change", async () => {
+      const target = personalitySelect.value;
+      if (target === lastPersonality) return;
+      try {
+        const fd = new FormData();
+        fd.append("personality_id", target);
+        const r = await fetch("/api/personalities/active", {
+          method: "POST",
+          body: fd,
+        });
+        if (!r.ok) {
+          let detail = `HTTP ${r.status}`;
+          try {
+            const body = await r.json();
+            if (body && body.detail) detail = body.detail;
+          } catch (_) {}
+          throw new Error(detail);
+        }
+        lastPersonality = target;
+        if (announcer) {
+          const label = personalitySelect.options[personalitySelect.selectedIndex]?.text || target;
+          announcer.textContent = `Personality switched to ${label}. Takes effect on your next message.`;
+        }
+      } catch (err) {
+        personalitySelect.value = lastPersonality;
+        if (announcer) announcer.textContent = `Could not switch personality: ${err.message}`;
+      }
+    });
+  }
+
   function currentProject() {
     if (sessionProject) return sessionProject;
     return projectSelect ? projectSelect.value : "";
