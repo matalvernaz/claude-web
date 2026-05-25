@@ -22,9 +22,11 @@
     <p class="setup-intro">
       Personalities are system-prompt voices Claude uses when you chat.
       The picker in the header switches between them. Built-in personalities
-      are read-only; clone or add new ones to customise. An empty system
-      prompt leaves auto-memory's persona alone — useful when your
-      auto-memory already defines a character you want to keep.
+      are read-only; clone or add new ones to customise. Pick
+      <strong>No persona</strong> for the default Claude voice — claude-web
+      skips the system-prompt append and removes the auto-memory mirror
+      file, so the spawned CLI runs on the plain <code>claude_code</code>
+      preset.
     </p>
 
     <section aria-labelledby="list-heading" class="setup-card">
@@ -74,7 +76,7 @@
           <input type="text" id="editor-description" name="description" maxlength="200" autocomplete="off">
         </p>
         <p>
-          <label for="editor-prompt">System prompt <span class="hint">(leave blank to defer to auto-memory)</span></label><br>
+          <label for="editor-prompt">System prompt <span class="hint">(leave blank for default Claude voice — no append, no mirror)</span></label><br>
           <textarea id="editor-prompt" name="system_prompt" rows="14"></textarea>
         </p>
         <p>

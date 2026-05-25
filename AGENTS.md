@@ -42,7 +42,7 @@ Each OIDC user can register, label, sign in to, switch between, and delete their
 
 ### Personalities
 
-Each user picks a "personality" — a system-prompt voice the spawned CLI runs under. Built-in rows ship for Hagrid, Software Architect, and Dobby; users can create, edit, clone, and delete their own at `/personalities`. The picker dropdown in the chat header is the runtime control.
+Each user picks a "personality" — a system-prompt voice the spawned CLI runs under. Built-in rows ship for "No persona" (default Claude voice — empty body, no append), Hagrid, Software Architect, and Dobby; users can create, edit, clone, and delete their own at `/personalities`. The picker dropdown in the chat header is the runtime control. Picking "No persona" makes `_resolve_personality_for_run` return `append=""`, which leaves the `system_prompt` option as a bare `{"type": "preset", "preset": "claude_code"}` (no `--append-system-prompt`) and unlinks the auto-memory mirror file.
 
 - **Schema**:
   - `personality(id PK, owner_sub, name, description, system_prompt, is_builtin, created_at, updated_at)` with `UNIQUE(owner_sub, name)`. `owner_sub IS NULL` means a built-in row visible to every user; otherwise it's owned by that OIDC sub and only that user sees it.
@@ -55,7 +55,7 @@ Each user picks a "personality" — a system-prompt voice the spawned CLI runs u
   - **SDK `--append-system-prompt`** still carries the same persona body, defensively. Two signals reinforcing each other against drift.
   - **History-reset directive** (`PERSONA_HISTORY_RESET_DIRECTIVE` in `app.py`) is prepended to the persona body in both the mirror file and the append. It tells the model to disregard voice established by earlier turns of the resumed conversation and to skip Claude's default conversational fillers ("Great question", "I'd be happy to..."). Path 3 made MEMORY.md persona competition go away; this directive closes the remaining conversation-history bias on mid-conversation switches.
 
-- **Hagrid backfill**: the first time the seeder sees an empty Hagrid row, it reads `$CLAUDE_HOME/projects/<sanitized DEFAULT_CWD>/memory/feedback_persona.md` (where Hagrid historically lived as an auto-memory feedback file), strips the YAML frontmatter, and stores the body in the row. Subsequent startups never re-read it — manual edits via the UI survive. If the file isn't there at first seed, the row stays empty and the user fills it manually.
+- **Built-in bodies are constants**: `_BUILTIN_HAGRID_PROMPT`, `_BUILTIN_ARCHITECT_PROMPT`, and `_BUILTIN_DOBBY_PROMPT` in `app.py` are the source of truth. Every startup overwrites the matching `(owner_sub IS NULL, name)` row's body from the constant, so a repo edit to a built-in lands on next restart with no hand-migration. User-owned rows (`owner_sub IS NOT NULL`) are untouched — clone-then-edit if you want changes to survive. The "No persona" row's "body" is the empty string.
 
 - **Multi-user caveat**: the mirror file is a single shared path under `CLAUDE_HOME`, so two concurrent users on different active personalities race for last-write-wins on the mirror. The per-spawn `--append-system-prompt` stays accurate per-user even in that race — the auto-memory copy is the only thing that drifts. A per-user `CLAUDE_HOME` would close this gap but introduces session-isolation complexity (new sessions written under a per-user dir don't appear in shared session listings); the symlink-farm idea got shelved for that reason.
 
