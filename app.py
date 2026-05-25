@@ -1126,6 +1126,24 @@ ACTIVE_PERSONALITY_MEMORY_LINE = (
     "Currently selected personality (managed by claude-web)"
 )
 
+# Prepended to the active personality whenever it's served to the model
+# (via the mirror file and the SDK append). Path 3 made the mirror the
+# canonical persona source, but mid-conversation switches still drift on
+# two signals path 3 didn't touch: the assistant's own earlier turns in
+# the resumed session, and Claude's default conversational fillers. This
+# directive supersedes both. Deliberately narrow — MEMORY.md persona
+# competition is already gone, so we don't repeat that here.
+PERSONA_HISTORY_RESET_DIRECTIVE = """**Persona enforcement (read first):** This file defines your active persona — apply it to every response in this conversation from this point forward. Two specific signals do NOT determine your voice and are SUPERSEDED:
+
+1. Voice, dialect, persona, or mannerisms established by your earlier turns in this conversation. You may have been a different character before; that's done. Switch now, fully, and don't drift back.
+2. Default conversational fillers: validation phrases ("Great question", "Excellent point"), hedge openers ("I'd be happy to..."), customer-service closers ("Let me know if you need anything else").
+
+If you notice yourself drifting toward an earlier voice or a default Claude voice mid-response, stop, reset, and continue in the persona below.
+
+---
+
+"""
+
 
 _BUILTIN_ARCHITECT_PROMPT = """<persona name="Software Architect">
 
@@ -1883,17 +1901,22 @@ def _set_user_active_personality(user_sub: str, personality_id: int) -> None:
 
 
 def _resolve_personality_for_run(user: dict) -> dict:
-    """Pick the personality to apply on a fresh run. Returns the full row
-    plus an `append` string ready to drop into ClaudeAgentOptions. Empty
-    `append` means "use whatever auto-memory provides" — the seeded Hagrid
-    row works this way."""
+    """Pick the personality to apply on a fresh run.
+
+    Returns the full row plus an ``append`` string ready to drop into
+    ClaudeAgentOptions. The append carries the same history-reset directive
+    the mirror file does, so both system-context signals reinforce each
+    other against conversation-history drift. Empty ``append`` means the
+    personality row itself has no body (rare — only the seeded "empty
+    Hagrid" pre-backfill state).
+    """
     sub = (user or {}).get("sub")
     pid = _user_active_personality_id(sub)
     row = _get_personality(pid, sub) if pid is not None else None
     return {
         "id": pid,
         "personality": row,
-        "append": (row or {}).get("system_prompt") or "",
+        "append": _persona_body_with_directive(row) if row else "",
     }
 
 
@@ -1936,12 +1959,27 @@ def _memory_index_path() -> Path:
     )
 
 
-def _format_persona_mirror(personality: dict) -> str:
-    """Wrap the personality body in the YAML frontmatter the auto-memory
-    loader expects on a feedback file. Body is stripped of any existing
-    frontmatter so backfilled-from-disk Hagrid content doesn't double-wrap.
+def _persona_body_with_directive(personality: dict) -> str:
+    """Apply the conversation-history reset directive to the personality
+    body. Used identically by the mirror writer and the SDK append path so
+    both signals the model receives carry the same instruction to ignore
+    prior-turn voice and Claude's default fillers.
     """
     body = _strip_frontmatter(personality.get("system_prompt") or "")
+    if not body.strip():
+        # Empty personality: don't add the directive; an empty mirror is the
+        # cleanup signal that no personality is active.
+        return ""
+    return PERSONA_HISTORY_RESET_DIRECTIVE + body
+
+
+def _format_persona_mirror(personality: dict) -> str:
+    """Wrap the personality body in the YAML frontmatter the auto-memory
+    loader expects on a feedback file. Body carries the history-reset
+    directive so this file fights conversation-context drift on its own,
+    without relying on the SDK append for that signal.
+    """
+    body = _persona_body_with_directive(personality)
     name = (personality.get("name") or "Active personality").replace("\n", " ")
     description = (personality.get("description") or "").replace("\n", " ")
     return (
