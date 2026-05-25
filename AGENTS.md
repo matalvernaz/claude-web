@@ -40,6 +40,38 @@ Each OIDC user can register, label, sign in to, switch between, and delete their
 - **API**: `/api/account/credentials` (GET list / POST create / PATCH rename / DELETE) plus per-cred `/oauth/start`, `/oauth/code`, `/oauth/cancel`, `/apikey`, `/signout`, `/status`. All scoped to the caller's OIDC sub — rows owned by other users return **404, not 403**.
 - **Env**: `CLAUDE_WEB_PERSONAL_HOMES_DIR` (default `~/.claude-homes`), `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` (default `"Shared"`).
 
+### Personalities
+
+Each user picks a "personality" — a system-prompt voice the spawned CLI runs under. Built-in rows ship for Hagrid and Software Architect; users can create, edit, clone, and delete their own at `/personalities`. The picker dropdown in the chat header is the runtime control.
+
+- **Schema**:
+  - `personality(id PK, owner_sub, name, description, system_prompt, is_builtin, created_at, updated_at)` with `UNIQUE(owner_sub, name)`. `owner_sub IS NULL` means a built-in row visible to every user; otherwise it's owned by that OIDC sub and only that user sees it.
+  - `user_personality(user_sub PK, personality_id, updated_at)` is the per-user active pick.
+  - **SQLite UNIQUE gotcha**: NULL is distinct from every other NULL, so `ON CONFLICT(owner_sub, name)` doesn't detect existing built-in rows (they all have `owner_sub IS NULL`). The seeder uses an explicit `SELECT-then-UPDATE-or-INSERT` instead, keeping row ids stable across restarts so `user_personality.personality_id` pointers don't dangle when content is refreshed.
+
+- **Where the persona content actually lives at runtime** (path-3 architecture):
+  - **Mirror file** at `$CLAUDE_HOME/projects/<sanitized-cwd>/memory/active_personality.md`. claude-web writes the active personality's body here (with YAML frontmatter) on every picker change, content edit affecting the caller's active, deletion of the active row, and at startup. The `claude_code` preset loads it as a first-class feedback memory entry — same loading weight any other auto-memory file carries.
+  - **MEMORY.md auto-edit**: at startup, `_ensure_memory_index_references_mirror()` strips any line referencing `feedback_persona.md` from `<cwd>/memory/MEMORY.md` and appends a line for `active_personality.md`. The original `feedback_persona.md` file stays on disk untouched; it's just not in the index anymore. **claude-web silently modifies a user-owned file here** — surprising, but it's the cleanest way to make the picker the canonical persona source without touching auto-memory loader internals.
+  - **SDK `--append-system-prompt`** still carries the same persona body, defensively. Two signals reinforcing each other against drift.
+  - **History-reset directive** (`PERSONA_HISTORY_RESET_DIRECTIVE` in `app.py`) is prepended to the persona body in both the mirror file and the append. It tells the model to disregard voice established by earlier turns of the resumed conversation and to skip Claude's default conversational fillers ("Great question", "I'd be happy to..."). Path 3 made MEMORY.md persona competition go away; this directive closes the remaining conversation-history bias on mid-conversation switches.
+
+- **Hagrid backfill**: the first time the seeder sees an empty Hagrid row, it reads `$CLAUDE_HOME/projects/<sanitized DEFAULT_CWD>/memory/feedback_persona.md` (where Hagrid historically lived as an auto-memory feedback file), strips the YAML frontmatter, and stores the body in the row. Subsequent startups never re-read it — manual edits via the UI survive. If the file isn't there at first seed, the row stays empty and the user fills it manually.
+
+- **Multi-user caveat**: the mirror file is a single shared path under `CLAUDE_HOME`, so two concurrent users on different active personalities race for last-write-wins on the mirror. The per-spawn `--append-system-prompt` stays accurate per-user even in that race — the auto-memory copy is the only thing that drifts. A per-user `CLAUDE_HOME` would close this gap but introduces session-isolation complexity (new sessions written under a per-user dir don't appear in shared session listings); the symlink-farm idea got shelved for that reason.
+
+- **API**: `/api/personalities` (GET list / POST create), `/api/personalities/{id}` (PATCH / DELETE), `/api/personalities/active` (POST with `personality_id` form field). All scoped to the caller's OIDC sub. Built-ins are read-only (clone-then-edit is the pattern).
+
+### Personality respawn vs `/api/chat/send`
+
+The CLI subprocess bakes its `--append-system-prompt` in at spawn — so a picker change after the spawn doesn't reach the live model unless we tear the run down. Two paths feed into a long-lived conversation, and they don't both check the active personality:
+
+| Endpoint | When | Personality check? |
+| --- | --- | --- |
+| `POST /api/chat` | Turn-start (new run, or sending a message when no run is live) | Yes — `existing.personality_id != active_personality_id` triggers cancel + respawn with `--resume <session>` |
+| `POST /api/chat/send/{run_id}` | Mid-turn input injection (UI sends a follow-up while a turn is generating, or just queues into the live run) | **No** — feeds straight into the existing CLI's stdin |
+
+That asymmetry is closed by `_cancel_runs_for_personality_swap` in the `/api/personalities/active` handler: when the picker changes, claude-web walks `ACTIVE_RUNS_BY_SESSION` for the calling user, finds runs whose `personality_id` differs from the new pick, and cancels them. The driver's cleanup pops the run from the session map, so the next message — whichever endpoint it hits — finds no live run and falls through to the `/api/chat` fresh-spawn path under the new persona. Logged as `personality-swap cancel run=… session=…` (note: the `claude-web` logger has no handler attached by default, so these lines don't show up in `journalctl` without explicit `logging.basicConfig`).
+
 ### Identity passed to the spawned CLI
 
 Every CLI subprocess started by claude-web receives three identity env vars from `_identity_env_for(user)` (called by `_resolve_account_for_run`), so `SessionStart` hooks and `CLAUDE.md` personalities can address the signed-in user by name without claude-web touching the model context itself:
@@ -107,6 +139,32 @@ SQLite at `$CLAUDE_WEB_STATE_DIR/state.db` (WAL mode) holds run metadata + event
 
 Per-user creds: `$CLAUDE_WEB_PERSONAL_HOMES_DIR/<safe_sub>/<id>/`.
 
+### Roundtable
+
+`/roundtable` is a multi-AI panel where Gemini Pro + GPT-5 answer in parallel and Claude Opus synthesises a single consolidated reply. Code-related questions can return unified diffs in the synth output that click-to-apply against the bound project. Two surfaces:
+
+- **Assistant view** (`mode-assistant`, default): one input box + file picker + "Ask the panel" button. Each user turn fires `roundtable_ask_parallel` against two paid participants (default `gemini-pro` + `gpt-5`) then `roundtable_ask` against the synthesiser (`claude-opus`, free via subscription CLI when `CLAUDE_ROUNDTABLE_ANTHROPIC_TRANSPORT=cli`). Conversation persists in a roundtable thread.
+- **Advanced view** (`mode-advanced`): underlying thread browser + manual-driving panels (post / ask / ask_parallel / attach / close). Same body, different `mode-*` class.
+
+Optional editable dependency on the `roundtable` package — `pip install -e /home/matt/roundtable-mcp` (or wherever the operator put it). If the import fails the route renders a "not installed" panel. The wrapper at `roundtable/` in this repo is a thin shim re-exporting from the installed package.
+
+- **Shared store**: `~/.claude-roundtable/state.db` (SQLite, WAL). Same store the standalone `roundtable-mcp` stdio server uses — threads created via Claude Code MCP tools are visible in the web UI and vice versa. No sync layer.
+
+- **Project binding**: `roundtable_thread_project(thread_id PK, project_key, created_by, created_at)` maps each thread to a `project_key` from `CLAUDE_WEB_PROJECT_DIRS`. Threads created outside claude-web (MCP) have no row and surface under an "Unbound" filter; the assistant view inherits the chat-side project picker for new threads.
+
+- **Streaming SSE** on `POST /api/roundtable/assistant`. Event order per turn: `created` → `attached` (per file) → `prompt_posted` → `panel_start` → `panel_done` (with per-panelist char counts) → `synth_start` → `done` (full payload incl. patches). The browser uses `fetch().body.getReader()` + a small SSE parser; aria-live announcements track each step for NVDA. Per-token streaming of the synth is a future improvement — would need streaming added to `roundtable.core`.
+
+- **Markdown rendering on synth turns**: `marked.min.js` + `purify.min.js` are loaded on the roundtable page. AI output goes through `marked.parse()` → `DOMPurify.sanitize()` before insertion. Falls back to plain `<pre>` if either lib is missing.
+
+- **Click-to-apply diff**: synth system prompt asks for unified diffs in ` ```diff <filename>` fences when fixes are warranted (only when a code artifact is attached AND the panel reached agreement). Server-side regex `_DIFF_FENCE_RE` parses fences out; `_extract_patches()` returns `[{target, diff}]`. Each detected patch gets an "Apply" button in the UI; click POSTs to `/api/roundtable/assistant/apply` with `{thread_id, target, diff}`.
+  - **Safety rails**: target must resolve inside the thread's bound project (or, for unbound threads, inside any configured project root); path traversal returns HTTP 400. `patch --dry-run` validates the hunks before any write; failure returns 422 with stderr tail. Original is saved alongside as `<target>.rt-orig` before apply. Tries `-p0` first, falls back to `-p1` for `a/foo b/foo`-style headers. Requires GNU `patch` on `PATH`.
+
+- **Routes**: `/roundtable` (HTML); `GET /api/roundtable/threads` (list, filterable by `open_only` / `limit` / `project`, including `project=__unbound__`); `GET /api/roundtable/threads/{id}` (structured detail with `project_key`); `POST /api/roundtable/threads` (create, optional `project_key`); `POST /api/roundtable/threads/{id}/{post,ask,ask_parallel,artifact,close}` (manual driving); `POST /api/roundtable/assistant` (streaming); `POST /api/roundtable/assistant/apply`; `GET /api/roundtable/participants`. All gated by `auth.require_user`.
+
+- **Env config**: `GEMINI_API_KEY`, `OPENAI_API_KEY` for the paid panel; `CLAUDE_ROUNDTABLE_ANTHROPIC_TRANSPORT=cli` to bill Claude participants through the subscription CLI (no `ANTHROPIC_API_KEY` needed); optional `CLAUDE_WEB_ROUNDTABLE_ASSISTANT_MAX_BYTES` (default 2 MiB per upload).
+
+- **Cost picture**: per "Ask the panel" turn = 1 Gemini Pro call + 1 GPT-5 call (paid) + 1 Claude Opus call (subscription, free in CLI transport mode). Typical 20-40s round-trip.
+
 ### Portability
 
 All paths are env-driven: `CLAUDE_PROJECT_DIR`, `CLAUDE_WEB_PROJECT_DIRS`, `CLAUDE_HOME`, `CLAUDE_WEB_STATE_DIR`, `CLAUDE_WEB_PERSONAL_HOMES_DIR`, `CLAUDE_WEB_SHARED_ACCOUNT_LABEL`, `CLAUDE_WEB_SITE_TITLE`, `AUTH_MODE=oidc|none`. **Don't hardcode an operator's home directory back into the source.**
@@ -118,6 +176,16 @@ All paths are env-driven: `CLAUDE_PROJECT_DIR`, `CLAUDE_WEB_PROJECT_DIRS`, `CLAU
 If the model has a `ScheduleWakeup` pending and the user queues a message while the turn is ending, the harness dispatches the fired wakeup's sentinel (`<<autonomous-loop-dynamic>>` or `<<autonomous-loop>>`) into the next prompt slot **instead of** the user's queued message. The user sees a "1 QUEUED" indicator that never drains and has to manually cancel.
 
 This is a claude-web bug, not upstream Claude Code — the next-prompt picker after a turn ends needs to prefer a queued user message over a fired scheduled wakeup. Fix is most likely in the run-lifecycle / agent-loop code in `app.py` that decides what to feed the SDK next.
+
+### Per-conversation personality binding (design issue, not a crash)
+
+The personality picker is **per-user** (`user_personality(user_sub PK, personality_id)`), not per-conversation. Switching it in chat A immediately changes the active pick for every other chat that user owns; closing chat A doesn't reset anything because chat A's pick was never bound to its session.
+
+What you'd actually want: per-conversation binding so that new chats pick up your default, switching the picker in chat A doesn't bleed into chat B, and reopening a closed chat restores its last personality. Fix sketch: new table `session_personality(session_id PK, personality_id, updated_at)`, picker reads/writes that on the current session, the user-level `user_personality` row stays as the seed for new-chat defaults, page-load JS reads from `session_personality` to populate the picker per-chat. ~30 lines, unsplit between `app.py` and `static/app.js`.
+
+### Application-level logs don't reach `journalctl`
+
+The `claude-web` logger (`logging.getLogger("claude-web")`) has no handler attached — uvicorn captures stdout for access logs but the application logger drops its records on the floor. So lines like `personality-swap cancel run=…` and `perm decision=…` exist in the code but never reach the journal, making in-prod debugging surprising. Fix is a one-liner `logging.basicConfig(level=logging.INFO, format=…)` near the top of `app.py` (or a proper `dictConfig` in `setup_flow.py`). Until then, debugging in-prod state often requires inspecting `ps`, the SQLite store, or the file system rather than the log stream.
 
 ## Local dev / CI
 
@@ -133,9 +201,12 @@ This is a claude-web bug, not upstream Claude Code — the next-prompt picker af
 
 | file | what's in it |
 | --- | --- |
-| `app.py` | routes, SSE, permission Future plumbing, `state.db`, run lifecycle, per-user-account API |
+| `app.py` | routes, SSE, permission Future plumbing, `state.db`, run lifecycle, per-user-account API, personality CRUD + mirror writer, roundtable assistant + apply, picker-driven run cancellation, MEMORY.md auto-edit at startup |
 | `auth.py` | OIDC code+PKCE via authlib |
 | `setup_flow.py` | in-browser sign-in flows for the bundled CLI, keyed per-credential |
-| `templates/{index,account,setup}.html` | UI |
-| `static/{app,account,setup}.js` | client JS |
+| `roundtable/` | thin shim re-exporting the installed `roundtable` package (`pip install -e ../roundtable-mcp`); absent imports degrade `/roundtable` to a "not installed" panel |
+| `templates/{index,account,setup,personalities,roundtable}.html` | UI |
+| `static/{app,account,setup,personalities,roundtable}.js` | client JS |
+| `static/{style,setup,roundtable}.css` | styles |
+| `static/{marked,purify}.min.js` | markdown rendering + sanitisation for roundtable synth output |
 | `tests/` | pytest suite |
