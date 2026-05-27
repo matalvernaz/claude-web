@@ -58,6 +58,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
+import currency
 import setup_flow
 
 log = logging.getLogger("claude-web")
@@ -208,6 +209,7 @@ USAGE_DIR.mkdir(parents=True, exist_ok=True)
 USAGE_LOG = USAGE_DIR / "usage.jsonl"
 RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
 STATE_DB_PATH = USAGE_DIR / "state.db"
+currency.configure_cache(USAGE_DIR / "currency_rates.json")
 UPLOADS_ROOT = USAGE_DIR / "uploads"
 UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -6909,11 +6911,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "tool_use_id": msg.tool_use_id,
         }]
     if isinstance(msg, ResultMessage):
-        _log_usage(
-            msg,
-            account_slot=(run.account_slot if run is not None else "shared"),
-            owner_sub=(run.owner_sub if run is not None else None),
-        )
+        slot = run.account_slot if run is not None else "shared"
+        owner = run.owner_sub if run is not None else None
+        _log_usage(msg, account_slot=slot, owner_sub=owner)
+        cred_mode = _resolve_credential_mode(slot, owner)
         usage = msg.usage or {}
         return [{
             "type": "result",
@@ -6922,6 +6923,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "errors": list(msg.errors or []),
             "duration_ms": msg.duration_ms,
             "total_cost_usd": msg.total_cost_usd,
+            "cost_is_billed": cred_mode == "api_key",
             "session_id": msg.session_id,
             "subtype": msg.subtype,
             "stop_reason": msg.stop_reason,
@@ -6953,13 +6955,38 @@ def _save_rate_limit(rli: dict) -> None:
         log.exception("save_rate_limit failed")
 
 
+def _resolve_credential_mode(account_slot: str, owner_sub: Optional[str]) -> str:
+    """Return ``api_key``, ``oauth``, or ``unknown`` for a logged turn.
+
+    The mode determines whether ``total_cost_usd`` reflects a real bill.
+    OAuth/subscription turns have synthetic API-equivalent costs that
+    don't match what the user actually pays, so the UI hides cost on
+    those rows. ``unknown`` is the safe default when the home directory
+    has been cleaned up before the run finished logging.
+    """
+    try:
+        if account_slot == "shared" or not account_slot:
+            return setup_flow.whoami().get("mode") or "unknown"
+        if account_slot.startswith("cred:") and owner_sub:
+            cred_id = _parse_cred_active(account_slot)
+            if cred_id is None:
+                return "unknown"
+            home = _credential_home_path(owner_sub, cred_id)
+            return setup_flow.whoami(home).get("mode") or "unknown"
+    except Exception:
+        log.exception("resolve_credential_mode failed for slot=%s", account_slot)
+    return "unknown"
+
+
 def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = None) -> None:
     """Append one row per completed turn to usage.jsonl.
 
     ``account_slot`` records which credential slot this turn authenticated as
     ('shared' or 'personal'), and ``owner_sub`` records which logged-in user
     spawned the run. Both are written so /api/usage can break out personal
-    spend per user from the deployment-wide shared spend.
+    spend per user from the deployment-wide shared spend. ``credential_mode``
+    snapshots whether the slot was an API key (real cost) or OAuth/subscription
+    (synthetic cost) at log time, so /api/usage can avoid surfacing fake totals.
     """
     usage = getattr(msg, "usage", None) or {}
     row = {
@@ -6974,6 +7001,7 @@ def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = 
         "is_error": msg.is_error,
         "account_slot": account_slot,
         "owner_sub": owner_sub,
+        "credential_mode": _resolve_credential_mode(account_slot, owner_sub),
     }
     try:
         with USAGE_LOG.open("a", encoding="utf-8") as f:
@@ -6989,7 +7017,14 @@ def _today_window() -> tuple[int, int]:
     return int(start.timestamp()), int((start + datetime.timedelta(days=1)).timestamp())
 
 
-def _compute_usage_payload(user_sub: Optional[str]) -> dict:
+def _is_billed_row(row: dict) -> bool:
+    """Cost is meaningful only when the slot was an API key. OAuth/subscription
+    turns get a synthetic ``total_cost_usd`` from the SDK that doesn't map
+    to the actual subscription bill, so we treat them as unbilled."""
+    return row.get("credential_mode") == "api_key"
+
+
+def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -> dict:
     """Synchronous body of /api/usage — invoked on a worker thread so a fat
     usage.jsonl doesn't block the event loop.
 
@@ -7008,11 +7043,15 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
     by_session: dict[str, dict] = {}
     for r in today_rows:
         sid = r.get("session_id") or "?"
-        agg = by_session.setdefault(sid, {"turns": 0, "cost": 0.0, "input": 0, "output": 0})
+        agg = by_session.setdefault(
+            sid, {"turns": 0, "billed_turns": 0, "cost": 0.0, "input": 0, "output": 0},
+        )
         agg["turns"] += 1
-        agg["cost"] += float(r.get("total_cost_usd") or 0.0)
         agg["input"] += int(r.get("input_tokens") or 0)
         agg["output"] += int(r.get("output_tokens") or 0)
+        if _is_billed_row(r):
+            agg["billed_turns"] += 1
+            agg["cost"] += float(r.get("total_cost_usd") or 0.0)
 
     sessions = []
     for sid, s in sorted(by_session.items(), key=lambda kv: kv[1]["cost"], reverse=True):
@@ -7020,6 +7059,7 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
             "session_id": sid,
             "title": session_title(sid) or sid[:8],
             "turns": s["turns"],
+            "billed_turns": s["billed_turns"],
             "cost_usd": round(s["cost"], 4),
             "input_tokens": s["input"],
             "output_tokens": s["output"],
@@ -7028,14 +7068,16 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
     total_cost = round(sum(s["cost_usd"] for s in sessions), 4)
     total_input = sum(s["input_tokens"] for s in sessions)
     total_output = sum(s["output_tokens"] for s in sessions)
+    total_turns = sum(s["turns"] for s in sessions)
+    total_billed_turns = sum(s["billed_turns"] for s in sessions)
 
     # Slot breakdown: shared is deployment-wide (everyone shares one bill);
     # per-credential slots are filtered to the current user so each user
     # sees only their own spend on their own credentials. Rows from before
     # the slot-tagging change (missing account_slot) are treated as 'shared'.
     slot_totals = {
-        "shared": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
-        "personal": {"turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+        "shared": {"turns": 0, "billed_turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
+        "personal": {"turns": 0, "billed_turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
     }
     for r in today_rows:
         slot = r.get("account_slot") or "shared"
@@ -7052,9 +7094,11 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
         else:
             continue
         bucket["turns"] += 1
-        bucket["cost_usd"] += float(r.get("total_cost_usd") or 0.0)
         bucket["input_tokens"] += int(r.get("input_tokens") or 0)
         bucket["output_tokens"] += int(r.get("output_tokens") or 0)
+        if _is_billed_row(r):
+            bucket["billed_turns"] += 1
+            bucket["cost_usd"] += float(r.get("total_cost_usd") or 0.0)
     for bucket in slot_totals.values():
         bucket["cost_usd"] = round(bucket["cost_usd"], 4)
 
@@ -7065,21 +7109,33 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
     except Exception:
         rate_limit = None
 
+    currency_code = currency.resolve_currency(
+        accept_language, override=os.getenv("CLAUDE_WEB_CURRENCY"),
+    )
+    rate = currency.usd_rate(currency_code)
+    if rate is None:
+        currency_code = "USD"
+        rate = 1.0
+
     return {
         "today": {
-            "turns": sum(s["turns"] for s in sessions),
+            "turns": total_turns,
+            "billed_turns": total_billed_turns,
+            "has_billed_usage": total_billed_turns > 0,
             "cost_usd": total_cost,
             "input_tokens": total_input,
             "output_tokens": total_output,
             "sessions": sessions[:20],
             "by_slot": slot_totals,
         },
+        "currency": currency_code,
+        "usd_rate": rate,
         "rate_limit": rate_limit,
     }
 
 
 @app.get("/api/usage")
-async def api_usage(user: dict = Depends(auth.require_user)):
+async def api_usage(request: Request, user: dict = Depends(auth.require_user)):
     """Aggregate today's usage and return whatever rate-limit info we last saw.
 
     Delegates the disk scan + JSON parsing to a worker thread because
@@ -7088,7 +7144,10 @@ async def api_usage(user: dict = Depends(auth.require_user)):
     blocking work, which starves every other in-flight request and stalls
     SSE streams. asyncio.to_thread is the minimal-blast-radius fix.
     """
-    return await asyncio.to_thread(_compute_usage_payload, user.get("sub"))
+    accept_language = request.headers.get("accept-language", "")
+    return await asyncio.to_thread(
+        _compute_usage_payload, user.get("sub"), accept_language,
+    )
 
 
 @app.get("/account")

@@ -373,16 +373,74 @@
     renderContextMeter();
   })();
 
+  // Currency + rate state shared by the header, per-turn meta, and usage
+  // dialog. Populated by /api/usage on first refresh. Stays at USD/1.0 until
+  // the server tells us otherwise so a fetch failure can't blank the UI.
+  let costCurrency = "USD";
+  let costUsdRate = 1.0;
+  let costFormatter = null;
+
+  function buildCostFormatter() {
+    try {
+      costFormatter = new Intl.NumberFormat(navigator.language || "en-US", {
+        style: "currency",
+        currency: costCurrency,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4,
+      });
+    } catch {
+      // Unknown currency code on this browser: fall back to USD format.
+      costFormatter = new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4,
+      });
+    }
+  }
+
+  buildCostFormatter();
+
+  function formatCost(usdAmount) {
+    const usd = Number(usdAmount);
+    if (!Number.isFinite(usd)) return "";
+    const local = usd * costUsdRate;
+    if (!costFormatter) buildCostFormatter();
+    try {
+      return costFormatter.format(local);
+    } catch {
+      return "$" + usd.toFixed(4);
+    }
+  }
+
   async function refreshHeaderCost() {
-    if (!headerCostEl) return;
     try {
       const r = await fetch("/api/usage");
       if (!r.ok) return;
       const data = await r.json();
-      const raw = data.today && data.today.cost_usd;
-      const cost = Number(raw);
+      const cur = typeof data.currency === "string" ? data.currency : "USD";
+      const rate = Number(data.usd_rate);
+      if (cur !== costCurrency || (Number.isFinite(rate) && rate !== costUsdRate)) {
+        costCurrency = cur;
+        if (Number.isFinite(rate) && rate > 0) costUsdRate = rate;
+        buildCostFormatter();
+      }
+      if (!headerCostEl) return;
+      const today = data.today || {};
+      // Hide the header price entirely on subscription-only days — the
+      // synthetic SDK cost doesn't match the actual bill, so showing it
+      // would mislead. The element is reclaimed for screen readers via
+      // aria-hidden + empty text rather than display:none, so a later
+      // billed turn can flip it back on without a layout shift.
+      if (!today.has_billed_usage) {
+        headerCostEl.textContent = "";
+        headerCostEl.setAttribute("aria-hidden", "true");
+        return;
+      }
+      const cost = Number(today.cost_usd);
       if (Number.isFinite(cost)) {
-        headerCostEl.textContent = "$" + cost.toFixed(4);
+        headerCostEl.textContent = formatCost(cost);
+        headerCostEl.removeAttribute("aria-hidden");
       }
     } catch { /* ignore */ }
   }
@@ -1952,7 +2010,12 @@
     };
     parts.push(reasonLabels[reason] || ("Stopped: " + reason));
     if (typeof r.num_turns === "number") parts.push(r.num_turns + " turn" + (r.num_turns === 1 ? "" : "s"));
-    if (typeof r.total_cost_usd === "number") parts.push("$" + r.total_cost_usd.toFixed(4));
+    // Only attach a dollar figure when the server marked the turn as billed
+    // (API-key slot). Subscription slots get a synthetic SDK cost that
+    // doesn't match the actual bill, so we omit it rather than mislead.
+    if (r.cost_is_billed && typeof r.total_cost_usd === "number") {
+      parts.push(formatCost(r.total_cost_usd));
+    }
     if (r.is_error) parts.unshift("Error");
     return parts.join(" · ");
   }
@@ -2213,9 +2276,9 @@
   function renderUsage(data) {
     const t = data.today || {};
     const rl = data.rate_limit && data.rate_limit.info ? data.rate_limit.info : null;
+    const showCost = !!t.has_billed_usage;
 
     const fmt = new Intl.NumberFormat();
-    const cost = (n) => "$" + (n || 0).toFixed(4);
 
     let html = "";
 
@@ -2233,23 +2296,29 @@
     }
 
     html += `<h3 class="usage-section">Today</h3>`;
+    const costCell = showCost ? `<span><strong>${formatCost(t.cost_usd)}</strong></span>` : "";
     html += `<div class="summary">
       <span><strong>${t.turns || 0}</strong> turns</span>
-      <span><strong>${cost(t.cost_usd)}</strong></span>
+      ${costCell}
       <span>${fmt.format(t.input_tokens || 0)} in</span>
       <span>${fmt.format(t.output_tokens || 0)} out</span>
     </div>`;
 
     if (t.sessions && t.sessions.length) {
-      html += `<table><thead><tr><th>Session</th><th>Turns</th><th>Cost</th></tr></thead><tbody>`;
+      const costHeader = showCost ? "<th>Cost</th>" : "";
+      html += `<table><thead><tr><th>Session</th><th>Turns</th>${costHeader}</tr></thead><tbody>`;
       for (const s of t.sessions) {
-        html += `<tr><td>${htmlEscape(s.title)}</td><td>${s.turns}</td><td>${cost(s.cost_usd)}</td></tr>`;
+        const costRow = showCost ? `<td>${s.billed_turns > 0 ? formatCost(s.cost_usd) : "—"}</td>` : "";
+        html += `<tr><td>${htmlEscape(s.title)}</td><td>${s.turns}</td>${costRow}</tr>`;
       }
       html += `</tbody></table>`;
     } else {
       html += `<p class="usage-empty">No turns recorded yet today.</p>`;
     }
 
+    if (!showCost && (t.turns || 0) > 0) {
+      html += `<p class="usage-note">Costs are hidden because today's turns ran on subscription credentials — Anthropic bills you the flat plan rate, not per-token. Switch to an API-key slot to see real per-turn costs.</p>`;
+    }
     html += `<p class="usage-note">Anthropic doesn't expose plan-level capacity via API. "Today" is what this app has logged since it started.</p>`;
     usageBody.innerHTML = html;
   }
