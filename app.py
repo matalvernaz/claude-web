@@ -617,8 +617,14 @@ def _is_user_visible(text: str) -> bool:
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict]:
+    # encoding="utf-8" is load-bearing on Windows: Python's text-mode
+    # default is the system codepage (cp1252 in en-US locales), and
+    # transcript JSONL files routinely contain non-ASCII bytes the CLI
+    # wrote as UTF-8 (curly quotes, em-dashes, emoji, non-Latin chat
+    # content). Without the explicit encoding, GET / 500s on the very
+    # first session that mentions an em-dash.
     try:
-        with path.open() as f:
+        with path.open(encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     yield json.loads(line)
@@ -4029,7 +4035,7 @@ def _resolve_account_for_run(user: dict) -> dict:
                 # An API key in the per-credential home overrides the
                 # shared-slot ANTHROPIC_API_KEY for this run.
                 try:
-                    key = (home / ".anthropic_api_key").read_text().strip()
+                    key = (home / ".anthropic_api_key").read_text(encoding="utf-8").strip()
                 except FileNotFoundError:
                     key = ""
                 if key:
@@ -5145,7 +5151,10 @@ async def api_commands(user: dict = Depends(auth.require_user)):
             description = ""
             try:
                 if desc_path.exists():
-                    with desc_path.open() as f:
+                    # Skill / command frontmatter is markdown; UTF-8 is the
+                    # only encoding the CLI writes. cp1252 default on
+                    # Windows raises on any non-ASCII description.
+                    with desc_path.open(encoding="utf-8", errors="replace") as f:
                         for _ in range(40):
                             line = f.readline()
                             if not line:
@@ -6936,7 +6945,7 @@ def _save_rate_limit(rli: dict) -> None:
     try:
         payload = json.dumps({"info": rli, "captured_at": int(time.time())})
         tmp = RATE_LIMIT_CACHE.with_suffix(RATE_LIMIT_CACHE.suffix + ".tmp")
-        tmp.write_text(payload)
+        tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, RATE_LIMIT_CACHE)
     except Exception:
         # Log so a permission/disk issue is debuggable, but don't propagate
@@ -6967,7 +6976,7 @@ def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = 
         "owner_sub": owner_sub,
     }
     try:
-        with USAGE_LOG.open("a") as f:
+        with USAGE_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
         log.exception("log_usage failed")
@@ -7052,7 +7061,7 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
     rate_limit = None
     try:
         if RATE_LIMIT_CACHE.exists():
-            rate_limit = json.loads(RATE_LIMIT_CACHE.read_text())
+            rate_limit = json.loads(RATE_LIMIT_CACHE.read_text(encoding="utf-8"))
     except Exception:
         rate_limit = None
 

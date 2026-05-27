@@ -153,6 +153,41 @@ def test_session_title_rejects_traversal() -> None:
     assert app_module.session_title("../etc/shadow") is None
 
 
+# ─── transcript UTF-8 robustness (Windows cp1252 default trap) ─────────
+
+
+def test_iter_jsonl_reads_non_ascii_utf8(tmp_path) -> None:
+    """A JSONL line with non-ASCII bytes (em-dash, curly quote, emoji)
+    must decode under the helper. Python on Windows defaults text-mode
+    open() to the system codepage (cp1252 in en-US), which raises on
+    any UTF-8 byte > 0x7f that doesn't map to a cp1252 character — the
+    exact 500 the bundled CLI's transcripts trigger. The fix pins
+    encoding="utf-8" on every text-mode open in app.py."""
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "user", "message": {"content": [{"type": "text", "text": "hello — world"}]}},
+        {"type": "ai-title", "aiTitle": "“Snorkack” tracking session \U0001F438"},
+    ]
+    payload = "\n".join(__import__("json").dumps(r) for r in rows) + "\n"
+    # Write the bytes ourselves to control the on-disk encoding.
+    path.write_bytes(payload.encode("utf-8"))
+    out = list(app_module._iter_jsonl(path))
+    assert out == rows
+
+
+def test_session_title_from_utf8_transcript(tmp_path) -> None:
+    """End-to-end: session_title_from must surface the ai-title even
+    when its value contains non-ASCII characters. Regression for the
+    cp1252 GET / 500 reported from a Windows install."""
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "ai-title", "aiTitle": "Wrackspurts in the cache — fix"},
+    ]
+    payload = "\n".join(__import__("json").dumps(r) for r in rows) + "\n"
+    path.write_bytes(payload.encode("utf-8"))
+    assert app_module.session_title_from(path) == "Wrackspurts in the cache — fix"
+
+
 # ─── _ensure_credential_home symlink-attack hardening ──────────────────────
 
 def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypatch) -> None:

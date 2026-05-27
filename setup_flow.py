@@ -101,7 +101,7 @@ def load_api_key_into_env() -> Optional[str]:
         return os.environ["ANTHROPIC_API_KEY"]
     for candidate in (api_key_path(CLAUDE_HOME), API_KEY_FILE):
         try:
-            key = candidate.read_text().strip()
+            key = candidate.read_text(encoding="utf-8").strip()
         except FileNotFoundError:
             continue
         if key:
@@ -136,7 +136,7 @@ def whoami(home: Optional[Path] = None) -> dict:
     if not cred.exists():
         return {"mode": "none"}
     try:
-        data = json.loads(cred.read_text())
+        data = json.loads(cred.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"mode": "oauth"}
     oauth = data.get("claudeAiOauth") or {}
