@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -125,27 +126,62 @@ def whoami(home: Optional[Path] = None) -> dict:
     }
 
 
+# Anthropic API keys start with ``sk-ant-`` followed by ~90 chars of
+# url-safe alphabet (``[A-Za-z0-9_-]``). Accept a generous suffix length
+# so future format changes don't reject still-valid keys at the boundary,
+# but catch obvious paste mistakes (whole bash export line, junk text)
+# before they hit the SDK and surface as an opaque 401 to the user.
+_API_KEY_RE = re.compile(r"^sk-ant-[A-Za-z0-9_-]{20,}$")
+
+
+def _atomic_write_secret(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` at mode 0o600 atomically.
+
+    Creates a sibling temp file with O_CREAT|O_EXCL|0o600 so the bytes
+    are never observable at the process umask, then ``os.replace`` to
+    the target. Replaces ``path.write_text`` + ``path.chmod(0o600)``,
+    which leaves the file at the default umask between those two calls
+    — a real window for another local user to read a freshly-written
+    API key on a shared host.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    tmp = Path(tmp_name)
+    try:
+        # mkstemp gives 0o600 by default on POSIX; the explicit chmod is
+        # defense-in-depth in case a future libc changes that or someone
+        # ports this to a platform where mkstemp's default is laxer.
+        os.chmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as outf:
+            outf.write(content)
+            outf.flush()
+            os.fsync(outf.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def save_api_key(key: str, home: Optional[Path] = None) -> None:
     key = (key or "").strip()
     if not key:
         raise ValueError("api key is empty")
+    if not _API_KEY_RE.fullmatch(key):
+        raise ValueError(
+            "api key doesn't match the expected sk-ant-* format. "
+            "Paste only the key, not a whole `export ANTHROPIC_API_KEY=...` line."
+        )
     target_home = home or CLAUDE_HOME
-    target_home.mkdir(parents=True, exist_ok=True)
-    path = api_key_path(target_home)
-    path.write_text(key)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    _atomic_write_secret(api_key_path(target_home), key)
     # Only the shared slot feeds the process-wide env var; per-user keys
     # are pulled into the spawned CLI's env on demand.
     if home is None:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        API_KEY_FILE.write_text(key)
-        try:
-            API_KEY_FILE.chmod(0o600)
-        except OSError:
-            pass
+        _atomic_write_secret(API_KEY_FILE, key)
         os.environ["ANTHROPIC_API_KEY"] = key
 
 

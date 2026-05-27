@@ -42,6 +42,21 @@ def _split_csv(value: str) -> set[str]:
 
 ALLOWED_EMAILS = _split_csv(os.getenv("OIDC_ALLOWED_EMAILS", ""))
 ALLOWED_GROUPS = _split_csv(os.getenv("OIDC_ALLOWED_GROUPS", ""))
+# How to combine the two allowlists when both are set:
+#   "all" (default) — user must pass *every* configured list (fail-closed).
+#                     Pick this when each list is an independent dimension of
+#                     authorisation, e.g. "@company.com email" AND "in the
+#                     claude-admins group".
+#   "any"           — user passes if *any* configured list matches (fail-open
+#                     across the lists). Pick this when the lists are
+#                     interchangeable identifiers for the same group of
+#                     people, e.g. "admin email" OR "engineers group".
+# When only one list is set, the mode is irrelevant — that single list gates.
+ALLOWLIST_MODE = os.getenv("OIDC_ALLOWLIST_MODE", "all").strip().lower()
+if ALLOWLIST_MODE not in ("all", "any"):
+    raise RuntimeError(
+        f"OIDC_ALLOWLIST_MODE must be 'all' or 'any'; got {ALLOWLIST_MODE!r}"
+    )
 
 
 def safe_next(value: Optional[str]) -> str:
@@ -130,14 +145,28 @@ def configure(app) -> None:
 
 
 def _user_allowed(user: dict) -> bool:
+    """Apply the configured email/group allowlists.
+
+    In ``ALLOWLIST_MODE=all`` (default) the user must pass every
+    *configured* list (each list that is set must match; unset lists
+    are skipped). In ``ALLOWLIST_MODE=any`` at least one configured
+    list must match. With neither list set, every authenticated user
+    is allowed.
+    """
+    if not ALLOWED_EMAILS and not ALLOWED_GROUPS:
+        return True
+    email_ok: Optional[bool] = None
     if ALLOWED_EMAILS:
-        if (user.get("email") or "").lower() not in {e.lower() for e in ALLOWED_EMAILS}:
-            return False
+        email_ok = (user.get("email") or "").lower() in {
+            e.lower() for e in ALLOWED_EMAILS
+        }
+    groups_ok: Optional[bool] = None
     if ALLOWED_GROUPS:
-        groups = set(user.get("groups") or [])
-        if not (groups & ALLOWED_GROUPS):
-            return False
-    return True
+        groups_ok = bool(set(user.get("groups") or []) & ALLOWED_GROUPS)
+    checks = [r for r in (email_ok, groups_ok) if r is not None]
+    if ALLOWLIST_MODE == "any":
+        return any(checks)
+    return all(checks)
 
 
 def current_user(request: Request) -> Optional[dict]:

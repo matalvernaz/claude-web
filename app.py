@@ -15,6 +15,7 @@ import base64
 import concurrent.futures as cf_futures
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +61,34 @@ import auth
 import setup_flow
 
 log = logging.getLogger("claude-web")
+
+
+def _configure_app_logging() -> None:
+    """Attach a stream handler to the ``claude-web`` logger if none is present.
+
+    Uvicorn configures its own ``uvicorn.*`` loggers but doesn't touch ours,
+    so without this every app-level INFO record (CSRF rejections, personality
+    respawns, permission decisions, etc.) is dropped on the floor. Setting
+    ``propagate = False`` keeps these out of uvicorn's access-log stream.
+    Idempotent: returns immediately if a handler is already attached, so a
+    second import or an operator dictConfig wins.
+    """
+    if log.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(name)s %(levelname)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
+    log.addHandler(handler)
+    level_name = os.getenv("CLAUDE_WEB_LOG_LEVEL", "INFO").upper()
+    log.setLevel(getattr(logging, level_name, logging.INFO))
+    log.propagate = False
+
+
+_configure_app_logging()
 
 # Optional dependency: the ``roundtable`` package (multi-AI threaded debates)
 # is installed as an editable dependency when the operator wants the
@@ -228,6 +257,12 @@ ALLOWED_IMAGE_MEDIA_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp
 # Anthropic API can't take arbitrary binary blobs as content blocks anyway.
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_FILES_PER_TURN = 10
+# Cap the plain-text body of a chat turn. Without this, an authenticated
+# user posting a 100 MB string would be accepted by Form(...) parsing, fed
+# into the SDK, and either crash the worker or burn the operator's API
+# spend at the first /v1/messages call. 1 MiB is generous for legitimate
+# prose + pasted-stacktrace use while keeping the worst-case bounded.
+MAX_MESSAGE_BYTES = int(os.getenv("CLAUDE_WEB_MAX_MESSAGE_BYTES", str(1 * 1024 * 1024)))
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Models exposed in the UI dropdown. The form sends `key`; the server maps
@@ -3788,12 +3823,37 @@ def _persona_body_with_directive(personality: dict) -> str:
     return PERSONA_HISTORY_RESET_DIRECTIVE + body
 
 
-def _safe_sub(user_sub: str) -> str:
-    """Sanitise an OIDC subject for use as a directory name. Subs are
-    typically opaque UUIDs but we don't trust the IdP to keep them out of
-    `/` / `..` territory."""
+def _safe_sub_legacy(user_sub: str) -> str:
+    """The pre-migration ``_safe_sub`` (strip + truncate to 64 chars).
+
+    Kept for the one-shot startup migration that renames legacy
+    PERSONAL_HOMES_DIR entries to the new collision-free hash names.
+    Once that migration has run for the last existing user, this is
+    only reached via `_personal_homes_legacy_dir` for log diagnostics.
+    """
     sanitised = re.sub(r"[^A-Za-z0-9_-]", "_", user_sub or "")[:64]
     return sanitised or "anonymous"
+
+
+def _safe_sub(user_sub: str) -> str:
+    """Injective per-OIDC-sub directory name.
+
+    The previous trim-and-truncate scheme could collide silently: two
+    distinct subs that shared the same first 64 sanitised characters
+    resolved to the same `PERSONAL_HOMES_DIR/<safe_sub>/` directory,
+    so their `cred:<id>` slots could potentially expose each other's
+    `.credentials.json`. A SHA-256-based directory name is collision-
+    free for any realistic adversary and stable across restarts; the
+    sub itself never leaves the request handler.
+
+    The empty/missing-sub case maps to `"anonymous"` instead of a hash
+    so AUTH_MODE=none single-user deployments keep a stable, readable
+    directory name.
+    """
+    if not user_sub:
+        return "anonymous"
+    digest = hashlib.sha256(user_sub.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
 def _credential_home_path(user_sub: str, cred_id: int) -> Path:
@@ -3856,6 +3916,28 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     return home
 
 
+_IDENTITY_ENV_MAX = 200
+
+
+def _sanitize_identity_value(value: Optional[str]) -> str:
+    """Strip NUL/CR/LF + cap length on an OIDC claim before it lands in env.
+
+    Most IdPs let users edit their own display name and email; a user
+    could put `\\n` or NUL bytes in either, and a hook script that
+    interpolates the resulting env var into a shell command would
+    misbehave. claude-web doesn't shell out with these values itself,
+    but every spawned CLI inherits them — sanitising at the boundary
+    keeps the hook-author surface area honest.
+    """
+    if not value:
+        return ""
+    # Drop NUL outright (would terminate the env string in C-land) and
+    # control chars (CR/LF break a hook's eval; tabs are harmless but
+    # easier to forbid wholesale than enumerate).
+    cleaned = "".join(c for c in value if c >= " " and c != "\x7f")
+    return cleaned[:_IDENTITY_ENV_MAX]
+
+
 def _identity_env_for(user: dict) -> dict[str, str]:
     """Identity vars surfaced to every spawned CLI so hooks/personalities can
     address the signed-in user by name. Empty strings are emitted (rather than
@@ -3864,9 +3946,9 @@ def _identity_env_for(user: dict) -> dict[str, str]:
     """
     u = user or {}
     return {
-        "CLAUDE_WEB_USER_SUB": u.get("sub") or "",
-        "CLAUDE_WEB_USER_EMAIL": u.get("email") or "",
-        "CLAUDE_WEB_USER_NAME": u.get("name") or "",
+        "CLAUDE_WEB_USER_SUB": _sanitize_identity_value(u.get("sub")),
+        "CLAUDE_WEB_USER_EMAIL": _sanitize_identity_value(u.get("email")),
+        "CLAUDE_WEB_USER_NAME": _sanitize_identity_value(u.get("name")),
     }
 
 
@@ -5694,6 +5776,12 @@ async def api_chat(
             {"error": "claude_not_configured", "setup_url": "/setup"},
             status_code=503,
         )
+    if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        raise HTTPException(
+            413,
+            f"message too large (> {MAX_MESSAGE_BYTES} bytes). "
+            f"Split into multiple turns or attach as a file.",
+        )
     _gc_runs()
 
     # Validate any provided session_id: it ends up as `resume=<id>` on the
@@ -6536,6 +6624,12 @@ async def api_chat_send(
     /api/chat, which respawns under the current state.
     """
     _safe_id(run_id)
+    if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        raise HTTPException(
+            413,
+            f"message too large (> {MAX_MESSAGE_BYTES} bytes). "
+            f"Split into multiple turns or attach as a file.",
+        )
     run = ACTIVE_RUNS.get(run_id)
     if run is None or run.done:
         raise HTTPException(404, "no such run")
@@ -7105,6 +7199,133 @@ def _roundtable_get_project(thread_id: int) -> Optional[str]:
     return row[0] if row else None
 
 
+def _roundtable_thread_owner(thread_id: int) -> Optional[str]:
+    """Return the OIDC sub that bound this thread to a project, or None
+    if the thread is unbound (no row) or was bound before owner tracking
+    landed (row exists with ``created_by IS NULL``)."""
+    row = _state_db().execute(
+        "SELECT created_by FROM roundtable_thread_project WHERE thread_id = ?",
+        (int(thread_id),),
+    ).fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def _is_roundtable_admin(user: dict) -> bool:
+    """Admin gate for the patch-apply path: an empty ``ADMIN_EMAILS`` means
+    no admin override (single-user homelab); explicit membership otherwise.
+    """
+    if not ADMIN_EMAILS:
+        return False
+    email = (user.get("email") or "").lower()
+    return email in ADMIN_EMAILS
+
+
+# ─── roundtable rate limiting ──────────────────────────────────────────────
+#
+# Token bucket per OIDC sub. Each panel-side AI call burns one token; an
+# ``ask_parallel`` with N participants burns N. The assistant route adds one
+# extra for the synthesiser turn. Single-worker enforcement means an
+# in-process dict is enough; multi-worker deployments would need redis.
+
+_ROUNDTABLE_RATE_CAPACITY = int(os.getenv(
+    "CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY", "60",
+))
+_ROUNDTABLE_RATE_REFILL_PER_SEC = float(os.getenv(
+    "CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC", "1.0",
+))
+_roundtable_buckets: dict[str, tuple[float, float]] = {}
+
+
+def _roundtable_rate_limit_check(user: dict, *, weight: int = 1) -> None:
+    """Consume ``weight`` tokens from the caller's bucket, or 429.
+
+    Single-worker enforcement (see ``_enforce_single_worker``) plus
+    asyncio's cooperative scheduling makes the read-modify-write below
+    safe without an explicit lock: there's no ``await`` between the
+    bucket read and the write-back, so no other task can interleave.
+    Multi-worker deployments would need a shared store (redis or the
+    sqlite ``state.db``) for this to be correct.
+
+    Raises HTTPException 429 with a ``Retry-After`` header if the
+    bucket can't cover the request. Anonymous (AUTH_MODE=none) callers
+    all share the same bucket — fine for the single-user homelab case
+    that mode targets.
+    """
+    sub = (user.get("sub") if user else None) or "anonymous"
+    now = time.monotonic()
+    tokens, last = _roundtable_buckets.get(sub, (_ROUNDTABLE_RATE_CAPACITY, now))
+    tokens = min(
+        float(_ROUNDTABLE_RATE_CAPACITY),
+        tokens + (now - last) * _ROUNDTABLE_RATE_REFILL_PER_SEC,
+    )
+    if tokens < weight:
+        # How long until enough tokens accrue.
+        needed = weight - tokens
+        retry_after = max(1, int(needed / _ROUNDTABLE_RATE_REFILL_PER_SEC) + 1)
+        _roundtable_buckets[sub] = (tokens, now)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"roundtable rate limit exceeded; retry after "
+                f"~{retry_after}s (capacity={_ROUNDTABLE_RATE_CAPACITY}, "
+                f"refill={_ROUNDTABLE_RATE_REFILL_PER_SEC}/s)"
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+    _roundtable_buckets[sub] = (tokens - weight, now)
+
+
+def _require_roundtable_thread_access(
+    thread_id: int, user: dict, *, for_apply: bool = False,
+) -> None:
+    """Enforce per-thread authorization on roundtable routes.
+
+    Policy:
+      * Threads with a recorded ``created_by`` — only the creator (or a
+        configured admin) may read or mutate. Returns HTTPException 404
+        on mismatch (mimic-not-found so we don't leak thread existence).
+      * Bound threads with ``created_by IS NULL`` (pre-tracking rows) —
+        any authenticated user may read/post. For the patch-apply path
+        we still require the row to be NOT NULL: a legacy bound thread
+        of unknown provenance shouldn't grant write access to the bound
+        project, and the user can simply re-bind via /threads to claim
+        ownership.
+      * Unbound threads (no row at all) — any authenticated user may
+        read/post (preserves MCP/CLI interop). Apply is **refused**:
+        without a binding there's no scope of authority for a diff.
+
+    Reasons it's a 404 rather than 403: thread ids are dense integers,
+    so probing for existence is feasible. Returning the same shape on
+    "doesn't exist" and "not yours" avoids the disclosure.
+    """
+    owner = _roundtable_thread_owner(thread_id)
+    project_key = _roundtable_get_project(thread_id)
+    if for_apply:
+        # Patch-apply must always target a bound project with a known
+        # owner; otherwise we'd be letting any signed-in user mutate
+        # files in *some* configured project root from a thread they
+        # may not have created.
+        if project_key is None:
+            raise HTTPException(
+                400,
+                "Cannot apply a patch from an unbound thread. Bind the "
+                "thread to a project (and claim it) first.",
+            )
+        if not owner:
+            raise HTTPException(
+                400,
+                "This thread predates ownership tracking. Re-bind it to "
+                "a project under your own account before applying patches.",
+            )
+        if owner != user.get("sub") and not _is_roundtable_admin(user):
+            raise HTTPException(404, f"No such thread: {thread_id}")
+        return
+    if owner and owner != user.get("sub") and not _is_roundtable_admin(user):
+        raise HTTPException(404, f"No such thread: {thread_id}")
+
+
 def _roundtable_threads_for_project(project_key: str) -> set[int]:
     """All thread ids bound to a given project."""
     rows = _state_db().execute(
@@ -7227,6 +7448,22 @@ async def api_roundtable_threads(
         int(t["thread_id"]): _roundtable_get_project(int(t["thread_id"]))
         for t in threads
     }
+    # Hide threads owned by other users. A bound thread with a non-NULL
+    # ``created_by`` is private to the owner (and any configured admin);
+    # unbound threads and legacy bound rows with NULL ``created_by`` stay
+    # visible to everyone (MCP / pre-tracking interop). Mirrors the
+    # 404-not-403 stance of `_require_roundtable_thread_access` so a user
+    # can't enumerate thread ownership by listing.
+    sub = user.get("sub")
+    admin = _is_roundtable_admin(user)
+    owner_map: dict[int, Optional[str]] = {
+        int(t["thread_id"]): _roundtable_thread_owner(int(t["thread_id"]))
+        for t in threads
+    }
+    threads = [
+        t for t in threads
+        if owner_map[int(t["thread_id"])] in (None, sub) or admin
+    ]
     if project:
         if project == "__unbound__":
             threads = [t for t in threads if bound_map[int(t["thread_id"])] is None]
@@ -7294,6 +7531,7 @@ async def api_roundtable_thread_detail(
     workflow this app is designed around.
     """
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
     # _thread_row + _thread_messages are private library helpers; we use
     # them here because roundtable_history returns a pre-rendered string
     # that's lossy for structured UI. If/when the library grows a public
@@ -7341,6 +7579,7 @@ async def api_roundtable_post(
     ``"orchestrator"``; reserved AI labels are blocked by the core layer.
     """
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
     body = await request.json()
     content = body.get("content") or ""
     if not content.strip():
@@ -7371,6 +7610,8 @@ async def api_roundtable_ask(
     "web_search": bool}``. Returns ``{"response": str}`` on success.
     """
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
+    _roundtable_rate_limit_check(user, weight=1)
     body = await request.json()
     participant = (body.get("participant") or "").strip()
     if not participant:
@@ -7407,10 +7648,14 @@ async def api_roundtable_ask_parallel(
     ``{"responses": {name: text}, "errors": {name: "Type: msg"}}``.
     """
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
     body = await request.json()
     participants = body.get("participants") or []
     if not participants or not isinstance(participants, list):
         raise HTTPException(400, "participants must be a non-empty list")
+    # Rate limit weighted by the number of participants — a 5-way parallel
+    # ask burns five external model calls, not one.
+    _roundtable_rate_limit_check(user, weight=len(participants))
     prompt = body.get("prompt") or ""
     effort = (body.get("effort") or "").strip()
     web_search = bool(body.get("web_search"))
@@ -7452,6 +7697,7 @@ async def api_roundtable_attach(
     file's basename so participants see a sensible identifier.
     """
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
     body = await request.json()
     raw_path = (body.get("path") or "").strip()
     if not raw_path:
@@ -7487,11 +7733,18 @@ async def api_roundtable_attach(
                 f"({project_key}).",
             ) from exc
     else:
-        allowed_roots = [p.resolve() for p in _configured_projects()]
-        inside_any = any(
-            str(candidate).startswith(str(r) + os.sep) or candidate == r
-            for r in allowed_roots
-        )
+        # Use ``relative_to`` rather than string-prefix matching so a
+        # future refactor that adds a project root sharing a prefix
+        # with an existing one (e.g. ``/srv/foo`` and ``/srv/foo-bar``)
+        # can't accidentally accept a path under the wrong root.
+        inside_any = False
+        for root in _configured_projects():
+            try:
+                candidate.relative_to(root.resolve())
+                inside_any = True
+                break
+            except ValueError:
+                continue
         if not inside_any:
             raise HTTPException(
                 400,
@@ -7543,6 +7796,7 @@ async def api_roundtable_close(
 ):
     """Soft-close a thread. History stays queryable; ask/post refuse."""
     rt = _require_roundtable()
+    _require_roundtable_thread_access(thread_id, user)
     try:
         result = await asyncio.to_thread(rt.roundtable_close, thread_id=thread_id)
     except ValueError as exc:
@@ -7818,13 +8072,21 @@ async def api_roundtable_assistant(
     prompt_str = (prompt or "").strip()
     if not prompt_str:
         raise HTTPException(400, "prompt is required")
-
+    if thread_id is not None:
+        # Continuing an existing thread — must own it. A new thread
+        # (thread_id None) gets created later in the generator and is
+        # owned by the caller from the moment of creation.
+        _require_roundtable_thread_access(thread_id, user)
     # Resolve participants up front so we can fail fast (HTTPException)
     # before opening the SSE response — easier to debug than an SSE
     # error frame.
     panel_keys_in = [
         p.strip() for p in (participants_csv or "").split(",") if p.strip()
     ] or list(_ASSISTANT_DEFAULT_PANEL)
+    # Token-bucket the panel + synth fan-out: 1 unit per panellist + 1
+    # for the synthesiser. Failing fast here is cleaner than refusing
+    # inside the SSE stream.
+    _roundtable_rate_limit_check(user, weight=max(1, len(panel_keys_in) + 1))
     panel: list[str] = []
     panel_unavailable: list[str] = []
     for key in panel_keys_in:
@@ -8133,32 +8395,28 @@ async def api_roundtable_apply(
         raise HTTPException(400, "diff body is required")
     if target.startswith("/") or ".." in Path(target).parts:
         raise HTTPException(400, "target path must be relative and inside a configured project")
+    # Patch-apply is the highest-impact roundtable route: a missing
+    # ownership check here lets any signed-in user rewrite files in
+    # another user's bound project, then ride that user's next build /
+    # test cycle to RCE. Demand a bound thread with a known owner and
+    # refuse unbound threads outright.
+    _require_roundtable_thread_access(thread_id, user, for_apply=True)
 
-    # Resolve target to an absolute path. Bound thread = restrict to its
-    # project; unbound = allow inside any configured project root.
+    # Resolve target to an absolute path inside the thread's bound
+    # project. ``_require_roundtable_thread_access(..., for_apply=True)``
+    # already refused unbound threads above, so ``project_key`` is
+    # guaranteed non-None here.
     project_key = _roundtable_get_project(thread_id)
-    if project_key:
-        project_root = _resolve_project_path(project_key)
-        candidate = (project_root / target).resolve()
-        try:
-            candidate.relative_to(project_root.resolve())
-        except ValueError as exc:
-            raise HTTPException(
-                400,
-                f"target {target!r} is outside the bound project ({project_key}).",
-            ) from exc
-    else:
-        candidate = Path(target).expanduser().resolve()
-        allowed_roots = [p.resolve() for p in _configured_projects()]
-        inside = any(
-            str(candidate).startswith(str(r) + os.sep) or candidate == r
-            for r in allowed_roots
-        )
-        if not inside:
-            raise HTTPException(
-                400,
-                "target path is outside every configured project root.",
-            )
+    assert project_key is not None  # guaranteed by access check above
+    project_root = _resolve_project_path(project_key)
+    candidate = (project_root / target).resolve()
+    try:
+        candidate.relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            f"target {target!r} is outside the bound project ({project_key}).",
+        ) from exc
 
     if not candidate.is_file():
         raise HTTPException(404, f"target file does not exist: {target}")
@@ -8271,4 +8529,65 @@ def _startup_init_state_db() -> None:
         log.warning("startup: _state_db init failed: %s", e)
 
 
+def _startup_migrate_personal_homes() -> None:
+    """Rename legacy ``_safe_sub``-named per-user homes to the new hash names.
+
+    Walks every distinct ``user_credential.user_sub``. For each, computes
+    the legacy directory name (the pre-hash naming, kept in
+    `_safe_sub_legacy`) and the new hash name; if the legacy path exists,
+    the new one doesn't, and the legacy path is a real directory (not a
+    symlink), renames in place. Logs every action so an operator can see
+    the migration land in the journal.
+
+    Idempotent: subsequent boots are no-ops once every user has been
+    migrated. Best-effort: any single failure is logged and skipped so
+    one stuck dir doesn't block the rest.
+    """
+    if not PERSONAL_HOMES_DIR.exists():
+        return
+    try:
+        rows = _state_db().execute(
+            "SELECT DISTINCT user_sub FROM user_credential"
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.warning("startup: personal-homes migration query failed: %s", e)
+        return
+    for (sub,) in rows:
+        if not sub:
+            continue
+        legacy = _safe_sub_legacy(sub)
+        new = _safe_sub(sub)
+        if legacy == new:
+            continue
+        legacy_path = PERSONAL_HOMES_DIR / legacy
+        new_path = PERSONAL_HOMES_DIR / new
+        if not legacy_path.exists():
+            continue
+        if legacy_path.is_symlink():
+            log.warning(
+                "personal-homes migration: refusing to follow symlink %s",
+                legacy_path,
+            )
+            continue
+        if new_path.exists():
+            log.warning(
+                "personal-homes migration: both %s and %s exist; leaving "
+                "legacy in place for operator review",
+                legacy_path, new_path,
+            )
+            continue
+        try:
+            legacy_path.rename(new_path)
+            log.info(
+                "personal-homes migration: renamed %s → %s",
+                legacy_path, new_path,
+            )
+        except OSError as e:
+            log.warning(
+                "personal-homes migration: rename %s → %s failed: %s",
+                legacy_path, new_path, e,
+            )
+
+
 _startup_init_state_db()
+_startup_migrate_personal_homes()

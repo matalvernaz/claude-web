@@ -33,7 +33,7 @@ Set `CLAUDE_WEB_PROJECT_DIRS=/a,/b,/c` to enable the project picker. Legacy sing
 
 Each OIDC user can register, label, sign in to, switch between, and delete their own Claude credentials at `/account`. The header dropdown lists their slots (shared + each named cred).
 
-- **Filesystem layout**: per-user `CLAUDE_CONFIG_DIR = $PERSONAL_HOMES_DIR/<safe_sub>/<id>/` — a symlink skeleton over the shared `CLAUDE_HOME` where **only `.credentials.json` is a real per-user file**. Projects, sessions, skills, settings stay shared, and the transcript jsonl is the same file regardless of slot. Mid-conversation slot toggles cancel + respawn the CLI with `--resume <session_id>` so the conversation picks up unbroken on the new credentials.
+- **Filesystem layout**: per-user `CLAUDE_CONFIG_DIR = $PERSONAL_HOMES_DIR/<safe_sub>/<id>/` — a symlink skeleton over the shared `CLAUDE_HOME` where **only `.credentials.json` is a real per-user file**. Projects, sessions, skills, settings stay shared, and the transcript jsonl is the same file regardless of slot. Mid-conversation slot toggles cancel + respawn the CLI with `--resume <session_id>` so the conversation picks up unbroken on the new credentials. `<safe_sub>` is `urlsafe_b64(sha256(sub))` — collision-free across distinct OIDC subjects. The previous "strip + truncate to 64 chars" naming could silently collide; a startup migration (`_startup_migrate_personal_homes`) renames legacy directories to the new hash names on first boot.
 - **Schema**:
   - `user_credential(id, user_sub, label, created_at)` with `UNIQUE(user_sub, label)`
   - `user_account.active` is a free string `'shared'` or `'cred:<id>'` (legacy `'personal'` rows migrate on startup).
@@ -131,6 +131,11 @@ SQLite at `$CLAUDE_WEB_STATE_DIR/state.db` (WAL mode) holds run metadata + event
 | `CLAUDE_WEB_PERMISSION_TIMEOUT` | 900 | seconds before an unanswered permission prompt auto-denies |
 | `CLAUDE_WEB_MAX_AUTO_FIRES` | 3 | cap on consecutive ScheduleWakeup auto-fires before requiring user input |
 | `CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE` | 1000 | SSE per-subscriber queue size before backpressure kicks in |
+| `CLAUDE_WEB_MAX_MESSAGE_BYTES` | 1048576 | max bytes for a single `/api/chat` or `/api/chat/send` text body (HTTP 413 above this) |
+| `CLAUDE_WEB_LOG_LEVEL` | `INFO` | log level for the `claude-web` application logger |
+| `CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY` | 60 | per-user roundtable bucket capacity (1 token = 1 panellist or synth call) |
+| `CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC` | 1.0 | roundtable token refill rate per user |
+| `OIDC_ALLOWLIST_MODE` | `all` | `all` (default; user must be in every configured email/group list) or `any` (one match is enough) |
 
 ### State / cost files (under `$CLAUDE_WEB_STATE_DIR`, default `~/.claude-web/`)
 
@@ -155,12 +160,16 @@ Optional editable dependency on the `roundtable` package — `pip install -e /ho
 
 - **Project binding**: `roundtable_thread_project(thread_id PK, project_key, created_by, created_at)` maps each thread to a `project_key` from `CLAUDE_WEB_PROJECT_DIRS`. Threads created outside claude-web (MCP) have no row and surface under an "Unbound" filter; the assistant view inherits the chat-side project picker for new threads.
 
+- **Ownership / authorization**: `_require_roundtable_thread_access(thread_id, user, *, for_apply=False)` gates every per-thread route (read, post, ask, ask_parallel, attach, close, apply). Policy: a bound thread with a non-NULL `created_by` is private to that OIDC sub and any operator in `CLAUDE_WEB_ADMIN_EMAILS`; bound threads with NULL `created_by` (legacy rows) and unbound threads (MCP / CLI created) stay readable+postable by any authenticated user to preserve interop. **Apply is stricter**: it refuses unbound threads outright and demands a non-NULL `created_by` matching the caller — without that gate, any signed-in user could rewrite files in another user's bound project and ride the next build/test for RCE. Cross-user access returns 404 (not 403) so thread ids aren't enumerable.
+
+- **Rate limiting**: per-OIDC-sub token bucket via `_roundtable_rate_limit_check(user, weight=…)`. `ask` consumes 1, `ask_parallel` consumes one per participant, the assistant route consumes `len(panel) + 1`. Bucket sizing is `CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY` / `CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC`. Refused requests return HTTP 429 with a `Retry-After` header.
+
 - **Streaming SSE** on `POST /api/roundtable/assistant`. Event order per turn: `created` → `attached` (per file) → `prompt_posted` → `panel_start` → `panel_done` (with per-panelist char counts) → `synth_start` → `done` (full payload incl. patches). The browser uses `fetch().body.getReader()` + a small SSE parser; aria-live announcements track each step for NVDA. Per-token streaming of the synth is a future improvement — would need streaming added to `roundtable.core`.
 
 - **Markdown rendering on synth turns**: `marked.min.js` + `purify.min.js` are loaded on the roundtable page. AI output goes through `marked.parse()` → `DOMPurify.sanitize()` before insertion. Falls back to plain `<pre>` if either lib is missing.
 
 - **Click-to-apply diff**: synth system prompt asks for unified diffs in ` ```diff <filename>` fences when fixes are warranted (only when a code artifact is attached AND the panel reached agreement). Server-side regex `_DIFF_FENCE_RE` parses fences out; `_extract_patches()` returns `[{target, diff}]`. Each detected patch gets an "Apply" button in the UI; click POSTs to `/api/roundtable/assistant/apply` with `{thread_id, target, diff}`.
-  - **Safety rails**: target must resolve inside the thread's bound project (or, for unbound threads, inside any configured project root); path traversal returns HTTP 400. `patch --dry-run` validates the hunks before any write; failure returns 422 with stderr tail. Original is saved alongside as `<target>.rt-orig` before apply. Tries `-p0` first, falls back to `-p1` for `a/foo b/foo`-style headers. Requires GNU `patch` on `PATH`.
+  - **Safety rails**: target must resolve inside the thread's bound project (unbound threads are refused outright by the ownership gate, see "Ownership / authorization" above). Path traversal returns HTTP 400. `patch --dry-run` validates the hunks before any write; failure returns 422 with stderr tail. Original is saved alongside as `<target>.rt-orig` before apply. Tries `-p0` first, falls back to `-p1` for `a/foo b/foo`-style headers. Requires GNU `patch` on `PATH`.
 
 - **Routes**: `/roundtable` (HTML); `GET /api/roundtable/threads` (list, filterable by `open_only` / `limit` / `project`, including `project=__unbound__`); `GET /api/roundtable/threads/{id}` (structured detail with `project_key`); `POST /api/roundtable/threads` (create, optional `project_key`); `POST /api/roundtable/threads/{id}/{post,ask,ask_parallel,artifact,close}` (manual driving); `POST /api/roundtable/assistant` (streaming); `POST /api/roundtable/assistant/apply`; `GET /api/roundtable/participants`. All gated by `auth.require_user`.
 
@@ -180,15 +189,6 @@ If the model has a `ScheduleWakeup` pending and the user queues a message while 
 
 This is a claude-web bug, not upstream Claude Code — the next-prompt picker after a turn ends needs to prefer a queued user message over a fired scheduled wakeup. Fix is most likely in the run-lifecycle / agent-loop code in `app.py` that decides what to feed the SDK next.
 
-### Per-conversation personality binding (design issue, not a crash)
-
-The personality picker is **per-user** (`user_personality(user_sub PK, personality_id)`), not per-conversation. Switching it in chat A immediately changes the active pick for every other chat that user owns; closing chat A doesn't reset anything because chat A's pick was never bound to its session.
-
-What you'd actually want: per-conversation binding so that new chats pick up your default, switching the picker in chat A doesn't bleed into chat B, and reopening a closed chat restores its last personality. Fix sketch: new table `session_personality(session_id PK, personality_id, updated_at)`, picker reads/writes that on the current session, the user-level `user_personality` row stays as the seed for new-chat defaults, page-load JS reads from `session_personality` to populate the picker per-chat. ~30 lines, unsplit between `app.py` and `static/app.js`.
-
-### Application-level logs don't reach `journalctl`
-
-The `claude-web` logger (`logging.getLogger("claude-web")`) has no handler attached — uvicorn captures stdout for access logs but the application logger drops its records on the floor. So lines like `personality-swap cancel run=…` and `perm decision=…` exist in the code but never reach the journal, making in-prod debugging surprising. Fix is a one-liner `logging.basicConfig(level=logging.INFO, format=…)` near the top of `app.py` (or a proper `dictConfig` in `setup_flow.py`). Until then, debugging in-prod state often requires inspecting `ps`, the SQLite store, or the file system rather than the log stream.
 
 ## Local dev / CI
 
