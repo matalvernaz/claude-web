@@ -56,8 +56,17 @@ for pkg in ("claude_agent_sdk", "anthropic", "google.genai", "openai", "mcp"):
 datas += [
     ("templates", "templates"),
     ("static", "static"),
-    ("roundtable", "roundtable"),
 ]
+
+# Roundtable is an OPTIONAL editable dependency that lives outside the
+# repo; the directory exists in some development checkouts but is not
+# committed. Include it when it's there so a local build is feature-
+# complete, omit it otherwise — app.py's `from roundtable import ...`
+# is wrapped in try/except and the /roundtable route renders a "not
+# installed" panel when missing.
+import os
+if os.path.isdir("roundtable"):
+    datas.append(("roundtable", "roundtable"))
 
 
 a = Analysis(
