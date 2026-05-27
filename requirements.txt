@@ -6,3 +6,11 @@ python-multipart>=0.0.20
 authlib>=1.3
 itsdangerous>=2.2
 httpx>=0.27
+
+# Roundtable multi-AI debate package (vendored under ./roundtable/).
+# API keys are read from env at runtime (GEMINI_API_KEY, OPENAI_API_KEY,
+# ANTHROPIC_API_KEY) and are NEVER committed to source.
+anthropic>=0.39
+google-genai>=0.5
+openai>=1.50
+mcp>=1.0

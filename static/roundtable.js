@@ -141,8 +141,100 @@
       loadThreads();
     } else {
       announce("Switched to assistant view: ask the panel directly.");
+      // If the user picked a different thread in advanced view, the
+      // assistant view should pick it up — otherwise the next "Ask the
+      // panel" silently continues whatever thread the assistant view
+      // was last on, which is confusing. Empty currentThreadId (advanced
+      // view never selected anything) → no adoption; identical id →
+      // nothing to do.
+      if (currentThreadId != null && currentThreadId !== assistantThreadId) {
+        adoptAdvancedThread(currentThreadId);
+      }
     }
   });
+
+  // Pull a thread's history into the assistant view as user + synth
+  // pairs. The full panel debate isn't replayed (that's what the
+  // advanced view is for) — assistant mode is a chat abstraction over
+  // user-prompt → synthesised-response, so the replay matches that
+  // shape. Threads created outside the assistant flow (e.g. via MCP)
+  // may not have any synth-labelled turns; in that case the user
+  // prompts are still rendered but without a paired assistant reply.
+  async function adoptAdvancedThread(threadId) {
+    let payload;
+    try {
+      payload = await jsonFetch(`/api/roundtable/threads/${threadId}`);
+    } catch (err) {
+      asstError.textContent = `Could not load thread ${threadId}: ${err.message}`;
+      asstError.hidden = false;
+      announce(`Could not load thread ${threadId}: ${err.message}`);
+      return;
+    }
+    assistantThreadId = threadId;
+    // Clear any prior assistant history before redrawing — we're now
+    // showing a different conversation.
+    while (asstHistory.firstChild !== asstEmpty) {
+      asstHistory.removeChild(asstHistory.firstChild);
+    }
+    asstEmpty.hidden = true;
+
+    const messages = payload.messages || [];
+    const participantLabels = new Set((PARTICIPANTS || []).map(p => p.label));
+    const isUserSpeaker = sp => sp !== "orchestrator" && !participantLabels.has(sp);
+    const isParticipant = sp => participantLabels.has(sp);
+
+    // Walk: for each user turn, the last participant turn before the
+    // next user turn is the synthesis. Panel turns between them are
+    // intentionally skipped — the debate expander lives in the live
+    // flow only (we don't have panel/error metadata after the fact).
+    let i = 0;
+    let rendered = 0;
+    while (i < messages.length) {
+      const m = messages[i];
+      if (!isUserSpeaker(m.speaker)) { i++; continue; }
+      let j = i + 1;
+      while (j < messages.length && !isUserSpeaker(messages[j].speaker)) j++;
+      let synthIdx = -1;
+      for (let k = i + 1; k < j; k++) {
+        if (isParticipant(messages[k].speaker)) synthIdx = k;
+      }
+      appendUserTurn(m.content, []);
+      if (synthIdx >= 0) {
+        renderReplayedSynthTurn(messages[synthIdx]);
+      }
+      rendered++;
+      i = j;
+    }
+
+    if (rendered === 0) {
+      asstEmpty.hidden = false;
+      announce(`Continuing thread ${threadId}: ${payload.thread.topic}. No prior user turns to replay.`);
+    } else {
+      announce(`Continuing thread ${threadId}: ${payload.thread.topic}. ${rendered} prior turn${rendered === 1 ? "" : "s"} replayed.`);
+    }
+  }
+
+  // Render a past synth turn from raw thread-message data. Skips the
+  // patches + debate expander (the source data doesn't carry the panel
+  // responses post-hoc) — just speaker, timestamp, and markdown body.
+  function renderReplayedSynthTurn(msg) {
+    const article = document.createElement("article");
+    article.className = "asst-turn asst-turn-assistant";
+    const h = document.createElement("header");
+    h.className = "asst-turn-header";
+    const who = document.createElement("h3");
+    who.className = "asst-turn-speaker";
+    who.textContent = msg.speaker;
+    who.tabIndex = -1;
+    h.appendChild(who);
+    const t = document.createElement("time");
+    t.dateTime = msg.ts || "";
+    t.textContent = formatTs(msg.ts);
+    h.appendChild(t);
+    article.appendChild(h);
+    article.appendChild(renderMarkdown(msg.content || ""));
+    asstHistory.appendChild(article);
+  }
 
   // ── Assistant flow ──────────────────────────────────────────────
   newConvBtn.addEventListener("click", () => {

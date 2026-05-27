@@ -125,6 +125,24 @@
           </label>
           <span id="assistant-file-list" class="assistant-file-list" aria-live="polite"></span>
 
+          <div class="assistant-turn-knobs">
+            <p class="action-form-row">
+              <label for="override-effort">Effort</label>
+              <select id="override-effort">
+                <option value="">Provider default</option>
+                <option value="low">Low (fastest)</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High (best reasoning)</option>
+              </select>
+            </p>
+            <p class="action-form-row">
+              <label for="override-web-search">
+                <input type="checkbox" id="override-web-search">
+                Web search (Google / OpenAI / Anthropic hosted web_search)
+              </label>
+            </p>
+          </div>
+
           <details class="assistant-advanced-knobs">
             <summary>Override panel</summary>
             <p class="hint">
@@ -144,23 +162,6 @@
                 <option value="claude-sonnet">claude-sonnet (faster)</option>
                 <option value="claude-opus">claude-opus</option>
               </select>
-            </p>
-            <p class="action-form-row">
-              <label for="override-effort">Effort</label>
-              <select id="override-effort">
-                <option value="">Provider default</option>
-                <option value="low">Low (fastest)</option>
-                <option value="medium" selected>Medium</option>
-                <option value="high">High (best reasoning)</option>
-              </select>
-            </p>
-            <p class="action-form-row">
-              <label for="override-web-search">
-                <input type="checkbox" id="override-web-search">
-                Allow web search (Google grounding / OpenAI / Anthropic
-                hosted web_search) — turn on when the answer needs current
-                information.
-              </label>
             </p>
           </details>
 

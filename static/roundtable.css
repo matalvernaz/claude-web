@@ -712,6 +712,25 @@ body.mode-advanced .assistant       { display: none; }
   margin: 0.3rem 0;
 }
 
+.assistant-turn-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem 1.2rem;
+  align-items: center;
+  margin: 0 0 0.3rem 0;
+}
+
+.assistant-turn-knobs .action-form-row {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.assistant-turn-knobs label {
+  font-size: 0.9rem;
+}
+
 #assistant-submit {
   background: var(--accent);
   color: #000;
