@@ -47,7 +47,7 @@ jobs:
         # skipped because SIM105 flags equivalent try/except/pass patterns the
         # project uses on purpose; if a SIM check ever catches a real bug,
         # add it back here.
-        run: ruff check app.py auth.py setup_flow.py --select=F,E,W,B --ignore=E501,B008
+        run: ruff check app.py auth.py setup_flow.py launcher.py --select=F,E,W,B --ignore=E501,B008
       - name: Tests (pytest)
         run: pytest -q
       - name: JS syntax check

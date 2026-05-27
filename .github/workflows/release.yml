@@ -77,6 +77,14 @@ jobs:
         # silently pin an old hidden-import list across releases.
         run: pyinstaller --clean --noconfirm claude_web.spec
 
+      - name: Drop .env.example next to the binary
+        # PyInstaller's onedir mode buries `datas` under `_internal/`,
+        # which is the wrong place for a file users are supposed to copy
+        # and edit. Stage it at the top of the dist tree so it lands as
+        # a sibling of the exe in the archive.
+        shell: bash
+        run: cp .env.example dist/claude-web/.env.example
+
       - name: Package archive (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh

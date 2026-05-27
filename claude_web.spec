@@ -53,6 +53,11 @@ for pkg in ("claude_agent_sdk", "anthropic", "google.genai", "openai", "mcp"):
 # under matching names so Jinja2Templates("templates") and
 # StaticFiles(directory="static") resolve identically to the source
 # layout.
+#
+# .env.example is intentionally NOT included here — PyInstaller's onedir
+# mode buries datas inside `_internal/`, which is the wrong place for a
+# file the user is supposed to find and copy. The release workflow drops
+# .env.example as a sibling of the exe in the archive instead.
 datas += [
     ("templates", "templates"),
     ("static", "static"),

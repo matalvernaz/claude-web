@@ -15,6 +15,20 @@ the upstream ``uvicorn app:app`` invocation in README.md):
 * ``CLAUDE_WEB_PORT`` — bind port, default ``3001``
 * ``CLAUDE_WEB_FORWARDED_ALLOW_IPS`` — proxy-trust list, default ``*``
 
+When run as a frozen binary (PyInstaller), the launcher also:
+
+* loads ``.env`` from the directory of the executable (or the current
+  working directory) before importing the app, so users don't have to
+  set env vars in their shell to configure OIDC / Claude paths;
+* bootstraps a localhost-only ``AUTH_MODE=none`` first-run if **no**
+  config is present anywhere, so a freshly-extracted zip actually
+  boots on double-click instead of crashing on missing OIDC creds;
+* traps any startup exception, writes the traceback to
+  ``claude-web-startup.log`` next to the executable, prints it to the
+  console, and pauses so the console window stays open. Without this
+  trap, PyInstaller windows close on uncaught exception and users see
+  nothing.
+
 Run ``claude-web --help`` from the frozen binary for the CLI surface.
 """
 from __future__ import annotations
@@ -22,6 +36,103 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import traceback
+from pathlib import Path
+
+
+def _binary_dir() -> Path:
+    """Directory containing the executable (or the launcher script).
+
+    PyInstaller sets ``sys.frozen`` on the frozen binary; ``sys.executable``
+    is then the .exe path itself. From source the same logic falls back to
+    the launcher.py path, which keeps both paths exercised in tests.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _load_dotenv_files() -> list[Path]:
+    """Load `.env` from the binary's directory and the current working
+    directory before importing the app, populating ``os.environ`` with
+    any KEY=VALUE pairs that aren't already set.
+
+    The shell environment wins over the file (so an operator who
+    exports values in their session can override the bundled file).
+    Returns the paths that were actually read, for the first-run banner.
+    """
+    candidates = [_binary_dir() / ".env", Path.cwd() / ".env"]
+    seen: set[Path] = set()
+    loaded: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        try:
+            text = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            # Strip a single layer of surrounding quotes — bash-style
+            # `FOO="bar baz"` is the common idiom, no shell parsing.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if not key or key in os.environ:
+                continue
+            os.environ[key] = value
+        loaded.append(resolved)
+    return loaded
+
+
+def _looks_unconfigured() -> bool:
+    """True when no `.env` was loaded AND no auth-related env vars are
+    present. Drives the first-run banner that flips ``AUTH_MODE=none``
+    so a double-clicked binary actually boots into a usable state."""
+    if os.environ.get("AUTH_MODE"):
+        return False
+    # Any OIDC variable means the user has at least started configuring
+    # the auth path — respect it and let auth.configure fail loudly if
+    # incomplete, rather than silently re-mode them to `none`.
+    for var in ("SESSION_SECRET", "OIDC_ISSUER_URL", "OIDC_CLIENT_ID",
+                "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URI"):
+        if os.environ.get(var):
+            return False
+    return True
+
+
+def _print_first_run_banner(host: str, port: int) -> None:
+    sample = _binary_dir() / ".env.example"
+    msg = [
+        "─" * 68,
+        "claude-web — first-run bootstrap",
+        "─" * 68,
+        "No .env file or auth env vars were found, so we're starting in",
+        "  AUTH_MODE=none  (localhost-only, no authentication)",
+        "",
+        f"Open http://{host}:{port}/setup in a browser to sign Claude in.",
+        "",
+        "To enable proper auth (OIDC) and persistent config:",
+        f"  1. Copy {sample}",
+        f"     to    {sample.with_suffix('')}    (drop the .example)",
+        "  2. Edit it (set SESSION_SECRET + OIDC_* values).",
+        "  3. Restart this binary.",
+        "─" * 68,
+    ]
+    print("\n".join(msg), flush=True)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -52,8 +163,23 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _run(argv: list[str] | None) -> int:
     args = _parse_args(list(sys.argv[1:] if argv is None else argv))
+
+    # Load `.env` BEFORE importing app — app.py reads many env vars at
+    # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so a
+    # post-import load would be ignored.
+    loaded = _load_dotenv_files()
+
+    # If literally nothing is configured, flip to AUTH_MODE=none so the
+    # binary boots on first launch. The banner makes it loud — this is
+    # not a silent default change for real deployments (any one auth var
+    # disables the bootstrap).
+    if not loaded and _looks_unconfigured():
+        os.environ["AUTH_MODE"] = "none"
+        os.environ.setdefault("SESSION_COOKIE_INSECURE", "true")
+        os.environ.setdefault("CLAUDE_WEB_CSRF_STRICT", "false")
+        _print_first_run_banner(args.host, args.port)
 
     # Imports are deferred so --help is fast and importing uvicorn/app
     # at module load doesn't trip the PyInstaller analyzer twice.
@@ -69,6 +195,47 @@ def main(argv: list[str] | None = None) -> int:
         forwarded_allow_ips=args.forwarded_allow_ips,
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Wrap `_run` so a startup crash is *visible* instead of vanishing.
+
+    On Windows the bundled exe opens its own console window when
+    double-clicked; that console dies with the process, so an uncaught
+    exception during import leaves the user with a one-second flash and
+    no information. Trap, log to a file next to the exe, print to the
+    still-attached console, and pause on input() so the user can read
+    the traceback before the window closes.
+    """
+    try:
+        return _run(argv)
+    except SystemExit:
+        # argparse exits cleanly on --help / bad args; let it through
+        # without the post-mortem prompt or the user gets a confusing
+        # "Press Enter" after --help.
+        raise
+    except BaseException:  # noqa: BLE001 — diagnostic catch-all
+        tb = traceback.format_exc()
+        log_path = _binary_dir() / "claude-web-startup.log"
+        try:
+            log_path.write_text(tb, encoding="utf-8")
+        except OSError:
+            pass
+        # Newline before so the trace stands clear of any prior output.
+        sys.stderr.write("\n" + tb)
+        sys.stderr.write(
+            f"\nclaude-web failed during startup. Full traceback above and\n"
+            f"in: {log_path}\n"
+        )
+        # input() only meaningfully holds the console open when a TTY is
+        # attached. On a launched-from-explorer .exe that's true; from a
+        # detached daemon / service it's a no-op. The try wraps EOFError
+        # for non-interactive runs (CI smoke tests, docker logs).
+        try:
+            input("\nPress Enter to close this window… ")
+        except (EOFError, OSError):
+            pass
+        return 1
 
 
 if __name__ == "__main__":
