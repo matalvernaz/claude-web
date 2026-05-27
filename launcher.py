@@ -290,6 +290,48 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _install_runtime_error_logger() -> None:
+    """Tee unhandled server exceptions into a log file next to the exe.
+
+    A 500 inside FastAPI is logged by uvicorn to stderr — fine when the
+    user has a console window open, fine when systemd is journaling. For
+    a desktop-style launch the console window scrolls and the user can't
+    easily copy the traceback. Add a FileHandler at WARNING that catches
+    everything FastAPI / uvicorn / our own ``claude-web`` logger throws,
+    so the user can attach ``claude-web-runtime.log`` to a bug report and
+    we get the actual exception instead of guessing.
+
+    Idempotent — guarded by the handler's ``_clw_runtime`` attribute so a
+    re-entry (e.g. tests calling _run twice) doesn't pile up handlers.
+    """
+    import logging
+
+    log_path = _binary_dir() / "claude-web-runtime.log"
+    root = logging.getLogger()
+    if any(getattr(h, "_clw_runtime", False) for h in root.handlers):
+        return
+    try:
+        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    except OSError:
+        # Read-only install dir — fall back silently. Stderr still gets
+        # the trace, which is the only loss.
+        return
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    ))
+    handler._clw_runtime = True  # type: ignore[attr-defined]
+    # Attach to root so uvicorn.error / fastapi exception messages route
+    # in too, alongside our own claude-web logger.
+    root.addHandler(handler)
+    # Uvicorn's own loggers propagate=False by default; nudge them back
+    # to propagate so the root file handler sees their errors.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+        lg = logging.getLogger(name)
+        lg.propagate = True
+
+
 def _try_import_webview():
     """Return the ``webview`` module on success, ``None`` on any failure.
 
@@ -485,6 +527,11 @@ def _run_headless_mode(host: str, port: int,
 
 def _run(argv: list[str] | None) -> int:
     args = _parse_args(list(sys.argv[1:] if argv is None else argv))
+
+    # Capture runtime exceptions to a file the user can attach to a bug
+    # report. Set up before importing app so the app's own logger writes
+    # land in the file too.
+    _install_runtime_error_logger()
 
     # Load `.env` BEFORE importing app — app.py reads many env vars at
     # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so a
