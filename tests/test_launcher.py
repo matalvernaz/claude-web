@@ -81,3 +81,91 @@ def test_looks_unconfigured_false_when_any_auth_var_set(launcher, monkeypatch) -
 def test_looks_unconfigured_false_when_auth_mode_set(launcher, monkeypatch) -> None:
     monkeypatch.setenv("AUTH_MODE", "none")
     assert launcher._looks_unconfigured() is False
+
+
+# ─── browser auto-open precedence matrix ──────────────────────────────
+
+
+def _make_args(open_browser: object) -> object:
+    import argparse
+    ns = argparse.Namespace()
+    ns.open_browser = open_browser
+    return ns
+
+
+def test_resolve_open_browser_cli_flag_wins(launcher, monkeypatch) -> None:
+    """--no-browser and CLAUDE_WEB_OPEN_BROWSER=true together: the CLI
+    flag wins. Otherwise an env var in the user's shell could silently
+    re-enable an opt-out they explicitly requested."""
+    monkeypatch.setenv("CLAUDE_WEB_OPEN_BROWSER", "true")
+    assert launcher._resolve_open_browser(_make_args(False), first_run=True) is False
+    assert launcher._resolve_open_browser(_make_args(True), first_run=False) is True
+
+
+def test_resolve_open_browser_env_var_overrides_first_run(launcher, monkeypatch) -> None:
+    """A persistent CLAUDE_WEB_OPEN_BROWSER=false keeps the browser
+    suppressed even on first-run (useful for headless/CI bootstraps)."""
+    monkeypatch.setenv("CLAUDE_WEB_OPEN_BROWSER", "false")
+    assert launcher._resolve_open_browser(_make_args(None), first_run=True) is False
+
+
+def test_resolve_open_browser_defaults_open_on_first_run_only(launcher, monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_WEB_OPEN_BROWSER", raising=False)
+    assert launcher._resolve_open_browser(_make_args(None), first_run=True) is True
+    assert launcher._resolve_open_browser(_make_args(None), first_run=False) is False
+
+
+def test_open_browser_when_ready_calls_webbrowser_on_200(launcher, monkeypatch) -> None:
+    """Once /healthz responds 200 the helper must call webbrowser.open
+    exactly once with the /setup URL — no retries, no extra hits."""
+    calls: list[str] = []
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    def fake_urlopen(url, timeout):
+        return FakeResponse()
+
+    def fake_open(url, new=0):
+        calls.append(url)
+        return True
+
+    monkeypatch.setattr(launcher, "urlopen", fake_urlopen)
+    monkeypatch.setattr(launcher.webbrowser, "open", fake_open)
+    launcher._open_browser_when_ready("127.0.0.1", 3001, "/setup", timeout_s=1.0)
+    assert calls == ["http://127.0.0.1:3001/setup"]
+
+
+def test_open_browser_when_ready_rewrites_wildcard_host(launcher, monkeypatch) -> None:
+    """Server binding to 0.0.0.0 means "all interfaces", which isn't a
+    valid URL host on Windows. The browser open must rewrite to
+    127.0.0.1 so the URL is actually clickable."""
+    calls: list[str] = []
+
+    class FakeResponse:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    monkeypatch.setattr(launcher, "urlopen", lambda url, timeout: FakeResponse())
+    monkeypatch.setattr(launcher.webbrowser, "open", lambda url, new=0: calls.append(url) or True)
+    launcher._open_browser_when_ready("0.0.0.0", 3001, "/setup", timeout_s=1.0)
+    assert calls == ["http://127.0.0.1:3001/setup"]
+
+
+def test_open_browser_when_ready_times_out_quietly(launcher, monkeypatch) -> None:
+    """If /healthz never responds, the helper must give up instead of
+    looping forever — daemon thread or not, a stuck poll on shutdown
+    masks real errors."""
+    from urllib.error import URLError
+
+    def always_fail(url, timeout):
+        raise URLError("nope")
+
+    calls: list[str] = []
+    monkeypatch.setattr(launcher, "urlopen", always_fail)
+    monkeypatch.setattr(launcher.webbrowser, "open", lambda url, new=0: calls.append(url) or True)
+    launcher._open_browser_when_ready("127.0.0.1", 3001, "/setup", timeout_s=0.5)
+    assert calls == []

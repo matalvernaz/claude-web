@@ -35,9 +35,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
+import threading
+import time
 import traceback
+import webbrowser
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 def _binary_dir() -> Path:
@@ -114,8 +120,14 @@ def _looks_unconfigured() -> bool:
     return True
 
 
-def _print_first_run_banner(host: str, port: int) -> None:
+def _print_first_run_banner(host: str, port: int, will_open_browser: bool) -> None:
     sample = _binary_dir() / ".env.example"
+    setup_url = f"http://{host}:{port}/setup"
+    open_line = (
+        "Opening that URL in your default browser now…"
+        if will_open_browser
+        else "Open that URL manually (auto-open was disabled with --no-browser)."
+    )
     msg = [
         "─" * 68,
         "claude-web — first-run bootstrap",
@@ -123,7 +135,8 @@ def _print_first_run_banner(host: str, port: int) -> None:
         "No .env file or auth env vars were found, so we're starting in",
         "  AUTH_MODE=none  (localhost-only, no authentication)",
         "",
-        f"Open http://{host}:{port}/setup in a browser to sign Claude in.",
+        f"Setup page: {setup_url}",
+        open_line,
         "",
         "To enable proper auth (OIDC) and persistent config:",
         f"  1. Copy {sample}",
@@ -133,6 +146,66 @@ def _print_first_run_banner(host: str, port: int) -> None:
         "─" * 68,
     ]
     print("\n".join(msg), flush=True)
+
+
+def _check_claude_cli() -> None:
+    """Warn loudly if the `claude` CLI isn't on PATH.
+
+    The Anthropic Agent SDK shells out to the bundled Node CLI for every
+    model interaction; without it the user can sign into Claude on the
+    /setup page but every subsequent chat turn will fail with an opaque
+    "claude not found" error from the SDK. Better to surface this once,
+    visibly, at startup. Doesn't block — the user may install it
+    afterwards or use the binary purely as a viewer.
+    """
+    if shutil.which("claude") is not None or shutil.which("claude.cmd") is not None:
+        return
+    print(
+        "\nWarning: the `claude` CLI was not found on PATH.\n"
+        "  claude-web relies on @anthropic-ai/claude-code (the Node CLI)\n"
+        "  for every model interaction. Install Node.js, then:\n"
+        "    npm install -g @anthropic-ai/claude-code\n"
+        "  Chat turns will fail until that's done.\n",
+        flush=True,
+    )
+
+
+def _open_browser_when_ready(host: str, port: int, path: str,
+                             timeout_s: float = 30.0) -> None:
+    """Background thread: poll /healthz, then open the browser.
+
+    The launcher hands control to ``uvicorn.run`` (a blocking call), so
+    we can't await readiness on the main thread. A daemon thread polls
+    ``/healthz`` until it returns 200 (or the timeout elapses) and then
+    calls ``webbrowser.open`` once. Daemon so it dies with the process
+    if the user Ctrl-Cs before readiness.
+
+    Host coercion: ``0.0.0.0`` isn't a valid URL host on Windows; rewrite
+    to ``127.0.0.1`` for the loopback probe and the browser URL. The
+    server itself still binds the original host.
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "::1") else host
+    base = f"http://{probe_host}:{port}"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(base + "/healthz", timeout=1) as r:
+                if r.status == 200:
+                    break
+        except (URLError, OSError, ValueError):
+            pass
+        time.sleep(0.25)
+    else:
+        print(
+            f"\nNote: /healthz did not respond within {timeout_s:.0f}s; "
+            "skipping browser auto-open.",
+            flush=True,
+        )
+        return
+    try:
+        webbrowser.open(base + path, new=2)
+    except webbrowser.Error as e:
+        print(f"\nNote: could not open the browser automatically ({e}).", flush=True)
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -160,7 +233,39 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "directly."
         ),
     )
+    # Browser auto-open: defaults to "yes on first-run, no otherwise" so
+    # double-clicking the binary on a fresh machine lands the user on
+    # /setup, while a configured deployment doesn't get its operator's
+    # browser hijacked on every restart. --open forces, --no-browser
+    # suppresses, CLAUDE_WEB_OPEN_BROWSER=true/false sets a default.
+    open_group = p.add_mutually_exclusive_group()
+    open_group.add_argument(
+        "--open", dest="open_browser", action="store_true", default=None,
+        help="Open /setup in the default browser once the server is ready.",
+    )
+    open_group.add_argument(
+        "--no-browser", dest="open_browser", action="store_false",
+        help="Suppress the first-run browser auto-open.",
+    )
     return p.parse_args(argv)
+
+
+def _resolve_open_browser(args: argparse.Namespace, first_run: bool) -> bool:
+    """Decide whether to auto-open the browser this launch.
+
+    Precedence: explicit CLI flag (--open / --no-browser) wins; then the
+    CLAUDE_WEB_OPEN_BROWSER env var; otherwise default to True only on
+    first-run so a configured server doesn't hijack the operator's
+    browser on every restart.
+    """
+    if args.open_browser is not None:
+        return args.open_browser
+    env_val = os.environ.get("CLAUDE_WEB_OPEN_BROWSER", "").strip().lower()
+    if env_val in ("1", "true", "yes", "on"):
+        return True
+    if env_val in ("0", "false", "no", "off"):
+        return False
+    return first_run
 
 
 def _run(argv: list[str] | None) -> int:
@@ -175,11 +280,25 @@ def _run(argv: list[str] | None) -> int:
     # binary boots on first launch. The banner makes it loud — this is
     # not a silent default change for real deployments (any one auth var
     # disables the bootstrap).
-    if not loaded and _looks_unconfigured():
+    first_run = not loaded and _looks_unconfigured()
+    open_browser = _resolve_open_browser(args, first_run)
+
+    if first_run:
         os.environ["AUTH_MODE"] = "none"
         os.environ.setdefault("SESSION_COOKIE_INSECURE", "true")
         os.environ.setdefault("CLAUDE_WEB_CSRF_STRICT", "false")
-        _print_first_run_banner(args.host, args.port)
+        _print_first_run_banner(args.host, args.port, open_browser)
+        _check_claude_cli()
+
+    if open_browser:
+        # Daemon thread; dies with the process. The thread polls
+        # /healthz so the browser opens only after uvicorn is actually
+        # serving requests, not just after the python import completes.
+        threading.Thread(
+            target=_open_browser_when_ready,
+            args=(args.host, args.port, "/setup"),
+            daemon=True,
+        ).start()
 
     # Imports are deferred so --help is fast and importing uvicorn/app
     # at module load doesn't trip the PyInstaller analyzer twice.
