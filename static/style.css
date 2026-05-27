@@ -113,6 +113,16 @@ h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
   color: var(--fg);
 }
 .header-link:hover, .header-link:focus { border-color: var(--accent); outline: none; }
+.header-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: var(--fg);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.header-toggle input { margin: 0; }
 .header-cost {
   font-variant-numeric: tabular-nums;
   font-size: 0.85rem;

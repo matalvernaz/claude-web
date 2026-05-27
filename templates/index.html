@@ -47,6 +47,10 @@
           {% endfor %}
         </select>
       </label>
+      <label class="header-toggle" for="personality-apply-current" title="When checked, switching personality keeps the current chat going under the new voice (best-effort — earlier turns in the transcript may leak the old voice through). When unchecked, switching personality starts a fresh chat in the new voice.">
+        <input type="checkbox" id="personality-apply-current">
+        <span>Apply to current chat</span>
+      </label>
       <a href="/personalities" class="header-link" aria-label="Manage your personalities">Manage personalities</a>
       <a href="/roundtable" class="header-link" aria-label="Multi-AI roundtable debates">Roundtable</a>
       {% if multi_project %}

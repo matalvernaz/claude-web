@@ -269,17 +269,41 @@
     });
   }
 
-  // Personality picker. The active personality's system_prompt is appended
-  // to the claude_code preset on the next run; switching mid-conversation
-  // causes api_chat to respawn the CLI (parallel to account-slot toggling)
-  // so the new voice takes effect immediately on the next message.
+  // Personality picker. The picker value is bound to the session via the
+  // ``personality_id`` form field on /api/chat — each session holds its
+  // own voice, so two tabs on two sessions can run two personalities
+  // simultaneously. POST to /api/personalities/active sets the *default*
+  // for new chats only; it does not reach back into other live sessions.
+  //
+  // Mid-conversation behaviour depends on the "Apply to current chat"
+  // checkbox. Unchecked (default): a personality switch starts a fresh
+  // chat, since a resumed JSONL transcript full of the prior voice will
+  // leak that voice through even with the history-reset directive in the
+  // append. Checked: keep the current session and best-effort apply the
+  // new voice — the server respawns the CLI under the new persona on
+  // the next message.
   const personalitySelect = document.getElementById("personality-select");
+  const applyToCurrent = document.getElementById("personality-apply-current");
+  const APPLY_KEY = "personality-apply-current";
+  if (applyToCurrent) {
+    const saved = safeGet(localStorage, APPLY_KEY);
+    if (saved === "true") applyToCurrent.checked = true;
+    applyToCurrent.addEventListener("change", () => {
+      safeSet(localStorage, APPLY_KEY, applyToCurrent.checked ? "true" : "false");
+    });
+  }
   if (personalitySelect) {
     let lastPersonality = personalitySelect.value;
     personalitySelect.addEventListener("change", async () => {
       const target = personalitySelect.value;
       if (target === lastPersonality) return;
+      const label = personalitySelect.options[personalitySelect.selectedIndex]?.text || target;
+      const hasLiveChat = !!(sessionId || currentRunId);
+      const applyMode = applyToCurrent && applyToCurrent.checked;
       try {
+        // Set user-default first so new chats opened later default to
+        // this pick. Existing sessions are session-bound and not affected
+        // by this POST.
         const fd = new FormData();
         fd.append("personality_id", target);
         const r = await fetch("/api/personalities/active", {
@@ -295,8 +319,24 @@
           throw new Error(detail);
         }
         lastPersonality = target;
-        if (announcer) {
-          const label = personalitySelect.options[personalitySelect.selectedIndex]?.text || target;
+        if (hasLiveChat && !applyMode) {
+          // Default mid-conversation behaviour: fork. The current
+          // transcript is preserved in the sidebar; the next message
+          // starts a fresh chat in the new voice with no resumed
+          // history fighting the persona.
+          newChatBtn.click();
+          if (announcer) {
+            announcer.textContent = `Personality switched to ${label}. Started a fresh chat in the new voice.`;
+          }
+        } else if (hasLiveChat && applyMode) {
+          // Opt-in mid-conversation apply: the existing session keeps
+          // its session_id, the next /api/chat send carries the new
+          // personality_id which the server compares to the run's and
+          // respawns the CLI under the new persona.
+          if (announcer) {
+            announcer.textContent = `Personality switched to ${label}. Applied to current chat — voice may carry over from prior turns.`;
+          }
+        } else if (announcer) {
           announcer.textContent = `Personality switched to ${label}. Takes effect on your next message.`;
         }
       } catch (err) {
@@ -1064,6 +1104,15 @@
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
+      // Carry the picker's current value so the server can compare it to
+      // the run's spawned personality. If they disagree (mid-conversation
+      // switch) the server rejects with 409 personality_changed; the
+      // browser then falls back to /api/chat which respawns under the
+      // new voice. Without this field, /api/chat/send happily injects
+      // into the old persona's stdin until task.cancel propagates.
+      if (personalitySelect && personalitySelect.value) {
+        fd.append("personality_id", personalitySelect.value);
+      }
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
       }
@@ -1084,15 +1133,28 @@
         return false;
       }
       if (!r.ok) {
-        // Any other non-2xx — 404 (run gone), 5xx (driver crashed), network
-        // blip through the proxy — means the existing stream can't carry
-        // this message. Abort the old SSE reader so its events don't bleed
-        // into the new run's transcript, then open a fresh one.
+        // Any other non-2xx — 404 (run gone), 409 (run superseded by a
+        // personality/account swap mid-conversation), 5xx (driver
+        // crashed), network blip through the proxy — means the existing
+        // stream can't carry this message. Abort the old SSE reader so
+        // its events don't bleed into the new run's transcript, then open
+        // a fresh one. 409 personality_changed/account_changed is the
+        // expected fall-through after a mid-conversation switch, so we
+        // suppress the failure toast for those.
+        let supersededReason = null;
+        if (r.status === 409) {
+          try {
+            const body = await r.clone().json();
+            supersededReason = body && body.error;
+          } catch (_) {}
+        }
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
         safeRemove(sessionStorage, RUN_KEY);
-        if (r.status !== 404) {
+        const benign409 = supersededReason === "personality_changed" ||
+                          supersededReason === "account_changed";
+        if (r.status !== 404 && !benign409) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
         await sendOne(entry);
@@ -1162,6 +1224,14 @@
       const project = currentProject();
       if (project) fd.append("project", project);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+      // Picker value as session-scoped personality override. Server uses
+      // this to bind the session's personality on first send and to
+      // detect mid-conversation switches on subsequent sends. Two tabs
+      // each carry their own picker value, so two sessions hold two
+      // voices without racing on a user-global pick.
+      if (personalitySelect && personalitySelect.value) {
+        fd.append("personality_id", personalitySelect.value);
+      }
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
       }

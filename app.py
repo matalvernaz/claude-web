@@ -1057,14 +1057,31 @@ def _state_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_personality_owner ON personality(owner_sub)"
         )
-        # Per-user active personality. Falls back to the lowest-id built-in
-        # if absent. Stored separately from user_account so a persona switch
-        # doesn't accidentally clobber the credential slot.
+        # Per-user active personality. Used only as the DEFAULT for *new*
+        # chat sessions. Existing sessions are bound to a personality via
+        # ``session_personality`` (below) so two chats can hold two voices
+        # simultaneously without racing on a single user-global pick.
         conn.execute("""CREATE TABLE IF NOT EXISTS user_personality (
             user_sub TEXT PRIMARY KEY,
             personality_id INTEGER NOT NULL,
             updated_at REAL NOT NULL
         )""")
+        # Per-session active personality. Inserted the first time a session
+        # is observed (either via /api/chat form field or the SDK's init
+        # event), updated when the user switches mid-conversation. Lets
+        # concurrent chats hold independent voices — the old design keyed
+        # on user_sub PK, which forced last-writer-wins across every tab.
+        conn.execute("""CREATE TABLE IF NOT EXISTS session_personality (
+            session_id TEXT PRIMARY KEY,
+            user_sub TEXT,
+            personality_id INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_personality_user "
+            "ON session_personality(user_sub)"
+        )
         _migrate_user_account_legacy(conn)
         _seed_personalities(conn)
         _STATE_DB = conn
@@ -1114,25 +1131,16 @@ def _migrate_user_account_legacy(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE user_account_legacy")
 
 
-# Name of the auto-memory file claude-web rewrites to mirror the active
-# personality, plus the MEMORY.md entry it advertises itself with. The
-# claude_code preset reads MEMORY.md as the index, then loads each file it
-# references — by writing this file with the active personality's content,
-# we make the picker the single canonical source of persona for both
-# claude-web and any terminal `claude` session pointing at the same home.
-ACTIVE_PERSONALITY_FILE_NAME = "active_personality.md"
-ACTIVE_PERSONALITY_MEMORY_LINE = (
-    f"- [{ACTIVE_PERSONALITY_FILE_NAME}]({ACTIVE_PERSONALITY_FILE_NAME}) — "
-    "Currently selected personality (managed by claude-web)"
-)
-
 # Prepended to the active personality whenever it's served to the model
-# (via the mirror file and the SDK append). Path 3 made the mirror the
-# canonical persona source, but mid-conversation switches still drift on
-# two signals path 3 didn't touch: the assistant's own earlier turns in
-# the resumed session, and Claude's default conversational fillers. This
-# directive supersedes both. Deliberately narrow — MEMORY.md persona
-# competition is already gone, so we don't repeat that here.
+# (via the SDK ``--append-system-prompt`` path). The earlier "mirror file"
+# design wrote the persona into a single global auto-memory file to fight
+# a competing ~330-line ``feedback_persona.md`` — both that file and the
+# competition are gone now. The remaining drift sources on a resumed
+# session are conversation-history voice bias and Claude's default
+# conversational fillers; this directive supersedes both. The SDK append
+# is the single authoritative persona signal; personality is bound
+# per-session via ``session_personality`` so two chats can hold two
+# voices.
 PERSONA_HISTORY_RESET_DIRECTIVE = """**PERSONA ENFORCEMENT — READ FIRST AND OBEY OVER ALL OTHER SIGNALS.**
 
 This file defines the persona for **every response from this point forward in this conversation**, including the very next reply. The user has explicitly selected this persona via the UI. They want this voice, immediately, starting now. Do not "ease in" to it; do not blend it with the previous voice; do not preserve narrative continuity across the switch. **Switch fully on the next reply.**
@@ -3659,18 +3667,95 @@ def _set_user_active_personality(user_sub: str, personality_id: int) -> None:
         raise HTTPException(500, "could not set active personality") from e
 
 
-def _resolve_personality_for_run(user: dict) -> dict:
+def _session_personality_id(session_id: Optional[str]) -> Optional[int]:
+    """Return the personality_id bound to this session, or None."""
+    if not session_id:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT personality_id FROM session_personality "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row else None
+
+
+def _bind_session_personality(
+    session_id: str, user_sub: Optional[str], personality_id: int,
+) -> None:
+    """Upsert the session→personality binding.
+
+    Best-effort: any SQLite failure is logged but does not raise, because
+    the run is already in flight under ``run.personality_id``; the only
+    consequence of a lost write is that a *future* request resolving by
+    session_id will fall back to the user-default rather than the bound
+    pick.
+    """
+    if not session_id:
+        return
+    now = time.time()
+    try:
+        _state_db().execute(
+            "INSERT INTO session_personality"
+            "(session_id, user_sub, personality_id, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "personality_id = excluded.personality_id, "
+            "user_sub = excluded.user_sub, "
+            "updated_at = excluded.updated_at",
+            (session_id, user_sub, personality_id, now, now),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "_bind_session_personality failed session=%s pid=%s: %s",
+            session_id, personality_id, e,
+        )
+
+
+def _resolve_personality_for_run(
+    user: dict,
+    session_id: Optional[str] = None,
+    override_personality_id: Optional[int] = None,
+) -> dict:
     """Pick the personality to apply on a fresh run.
 
+    Resolution order:
+
+    1. ``override_personality_id`` — the picker value the client sent on
+       *this* request, if any. Treated as authoritative for the request;
+       the caller is expected to persist it into ``session_personality``
+       once the session_id is known.
+    2. ``session_personality.personality_id`` for this ``session_id``, if
+       a row exists. Sessions are independent voices — picking a new
+       personality in one tab doesn't affect another tab's bound voice.
+    3. ``user_personality.personality_id`` — the user-global default,
+       used only when neither of the above applies (i.e. a brand-new
+       session before the first message lands and the picker hasn't been
+       touched on this request).
+
     Returns the full row plus an ``append`` string ready to drop into
-    ClaudeAgentOptions. The append carries the same history-reset directive
-    the mirror file does, so both system-context signals reinforce each
-    other against conversation-history drift. Empty ``append`` means the
-    personality row itself has no body (rare — only the seeded "empty
-    Hagrid" pre-backfill state).
+    ClaudeAgentOptions. The append carries the history-reset directive
+    so the conversation-history bias on resumed sessions has at least
+    one explicit override signal. Empty ``append`` means the personality
+    row itself has no body (the "No persona" built-in).
     """
     sub = (user or {}).get("sub")
-    pid = _user_active_personality_id(sub)
+    pid: Optional[int] = None
+    if override_personality_id is not None and _get_personality(
+        override_personality_id, sub,
+    ):
+        pid = override_personality_id
+    if pid is None:
+        pid = _session_personality_id(session_id)
+        if pid is not None and not _get_personality(pid, sub):
+            # Bound personality was deleted or is no longer visible to
+            # this user; fall back to the user default rather than
+            # spawning under a phantom pid.
+            pid = None
+    if pid is None:
+        pid = _user_active_personality_id(sub)
     row = _get_personality(pid, sub) if pid is not None else None
     return {
         "id": pid,
@@ -3689,132 +3774,18 @@ def _personalities_payload(user: dict) -> dict:
     }
 
 
-# ─── active-personality auto-memory mirror ─────────────────────────────────
-#
-# claude-web writes the active personality's content to
-# ``$CLAUDE_HOME/projects/<DEFAULT_CWD>/memory/active_personality.md`` and
-# advertises it in ``MEMORY.md`` so the claude_code preset loads it as a
-# first-class feedback file — same weight any other auto-memory entry
-# carries. This is what makes the picker the canonical source of voice
-# instead of an append fighting against a more deeply-loaded persona file.
-#
-# Multi-user caveat: the mirror file sits in a single shared location, so
-# when two users have different picks they race for last-write-wins. For
-# the single-user-with-multiple-personalities case this is fine; multi-user
-# parity needs a per-user CLAUDE_HOME (the symlink-farm idea we shelved).
-
-
-def _active_persona_mirror_path() -> Path:
-    return (
-        CLAUDE_HOME / "projects" / _sanitize_project_key(DEFAULT_CWD)
-        / "memory" / ACTIVE_PERSONALITY_FILE_NAME
-    )
-
-
-def _memory_index_path() -> Path:
-    return (
-        CLAUDE_HOME / "projects" / _sanitize_project_key(DEFAULT_CWD)
-        / "memory" / "MEMORY.md"
-    )
-
-
 def _persona_body_with_directive(personality: dict) -> str:
-    """Apply the conversation-history reset directive to the personality
-    body. Used identically by the mirror writer and the SDK append path so
-    both signals the model receives carry the same instruction to ignore
-    prior-turn voice and Claude's default fillers.
+    """Build the SDK ``--append-system-prompt`` payload for a personality.
+
+    Prepends ``PERSONA_HISTORY_RESET_DIRECTIVE`` so a resumed session has
+    at least one explicit override against conversation-history voice
+    bias. Empty body (the "No persona" built-in) returns empty so the
+    spawn omits the append flag entirely.
     """
     body = _strip_frontmatter(personality.get("system_prompt") or "")
     if not body.strip():
-        # Empty personality: don't add the directive; an empty mirror is the
-        # cleanup signal that no personality is active.
         return ""
     return PERSONA_HISTORY_RESET_DIRECTIVE + body
-
-
-def _format_persona_mirror(personality: dict) -> str:
-    """Wrap the personality body in the YAML frontmatter the auto-memory
-    loader expects on a feedback file. Body carries the history-reset
-    directive so this file fights conversation-context drift on its own,
-    without relying on the SDK append for that signal.
-    """
-    body = _persona_body_with_directive(personality)
-    name = (personality.get("name") or "Active personality").replace("\n", " ")
-    description = (personality.get("description") or "").replace("\n", " ")
-    return (
-        "---\n"
-        f"name: {name}\n"
-        f"description: {description}\n"
-        "type: feedback\n"
-        "---\n"
-        f"{body}\n"
-    )
-
-
-def _write_active_persona_mirror(user: Optional[dict]) -> None:
-    """Sync the auto-memory mirror file to the caller's active personality.
-
-    Best-effort: any IO failure logs a warning and returns. The picker
-    still records the choice in the DB even if disk writes fail, so the
-    in-claude-web append path keeps working.
-    """
-    path = _active_persona_mirror_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        log.warning("mirror: parent mkdir failed at %s: %s", path, e)
-        return
-    sub = (user or {}).get("sub") if user else None
-    pid = _user_active_personality_id(sub)
-    row = _get_personality(pid, sub) if pid is not None else None
-    if not row or not (row.get("system_prompt") or "").strip():
-        # Empty / missing personality: clear the mirror so the loader
-        # doesn't keep serving a stale body.
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            log.warning("mirror: unlink %s failed: %s", path, e)
-        return
-    try:
-        path.write_text(_format_persona_mirror(row))
-    except OSError as e:
-        log.warning("mirror: write %s failed: %s", path, e)
-
-
-def _ensure_memory_index_references_mirror() -> None:
-    """Make sure MEMORY.md indexes the mirror file (once, idempotent).
-
-    Also strips the legacy ``feedback_persona.md`` line — that file is no
-    longer the canonical persona source under the path-3 architecture, and
-    leaving it in the index would re-introduce the competing-signal problem
-    we're solving. The file itself stays on disk untouched; only the
-    MEMORY.md reference is removed.
-    """
-    index = _memory_index_path()
-    try:
-        text = index.read_text()
-    except (OSError, FileNotFoundError):
-        return
-    original = text
-    # Drop any line that references feedback_persona.md (whatever flavour
-    # of bullet/wording the user has there).
-    cleaned_lines = [
-        line for line in text.splitlines()
-        if "feedback_persona.md" not in line
-    ]
-    text = "\n".join(cleaned_lines)
-    # Append the mirror reference if it's not already there.
-    if ACTIVE_PERSONALITY_FILE_NAME not in text:
-        if text and not text.endswith("\n"):
-            text += "\n"
-        text += ACTIVE_PERSONALITY_MEMORY_LINE + "\n"
-    if text != original:
-        try:
-            index.write_text(text)
-        except OSError as e:
-            log.warning("mirror: rewrite MEMORY.md %s failed: %s", index, e)
 
 
 def _safe_sub(user_sub: str) -> str:
@@ -4243,6 +4214,18 @@ class ActiveRun:
         self._next_idx: int = 0
         self.subscribers: set[asyncio.Queue] = set()
         self.done = False
+        # Explicit input gate. ``task.cancel()`` is asynchronous: the run
+        # lingers in ACTIVE_RUNS and ``done`` stays False until the task
+        # hits an await point and unwinds, leaving a window where
+        # ``/api/chat/send/{run_id}`` would inject a message into a CLI
+        # subprocess we've already decided to tear down. Flipping
+        # ``accepting_input`` to False *before* calling ``task.cancel()``
+        # closes that window deterministically. ``superseded_reason`` lets
+        # the rejecting handler tell the browser why so it can pick the
+        # right fallback ("personality_changed" → re-route through
+        # /api/chat to respawn under the new persona).
+        self.accepting_input: bool = True
+        self.superseded_reason: Optional[str] = None
         self.session_id: Optional[str] = None
         self.project_key: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
@@ -4306,6 +4289,16 @@ class ActiveRun:
                 # First-write-wins claim so PER_USER_SESSIONS mode knows who
                 # owns this transcript. Idempotent; no-op when disabled.
                 _claim_session_owner(sid, self.owner_sub, self.project_key)
+                # Persist the session→personality binding so a later
+                # request resolving by this session_id sees the same
+                # voice this run spawned under. Without this, a tab
+                # opened on a resumed session would resolve to the
+                # user-global default and silently respawn under the
+                # wrong personality.
+                if self.personality_id is not None:
+                    _bind_session_personality(
+                        sid, self.owner_sub, self.personality_id,
+                    )
         if event.get("type") == "run_started":
             meta_changed = True
         self.last_activity = time.time()
@@ -4732,7 +4725,7 @@ async def _inject_user_input(
     discarded. The fix is to always enqueue; the driver pops only when
     between turns, serializing every write through one writer.
     """
-    if run.done:
+    if run.done or not run.accepting_input:
         return False
     loop = asyncio.get_running_loop()
     delivered: asyncio.Future = loop.create_future()
@@ -4773,6 +4766,21 @@ def _log_task_exception(task: asyncio.Task) -> None:
 async def index(request: Request, user: dict = Depends(auth.require_user)):
     if not setup_flow.is_configured():
         return RedirectResponse(url="/setup", status_code=302)
+    # If the URL points at a specific session, render the picker selected
+    # to that session's bound personality rather than the user-global
+    # default. Two tabs on two sessions then show two different voices
+    # without a client-side fetch round-trip.
+    personalities_payload = _personalities_payload(user)
+    session_qs = request.query_params.get("session", "")
+    if session_qs:
+        try:
+            sid = _safe_id(session_qs)
+        except HTTPException:
+            sid = ""
+        bound = _session_personality_id(sid) if sid else None
+        if bound is not None and _get_personality(bound, user.get("sub")):
+            personalities_payload = dict(personalities_payload)
+            personalities_payload["active"] = bound
     response = templates.TemplateResponse(
         request, "index.html", {
             "sessions": list_sessions(user),
@@ -4790,7 +4798,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             ]),
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
-            "personalities_payload": _personalities_payload(user),
+            "personalities_payload": personalities_payload,
             "site_title": SITE_TITLE,
         }
     )
@@ -5339,10 +5347,6 @@ async def api_personalities_update(
         body.get("description") or "",
         body.get("system_prompt") or "",
     )
-    # If the user just edited their *active* personality, the mirror file is
-    # stale — refresh so the next CLI spawn loads the new content.
-    if _user_active_personality_id(sub) == personality_id:
-        _write_active_persona_mirror(user)
     return updated
 
 
@@ -5352,53 +5356,30 @@ async def api_personalities_delete(
     user: dict = Depends(auth.require_user),
 ):
     sub = user.get("sub")
-    was_active = _user_active_personality_id(sub) == personality_id
     _delete_personality(sub, personality_id)
     # _delete_personality drops the user_personality pointer if it matched
     # the deleted row; the next _user_active_personality_id falls back to
-    # the default built-in. Refresh the mirror so the auto-memory file
-    # tracks that fallback instead of pointing at content that no longer
-    # exists.
-    if was_active:
-        _write_active_persona_mirror(user)
+    # the default built-in. Any sessions currently bound to the deleted
+    # personality will fall back to the user default via
+    # _resolve_personality_for_run's "row no longer visible" guard on
+    # their next message.
     return _personalities_payload(user)
 
 
-def _cancel_runs_for_personality_swap(
-    user_sub: str, new_personality_id: Optional[int],
-) -> int:
-    """Tear down any live runs owned by ``user_sub`` whose CLI subprocess was
-    spawned under a different personality, so the next message — whether it
-    lands on /api/chat or /api/chat/send/{run_id} — is forced to spawn a
-    fresh CLI under the new personality's append.
+def _supersede_run(run: ActiveRun, reason: str) -> None:
+    """Mark a run as no longer accepting input, then cancel its driver task.
 
-    Returns the number of runs cancelled (for logging / response payload).
-
-    Why this exists: the personality respawn check lives in /api/chat, which
-    is only hit on turn-start. Once a long-lived conversation is alive,
-    follow-up user messages go through /api/chat/send/{run_id} (mid-turn
-    injection), which feeds straight into the existing CLI's stdin without
-    re-checking the active personality. Cancelling here closes that gap.
+    ``task.cancel()`` is asynchronous: until the task hits an await point
+    and unwinds, ``run.done`` stays False and ACTIVE_RUNS still routes
+    ``/api/chat/send/{run_id}`` into the dying CLI's stdin. Flipping
+    ``accepting_input`` to False synchronously closes that window; the
+    input gate in ``_inject_user_input`` and the personality re-check in
+    ``api_chat_send`` both refuse new input the instant this returns.
     """
-    if not user_sub:
-        return 0
-    # Snapshot first — task.cancel() triggers the run's cleanup which mutates
-    # ACTIVE_RUNS_BY_SESSION, and iterating a dict while it's mutated raises.
-    candidates = [
-        r for r in list(ACTIVE_RUNS_BY_SESSION.values())
-        if r.owner_sub == user_sub
-        and r.personality_id != new_personality_id
-        and not r.done
-    ]
-    for run in candidates:
-        log.info(
-            "personality-swap cancel run=%s session=%s %s→%s",
-            run.run_id, run.session_id,
-            run.personality_id, new_personality_id,
-        )
-        if run.task and not run.task.done():
-            run.task.cancel()
-    return len(candidates)
+    run.accepting_input = False
+    run.superseded_reason = reason
+    if run.task and not run.task.done():
+        run.task.cancel()
 
 
 @app.post("/api/personalities/active")
@@ -5406,17 +5387,19 @@ async def api_personalities_set_active(
     personality_id: int = Form(...),
     user: dict = Depends(auth.require_user),
 ):
+    """Set the user's DEFAULT personality for *new* chat sessions.
+
+    Existing chats are bound to their own personality via
+    ``session_personality`` and are not affected by this endpoint. To
+    switch a live chat's voice the browser sends ``personality_id`` on
+    the next ``/api/chat`` (or ``/api/chat/send/{run_id}``) call; that
+    path rebinds the session and triggers a respawn under the new
+    persona — see ``_resolve_personality_for_run`` and the
+    ``personality_changed`` 409 handling.
+    """
     sub = user.get("sub")
     _set_user_active_personality(sub, personality_id)
-    # Mirror the new pick to disk BEFORE cancelling the existing run: the
-    # in-flight CLI is going to die, and the next message will spawn a
-    # fresh one that loads auto-memory from the mirror file. Writing first
-    # closes the race where the new spawn could read a stale mirror.
-    _write_active_persona_mirror(user)
-    cancelled = _cancel_runs_for_personality_swap(sub, personality_id)
-    payload = _personalities_payload(user)
-    payload["cancelled_runs"] = cancelled
-    return payload
+    return _personalities_payload(user)
 
 
 def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
@@ -5688,6 +5671,7 @@ async def api_chat(
     session_id: str = Form(default=""),
     project: str = Form(default=""),
     model: str = Form(default=""),
+    personality_id: Optional[int] = Form(default=None),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
@@ -5743,23 +5727,38 @@ async def api_chat(
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
         account = _resolve_account_for_run(user)
-        personality_for_run = _resolve_personality_for_run(user)
+        personality_for_run = _resolve_personality_for_run(
+            user,
+            session_id=session_id or None,
+            override_personality_id=personality_id,
+        )
         active_personality_id = personality_for_run["id"]
+        # Persist the picker-driven override now so a concurrent reader
+        # (refresh, second tab) resolving by session_id sees the new
+        # voice. The run-side emit() hook also binds on SDK init, but
+        # binding here closes the gap between the client's POST landing
+        # and the SDK confirming session_id back to us.
+        if (
+            session_id and personality_id is not None
+            and active_personality_id is not None
+        ):
+            _bind_session_personality(
+                session_id, user.get("sub"), active_personality_id,
+            )
         existing = _existing_run_for_session(session_id) if session_id else None
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
             # bound its credentials at startup, so we can't just keep using
-            # it; cancel the driver and fall through to spawning a fresh run
-            # with `resume=session_id`. The session JSONL is in the shared
-            # projects/ directory (personal home symlinks back to it), so
-            # the conversation continues unbroken from the new CLI.
+            # it; supersede the driver and fall through to spawning a fresh
+            # run with `resume=session_id`. The session JSONL is in the
+            # shared projects/ directory (personal home symlinks back to
+            # it), so the conversation continues unbroken from the new CLI.
             log.info(
                 "account-toggle respawn session=%s run=%s %s→%s",
                 session_id, existing.run_id, existing.account_slot, account["slot"],
             )
             _require_owner(existing, user)
-            if existing.task and not existing.task.done():
-                existing.task.cancel()
+            _supersede_run(existing, "account_changed")
             existing = None
         if existing is not None and existing.personality_id != active_personality_id:
             # The system_prompt append is baked in at SDK init, so a
@@ -5772,8 +5771,7 @@ async def api_chat(
                 existing.personality_id, active_personality_id,
             )
             _require_owner(existing, user)
-            if existing.task and not existing.task.done():
-                existing.task.cancel()
+            _supersede_run(existing, "personality_changed")
             existing = None
         if existing is not None:
             _require_owner(existing, user)
@@ -6519,6 +6517,7 @@ async def api_chat(
 async def api_chat_send(
     run_id: str,
     message: str = Form(...),
+    personality_id: Optional[int] = Form(default=None),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
@@ -6531,12 +6530,51 @@ async def api_chat_send(
     can inject between tool calls (binary-style steerability), instead of
     waiting on our own end-of-turn boundary.
     Returns 202 Accepted; the existing stream emits the new events.
+
+    Refuses with 409 if the run has been superseded (personality or
+    account swap mid-conversation) so the browser falls back to
+    /api/chat, which respawns under the current state.
     """
     _safe_id(run_id)
     run = ACTIVE_RUNS.get(run_id)
     if run is None or run.done:
         raise HTTPException(404, "no such run")
     _require_owner(run, user)
+    if not run.accepting_input:
+        # Run is in the process of being torn down (personality/account
+        # swap, etc.). Surface the reason so the browser re-routes through
+        # /api/chat instead of retrying the same dying run.
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": run.superseded_reason or "run_superseded",
+            },
+            status_code=409,
+        )
+    # Defense-in-depth: re-resolve the personality bound to this run's
+    # session (or the client's explicit ``personality_id`` override) and
+    # the user's current account slot. If either disagrees with the
+    # values the CLI subprocess was spawned under, we can't apply the
+    # change to a live SDK — reject with 409 so the browser falls back
+    # to ``/api/chat`` and respawns under the new state. Without this
+    # check, a follow-up message sent through this endpoint after a
+    # picker change would inject into the old persona's stdin.
+    personality_for_run = _resolve_personality_for_run(
+        user,
+        session_id=run.session_id,
+        override_personality_id=personality_id,
+    )
+    account = _resolve_account_for_run(user)
+    if run.personality_id != personality_for_run["id"]:
+        _supersede_run(run, "personality_changed")
+        return JSONResponse(
+            {"ok": False, "error": "personality_changed"}, status_code=409,
+        )
+    if run.account_slot != account["slot"]:
+        _supersede_run(run, "account_changed")
+        return JSONResponse(
+            {"ok": False, "error": "account_changed"}, status_code=409,
+        )
     image_blocks, _meta = await _read_uploaded_images(images)
     file_metas = await _save_uploaded_files(files, run_id)
     effective = _file_attachment_prefix(file_metas) + message
@@ -8221,43 +8259,16 @@ async def healthz():
 
 # ─── module-level startup tasks ────────────────────────────────────────────
 #
-# Runs at import time on every uvicorn worker. Forces the DB to initialise
-# (so the schema + seed/backfill land before the first request), patches
-# MEMORY.md so it references the active-personality mirror file, and writes
-# that mirror to reflect the most recently active personality. Wrapped in
-# try/except so a write failure (read-only fs, etc.) logs a warning instead
-# of bricking startup — the in-claude-web append path keeps working
-# regardless.
+# Force the DB to initialise at import time on every uvicorn worker so the
+# schema + seed/backfill land before the first request, instead of paying
+# that cost (and possibly failing) on the first user-facing call.
 
 
-def _startup_sync_active_persona() -> None:
+def _startup_init_state_db() -> None:
     try:
         _state_db()
     except Exception as e:
         log.warning("startup: _state_db init failed: %s", e)
-        return
-    try:
-        _ensure_memory_index_references_mirror()
-    except Exception as e:
-        log.warning("startup: MEMORY.md sync failed: %s", e)
-    # Pick the most-recently-active personality across all users to seed the
-    # mirror. Single-user-with-multiple-personalities (the supported case)
-    # gets the right content; multi-user gets last-writer-wins with no race
-    # at startup, then per-user picker actions take over from there.
-    sub: Optional[str] = None
-    try:
-        row = _state_db().execute(
-            "SELECT user_sub FROM user_personality "
-            "ORDER BY updated_at DESC LIMIT 1"
-        ).fetchone()
-        if row:
-            sub = row[0]
-    except sqlite3.Error as e:
-        log.warning("startup: user_personality lookup failed: %s", e)
-    try:
-        _write_active_persona_mirror({"sub": sub} if sub else None)
-    except Exception as e:
-        log.warning("startup: mirror write failed: %s", e)
 
 
-_startup_sync_active_persona()
+_startup_init_state_db()
