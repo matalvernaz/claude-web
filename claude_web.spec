@@ -43,6 +43,18 @@ for pkg, filt in (
     else:
         hidden += collect_submodules(pkg, filter=filt)
 
+# pywebview powers the native desktop window. Pull it in only when it's
+# importable in the build environment — Linux runners without GTK/QT
+# backends raise ImportError and would otherwise fail the freeze. The
+# launcher already degrades to system-browser mode when webview can't
+# import at runtime, so a Linux bundle without the backend is fine.
+try:
+    import webview  # noqa: F401
+    hidden += collect_submodules("webview")
+    datas += collect_data_files("webview")
+except Exception:
+    pass
+
 # Some SDKs ship data files (JSON schemas, prompt assets). Pull them in
 # alongside the .py modules so the frozen binary can still find them.
 datas = []

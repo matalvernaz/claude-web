@@ -23,6 +23,11 @@ When run as a frozen binary (PyInstaller), the launcher also:
 * bootstraps a localhost-only ``AUTH_MODE=none`` first-run if **no**
   config is present anywhere, so a freshly-extracted zip actually
   boots on double-click instead of crashing on missing OIDC creds;
+* opens a **native desktop window** (pywebview → Edge WebView2 on
+  Windows / WebKit on macOS / GTK WebKit on Linux) embedding the app
+  by default. The window is the primary UI; the console window stays
+  as the off-switch. ``--no-window`` falls back to opening the system
+  browser, and ``--headless`` runs the server with no UI at all;
 * traps any startup exception, writes the traceback to
   ``claude-web-startup.log`` next to the executable, prints it to the
   console, and pauses so the console window stays open. Without this
@@ -46,6 +51,16 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
+# The three UI modes are mutually exclusive. The launcher resolves which
+# one to use from CLI flags + env vars + a sane default that depends on
+# whether we're a frozen binary (default to native window) or a from-source
+# launch (default to headless, since the developer probably wants to drive
+# the server with their own browser).
+UI_WINDOW = "window"
+UI_BROWSER = "browser"
+UI_HEADLESS = "headless"
+
+
 def _binary_dir() -> Path:
     """Directory containing the executable (or the launcher script).
 
@@ -56,6 +71,10 @@ def _binary_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
 
 def _load_dotenv_files() -> list[Path]:
@@ -120,14 +139,15 @@ def _looks_unconfigured() -> bool:
     return True
 
 
-def _print_first_run_banner(host: str, port: int, will_open_browser: bool) -> None:
+def _print_first_run_banner(host: str, port: int, ui_mode: str) -> None:
     sample = _binary_dir() / ".env.example"
     setup_url = f"http://{host}:{port}/setup"
-    open_line = (
-        "Opening that URL in your default browser now…"
-        if will_open_browser
-        else "Open that URL manually (auto-open was disabled with --no-browser)."
-    )
+    if ui_mode == UI_WINDOW:
+        ui_line = "Opening a native window onto that page now…"
+    elif ui_mode == UI_BROWSER:
+        ui_line = "Opening that URL in your default browser now…"
+    else:
+        ui_line = "Open that URL manually (UI auto-launch was disabled)."
     msg = [
         "─" * 68,
         "claude-web — first-run bootstrap",
@@ -136,7 +156,7 @@ def _print_first_run_banner(host: str, port: int, will_open_browser: bool) -> No
         "  AUTH_MODE=none  (localhost-only, no authentication)",
         "",
         f"Setup page: {setup_url}",
-        open_line,
+        ui_line,
         "",
         "To enable proper auth (OIDC) and persistent config:",
         f"  1. Copy {sample}",
@@ -170,32 +190,37 @@ def _check_claude_cli() -> None:
     )
 
 
+def _probe_host(host: str) -> str:
+    """Coerce a wildcard bind address to a loopback host for URL building."""
+    return "127.0.0.1" if host in ("0.0.0.0", "::", "::1") else host
+
+
+def _wait_for_healthz(host: str, port: int, timeout_s: float = 30.0) -> bool:
+    """Block until /healthz answers 200, or timeout. Returns True on ready."""
+    base = f"http://{_probe_host(host)}:{port}"
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(base + "/healthz", timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except (URLError, OSError, ValueError):
+            pass
+        time.sleep(0.25)
+    return False
+
+
 def _open_browser_when_ready(host: str, port: int, path: str,
                              timeout_s: float = 30.0) -> None:
-    """Background thread: poll /healthz, then open the browser.
+    """Background thread: poll /healthz, then open the system browser.
 
     The launcher hands control to ``uvicorn.run`` (a blocking call), so
     we can't await readiness on the main thread. A daemon thread polls
     ``/healthz`` until it returns 200 (or the timeout elapses) and then
     calls ``webbrowser.open`` once. Daemon so it dies with the process
     if the user Ctrl-Cs before readiness.
-
-    Host coercion: ``0.0.0.0`` isn't a valid URL host on Windows; rewrite
-    to ``127.0.0.1`` for the loopback probe and the browser URL. The
-    server itself still binds the original host.
     """
-    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "::1") else host
-    base = f"http://{probe_host}:{port}"
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            with urlopen(base + "/healthz", timeout=1) as r:
-                if r.status == 200:
-                    break
-        except (URLError, OSError, ValueError):
-            pass
-        time.sleep(0.25)
-    else:
+    if not _wait_for_healthz(host, port, timeout_s):
         print(
             f"\nNote: /healthz did not respond within {timeout_s:.0f}s; "
             "skipping browser auto-open.",
@@ -203,7 +228,7 @@ def _open_browser_when_ready(host: str, port: int, path: str,
         )
         return
     try:
-        webbrowser.open(base + path, new=2)
+        webbrowser.open(f"http://{_probe_host(host)}:{port}{path}", new=2)
     except webbrowser.Error as e:
         print(f"\nNote: could not open the browser automatically ({e}).", flush=True)
 
@@ -233,39 +258,229 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "directly."
         ),
     )
-    # Browser auto-open: defaults to "yes on first-run, no otherwise" so
-    # double-clicking the binary on a fresh machine lands the user on
-    # /setup, while a configured deployment doesn't get its operator's
-    # browser hijacked on every restart. --open forces, --no-browser
-    # suppresses, CLAUDE_WEB_OPEN_BROWSER=true/false sets a default.
-    open_group = p.add_mutually_exclusive_group()
-    open_group.add_argument(
-        "--open", dest="open_browser", action="store_true", default=None,
-        help="Open /setup in the default browser once the server is ready.",
+    # UI mode is a single-choice across the three behaviours: native
+    # window (pywebview-driven), system browser, or no UI at all. The
+    # flags are mutually exclusive and override CLAUDE_WEB_UI_MODE /
+    # the frozen-vs-source default chosen in _resolve_ui_mode.
+    ui_group = p.add_mutually_exclusive_group()
+    ui_group.add_argument(
+        "--window", dest="ui_mode", action="store_const", const=UI_WINDOW,
+        help="Embed the app in a native desktop window (pywebview). Default "
+             "for the frozen binary.",
     )
-    open_group.add_argument(
-        "--no-browser", dest="open_browser", action="store_false",
-        help="Suppress the first-run browser auto-open.",
+    ui_group.add_argument(
+        "--open", dest="ui_mode", action="store_const", const=UI_BROWSER,
+        help="Open /setup in the user's default system browser instead of "
+             "opening a native window.",
     )
+    ui_group.add_argument(
+        "--no-window", dest="ui_mode", action="store_const", const=UI_BROWSER,
+        help="Alias for --open. Suppresses the native window; falls back to "
+             "the system browser.",
+    )
+    ui_group.add_argument(
+        "--no-browser", dest="ui_mode", action="store_const", const=UI_HEADLESS,
+        help="Run headless: serve the app but do not open any UI.",
+    )
+    ui_group.add_argument(
+        "--headless", dest="ui_mode", action="store_const", const=UI_HEADLESS,
+        help="Alias for --no-browser.",
+    )
+    p.set_defaults(ui_mode=None)
     return p.parse_args(argv)
 
 
-def _resolve_open_browser(args: argparse.Namespace, first_run: bool) -> bool:
-    """Decide whether to auto-open the browser this launch.
+def _try_import_webview():
+    """Return the ``webview`` module on success, ``None`` on any failure.
 
-    Precedence: explicit CLI flag (--open / --no-browser) wins; then the
-    CLAUDE_WEB_OPEN_BROWSER env var; otherwise default to True only on
-    first-run so a configured server doesn't hijack the operator's
-    browser on every restart.
+    pywebview can fail to import on Linux when no GTK/QT backend is
+    installed, and at first call when the platform webview runtime is
+    missing (e.g. WebView2 evergreen on Windows 10 pre-1809). Both cases
+    must degrade gracefully to the system browser. Catching BaseException
+    is deliberate — some backends raise SystemExit on missing runtime.
     """
-    if args.open_browser is not None:
-        return args.open_browser
-    env_val = os.environ.get("CLAUDE_WEB_OPEN_BROWSER", "").strip().lower()
-    if env_val in ("1", "true", "yes", "on"):
-        return True
-    if env_val in ("0", "false", "no", "off"):
-        return False
-    return first_run
+    try:
+        import webview  # type: ignore[import-not-found]
+        return webview
+    except BaseException:
+        return None
+
+
+def _resolve_ui_mode(args: argparse.Namespace, first_run: bool) -> str:
+    """Pick the UI mode for this launch.
+
+    Precedence (highest → lowest):
+      1. Explicit CLI flag (--window / --open / --headless).
+      2. ``CLAUDE_WEB_UI_MODE`` env var.
+      3. Frozen-binary default: window mode (falls back to browser if
+         pywebview can't import) when this is a first-run AUTH_MODE=none
+         bootstrap, otherwise headless (a configured deployment is
+         likely server-style — don't hijack the operator's desktop).
+      4. From-source default: headless. A developer running
+         ``python launcher.py`` typically wants the server only.
+    """
+    if args.ui_mode is not None:
+        return _coerce_mode(args.ui_mode)
+    env_val = os.environ.get("CLAUDE_WEB_UI_MODE", "").strip().lower()
+    if env_val:
+        return _coerce_mode(env_val)
+    if _is_frozen() and first_run:
+        # The desktop-app target: double-clicked exe on a fresh machine.
+        return UI_WINDOW if _try_import_webview() is not None else UI_BROWSER
+    return UI_HEADLESS
+
+
+_UI_MODE_ALIASES = {
+    "window": UI_WINDOW, "webview": UI_WINDOW, "desktop": UI_WINDOW,
+    "browser": UI_BROWSER, "open": UI_BROWSER,
+    "headless": UI_HEADLESS, "none": UI_HEADLESS, "no": UI_HEADLESS,
+    # Permissive booleans for CLAUDE_WEB_OPEN_BROWSER back-compat below.
+    "true": UI_BROWSER, "1": UI_BROWSER, "yes": UI_BROWSER, "on": UI_BROWSER,
+    "false": UI_HEADLESS, "0": UI_HEADLESS, "off": UI_HEADLESS,
+}
+
+
+def _coerce_mode(value: str) -> str:
+    return _UI_MODE_ALIASES.get((value or "").strip().lower(), UI_HEADLESS)
+
+
+def _start_uvicorn_in_thread(host: str, port: int,
+                             forwarded_allow_ips: str):
+    """Spawn uvicorn on a background thread and return (server, thread).
+
+    Using ``uvicorn.Server`` rather than ``uvicorn.run`` so we can flip
+    ``server.should_exit = True`` from the main thread when the desktop
+    window closes — the graceful-shutdown signal documented by uvicorn.
+    Not a daemon thread so an in-flight request to /api/chat gets a
+    chance to drain on window-close rather than being abruptly killed.
+    """
+    import uvicorn
+
+    import app  # noqa: F401 — needed for app.app
+
+    config = uvicorn.Config(
+        app.app,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
+        # Suppress uvicorn's own signal handlers — they only work from
+        # the main thread, which webview owns when we're in window mode.
+        # The launcher drives shutdown via ``server.should_exit``.
+        log_config=None,
+    )
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    thread = threading.Thread(target=server.run, name="uvicorn", daemon=False)
+    thread.start()
+    return server, thread
+
+
+def _run_window_mode(host: str, port: int, forwarded_allow_ips: str,
+                     setup_path: str) -> int:
+    """Background-thread uvicorn + main-thread native window.
+
+    pywebview's ``webview.start()`` MUST run on the main thread on macOS
+    (Cocoa requirement) and is recommended-main on Windows/Linux. So we
+    invert the normal launcher shape: uvicorn moves to a background
+    thread, and the window owns the main thread until the user closes it.
+
+    On clean window close we flip ``server.should_exit`` to ask uvicorn
+    to drain and stop; if it doesn't exit within a short grace period
+    we abandon and rely on process exit to reclaim the port.
+    """
+    webview = _try_import_webview()
+    if webview is None:
+        # Resolver should have caught this and routed to browser mode;
+        # belt and braces in case an operator forces --window without
+        # the backend installed.
+        print(
+            "Native window backend is unavailable (pywebview did not import). "
+            "Falling back to system browser.",
+            flush=True,
+        )
+        return _run_browser_mode(host, port, forwarded_allow_ips, setup_path)
+
+    server, thread = _start_uvicorn_in_thread(host, port, forwarded_allow_ips)
+
+    # The window must point at the same URL the readiness probe just
+    # confirmed; otherwise the webview shows a connection-refused page
+    # while uvicorn is still warming up.
+    if not _wait_for_healthz(host, port):
+        print(
+            "\nServer did not become ready within 30s; opening the window "
+            "anyway. If it shows an error, the startup log next to the "
+            "binary has the details.",
+            flush=True,
+        )
+
+    url = f"http://{_probe_host(host)}:{port}{setup_path}"
+    try:
+        webview.create_window(
+            "claude-web",
+            url,
+            width=1100,
+            height=780,
+            min_size=(640, 480),
+            # Confirmation prompt is annoying for a daily-driver desktop
+            # app; rely on uvicorn's graceful shutdown to surface
+            # anything that actually warrants holding the user back.
+            confirm_close=False,
+        )
+        webview.start()
+    except BaseException as e:
+        # If the platform backend errors at start() (e.g. WebView2 not
+        # installed on Windows), bail out to browser mode cleanly so
+        # the user isn't stranded.
+        print(
+            f"\nNative window failed to launch ({type(e).__name__}: {e}). "
+            "Falling back to system browser.",
+            flush=True,
+        )
+        try:
+            webbrowser.open(url, new=2)
+        except webbrowser.Error:
+            pass
+        # Drop into the server's lifetime so the user can still use the
+        # app from the browser; Ctrl-C in the console window will stop it.
+        try:
+            thread.join()
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    # Window closed → drain and stop uvicorn.
+    server.should_exit = True
+    thread.join(timeout=10)
+    return 0
+
+
+def _run_browser_mode(host: str, port: int, forwarded_allow_ips: str,
+                      setup_path: str) -> int:
+    """Open the system browser when ready, run uvicorn on the main thread."""
+    threading.Thread(
+        target=_open_browser_when_ready,
+        args=(host, port, setup_path),
+        daemon=True,
+    ).start()
+    return _run_headless_mode(host, port, forwarded_allow_ips)
+
+
+def _run_headless_mode(host: str, port: int,
+                       forwarded_allow_ips: str) -> int:
+    """Plain uvicorn.run on the main thread, no UI auto-launch."""
+    import uvicorn
+
+    import app  # noqa: F401
+
+    uvicorn.run(
+        app.app,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_allow_ips,
+    )
+    return 0
 
 
 def _run(argv: list[str] | None) -> int:
@@ -276,44 +491,29 @@ def _run(argv: list[str] | None) -> int:
     # post-import load would be ignored.
     loaded = _load_dotenv_files()
 
-    # If literally nothing is configured, flip to AUTH_MODE=none so the
-    # binary boots on first launch. The banner makes it loud — this is
-    # not a silent default change for real deployments (any one auth var
-    # disables the bootstrap).
     first_run = not loaded and _looks_unconfigured()
-    open_browser = _resolve_open_browser(args, first_run)
+    ui_mode = _resolve_ui_mode(args, first_run)
 
     if first_run:
         os.environ["AUTH_MODE"] = "none"
         os.environ.setdefault("SESSION_COOKIE_INSECURE", "true")
         os.environ.setdefault("CLAUDE_WEB_CSRF_STRICT", "false")
-        _print_first_run_banner(args.host, args.port, open_browser)
+        _print_first_run_banner(args.host, args.port, ui_mode)
         _check_claude_cli()
 
-    if open_browser:
-        # Daemon thread; dies with the process. The thread polls
-        # /healthz so the browser opens only after uvicorn is actually
-        # serving requests, not just after the python import completes.
-        threading.Thread(
-            target=_open_browser_when_ready,
-            args=(args.host, args.port, "/setup"),
-            daemon=True,
-        ).start()
+    setup_path = "/setup" if first_run else "/"
 
-    # Imports are deferred so --help is fast and importing uvicorn/app
-    # at module load doesn't trip the PyInstaller analyzer twice.
-    import uvicorn
-
-    import app  # noqa: F401 — registers the FastAPI instance as `app.app`
-
-    uvicorn.run(
-        app.app,
-        host=args.host,
-        port=args.port,
-        proxy_headers=True,
-        forwarded_allow_ips=args.forwarded_allow_ips,
+    if ui_mode == UI_WINDOW:
+        return _run_window_mode(
+            args.host, args.port, args.forwarded_allow_ips, setup_path,
+        )
+    if ui_mode == UI_BROWSER:
+        return _run_browser_mode(
+            args.host, args.port, args.forwarded_allow_ips, setup_path,
+        )
+    return _run_headless_mode(
+        args.host, args.port, args.forwarded_allow_ips,
     )
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

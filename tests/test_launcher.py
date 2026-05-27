@@ -6,6 +6,7 @@ nothing else, so the helpers get unit coverage even though they're tiny.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import textwrap
@@ -32,6 +33,7 @@ def launcher(monkeypatch, tmp_path):
         "OIDC_ISSUER_URL", "OIDC_CLIENT_ID",
         "OIDC_CLIENT_SECRET", "OIDC_REDIRECT_URI",
         "FOO_NEW_KEY", "OVERRIDE_KEY",
+        "CLAUDE_WEB_UI_MODE", "CLAUDE_WEB_OPEN_BROWSER",
     ):
         monkeypatch.delenv(var, raising=False)
     import importlib
@@ -83,36 +85,87 @@ def test_looks_unconfigured_false_when_auth_mode_set(launcher, monkeypatch) -> N
     assert launcher._looks_unconfigured() is False
 
 
-# ─── browser auto-open precedence matrix ──────────────────────────────
+# ─── UI-mode resolver precedence matrix ───────────────────────────────
 
 
-def _make_args(open_browser: object) -> object:
-    import argparse
+def _make_args(ui_mode: object) -> argparse.Namespace:
     ns = argparse.Namespace()
-    ns.open_browser = open_browser
+    ns.ui_mode = ui_mode
     return ns
 
 
-def test_resolve_open_browser_cli_flag_wins(launcher, monkeypatch) -> None:
-    """--no-browser and CLAUDE_WEB_OPEN_BROWSER=true together: the CLI
-    flag wins. Otherwise an env var in the user's shell could silently
-    re-enable an opt-out they explicitly requested."""
-    monkeypatch.setenv("CLAUDE_WEB_OPEN_BROWSER", "true")
-    assert launcher._resolve_open_browser(_make_args(False), first_run=True) is False
-    assert launcher._resolve_open_browser(_make_args(True), first_run=False) is True
+def test_resolve_ui_mode_cli_flag_wins(launcher, monkeypatch) -> None:
+    """--headless and CLAUDE_WEB_UI_MODE=window together: the CLI flag
+    wins. Otherwise an env var in the user's shell could silently
+    re-enable a UI mode they explicitly opted out of."""
+    monkeypatch.setenv("CLAUDE_WEB_UI_MODE", "window")
+    assert (
+        launcher._resolve_ui_mode(_make_args(launcher.UI_HEADLESS), first_run=True)
+        == launcher.UI_HEADLESS
+    )
+    assert (
+        launcher._resolve_ui_mode(_make_args(launcher.UI_BROWSER), first_run=False)
+        == launcher.UI_BROWSER
+    )
 
 
-def test_resolve_open_browser_env_var_overrides_first_run(launcher, monkeypatch) -> None:
-    """A persistent CLAUDE_WEB_OPEN_BROWSER=false keeps the browser
-    suppressed even on first-run (useful for headless/CI bootstraps)."""
-    monkeypatch.setenv("CLAUDE_WEB_OPEN_BROWSER", "false")
-    assert launcher._resolve_open_browser(_make_args(None), first_run=True) is False
+def test_resolve_ui_mode_env_var_wins_over_default(launcher, monkeypatch) -> None:
+    """A persistent CLAUDE_WEB_UI_MODE=headless overrides the frozen-
+    binary default (which would otherwise be window)."""
+    monkeypatch.setenv("CLAUDE_WEB_UI_MODE", "headless")
+    assert (
+        launcher._resolve_ui_mode(_make_args(None), first_run=True)
+        == launcher.UI_HEADLESS
+    )
 
 
-def test_resolve_open_browser_defaults_open_on_first_run_only(launcher, monkeypatch) -> None:
-    monkeypatch.delenv("CLAUDE_WEB_OPEN_BROWSER", raising=False)
-    assert launcher._resolve_open_browser(_make_args(None), first_run=True) is True
-    assert launcher._resolve_open_browser(_make_args(None), first_run=False) is False
+def test_resolve_ui_mode_frozen_first_run_picks_window_when_available(
+    launcher, monkeypatch
+) -> None:
+    """The headline behaviour: a freshly-extracted Windows zip on a
+    machine with WebView2 installed picks UI_WINDOW so the user gets a
+    native window, not a console + browser."""
+    monkeypatch.setattr(launcher, "_try_import_webview", lambda: object())
+    assert (
+        launcher._resolve_ui_mode(_make_args(None), first_run=True)
+        == launcher.UI_WINDOW
+    )
+
+
+def test_resolve_ui_mode_frozen_first_run_falls_back_to_browser_when_no_webview(
+    launcher, monkeypatch
+) -> None:
+    """Linux runner without GTK/QT, or Windows pre-1809 without WebView2:
+    the launcher must degrade to system-browser mode, not crash trying
+    to open a window backend that doesn't exist."""
+    monkeypatch.setattr(launcher, "_try_import_webview", lambda: None)
+    assert (
+        launcher._resolve_ui_mode(_make_args(None), first_run=True)
+        == launcher.UI_BROWSER
+    )
+
+
+def test_resolve_ui_mode_frozen_subsequent_run_is_headless(launcher) -> None:
+    """A configured deployment (first_run=False) shouldn't hijack the
+    operator's desktop on every restart. Default to headless."""
+    assert (
+        launcher._resolve_ui_mode(_make_args(None), first_run=False)
+        == launcher.UI_HEADLESS
+    )
+
+
+def test_resolve_ui_mode_from_source_is_headless(launcher, monkeypatch) -> None:
+    """A developer running `python launcher.py` typically wants a server
+    + their own browser, not a native window that takes over the
+    terminal. Override the frozen fixture and confirm the default flips."""
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    assert (
+        launcher._resolve_ui_mode(_make_args(None), first_run=True)
+        == launcher.UI_HEADLESS
+    )
+
+
+# ─── browser-open readiness probe ─────────────────────────────────────
 
 
 def test_open_browser_when_ready_calls_webbrowser_on_200(launcher, monkeypatch) -> None:

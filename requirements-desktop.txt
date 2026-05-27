@@ -1,0 +1,17 @@
+# Desktop window support for the frozen PyInstaller binary.
+#
+# pywebview embeds the platform's native webview (Edge WebView2 on
+# Windows, WebKit on macOS, GTK WebKit / QtWebEngine on Linux). The
+# launcher uses this when `--window` mode is active, which is the
+# default for the frozen binary on first-run.
+#
+# The base package is small (~1 MB). Backend runtimes:
+#   * Windows : Edge WebView2 (pre-installed on Win11 / Win10 1809+).
+#               If absent, the launcher falls back to system browser.
+#   * macOS   : Cocoa + WebKit (system framework, no extra install).
+#   * Linux   : webview falls back if no GTK/Qt is present. The frozen
+#               Linux build degrades gracefully to system browser mode.
+#
+# Kept out of requirements.txt to keep the server-only deploy lean —
+# the homelab systemd unit doesn't need a desktop framework.
+pywebview>=5.0
