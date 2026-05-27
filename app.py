@@ -63,6 +63,51 @@ import setup_flow
 log = logging.getLogger("claude-web")
 
 
+# Whether we're running on Windows. Branches keyed on this stay rare —
+# almost everything is `pathlib` and `subprocess`, both portable — but
+# three pieces need it: `os.chmod(fd, mode)` is unsupported, `os.symlink`
+# needs Developer Mode/admin (we fall back to junctions + hardlinks), and
+# the bundled `claude` CLI is `claude.cmd` on PATH (resolved via
+# ``shutil.which`` rather than passed bare to subprocess_exec).
+IS_WINDOWS = os.name == "nt"
+
+
+def _link_or_copy(src: Path, link: Path) -> None:
+    """Create ``link`` pointing at ``src``, preferring a symlink.
+
+    Used to mirror entries from ``CLAUDE_HOME`` into a per-user credential
+    home (see ``_ensure_credential_home``). On POSIX this is always a
+    symlink. On Windows a symlink needs Developer Mode or admin; if the
+    symlink call fails we fall back to a junction for directories (no
+    privilege required on NTFS) and a hardlink for files. As a last
+    resort we leave the entry absent and log — better than crashing the
+    request.
+    """
+    try:
+        link.symlink_to(src)
+        return
+    except OSError as e:
+        if not IS_WINDOWS:
+            log.warning("credential-home symlink %s → %s failed: %s", link, src, e)
+            return
+    # Windows fallbacks.
+    try:
+        if src.is_dir():
+            # NTFS junction. _winapi.CreateJunction is private but stable
+            # since CPython 3.6 and doesn't require Developer Mode.
+            import _winapi  # type: ignore[import-not-found]
+
+            _winapi.CreateJunction(str(src), str(link))
+            return
+        os.link(str(src), str(link))
+        return
+    except (OSError, ImportError, AttributeError) as e:
+        log.warning(
+            "credential-home link %s → %s failed on Windows fallback: %s",
+            link, src, e,
+        )
+
+
 def _configure_app_logging() -> None:
     """Attach a stream handler to the ``claude-web`` logger if none is present.
 
@@ -107,9 +152,19 @@ except Exception as _rt_exc:  # pragma: no cover — optional dependency
     log.info("roundtable not installed (%s); /roundtable disabled", _rt_exc)
 
 
+_PROJECT_KEY_INVALID_RE = re.compile(r"[\\/:]")
+
+
 def _sanitize_project_key(cwd: Path) -> str:
-    """Mirror Claude Code's per-project session-dir naming."""
-    return str(cwd.resolve()).replace("/", "-")
+    """Mirror Claude Code's per-project session-dir naming.
+
+    On POSIX the resolved path only contains ``/``, so this collapses to
+    the original ``replace("/", "-")``. On Windows the resolved path has
+    ``\\`` separators and a drive-letter ``:`` — both invalid in NTFS
+    filenames — so we map all three to ``-`` to keep the produced key a
+    valid directory name and match the bundled CLI's own encoding.
+    """
+    return _PROJECT_KEY_INVALID_RE.sub("-", str(cwd.resolve()))
 
 
 CLAUDE_HOME = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).resolve()
@@ -3907,12 +3962,7 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
         # is_symlink() catches broken symlinks that exists() reports as False.
         if link.is_symlink() or link.exists():
             continue
-        try:
-            link.symlink_to(entry.absolute())
-        except OSError as e:
-            logging.getLogger("claude-web").warning(
-                "credential-home symlink %s → %s failed: %s", link, entry, e
-            )
+        _link_or_copy(entry.absolute(), link)
     return home
 
 
@@ -8420,6 +8470,16 @@ async def api_roundtable_apply(
 
     if not candidate.is_file():
         raise HTTPException(404, f"target file does not exist: {target}")
+
+    # GNU patch is the apply engine. On Windows it isn't installed by
+    # default — surface a clear 501 rather than a generic 500 from the
+    # subprocess FileNotFoundError so the UI can explain.
+    if shutil.which("patch") is None:
+        raise HTTPException(
+            501,
+            "GNU patch is required for click-to-apply but isn't on PATH. "
+            "Install it (e.g. via Git for Windows) and retry.",
+        )
 
     # Write the diff to a temp file. We use `patch` rather than a pure-
     # Python apply because GNU patch is robust to fuzz, mixed line

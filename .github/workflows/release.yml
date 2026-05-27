@@ -1,0 +1,127 @@
+name: Release binaries
+
+# Build standalone bundles on tag push (matching `v*`) and attach them
+# to the GitHub Release for that tag. The existing docker-publish.yml
+# already covers the container image on the same trigger; this workflow
+# is additive — Windows, macOS, and Linux native bundles for people who
+# don't want to run a container.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to attach binaries to (e.g. v0.4.2). Required for manual runs."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+            archive_ext: zip
+          - os: macos-latest
+            target: macos-arm64
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: linux-x64
+            archive_ext: tar.gz
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        # 3.13 is the highest version covered by the CI matrix; pin one
+        # to keep the frozen bundle's interpreter version deterministic
+        # across releases.
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install runtime + PyInstaller
+        # bash is uniform across all three runners; PowerShell would
+        # otherwise parse `>=6.10` as a redirection.
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.10"
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        # github.ref_name is the tag on a tag push but unset for
+        # workflow_dispatch; fall back to the manual input. Bash works
+        # uniformly on all three runners (windows-latest ships Git Bash).
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build with PyInstaller
+        # --clean wipes prior build caches so a stale hook doesn't
+        # silently pin an old hidden-import list across releases.
+        run: pyinstaller --clean --noconfirm claude_web.spec
+
+      - name: Package archive (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        # Compress-Archive -Path dist/claude-web (no trailing /*) zips
+        # the directory itself, so end users `Expand-Archive` and get a
+        # `claude-web\` folder rather than loose files in their downloads.
+        run: |
+          $archiveName = "claude-web-${{ steps.tag.outputs.name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path dist/claude-web -DestinationPath $archiveName
+          "ARCHIVE=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Package archive (POSIX)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          archive="claude-web-${{ steps.tag.outputs.name }}-${{ matrix.target }}.tar.gz"
+          tar -C dist -czf "$archive" claude-web
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-web-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Attach to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # workflow_dispatch jobs don't auto-create a release; only attach
+    # when this is a real tag push and skip on manual runs (the
+    # artifacts are still uploadable from the build job's artifact list).
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Glob across the three platform artifact folders.
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
+          # Don't overwrite an existing release body — let the developer
+          # write release notes; we just attach the binaries.
+          generate_release_notes: true

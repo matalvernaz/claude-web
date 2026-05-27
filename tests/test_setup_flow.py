@@ -7,6 +7,9 @@ import importlib
 import pytest
 
 
+_IS_WINDOWS = os.name == "nt"
+
+
 @pytest.fixture
 def fresh_setup_flow(tmp_path, monkeypatch):
     """Re-import setup_flow with a fresh STATE_DIR so tests don't share state."""
@@ -65,6 +68,7 @@ def test_save_api_key_rejects_malformed(fresh_setup_flow) -> None:
         fresh_setup_flow.save_api_key("export ANTHROPIC_API_KEY=sk-ant-abc")
 
 
+@pytest.mark.skipif(_IS_WINDOWS, reason="POSIX file modes don't apply on NTFS")
 def test_save_api_key_writes_mode_600(fresh_setup_flow) -> None:
     fresh_setup_flow.save_api_key(_FAKE_KEY)
     mode = oct(fresh_setup_flow.API_KEY_FILE.stat().st_mode)[-3:]
@@ -74,3 +78,13 @@ def test_save_api_key_writes_mode_600(fresh_setup_flow) -> None:
     # shared host.
     home_copy = fresh_setup_flow.api_key_path(fresh_setup_flow.CLAUDE_HOME)
     assert oct(home_copy.stat().st_mode)[-3:] == "600"
+
+
+def test_save_api_key_persists_on_windows(fresh_setup_flow) -> None:
+    """The atomic-write path must still produce a readable file on Windows
+    even though the chmod step is skipped. The directory permissions on
+    %USERPROFILE% are the real access boundary there."""
+    fresh_setup_flow.save_api_key(_FAKE_KEY)
+    assert fresh_setup_flow.API_KEY_FILE.read_text() == _FAKE_KEY
+    home_copy = fresh_setup_flow.api_key_path(fresh_setup_flow.CLAUDE_HOME)
+    assert home_copy.read_text() == _FAKE_KEY

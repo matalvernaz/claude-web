@@ -55,6 +55,27 @@ uvicorn app:app --host 127.0.0.1 --port 3001
 
 Then visit `http://localhost:3001/setup` (set `SESSION_COOKIE_INSECURE=true` and `AUTH_MODE=none` in `.env` for local-only testing) to sign Claude in.
 
+### Running from source on Windows
+
+The same source install works on Windows; the prerequisites are the same (Python 3.11+, Node.js + the `claude` CLI), just expressed in PowerShell. Two Windows-specific notes:
+
+```powershell
+git clone https://github.com/matalvernaz/claude-web.git
+cd claude-web
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+npm install -g @anthropic-ai/claude-code        # provides claude.cmd
+Copy-Item .env.example .env                     # edit values
+Get-Content .env | ForEach-Object {
+    if ($_ -match '^\s*([^#=]+?)\s*=\s*(.*)$') { Set-Item "env:$($matches[1])" $matches[2] }
+}
+uvicorn app:app --host 127.0.0.1 --port 3001
+```
+
+- The per-user-credentials feature (`/account`) mirrors `CLAUDE_HOME` into per-user subdirectories using symlinks. On Windows, `os.symlink` requires either **Developer Mode** (Settings → Privacy & security → For developers → "Developer Mode") or an Administrator shell. If neither is available we fall back to NTFS junctions for directories and hardlinks for files, which works without privilege but only on NTFS volumes — the warning will appear in the log if a fallback also fails. The shared slot doesn't need any of this; only the multi-credential view does.
+- Click-to-apply diffs in `/roundtable` shell out to GNU `patch`. It isn't installed by default on Windows; the route returns HTTP 501 with a clear message if it's missing. Install it via Git for Windows (it ships `usr\bin\patch.exe`) or any other GNU-utils bundle and the feature lights up.
+
 For a long-running install behind a reverse proxy, a systemd unit looks like:
 
 ```ini

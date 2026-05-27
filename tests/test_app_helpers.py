@@ -185,6 +185,28 @@ def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypa
     )
 
 
+# ─── path sanitiser portability ────────────────────────────────────────────
+
+
+def test_sanitize_project_key_posix_path() -> None:
+    """POSIX path produces the canonical `-` separator form (unchanged
+    by the Windows-portability refactor)."""
+    from pathlib import PurePosixPath
+
+    # Mirror the regex over a representative POSIX absolute path.
+    text = str(PurePosixPath("/home/matt/foo"))
+    assert app_module._PROJECT_KEY_INVALID_RE.sub("-", text) == "-home-matt-foo"
+
+
+def test_sanitize_project_key_windows_path() -> None:
+    """A Windows-style path with `\\` and a drive-letter `:` collapses to
+    a valid NTFS filename. Without this the per-project session-dir name
+    would contain `:` which NTFS rejects, and the UI wouldn't find
+    sessions the bundled CLI wrote next to it."""
+    text = r"C:\Users\matt\foo"
+    assert app_module._PROJECT_KEY_INVALID_RE.sub("-", text) == "C--Users-matt-foo"
+
+
 # ─── identity env passthrough ──────────────────────────────────────────────
 
 def test_identity_env_for_full_user() -> None:

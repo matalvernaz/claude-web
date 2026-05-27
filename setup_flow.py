@@ -25,10 +25,31 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
+
+
+# os.chmod on a file descriptor needs os.fchmod, which doesn't exist on
+# Windows — passing an fd there raises NotImplementedError. Branch once
+# here so the call sites stay readable.
+_FCHMOD_SUPPORTED = "fchmod" in dir(os)
+
+
+def _resolve_claude_cli() -> str:
+    """Locate the bundled `claude` CLI for ``create_subprocess_exec``.
+
+    On POSIX the bare name ``"claude"`` resolves through ``$PATH`` fine.
+    On Windows it's installed as ``claude.cmd`` and Python's
+    ``asyncio.create_subprocess_exec`` doesn't follow PATHEXT — pass it
+    ``"claude"`` and it raises FileNotFoundError. ``shutil.which`` does
+    walk PATHEXT, so use whatever it returns; fall back to the bare name
+    so the existing ``FileNotFoundError`` handlers fire if the CLI really
+    isn't installed.
+    """
+    return shutil.which("claude") or "claude"
 
 
 log = logging.getLogger(__name__)
@@ -153,7 +174,11 @@ def _atomic_write_secret(path: Path, content: str) -> None:
         # mkstemp gives 0o600 by default on POSIX; the explicit chmod is
         # defense-in-depth in case a future libc changes that or someone
         # ports this to a platform where mkstemp's default is laxer.
-        os.chmod(fd, 0o600)
+        # Windows lacks os.fchmod entirely, and POSIX file modes have no
+        # equivalent on NTFS — skip there. The directory permissions on
+        # %USERPROFILE% are the actual access boundary on Windows.
+        if _FCHMOD_SUPPORTED:
+            os.chmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as outf:
             outf.write(content)
             outf.flush()
@@ -215,7 +240,7 @@ async def sign_out(home: Optional[Path] = None) -> None:
         env = dict(os.environ)
         env["CLAUDE_CONFIG_DIR"] = str(target_home)
         proc = await asyncio.create_subprocess_exec(
-            "claude", "auth", "logout",
+            _resolve_claude_cli(), "auth", "logout",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -282,7 +307,7 @@ _flows: dict[str, OAuthFlowState] = {}
 
 
 async def _drive(state: OAuthFlowState) -> None:
-    args = ["claude", "auth", "login"]
+    args = [_resolve_claude_cli(), "auth", "login"]
     if state.variant == "console":
         args.append("--console")
 
