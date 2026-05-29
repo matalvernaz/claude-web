@@ -4331,6 +4331,151 @@ def _restore_persisted_runs() -> None:
                  restored, STATE_DB_PATH, interrupted)
 
 
+# ─── MCP servers ─────────────────────────────────────────────────────────────
+#
+# MCP (Model Context Protocol) servers extend Claude with extra tools and
+# resources. Two sources feed the bundled CLI:
+#   1. The CLI's own ``claude mcp add`` / ``add-json`` machinery, scoped per
+#      user / per project. The storage is opaque to claude-web; we list these
+#      by shelling out to ``claude mcp list`` and parsing the text output.
+#   2. In-process MCP servers registered via the SDK's
+#      ``create_sdk_mcp_server`` primitive. These are Python coroutines that
+#      run inside the FastAPI process — no subprocess, no IPC. Opt-in via
+#      ``CLAUDE_WEB_ENABLE_IN_PROCESS_MCP=true`` so the stub doesn't
+#      accidentally merge over a deployment's existing CLI-configured
+#      servers if the SDK's merge semantics change in a future release.
+
+
+_MCP_LIST_RE = re.compile(
+    r"^(?P<name>[^:]+?):\s+(?P<addr>.+?)\s+-\s+(?P<status>.+?)\s*$"
+)
+ENABLE_IN_PROCESS_MCP = os.getenv("CLAUDE_WEB_ENABLE_IN_PROCESS_MCP", "false").lower() in (
+    "1", "true", "yes",
+)
+
+
+def _list_cli_mcp_servers(timeout_seconds: float = 15.0) -> dict[str, Any]:
+    """Shell out to ``claude mcp list`` and parse the human-readable output.
+
+    The CLI doesn't expose a JSON mode and its own storage format moves
+    between releases, so text parsing is the only stable surface. ``claude
+    mcp list`` spawns stdio servers for health checks; ``timeout_seconds``
+    bounds the page-load cost.
+
+    Returns ``{"servers": [...], "error": str | None}`` so the template
+    can render a useful empty state when the CLI is missing or the parse
+    fails. Each server has ``name`` / ``address`` / ``status`` /
+    ``connected`` (bool) / ``transport`` (best-effort heuristic from the
+    address string).
+    """
+    cli = shutil.which("claude")
+    if not cli:
+        return {"servers": [], "error": "claude CLI not on PATH"}
+    try:
+        proc = subprocess.run(
+            [cli, "mcp", "list"], capture_output=True, text=True,
+            timeout=timeout_seconds, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "servers": [],
+            "error": f"claude mcp list timed out after {timeout_seconds:.0f}s",
+        }
+    except OSError as e:
+        return {"servers": [], "error": f"could not run claude mcp list: {e}"}
+    stdout = proc.stdout or ""
+    servers: list[dict[str, Any]] = []
+    for raw in stdout.splitlines():
+        m = _MCP_LIST_RE.match(raw.strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        addr = m.group("addr").strip()
+        status = m.group("status").strip()
+        connected = status.startswith("✓") or "Connected" in status
+        if addr.startswith(("http://", "https://")):
+            transport = "http"
+        elif addr.endswith("/sse") or "sse" in status.lower():
+            transport = "sse"
+        else:
+            transport = "stdio"
+        servers.append({
+            "name": name,
+            "address": addr,
+            "status": status,
+            "connected": connected,
+            "transport": transport,
+        })
+    err = None
+    if proc.returncode != 0 and not servers:
+        err = (proc.stderr or "").strip() or f"claude mcp list exited {proc.returncode}"
+    return {"servers": servers, "error": err}
+
+
+_IN_PROCESS_MCP_SERVERS: dict[str, Any] = {}
+
+
+def _register_in_process_mcp_servers() -> None:
+    """Build the in-process SDK MCP servers claude-web exposes to the model.
+
+    Off by default. When ``CLAUDE_WEB_ENABLE_IN_PROCESS_MCP=true``, registers
+    a single ``claude_web`` server with a ``ping`` tool that's enough to
+    confirm the wiring works end-to-end without touching app state. Add
+    more tools (e.g. session-search, run-introspection) here as the surface
+    becomes clear; mind that every registered tool ships in every spawned
+    run's tool catalog, so cost matters.
+    """
+    global _IN_PROCESS_MCP_SERVERS
+    if not ENABLE_IN_PROCESS_MCP or _IN_PROCESS_MCP_SERVERS:
+        return
+    try:
+        from claude_agent_sdk import create_sdk_mcp_server, tool
+    except ImportError as e:
+        log.warning("in-process MCP unavailable (SDK too old?): %s", e)
+        return
+
+    @tool("ping", "Return claude-web's identity and server time. Useful to confirm the in-process MCP tool surface is reachable.", {})
+    async def ping(args: dict[str, Any]) -> dict[str, Any]:
+        text = f"claude-web pong @ {datetime.datetime.now().isoformat(timespec='seconds')}"
+        return {"content": [{"type": "text", "text": text}]}
+
+    server = create_sdk_mcp_server(name="claude_web", version="1.0.0", tools=[ping])
+    _IN_PROCESS_MCP_SERVERS = {"claude_web": server}
+
+
+def _in_process_mcp_servers_for_run() -> dict[str, Any]:
+    """Return the dict of in-process MCP servers to merge into options.
+
+    Idempotent: registration happens on the first call. Returns an empty
+    dict when the feature is disabled so callers can spread-merge without
+    a None check.
+    """
+    if not ENABLE_IN_PROCESS_MCP:
+        return {}
+    if not _IN_PROCESS_MCP_SERVERS:
+        _register_in_process_mcp_servers()
+    return dict(_IN_PROCESS_MCP_SERVERS)
+
+
+def _mcp_payload() -> dict[str, Any]:
+    cli = _list_cli_mcp_servers()
+    in_process: list[dict[str, Any]] = []
+    for name in _in_process_mcp_servers_for_run():
+        in_process.append({
+            "name": name,
+            "address": "in-process (claude-web)",
+            "status": "ready",
+            "connected": True,
+            "transport": "sdk",
+        })
+    return {
+        "cli_servers": cli["servers"],
+        "cli_error": cli["error"],
+        "in_process_servers": in_process,
+        "in_process_enabled": ENABLE_IN_PROCESS_MCP,
+    }
+
+
 # ─── Skills ──────────────────────────────────────────────────────────────────
 #
 # Skills are filesystem directories under ``$CLAUDE_HOME/skills/<name>/`` that
@@ -5707,6 +5852,18 @@ def _supersede_run(run: ActiveRun, reason: str) -> None:
         run.task.cancel()
 
 
+@app.get("/api/mcp")
+async def api_mcp_list(user: dict = Depends(auth.require_user)):
+    """List MCP servers visible to spawned runs.
+
+    Combines CLI-managed servers (parsed from ``claude mcp list``) with the
+    in-process SDK servers claude-web registers when
+    ``CLAUDE_WEB_ENABLE_IN_PROCESS_MCP=true``. Shell-out runs in a worker
+    thread so the event loop doesn't stall on slow health checks.
+    """
+    return await asyncio.to_thread(_mcp_payload)
+
+
 def _skills_payload() -> dict[str, Any]:
     skills = _list_skills_metadata()
     return {
@@ -6355,6 +6512,10 @@ async def api_chat(
         # hidden specific skills via the /skills page, an explicit allow-list
         # of remaining enabled names is passed instead.
         skills=_resolve_skills_for_run(),
+        # Merge claude-web's in-process MCP servers (when enabled) on top of
+        # whatever the CLI discovers from its own mcp.json. strict_mcp_config
+        # stays False so the CLI's configured servers continue to load.
+        mcp_servers=_in_process_mcp_servers_for_run(),
         include_partial_messages=False,
         stderr=_capture_stderr,
     )
@@ -7461,6 +7622,30 @@ async def personalities_page(
         request, "personalities.html", {
             "user": user,
             "personalities_payload": _personalities_payload(user),
+            "site_title": SITE_TITLE,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/mcp")
+async def mcp_page(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """List MCP servers and the claude-web in-process SDK tools.
+
+    Read-only for now — add/remove still happens via the bundled
+    ``claude mcp`` CLI (the storage format is opaque and edits during a
+    live run race with the CLI's own writes). The page calls the API
+    asynchronously so the page itself renders fast even when the shell-out
+    spends time on stdio-server health checks.
+    """
+    payload = await asyncio.to_thread(_mcp_payload)
+    response = templates.TemplateResponse(
+        request, "mcp.html", {
+            "user": user,
+            "mcp_payload": payload,
             "site_title": SITE_TITLE,
         },
     )

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP servers — claude-web</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
+</head>
+<body>
+  <header>
+    <h1>MCP servers</h1>
+    <div class="header-actions">
+      <a href="/">Back to chat</a>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="setup">
+    <p class="setup-intro">
+      MCP (Model Context Protocol) servers extend Claude with extra tools
+      and resources. claude-web sees two sources: the bundled
+      <code>claude</code> CLI's configured servers, and any in-process
+      servers claude-web registers itself.
+    </p>
+
+    <section aria-labelledby="cli-heading" class="setup-card">
+      <h2 id="cli-heading">CLI-managed servers</h2>
+      {% if mcp_payload.cli_error %}
+        <p class="setup-error" role="alert">{{ mcp_payload.cli_error }}</p>
+      {% endif %}
+      {% if mcp_payload.cli_servers %}
+        <table class="mcp-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Transport</th>
+              <th>Address</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for s in mcp_payload.cli_servers %}
+              <tr>
+                <td>{{ s.name }}</td>
+                <td><code>{{ s.transport }}</code></td>
+                <td><code class="mcp-addr">{{ s.address }}</code></td>
+                <td>{% if s.connected %}<span class="badge badge-active">{{ s.status }}</span>{% else %}<span class="badge">{{ s.status }}</span>{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% elif not mcp_payload.cli_error %}
+        <p>No MCP servers configured via the CLI. Run
+          <code>claude mcp add &lt;name&gt; &lt;cmd-or-url&gt;</code> or
+          <code>claude mcp add --transport http &lt;name&gt; &lt;url&gt;</code>
+          from a shell on the host to add one.
+        </p>
+      {% endif %}
+    </section>
+
+    <section aria-labelledby="inproc-heading" class="setup-card">
+      <h2 id="inproc-heading">In-process tools (claude-web)</h2>
+      {% if mcp_payload.in_process_enabled %}
+        {% if mcp_payload.in_process_servers %}
+          <table class="mcp-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Transport</th>
+                <th>Address</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for s in mcp_payload.in_process_servers %}
+                <tr>
+                  <td>{{ s.name }}</td>
+                  <td><code>{{ s.transport }}</code></td>
+                  <td><code class="mcp-addr">{{ s.address }}</code></td>
+                  <td><span class="badge badge-active">{{ s.status }}</span></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p>In-process MCP is enabled but no servers are registered yet.</p>
+        {% endif %}
+      {% else %}
+        <p>
+          In-process MCP is disabled. Set
+          <code>CLAUDE_WEB_ENABLE_IN_PROCESS_MCP=true</code> in
+          <code>.env</code> and restart the unit to expose claude-web's
+          built-in tools to the model.
+        </p>
+      {% endif %}
+    </section>
+
+    <p class="setup-note">
+      Add / remove / re-auth still happens via the bundled
+      <code>claude mcp</code> CLI — its storage format is opaque to this
+      app and editing while a run is live would race the CLI's own writes.
+    </p>
+  </main>
+</body>
+</html>

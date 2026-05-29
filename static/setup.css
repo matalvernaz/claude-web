@@ -205,6 +205,25 @@ details.setup-apikey > summary:focus {
   color: var(--accent);
 }
 
+.mcp-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  font-size: 0.92rem;
+}
+
+.mcp-table th,
+.mcp-table td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.mcp-addr {
+  word-break: break-all;
+}
+
 .personality-prompt,
 .skill-body {
   width: 100%;
