@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skills — claude-web</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
+  <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
+</head>
+<body>
+  <header>
+    <h1>Skills</h1>
+    <div class="header-actions">
+      <a href="/">Back to chat</a>
+      {% if user and user.sub != 'anonymous' %}
+        <span class="user-badge">{{ user.name or user.email or user.sub }}</span>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="setup">
+    <p class="setup-intro">
+      Skills are filesystem packages under
+      <code>{{ skills_payload.skills_dir }}</code> that the bundled Claude
+      Code CLI auto-discovers. Disable one here to hide its SKILL.md from
+      the model on every run — the files stay on disk so re-enabling is
+      instant.
+    </p>
+
+    {% if not skills_payload.skills_dir_exists %}
+      <section class="setup-card">
+        <p class="setup-error" role="alert">
+          The skills directory <code>{{ skills_payload.skills_dir }}</code>
+          doesn't exist yet. Install a skill via the host-shell
+          <code>claude</code> CLI (<code>/skills install &lt;name&gt;</code>)
+          or drop a skill directory in place, then refresh this page.
+        </p>
+      </section>
+    {% elif not skills_payload.skills %}
+      <section class="setup-card">
+        <p>
+          No skills installed. The bundled CLI discovers any directory under
+          <code>{{ skills_payload.skills_dir }}</code> that contains a
+          <code>SKILL.md</code>; add one and refresh.
+        </p>
+      </section>
+    {% else %}
+      <section aria-labelledby="list-heading" class="setup-card">
+        <h2 id="list-heading">
+          Installed skills ({{ skills_payload.skills | length }})
+          {% if skills_payload.disabled_count %}
+            <span class="hint">— {{ skills_payload.disabled_count }} hidden from model</span>
+          {% endif %}
+        </h2>
+        <ul id="skill-list" class="cred-list" aria-live="polite">
+          {% for s in skills_payload.skills %}
+            <li class="cred-item skill-item"
+                data-name="{{ s.name }}"
+                data-enabled="{{ '1' if s.enabled else '0' }}">
+              <span class="cred-label">
+                {{ s.display_name }}
+                {% if s.name != s.display_name %}
+                  <span class="hint">({{ s.name }})</span>
+                {% endif %}
+                {% if not s.enabled %}<span class="badge">hidden</span>{% endif %}
+                {% if s.disallowed_tools %}<span class="badge" title="Tools the skill declares it will not call.">restricts tools</span>{% endif %}
+              </span>
+              <span class="cred-meta">{{ s.description or '—' }}</span>
+              <span class="cred-actions">
+                <label class="checkbox-row">
+                  <input type="checkbox" class="skill-toggle" data-name="{{ s.name }}" {% if s.enabled %}checked{% endif %}>
+                  Visible to model
+                </label>
+                {% if s.has_skill_md %}
+                  <button type="button" class="skill-view" data-name="{{ s.name }}">View SKILL.md</button>
+                {% endif %}
+              </span>
+              <pre class="skill-body" hidden></pre>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <p class="setup-note">
+      Hidden skills are excluded from the SDK <code>skills</code> option on
+      every spawned run, so the model neither sees nor can invoke them. The
+      setting is shared across all signed-in users.
+    </p>
+  </main>
+
+  <script type="application/json" id="skills-data">{{ skills_payload | tojson | safe }}</script>
+  <script src="/static/skills.js?v={{ asset_version('skills.js') }}"></script>
+</body>
+</html>

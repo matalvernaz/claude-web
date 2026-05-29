@@ -1182,6 +1182,18 @@ def _state_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_session_personality_user "
             "ON session_personality(user_sub)"
         )
+        # Skills hidden from the model. A row here is a directory name under
+        # ``~/.claude/skills/`` (or the per-user equivalent once that exists)
+        # that should be excluded from the SDK's ``skills`` option, so the
+        # model never sees the SKILL.md and can't invoke it. Globally scoped
+        # for now — the homelab deployment has one shared skills directory
+        # and per-user split would need to break the credential-home symlink
+        # skeleton first. Empty table = pass ``skills="all"`` through.
+        conn.execute("""CREATE TABLE IF NOT EXISTS disabled_skill (
+            name TEXT PRIMARY KEY,
+            disabled_at REAL NOT NULL,
+            disabled_by TEXT
+        )""")
         _migrate_user_account_legacy(conn)
         _seed_personalities(conn)
         _STATE_DB = conn
@@ -4319,6 +4331,174 @@ def _restore_persisted_runs() -> None:
                  restored, STATE_DB_PATH, interrupted)
 
 
+# ─── Skills ──────────────────────────────────────────────────────────────────
+#
+# Skills are filesystem directories under ``$CLAUDE_HOME/skills/<name>/`` that
+# the bundled CLI auto-discovers. Each holds a ``SKILL.md`` with YAML
+# frontmatter (``name``, ``description``, optional ``disallowed-tools``) plus
+# an instruction body, and may include supporting files the skill body refers
+# to. The SDK's ``skills`` option decides which the model sees: ``"all"`` is
+# discover-everything, a list of names is allow-listed, ``None`` hides them.
+#
+# This UI surfaces what's installed and lets a signed-in user hide individual
+# skills from the model without touching the filesystem. Hides are stored in
+# ``disabled_skill`` (sqlite, globally scoped) so they survive restarts and
+# apply to every run. Enabling/disabling never moves bytes on disk; the model
+# just never sees the SKILL.md.
+
+
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+_SKILL_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def _skills_dir() -> Path:
+    """Where the bundled CLI looks for skills.
+
+    Mirrors ``CLAUDE_HOME`` so the host-shell ``claude`` CLI and claude-web
+    see the same skills directory. Created on demand by the CLI itself; we
+    don't materialize it from claude-web because an empty dir would mask
+    a misconfigured ``CLAUDE_HOME``.
+    """
+    return CLAUDE_HOME / "skills"
+
+
+def _safe_skill_name(name: str) -> str:
+    if not name or not _SKILL_NAME_RE.fullmatch(name):
+        raise HTTPException(400, "bad skill name")
+    return name
+
+
+def _parse_skill_md(text: str) -> dict[str, Any]:
+    """Pull ``name`` / ``description`` / ``disallowed-tools`` out of a
+    SKILL.md's YAML frontmatter without taking a yaml dependency.
+
+    Frontmatter shape is rigid (Anthropic's skill loader expects the same):
+    ``key: value`` per line, no nested mappings. A missing or malformed
+    frontmatter is fine — we return the empty dict and the caller falls back
+    to the directory name. Bare list syntax (``[a, b]``) is enough for the
+    one list field we care about.
+    """
+    m = _SKILL_FRONTMATTER_RE.match(text or "")
+    if not m:
+        return {}
+    out: dict[str, Any] = {}
+    for raw in m.group(1).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            value = [v.strip().strip('"').strip("'") for v in value[1:-1].split(",") if v.strip()]
+        elif (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def _disabled_skill_names() -> set[str]:
+    try:
+        rows = _state_db().execute("SELECT name FROM disabled_skill").fetchall()
+    except sqlite3.Error as e:
+        log.warning("disabled_skill read failed: %s", e)
+        return set()
+    return {row[0] for row in rows}
+
+
+def _set_skill_disabled(name: str, disabled: bool, who: Optional[str]) -> None:
+    name = _safe_skill_name(name)
+    try:
+        if disabled:
+            _state_db().execute(
+                "INSERT OR REPLACE INTO disabled_skill(name, disabled_at, disabled_by) "
+                "VALUES(?, ?, ?)",
+                (name, time.time(), who),
+            )
+        else:
+            _state_db().execute("DELETE FROM disabled_skill WHERE name = ?", (name,))
+    except sqlite3.Error as e:
+        log.warning("set_skill_disabled(%s, %s) failed: %s", name, disabled, e)
+        raise HTTPException(500, "could not update skill state") from e
+
+
+def _list_skills_metadata() -> list[dict[str, Any]]:
+    """Scan ``~/.claude/skills`` and return one row per installed skill.
+
+    Empty list if the directory doesn't exist yet — that's the
+    no-skills-installed state, not an error.
+    """
+    root = _skills_dir()
+    if not root.is_dir():
+        return []
+    disabled = _disabled_skill_names()
+    out: list[dict[str, Any]] = []
+    for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if not _SKILL_NAME_RE.fullmatch(entry.name):
+            continue
+        skill_md = entry / "SKILL.md"
+        meta: dict[str, Any] = {}
+        if skill_md.is_file():
+            try:
+                meta = _parse_skill_md(skill_md.read_text(encoding="utf-8", errors="replace"))
+            except OSError as e:
+                log.warning("read SKILL.md %s failed: %s", skill_md, e)
+        out.append({
+            "name": entry.name,
+            "display_name": meta.get("name") or entry.name,
+            "description": meta.get("description") or "",
+            "disallowed_tools": meta.get("disallowed-tools") or [],
+            "has_skill_md": skill_md.is_file(),
+            "enabled": entry.name not in disabled,
+            "path": str(entry),
+        })
+    return out
+
+
+def _skill_md_text(name: str) -> str:
+    """Return the SKILL.md body (or empty string) for the named skill.
+
+    Path-safety: the name regex blocks ``..`` and slashes, and we resolve
+    against the canonical skills directory.
+    """
+    name = _safe_skill_name(name)
+    skill_md = _skills_dir() / name / "SKILL.md"
+    try:
+        resolved = skill_md.resolve()
+        skills_root = _skills_dir().resolve()
+    except OSError as e:
+        raise HTTPException(404, "no such skill") from e
+    if not str(resolved).startswith(str(skills_root) + os.sep):
+        raise HTTPException(400, "bad skill path")
+    if not skill_md.is_file():
+        raise HTTPException(404, "no SKILL.md for this skill")
+    return skill_md.read_text(encoding="utf-8", errors="replace")
+
+
+def _resolve_skills_for_run() -> Any:
+    """SDK ``skills=`` value for the next run, honoring the disabled list.
+
+    Returns ``"all"`` when no skills are hidden (the cheap default — the CLI
+    discovers everything on disk), or a list of enabled skill names when the
+    user has hidden one or more. Returns ``"all"`` if the skills directory is
+    absent so a misconfigured CLAUDE_HOME doesn't silently turn skills off.
+    """
+    disabled = _disabled_skill_names()
+    if not disabled:
+        return "all"
+    metas = _list_skills_metadata()
+    enabled = [m["name"] for m in metas if m["enabled"]]
+    if not enabled:
+        # All installed skills are hidden. The SDK treats an empty list the
+        # same as ``None`` (no skills at all); that's the user's choice.
+        return []
+    return enabled
+
+
 # ─── Active run tracking ─────────────────────────────────────────────────────
 
 
@@ -5527,6 +5707,49 @@ def _supersede_run(run: ActiveRun, reason: str) -> None:
         run.task.cancel()
 
 
+def _skills_payload() -> dict[str, Any]:
+    skills = _list_skills_metadata()
+    return {
+        "skills": skills,
+        "disabled_count": sum(1 for s in skills if not s["enabled"]),
+        "skills_dir": str(_skills_dir()),
+        "skills_dir_exists": _skills_dir().is_dir(),
+    }
+
+
+@app.get("/api/skills")
+async def api_skills_list(user: dict = Depends(auth.require_user)):
+    return _skills_payload()
+
+
+@app.get("/api/skills/{name}/content")
+async def api_skill_content(name: str, user: dict = Depends(auth.require_user)):
+    return {"name": name, "skill_md": _skill_md_text(name)}
+
+
+@app.post("/api/skills/{name}/toggle")
+async def api_skill_toggle(
+    name: str,
+    enabled: bool = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Show or hide a skill from the model.
+
+    Hiding flips the SDK's ``skills`` option from ``"all"`` to an explicit
+    allow-list of remaining enabled names; the bundled CLI never loads the
+    SKILL.md so the model can't discover or invoke it. Re-enabling drops
+    the row from ``disabled_skill``.
+    """
+    name = _safe_skill_name(name)
+    # Guard: don't let the user hide a name that isn't actually installed
+    # (would just clutter the table forever — there's no UI to remove it).
+    installed = {s["name"] for s in _list_skills_metadata()}
+    if name not in installed:
+        raise HTTPException(404, "no such skill")
+    _set_skill_disabled(name, disabled=not enabled, who=user.get("sub"))
+    return _skills_payload()
+
+
 @app.post("/api/personalities/active")
 async def api_personalities_set_active(
     personality_id: int = Form(...),
@@ -6128,8 +6351,10 @@ async def api_chat(
         system_prompt=system_prompt_opt,
         # Default-None hides every installed skill from the model. "all"
         # mirrors the host-shell `claude` CLI so /security-review,
-        # /init, /loop, /skill <name>, etc. actually run.
-        skills="all",
+        # /init, /loop, /skill <name>, etc. actually run. When the user has
+        # hidden specific skills via the /skills page, an explicit allow-list
+        # of remaining enabled names is passed instead.
+        skills=_resolve_skills_for_run(),
         include_partial_messages=False,
         stderr=_capture_stderr,
     )
@@ -7236,6 +7461,27 @@ async def personalities_page(
         request, "personalities.html", {
             "user": user,
             "personalities_payload": _personalities_payload(user),
+            "site_title": SITE_TITLE,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/skills")
+async def skills_page(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """List installed Anthropic Skills with per-skill enable/disable.
+
+    Skills are filesystem objects under ``~/.claude/skills/`` discovered
+    by the bundled CLI; this page lets the user hide one or more from the
+    model without deleting them from disk.
+    """
+    response = templates.TemplateResponse(
+        request, "skills.html", {
+            "user": user,
+            "skills_payload": _skills_payload(),
             "site_title": SITE_TITLE,
         },
     )
