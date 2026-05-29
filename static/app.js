@@ -1603,8 +1603,15 @@
       announce("Server restarted while the previous turn was running.");
       setStatus("Server restarted mid-turn — send a new message to continue.");
     } else if (obj.type === "system" && obj.subtype === "init") {
-      // first chunk has session_id — record it for resume
-      if (obj.session_id && !sessionId) {
+      // Adopt whatever session id the SDK reports. Fresh chats start with
+      // sessionId="" and learn theirs here; swap-respawn forks (server
+      // passes fork_session=True after a personality/credential toggle)
+      // arrive with a different id than the URL currently shows, and we
+      // want the URL to follow so the old transcript stays navigable via
+      // the sidebar while the new one becomes the active session. Replays
+      // (system:init re-emitted after a reload) will see obj.session_id
+      // match the current sessionId and no-op.
+      if (obj.session_id && obj.session_id !== sessionId) {
         sessionId = obj.session_id;
         const url = new URL(location.href);
         url.searchParams.set("session", sessionId);

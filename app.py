@@ -44,6 +44,7 @@ from claude_agent_sdk import (
     TaskProgressMessage,
     TaskStartedMessage,
     UserMessage,
+    list_sessions as sdk_list_sessions,
 )
 from claude_agent_sdk.types import (
     TextBlock,
@@ -692,24 +693,36 @@ def list_sessions(user: Optional[dict] = None) -> list[dict]:
     In PER_USER_SESSIONS mode, sessions owned by other users are filtered
     out. Sessions with no recorded owner (host-shell `claude` ones) remain
     visible to everyone.
+
+    Delegates the per-project enumeration + metadata extraction to
+    ``claude_agent_sdk.list_sessions``, which uses the same stat + head/tail
+    sniff the bundled CLI does for ``/resume``. ``SDKSessionInfo.summary``
+    picks ``custom_title`` (set by the CLI's auto-title) ahead of the first
+    user prompt — same preference order the legacy ``session_title_from``
+    implemented manually.
     """
     rows: list[dict] = []
     for project in PROJECTS:
-        d = _sessions_dir(project)
-        if not d.exists():
-            continue
         key = _sanitize_project_key(project)
-        for p in d.glob("*.jsonl"):
-            try:
-                mtime = p.stat().st_mtime
-            except FileNotFoundError:
-                continue
+        try:
+            sessions = sdk_list_sessions(
+                directory=str(project),
+                include_worktrees=False,
+            )
+        except (OSError, ValueError):
+            # Project dir missing, malformed jsonl, etc. — skip silently so a
+            # broken project can't take down the whole sidebar.
+            continue
+        for info in sessions:
             rows.append({
-                "id": p.stem,
+                "id": info.session_id,
                 "project": key,
                 "project_path": str(project),
-                "mtime": int(mtime),
-                "_path": p,
+                # SDKSessionInfo.last_modified is milliseconds since epoch;
+                # everything downstream (sort, JSON response, browser) uses
+                # whole seconds, matching the old stat().st_mtime path.
+                "mtime": info.last_modified // 1000,
+                "_summary": info.summary,
             })
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     if PER_USER_SESSIONS and user is not None:
@@ -717,11 +730,14 @@ def list_sessions(user: Optional[dict] = None) -> list[dict]:
     rows = rows[:MAX_LISTED_SESSIONS]
     out = []
     for r in rows:
+        title = (r["_summary"] or "").strip() or r["id"][:8]
+        if len(title) > MAX_TITLE_CHARS:
+            title = title[:MAX_TITLE_CHARS] + "…"
         out.append({
             "id": r["id"],
             "project": r["project"],
             "project_path": r["project_path"],
-            "title": session_title_from(r["_path"]) or r["id"][:8],
+            "title": title,
             "mtime": r["mtime"],
         })
     return out
@@ -6277,6 +6293,13 @@ async def api_chat(
                 session_id, user.get("sub"), active_personality_id,
             )
         existing = _existing_run_for_session(session_id) if session_id else None
+        # Flag set when we supersede an in-flight run because the user toggled
+        # credentials or personality between turns. The spawn below uses it to
+        # pass ``fork_session=True`` to the SDK so the post-swap turns get a
+        # fresh session id — the pre-swap transcript stays bound to its
+        # original credentials/personality, the post-swap conversation lives
+        # at the new id, and both are independently navigable in the sidebar.
+        swap_respawn = False
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
             # bound its credentials at startup, so we can't just keep using
@@ -6291,6 +6314,7 @@ async def api_chat(
             _require_owner(existing, user)
             _supersede_run(existing, "account_changed")
             existing = None
+            swap_respawn = True
         if existing is not None and existing.personality_id != active_personality_id:
             # The system_prompt append is baked in at SDK init, so a
             # personality change can't be applied to a live CLI — same
@@ -6304,6 +6328,7 @@ async def api_chat(
             _require_owner(existing, user)
             _supersede_run(existing, "personality_changed")
             existing = None
+            swap_respawn = True
         if existing is not None:
             _require_owner(existing, user)
             file_metas = await _save_uploaded_files(files, existing.run_id)
@@ -6496,6 +6521,13 @@ async def api_chat(
     personality_append = personality_for_run["append"]
     system_prompt_opt: dict[str, Any] = {
         "type": "preset", "preset": "claude_code",
+        # Per-machine sections (cwd, env, memory paths, git status) move into
+        # the first user message so the cached prompt prefix is stable across
+        # users. claude-web is multi-user (OIDC + per-user credential slots),
+        # so cross-user cache hits matter. Older CLIs silently ignore the
+        # field; the personality "append" still varies per session and breaks
+        # caching when set, but no-personality turns hit the shared prefix.
+        "exclude_dynamic_sections": True,
     }
     if personality_append:
         system_prompt_opt["append"] = personality_append
@@ -6535,6 +6567,14 @@ async def api_chat(
         # credential slot. The SDK merges this dict over inherited env, so
         # PATH/HOME/etc. survive.
         options_kwargs["env"] = account["env"]
+    if swap_respawn:
+        # Personality / credential toggles cancelled an in-flight run. Fork
+        # to a new session id so the pre-swap transcript stays bound to its
+        # original voice/credentials while post-swap turns land on a fresh
+        # session id. The SDK reports the new id via the system:init event,
+        # ActiveRun.emit() re-indexes ACTIVE_RUNS_BY_SESSION (app.py:4744),
+        # and the browser updates its URL when it sees the swap.
+        options_kwargs["fork_session"] = True
     options = ClaudeAgentOptions(**options_kwargs)
 
     async def _send_user_message(client: ClaudeSDKClient, text: str, blocks: list[dict]) -> None:
