@@ -323,12 +323,14 @@ MAX_MESSAGE_BYTES = int(os.getenv("CLAUDE_WEB_MAX_MESSAGE_BYTES", str(1 * 1024 *
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Models exposed in the UI dropdown. The form sends `key`; the server maps
-# that to (`model`, `betas`). Opus 4.7's 1M-context variant is exposed as a
-# separate option because it's enabled via a beta flag rather than a distinct
-# model id. The empty key ("" → "Default") omits `model=` so the SDK uses
-# whatever the CLI defaults to.
+# that to (`model`, `betas`). Opus 4.8 ships with the 1M context window by
+# default on the API and needs no beta flag. Opus 4.7's 1M variant is kept
+# as a separate option because that model gates 1M behind a beta. The empty
+# key ("" → "Default") pins Opus 4.8 explicitly so the dropdown's default
+# does not silently fall back to whatever the CLI happens to choose.
 KNOWN_MODELS = [
-    {"key": "", "model": "", "label": "Default", "betas": []},
+    {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": []},
+    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": []},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": []},
     {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
      "context": 1000000, "betas": ["context-1m-2025-08-07"]},
