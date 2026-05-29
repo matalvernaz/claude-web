@@ -6906,6 +6906,27 @@ async def api_chat(
                             # arriving between turns must keep between_turns
                             # = True so the grace timer can arm.
 
+                        if popped_user_item is not None and not between_turns:
+                            # Race fix (2026-05-29): if msg_get just delivered
+                            # a new UserMessage/AssistantMessage (commonly a
+                            # ScheduleWakeup firing inside the CLI), the
+                            # between_turns block above flipped to False AFTER
+                            # we'd already popped a queued user message. Sending
+                            # it now would write to the CLI's stdin mid-turn,
+                            # which (per the comment at the top of this loop)
+                            # silently consumes-and-discards the message. Push
+                            # it back onto user_input_queue so the next
+                            # between-turns moment picks it up. Ack stays
+                            # attached so the POST handler still resolves when
+                            # the message actually lands.
+                            log.info(
+                                "deferring queued user input for run %s — "
+                                "CLI started a new turn in the same wait round",
+                                run.run_id,
+                            )
+                            await run.user_input_queue.put(popped_user_item)
+                            popped_user_item = None
+
                         if popped_user_item is not None:
                             item = popped_user_item
                             run.consecutive_auto_fires = 0
