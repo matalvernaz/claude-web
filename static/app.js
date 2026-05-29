@@ -2297,19 +2297,32 @@
 
     html += `<h3 class="usage-section">Today</h3>`;
     const costCell = showCost ? `<span><strong>${formatCost(t.cost_usd)}</strong></span>` : "";
+    const hitCell = t.cache_hit_pct == null
+      ? ""
+      : `<span title="Prompt input tokens served from the prompt cache. Higher is cheaper.">${formatPct(t.cache_hit_pct)} cache hit</span>`;
     html += `<div class="summary">
       <span><strong>${t.turns || 0}</strong> turns</span>
       ${costCell}
       <span>${fmt.format(t.input_tokens || 0)} in</span>
       <span>${fmt.format(t.output_tokens || 0)} out</span>
+      ${hitCell}
     </div>`;
+    if ((t.cache_read_input_tokens || t.cache_creation_input_tokens || 0) > 0) {
+      html += `<div class="summary" aria-label="Prompt cache breakdown">
+        <span title="Prompt tokens served from the cache at 0.1× cost.">${fmt.format(t.cache_read_input_tokens || 0)} cache read</span>
+        <span title="Prompt tokens written to the cache (1.25× cost for 5-minute TTL, 2× for 1-hour TTL).">${fmt.format(t.cache_creation_input_tokens || 0)} cache write</span>
+        <span title="Of the writes, this many requested the 5-minute TTL.">${fmt.format(t.cache_5m_input_tokens || 0)} @ 5m</span>
+        <span title="Of the writes, this many requested the 1-hour TTL.">${fmt.format(t.cache_1h_input_tokens || 0)} @ 1h</span>
+      </div>`;
+    }
 
     if (t.sessions && t.sessions.length) {
       const costHeader = showCost ? "<th>Cost</th>" : "";
-      html += `<table><thead><tr><th>Session</th><th>Turns</th>${costHeader}</tr></thead><tbody>`;
+      html += `<table><thead><tr><th>Session</th><th>Turns</th>${costHeader}<th title="Prompt input tokens served from the prompt cache.">Cache hit</th></tr></thead><tbody>`;
       for (const s of t.sessions) {
         const costRow = showCost ? `<td>${s.billed_turns > 0 ? formatCost(s.cost_usd) : "—"}</td>` : "";
-        html += `<tr><td>${htmlEscape(s.title)}</td><td>${s.turns}</td>${costRow}</tr>`;
+        const hitRow = `<td>${s.cache_hit_pct == null ? "—" : formatPct(s.cache_hit_pct)}</td>`;
+        html += `<tr><td>${htmlEscape(s.title)}</td><td>${s.turns}</td>${costRow}${hitRow}</tr>`;
       }
       html += `</tbody></table>`;
     } else {
@@ -2333,6 +2346,12 @@
 
   function htmlEscape(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function formatPct(frac) {
+    const n = Number(frac);
+    if (!Number.isFinite(n)) return "—";
+    return (n * 100).toFixed(n >= 0.1 ? 0 : 1) + "%";
   }
 
   // Diffs longer than this default to collapsed. The threshold is set by

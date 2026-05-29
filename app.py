@@ -6918,6 +6918,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         _log_usage(msg, account_slot=slot, owner_sub=owner)
         cred_mode = _resolve_credential_mode(slot, owner)
         usage = msg.usage or {}
+        creation = usage.get("cache_creation") or {}
         return [{
             "type": "result",
             "is_error": msg.is_error,
@@ -6934,6 +6935,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "output_tokens": usage.get("output_tokens"),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_5m_input_tokens": creation.get("ephemeral_5m_input_tokens"),
+            "cache_1h_input_tokens": creation.get("ephemeral_1h_input_tokens"),
             "permission_denials": [_denial_dict(d) for d in (msg.permission_denials or [])],
         }]
     return []
@@ -6980,6 +6983,19 @@ def _resolve_credential_mode(account_slot: str, owner_sub: Optional[str]) -> str
     return "unknown"
 
 
+def _cache_hit_pct(cache_read: int, cache_creation: int, raw_input: int) -> Optional[float]:
+    """Fraction of prompt input tokens served from the prompt cache.
+
+    Cache reads are the win; cache creations and raw input are the rest of
+    the prompt that the model actually processed. ``None`` for empty totals
+    so the UI can render "—" instead of a divide-by-zero 0%.
+    """
+    total = cache_read + cache_creation + raw_input
+    if total <= 0:
+        return None
+    return round(cache_read / total, 4)
+
+
 def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = None) -> None:
     """Append one row per completed turn to usage.jsonl.
 
@@ -6991,6 +7007,7 @@ def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = 
     (synthetic cost) at log time, so /api/usage can avoid surfacing fake totals.
     """
     usage = getattr(msg, "usage", None) or {}
+    creation = usage.get("cache_creation") or {}
     row = {
         "ts": int(time.time()),
         "session_id": msg.session_id,
@@ -7000,6 +7017,8 @@ def _log_usage(msg, *, account_slot: str = "shared", owner_sub: Optional[str] = 
         "output_tokens": usage.get("output_tokens"),
         "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+        "cache_5m_input_tokens": creation.get("ephemeral_5m_input_tokens"),
+        "cache_1h_input_tokens": creation.get("ephemeral_1h_input_tokens"),
         "is_error": msg.is_error,
         "account_slot": account_slot,
         "owner_sub": owner_sub,
@@ -7045,12 +7064,19 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
     by_session: dict[str, dict] = {}
     for r in today_rows:
         sid = r.get("session_id") or "?"
-        agg = by_session.setdefault(
-            sid, {"turns": 0, "billed_turns": 0, "cost": 0.0, "input": 0, "output": 0},
-        )
+        agg = by_session.setdefault(sid, {
+            "turns": 0, "billed_turns": 0, "cost": 0.0,
+            "input": 0, "output": 0,
+            "cache_read": 0, "cache_creation": 0,
+            "cache_5m": 0, "cache_1h": 0,
+        })
         agg["turns"] += 1
         agg["input"] += int(r.get("input_tokens") or 0)
         agg["output"] += int(r.get("output_tokens") or 0)
+        agg["cache_read"] += int(r.get("cache_read_input_tokens") or 0)
+        agg["cache_creation"] += int(r.get("cache_creation_input_tokens") or 0)
+        agg["cache_5m"] += int(r.get("cache_5m_input_tokens") or 0)
+        agg["cache_1h"] += int(r.get("cache_1h_input_tokens") or 0)
         if _is_billed_row(r):
             agg["billed_turns"] += 1
             agg["cost"] += float(r.get("total_cost_usd") or 0.0)
@@ -7065,11 +7091,20 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
             "cost_usd": round(s["cost"], 4),
             "input_tokens": s["input"],
             "output_tokens": s["output"],
+            "cache_read_input_tokens": s["cache_read"],
+            "cache_creation_input_tokens": s["cache_creation"],
+            "cache_5m_input_tokens": s["cache_5m"],
+            "cache_1h_input_tokens": s["cache_1h"],
+            "cache_hit_pct": _cache_hit_pct(s["cache_read"], s["cache_creation"], s["input"]),
         })
 
     total_cost = round(sum(s["cost_usd"] for s in sessions), 4)
     total_input = sum(s["input_tokens"] for s in sessions)
     total_output = sum(s["output_tokens"] for s in sessions)
+    total_cache_read = sum(s["cache_read_input_tokens"] for s in sessions)
+    total_cache_creation = sum(s["cache_creation_input_tokens"] for s in sessions)
+    total_cache_5m = sum(s["cache_5m_input_tokens"] for s in sessions)
+    total_cache_1h = sum(s["cache_1h_input_tokens"] for s in sessions)
     total_turns = sum(s["turns"] for s in sessions)
     total_billed_turns = sum(s["billed_turns"] for s in sessions)
 
@@ -7077,10 +7112,15 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
     # per-credential slots are filtered to the current user so each user
     # sees only their own spend on their own credentials. Rows from before
     # the slot-tagging change (missing account_slot) are treated as 'shared'.
-    slot_totals = {
-        "shared": {"turns": 0, "billed_turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
-        "personal": {"turns": 0, "billed_turns": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0},
-    }
+    def _empty_slot() -> dict:
+        return {
+            "turns": 0, "billed_turns": 0, "cost_usd": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_5m_input_tokens": 0, "cache_1h_input_tokens": 0,
+        }
+
+    slot_totals = {"shared": _empty_slot(), "personal": _empty_slot()}
     for r in today_rows:
         slot = r.get("account_slot") or "shared"
         # Per-credential slots (`cred:<id>`) and the legacy 'personal' string
@@ -7098,11 +7138,20 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
         bucket["turns"] += 1
         bucket["input_tokens"] += int(r.get("input_tokens") or 0)
         bucket["output_tokens"] += int(r.get("output_tokens") or 0)
+        bucket["cache_read_input_tokens"] += int(r.get("cache_read_input_tokens") or 0)
+        bucket["cache_creation_input_tokens"] += int(r.get("cache_creation_input_tokens") or 0)
+        bucket["cache_5m_input_tokens"] += int(r.get("cache_5m_input_tokens") or 0)
+        bucket["cache_1h_input_tokens"] += int(r.get("cache_1h_input_tokens") or 0)
         if _is_billed_row(r):
             bucket["billed_turns"] += 1
             bucket["cost_usd"] += float(r.get("total_cost_usd") or 0.0)
     for bucket in slot_totals.values():
         bucket["cost_usd"] = round(bucket["cost_usd"], 4)
+        bucket["cache_hit_pct"] = _cache_hit_pct(
+            bucket["cache_read_input_tokens"],
+            bucket["cache_creation_input_tokens"],
+            bucket["input_tokens"],
+        )
 
     rate_limit = None
     try:
@@ -7127,6 +7176,13 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
             "cost_usd": total_cost,
             "input_tokens": total_input,
             "output_tokens": total_output,
+            "cache_read_input_tokens": total_cache_read,
+            "cache_creation_input_tokens": total_cache_creation,
+            "cache_5m_input_tokens": total_cache_5m,
+            "cache_1h_input_tokens": total_cache_1h,
+            "cache_hit_pct": _cache_hit_pct(
+                total_cache_read, total_cache_creation, total_input,
+            ),
             "sessions": sessions[:20],
             "by_slot": slot_totals,
         },
