@@ -144,7 +144,7 @@ PARTICIPANTS: dict[str, dict] = {
     },
     "claude-opus": {
         "provider": "anthropic",
-        "model": "claude-opus-4-7",
+        "model": "claude-opus-4-8",
         "label": "Claude Opus",
     },
 }
@@ -689,7 +689,7 @@ def _provider_call(what: str, fn):
 #   - Gemini 2.5 Flash thinking budgets are 0–24576 tokens; 2.5 Pro has
 #     dynamic budget when set to -1. We pick conservative integer budgets
 #     that work on both tiers.
-#   - Anthropic Opus 4.7 / Sonnet 4.6 only support ``thinking={"type":
+#   - Anthropic Opus 4.8 / 4.7 / Sonnet 4.6 only support ``thinking={"type":
 #     "adaptive"}``; the deprecated ``enabled``+``budget_tokens`` form is
 #     scheduled for removal. So effort here is just an on/off toggle —
 #     anything ≥ medium turns thinking on, low disables it.
@@ -834,7 +834,7 @@ def _call_anthropic(
     When ``effort`` is medium or high we enable adaptive extended
     thinking, which lets Opus / Sonnet allocate their own internal
     reasoning budget before producing the visible response. Adaptive is
-    the only supported thinking mode on 4.6 / 4.7 — the older
+    the only supported thinking mode on 4.6 / 4.7 / 4.8 — the older
     ``type=enabled`` with ``budget_tokens`` is deprecated. The visible
     response is composed of ``text`` blocks; ``thinking`` blocks are
     dropped before returning so the transcript stays human-readable.
