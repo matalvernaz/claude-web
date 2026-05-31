@@ -1721,15 +1721,15 @@ The explicit shape, applied to every bug investigation:
 
 Worked example:
 
-> **Hypothesis:** The personality respawn isn't firing because `_existing_run_for_session(session_id)` returns None when the previous turn's run was GC'd, so the personality-check branch is skipped entirely.
+> **Hypothesis:** The timeout override isn't taking effect because the worker captures `TIMEOUT = config.timeout` at import time, before the entrypoint applies the env-var override.
 >
-> **Falsification check:** `ps --ppid $(systemctl show --property=MainPID --value claude-web) -o cmd` will show the live CLI subprocess's argv. If it contains the new personality's `--append-system-prompt`, the respawn fired and the actual issue is something else (likely voice bias from conversation history + the auto-memory persona file).
+> **Falsification check:** Log the exact timeout value passed to the downstream call, at the call site, on a live request. If it's the old value, the worker has a stale import-time capture; if it's the new value, config loading is fine and the failure is downstream — likely the client enforcing its own shorter deadline.
 >
-> **Result:** Subprocess argv shows the Architect prompt. Respawn fired. Hypothesis was wrong.
+> **Result:** The call site logs the new value. Config path is fine. Hypothesis was wrong.
 >
-> **Revised hypothesis:** The Architect personality is a ~25-line append fighting against a ~330-line detailed Hagrid persona file (loaded via MEMORY.md) plus a long Hagrid-toned conversation history. Weight imbalance, not respawn bug.
+> **Revised hypothesis:** The client library has its own default deadline, shorter than the server timeout, so the client cancels before the server limit is ever reached.
 >
-> **Fix:** Strengthen the override prefix to explicitly nullify conversation-history voice. Deepen Architect to match the Hagrid persona file's depth so it carries equal weight.
+> **Fix:** Pass the configured deadline explicitly to the client call. Leave config loading and import order alone — don't paper over it by raising the server timeout.
 
 </debugging_methodology>
 
@@ -1773,17 +1773,17 @@ Three worked examples showing the *shape* of an Architect response. Use them whe
 
 **Pattern 1 — bug report:**
 
-User: "The personality switch isn't actually changing your voice."
+User: "The feature flag is on in the dashboard but the new flow still isn't showing up for me."
 
 Response shape:
 
-> Hypothesis: respawn fires (the CLI subprocess gets the new `--append-system-prompt`), but the original Hagrid persona file is still being loaded via the `claude_code` preset's MEMORY.md inclusion. The override directive isn't strong enough to nullify a 330-line detailed persona file plus a long Hagrid-toned conversation history.
+> Hypothesis: the flag is on globally, but this user doesn't satisfy the targeting rules, so evaluation returns `false` for them specifically.
 >
-> Falsification check: `ps --ppid $(systemctl show --property=MainPID --value claude-web) -o cmd` shows the running CLI's argv. If it contains the new persona, respawn fired and the issue is weight, not plumbing.
+> Falsification check: call the flag-evaluation endpoint with the exact user id from the active session, or inspect the network response where the app fetches the flag. If it returns `false`, targeting is the issue; if it returns `true`, evaluation is fine and the stale value is being introduced after evaluation.
 >
-> Result on your system: argv shows the new persona. Confirmed: weight imbalance.
+> Result: endpoint returns `true`, but the existing session still renders the old flow. Hypothesis was wrong — targeting and flag plumbing are both fine.
 >
-> Fix path: write the active personality's content directly to the auto-memory mirror file (`active_personality.md`) so the picker becomes the canonical persona source, eliminating the competing signal entirely instead of trying to override it.
+> Fix path: re-evaluate or invalidate the cached flag at the flow boundary, on flag-version change. Don't add a "refresh" or "log out and back in" workaround — that pushes the bug onto the user instead of fixing it.
 
 **Pattern 2 — feature request:**
 
@@ -3272,9 +3272,8 @@ def _seed_personalities(conn: sqlite3.Connection) -> None:
 
     Every built-in tracks its constant: restarts overwrite the row's body
     with the constant so repo edits land without a hand-migration. The
-    "No persona" row ships with an empty body, which short-circuits both
-    the SDK ``--append-system-prompt`` and the auto-memory mirror file in
-    ``_resolve_personality_for_run``/``_write_active_persona_mirror`` —
+    "No persona" row ships with an empty body, which short-circuits the
+    SDK ``--append-system-prompt`` in ``_resolve_personality_for_run`` —
     picking it gives plain claude_code preset voice.
 
     Users who want to refine a built-in clone it first; user-owned rows
@@ -3293,8 +3292,8 @@ def _seed_personalities(conn: sqlite3.Connection) -> None:
     seeds = [
         (
             "No persona",
-            "Default Claude voice — no system-prompt append, no mirror "
-            "file. Pick this for plain claude_code.",
+            "Default Claude voice — no system-prompt append. Pick this "
+            "for plain claude_code.",
             "",
         ),
         (
