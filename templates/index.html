@@ -75,9 +75,13 @@
           </select>
         </label>
       {% endif %}
-      <label class="header-toggle" for="sound-toggle" title="Play a sound when a turn finishes, a permission prompt is waiting, or an error occurs — only while this window is in the background, so you can step away and know when to come back.">
+      <label class="header-toggle" for="sound-toggle" title="Play a distinct sound for each kind of event: turn finished, a permission prompt is waiting, an error occurred, a background task settled, the model auto-fired a follow-up, auto-followups paused, or a permission prompt expired.">
         <input type="checkbox" id="sound-toggle">
         <span>Sounds</span>
+      </label>
+      <label class="header-toggle" for="sound-away-toggle" title="Only play sounds while this window is in the background. Off (default) plays them whether or not the window is focused.">
+        <input type="checkbox" id="sound-away-toggle">
+        <span>Background only</span>
       </label>
       <span id="header-cost" class="header-cost" aria-label="Today's spend so far" title="Today so far">$0.0000</span>
       <button type="button" id="show-usage" aria-haspopup="dialog">Usage</button>

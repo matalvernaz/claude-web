@@ -147,16 +147,25 @@
   let announceTimer = null;
 
   // --- Event sounds ----------------------------------------------------
-  // Audible cues so you can step away from the window and know when a turn
-  // finishes, a permission prompt is waiting, or something errored. Tones
-  // are synthesised with the Web Audio API (no asset files → nothing to ship
-  // in the frozen bundle, and the `default-src 'self'` CSP needs no
-  // exception). They only fire when the window is NOT focused — when you're
-  // looking at the page, NVDA's announcements already cover it and a chime
-  // over speech is just noise.
+  // Distinct earcons so the run state is audible without reading the
+  // transcript: a turn finished, a tool needs approval, an error landed, a
+  // background task settled, the model auto-fired, auto-followups paused, a
+  // permission prompt expired. Each event has its own tone shape so it's
+  // identifiable without looking. Tones are synthesised with the Web Audio
+  // API (no asset files → nothing to ship in the frozen bundle, and the
+  // `default-src 'self'` CSP needs no exception).
+  //
+  // By default cues fire whenever sounds are enabled, focused or not — a
+  // screen-reader user sits on this tab with the window focused, so the old
+  // focus-gated behaviour silenced every cue. The "background only" toggle
+  // restores the away-only mode (suppress while focused) as an opt-in for
+  // anyone who finds a chime over speech redundant.
   const SOUND_KEY = "claude-web.sounds";
+  const SOUND_AWAY_KEY = "claude-web.sounds.awayonly";
   const soundToggle = document.getElementById("sound-toggle");
+  const soundAwayToggle = document.getElementById("sound-away-toggle");
   let soundsEnabled = safeGet(localStorage, SOUND_KEY) !== "0"; // default on
+  let soundsAwayOnly = safeGet(localStorage, SOUND_AWAY_KEY) === "1"; // default off
   let audioCtx = null;
 
   function ensureAudioCtx() {
@@ -192,27 +201,57 @@
     osc.stop(startAt + dur + 0.02);
   }
 
-  // name: "done" | "permission" | "error". Distinct shapes so the cue is
-  // identifiable without looking — rising = finished, three-note = needs you,
-  // descending = error.
+  // Distinct shapes so each cue is identifiable without looking. The base
+  // three — rising = turn finished, three-note = needs you, descending =
+  // error — keep their original tones; the rest are deliberately different
+  // in pitch register and timbre so background events don't get mistaken for
+  // the turn you're waiting on.
   function playCue(name) {
     if (!soundsEnabled) return;
-    if (document.hasFocus()) return;
+    if (soundsAwayOnly && document.hasFocus()) return;
     const ctx = ensureAudioCtx();
     if (!ctx) return;
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
     const t = ctx.currentTime + 0.01;
     if (name === "done") {
+      // Turn finished OK — rising major third.
       tone(ctx, 660, t, 0.14, "sine", 0.18);
       tone(ctx, 880, t + 0.13, 0.18, "sine", 0.18);
     } else if (name === "permission") {
+      // A tool wants approval — insistent three-note climb, needs you.
       tone(ctx, 880, t, 0.12, "triangle", 0.22);
       tone(ctx, 880, t + 0.16, 0.12, "triangle", 0.22);
       tone(ctx, 1175, t + 0.32, 0.22, "triangle", 0.22);
     } else if (name === "error") {
+      // Turn errored — slow descending minor.
       tone(ctx, 440, t, 0.18, "sine", 0.2);
       tone(ctx, 330, t + 0.16, 0.18, "sine", 0.2);
       tone(ctx, 220, t + 0.32, 0.28, "sine", 0.2);
+    } else if (name === "task_done") {
+      // A background task settled OK — quick high double-blip, lighter than
+      // the main "done" so it reads as "one of several" not "the turn".
+      tone(ctx, 988, t, 0.08, "sine", 0.14);
+      tone(ctx, 1319, t + 0.1, 0.1, "sine", 0.14);
+    } else if (name === "task_error") {
+      // A background task failed — low descending double, darker than the
+      // full-turn error and shorter.
+      tone(ctx, 392, t, 0.12, "sine", 0.18);
+      tone(ctx, 262, t + 0.13, 0.18, "sine", 0.18);
+    } else if (name === "autofire") {
+      // Model is auto-firing a follow-up on its own — gentle low→mid swell,
+      // square timbre marks it as "Claude is talking unprompted".
+      tone(ctx, 523, t, 0.1, "square", 0.1);
+      tone(ctx, 698, t + 0.1, 0.14, "square", 0.1);
+    } else if (name === "attention") {
+      // Auto-followups paused / you must act — two equal mid notes, a polite
+      // alarm distinct from the climbing permission cue.
+      tone(ctx, 988, t, 0.12, "triangle", 0.2);
+      tone(ctx, 988, t + 0.2, 0.18, "triangle", 0.2);
+    } else if (name === "timeout") {
+      // A permission prompt expired (or was discarded) — soft descending
+      // fizzle, quieter than a real error.
+      tone(ctx, 587, t, 0.12, "sine", 0.14);
+      tone(ctx, 392, t + 0.13, 0.2, "sine", 0.14);
     }
   }
 
@@ -222,6 +261,14 @@
       soundsEnabled = soundToggle.checked;
       safeSet(localStorage, SOUND_KEY, soundsEnabled ? "1" : "0");
       if (soundsEnabled) unlockAudio(); // the toggle click is the gesture
+    });
+  }
+
+  if (soundAwayToggle) {
+    soundAwayToggle.checked = soundsAwayOnly;
+    soundAwayToggle.addEventListener("change", () => {
+      soundsAwayOnly = soundAwayToggle.checked;
+      safeSet(localStorage, SOUND_AWAY_KEY, soundsAwayOnly ? "1" : "0");
     });
   }
 
@@ -1830,6 +1877,7 @@
       announce(restarted
         ? `Permission request for ${obj.tool || "tool"} discarded due to server restart.`
         : `Permission request for ${obj.tool || "tool"} timed out.`);
+      playCue("timeout");
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
       markVisibleActivity();
@@ -1871,6 +1919,7 @@
       stopGerunds();
       setStreaming(false);
       announce("Auto-followups paused — send a message to continue.");
+      playCue("attention");
     } else if (obj.type === "auto_fire") {
       // Server is auto-firing a follow-up turn driven by a buffered
       // task notification. Render an info block so the user knows the
@@ -1902,6 +1951,7 @@
       setStreaming(true);
       startGerunds();
       announce("Auto-responding to background events.");
+      playCue("autofire");
     } else if (obj.type === "result") {
       ctx.lastResult = obj;
       if (typeof obj.input_tokens === "number") {
@@ -2013,6 +2063,7 @@
     markVisibleActivity();
     if (kind === "notification") {
       announce(`Background task ${id}: ${obj.status || "done"}`);
+      playCue(obj.status === "error" ? "task_error" : "task_done");
     }
   }
 
