@@ -567,3 +567,126 @@ def test_emit_persists_before_notifying_subscribers(monkeypatch) -> None:
     # happen later.
     assert "persist" in call_order
     assert call_order.index("persist") == 0  # persist is the first action
+
+
+# ─── New TaskCreate / TaskUpdate ledger (replaces TodoWrite in CLI 2.1.126+) ──
+
+def _assistant_with_tool_use(name: str, tool_use_id: str, inp: dict):
+    from claude_agent_sdk import AssistantMessage
+    from claude_agent_sdk.types import ToolUseBlock
+    return AssistantMessage(
+        content=[ToolUseBlock(id=tool_use_id, name=name, input=inp)],
+        model="test",
+    )
+
+
+def _user_with_tool_result(tool_use_id: str, text: str, is_error: bool = False):
+    from claude_agent_sdk import UserMessage
+    from claude_agent_sdk.types import ToolResultBlock
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id=tool_use_id, content=text, is_error=is_error)],
+    )
+
+
+def _todos_payloads(events: list[dict]) -> list[list[dict]]:
+    return [e["todos"] for e in events if e.get("type") == "todos_update"]
+
+
+def test_task_create_pending_until_result_arrives() -> None:
+    """TaskCreate stashes a partial entry keyed by tool_use_id. No
+    todos_update fires until the tool_result carries the assigned id."""
+    run = app_module.ActiveRun("task-create-pending")
+    events = app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskCreate", "tu_1", {
+            "subject": "First task", "description": "do thing", "activeForm": "Doing thing",
+        }),
+        run=run,
+    )
+    assert _todos_payloads(events) == []
+    assert "tu_1" in run.pending_task_creates
+    assert run.tasks == {}
+
+    events = app_module._sdk_message_to_events(
+        _user_with_tool_result("tu_1", "Task #1 created successfully: First task"),
+        run=run,
+    )
+    payloads = _todos_payloads(events)
+    assert len(payloads) == 1
+    assert payloads[0] == [{"content": "First task", "activeForm": "Doing thing", "status": "pending"}]
+    assert "tu_1" not in run.pending_task_creates
+    assert "1" in run.tasks
+
+
+def test_task_update_changes_status_and_emits() -> None:
+    """A TaskUpdate against a known task merges and emits the refreshed list."""
+    run = app_module.ActiveRun("task-update")
+    app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskCreate", "tu_a", {"subject": "A", "activeForm": "A-ing"}),
+        run=run,
+    )
+    app_module._sdk_message_to_events(_user_with_tool_result("tu_a", "Task #1 created: A"), run=run)
+    events = app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskUpdate", "tu_b", {"taskId": "1", "status": "in_progress"}),
+        run=run,
+    )
+    payloads = _todos_payloads(events)
+    assert payloads and payloads[-1][0]["status"] == "in_progress"
+
+
+def test_task_update_unknown_id_creates_placeholder() -> None:
+    """A TaskUpdate against an id we never saw a TaskCreate for (truncated
+    resume) is still rendered, with an empty subject placeholder."""
+    run = app_module.ActiveRun("task-update-unknown")
+    events = app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskUpdate", "tu_x", {"taskId": "42", "status": "completed"}),
+        run=run,
+    )
+    assert "42" in run.tasks
+    assert run.tasks["42"]["status"] == "completed"
+    assert _todos_payloads(events)[-1][0]["content"] == ""
+
+
+def test_task_update_deleted_removes_entry() -> None:
+    run = app_module.ActiveRun("task-update-deleted")
+    app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskCreate", "tu_c", {"subject": "C"}),
+        run=run,
+    )
+    app_module._sdk_message_to_events(_user_with_tool_result("tu_c", "Task #1 created: C"), run=run)
+    app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskUpdate", "tu_d", {"taskId": "1", "status": "deleted"}),
+        run=run,
+    )
+    assert "1" not in run.tasks
+
+
+def test_task_create_insertion_order_preserved() -> None:
+    """Tasks render in the order the model created them, not in lexicographic
+    id order (which matters once #10+ exists)."""
+    run = app_module.ActiveRun("task-create-order")
+    for use_id, tid, subject in [("tu_a", "9", "nine"), ("tu_b", "10", "ten"), ("tu_c", "11", "eleven")]:
+        app_module._sdk_message_to_events(
+            _assistant_with_tool_use("TaskCreate", use_id, {"subject": subject}),
+            run=run,
+        )
+        events = app_module._sdk_message_to_events(
+            _user_with_tool_result(use_id, f"Task #{tid} created: {subject}"),
+            run=run,
+        )
+    payloads = _todos_payloads(events)
+    assert [t["content"] for t in payloads[-1]] == ["nine", "ten", "eleven"]
+
+
+def test_task_create_error_result_does_not_add() -> None:
+    run = app_module.ActiveRun("task-create-error")
+    app_module._sdk_message_to_events(
+        _assistant_with_tool_use("TaskCreate", "tu_z", {"subject": "broken"}),
+        run=run,
+    )
+    events = app_module._sdk_message_to_events(
+        _user_with_tool_result("tu_z", "permission denied", is_error=True),
+        run=run,
+    )
+    assert run.tasks == {}
+    assert "tu_z" not in run.pending_task_creates
+    assert _todos_payloads(events) == []

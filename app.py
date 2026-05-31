@@ -4716,6 +4716,16 @@ class ActiveRun:
         self.created_at: float = now
         self.finished_at: Optional[float] = None
         self.session_allowlist: set[tuple[str, str]] = set()
+        # Task ledger for the new TaskCreate/TaskUpdate tool family (replaces
+        # TodoWrite from CLI 2.1.126+). The CLI assigns task ids in its tool
+        # *result* ("Task #N created successfully: ..."), not in the tool_use
+        # input, so creates land in pending_task_creates keyed by tool_use_id
+        # and migrate to tasks once the result parses out the id. Insertion
+        # order is preserved via _task_order so the panel renders in the
+        # order the model added them, not lexicographic id order.
+        self.tasks: dict[str, dict] = {}
+        self.pending_task_creates: dict[str, dict] = {}
+        self._task_order: int = 0
         # Long-lived conversation state.
         self.user_input_queue: asyncio.Queue = asyncio.Queue()
         self.pending_notifications: list[dict] = []
@@ -7267,6 +7277,26 @@ def _denial_dict(d) -> dict:
     }
 
 
+_TASK_CREATED_RE = re.compile(r"^\s*Task #(\d+)\s+created", re.IGNORECASE)
+
+
+def _tasks_to_todos(run: "ActiveRun") -> list[dict]:
+    """Render a run's task ledger into the legacy TodoWrite payload shape so
+    the existing browser ``updateTodosPanel`` consumer works unchanged.
+
+    ``subject`` maps to ``content`` (the old key the renderer reads); the
+    other fields keep their names.
+    """
+    items = []
+    for t in sorted(run.tasks.values(), key=lambda v: v.get("_order", 0)):
+        items.append({
+            "content": t.get("subject") or "",
+            "activeForm": t.get("activeForm") or "",
+            "status": t.get("status") or "pending",
+        })
+    return items
+
+
 def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
     """Translate one SDK message into one or more SSE-payload dicts.
 
@@ -7307,6 +7337,49 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 if blk.name == "TodoWrite":
                     todos = (blk.input or {}).get("todos") or []
                     out.append({"type": "todos_update", "todos": todos})
+                # The TaskCreate/TaskUpdate family replaced TodoWrite from CLI
+                # 2.1.126 onward. Same panel, different plumbing: the assigned
+                # task id arrives in the tool *result*, so TaskCreate parks a
+                # partial entry keyed by tool_use_id and the result-handler
+                # below promotes it once the id parses out. TaskUpdate merges
+                # in place and emits the refreshed list immediately.
+                elif blk.name == "TaskCreate" and run is not None:
+                    inp = blk.input or {}
+                    run.pending_task_creates[blk.id] = {
+                        "subject": inp.get("subject") or "",
+                        "description": inp.get("description") or "",
+                        "activeForm": inp.get("activeForm") or "",
+                        "status": "pending",
+                    }
+                elif blk.name == "TaskUpdate" and run is not None:
+                    inp = blk.input or {}
+                    tid = str(inp.get("taskId") or "")
+                    if tid:
+                        status = inp.get("status")
+                        if status == "deleted":
+                            run.tasks.pop(tid, None)
+                        else:
+                            t = run.tasks.get(tid)
+                            if t is None:
+                                # TaskUpdate against a task we never saw a
+                                # TaskCreate for — usually a resume with
+                                # truncated history. Placeholder keeps the
+                                # status flowing instead of being silently
+                                # dropped; the subject will fill in if a
+                                # later TaskCreate replay arrives.
+                                run._task_order += 1
+                                t = {
+                                    "subject": "",
+                                    "description": "",
+                                    "activeForm": "",
+                                    "status": "pending",
+                                    "_order": run._task_order,
+                                }
+                                run.tasks[tid] = t
+                            for k in ("status", "subject", "description", "activeForm"):
+                                if k in inp and inp[k] is not None:
+                                    t[k] = inp[k]
+                        out.append({"type": "todos_update", "todos": _tasks_to_todos(run)})
         out.append({
             "type": "assistant",
             "message": {"content": message_blocks},
@@ -7316,6 +7389,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
     if isinstance(msg, UserMessage):
         # Tool results coming back from Claude's tool runs.
         results = []
+        extra: list[dict] = []
         for blk in msg.content:
             if isinstance(blk, ToolResultBlock):
                 content = blk.content
@@ -7331,8 +7405,27 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                     "is_error": bool(blk.is_error),
                     "content": text[:TOOL_RESULT_PREVIEW * 4],
                 })
-        if results:
-            return [{"type": "user", "message": {"content": results}}]
+                # Finish a TaskCreate: the CLI's tool result carries the
+                # assigned id ("Task #1 created successfully: <subject>").
+                # Migrate the pending entry into the live ledger and emit a
+                # refreshed panel. Errors drop the pending entry without
+                # adding anything.
+                if run is not None and blk.tool_use_id in run.pending_task_creates:
+                    partial = run.pending_task_creates.pop(blk.tool_use_id)
+                    if not blk.is_error:
+                        m = _TASK_CREATED_RE.match(text or "")
+                        if m:
+                            tid = m.group(1)
+                            run._task_order += 1
+                            partial["_order"] = run._task_order
+                            run.tasks[tid] = partial
+                            extra.append({"type": "todos_update", "todos": _tasks_to_todos(run)})
+        if results or extra:
+            payload: list[dict] = []
+            if results:
+                payload.append({"type": "user", "message": {"content": results}})
+            payload.extend(extra)
+            return payload
         return []
     if isinstance(msg, TaskStartedMessage):
         return [{
