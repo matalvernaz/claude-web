@@ -234,9 +234,11 @@
   //   triangle climbing = a prompt wants you to approve
   //   sawtooth alternating = harsh alarm, you must act before anything continues
   //   square staccato = the machine is acting on its own
-  function playCue(name) {
+  function playCue(name, force) {
     if (!soundsEnabled) return;
-    if (soundsAwayOnly && document.hasFocus()) return;
+    // `force` lets the explicit enable-test cue sound even in background-only
+    // mode while the window is focused.
+    if (soundsAwayOnly && !force && document.hasFocus()) return;
     const ctx = ensureAudioCtx();
     if (!ctx) return;
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
@@ -291,7 +293,12 @@
     soundToggle.addEventListener("change", () => {
       soundsEnabled = soundToggle.checked;
       safeSet(localStorage, SOUND_KEY, soundsEnabled ? "1" : "0");
-      if (soundsEnabled) unlockAudio(); // the toggle click is the gesture
+      if (soundsEnabled) {
+        unlockAudio(); // the toggle click is the gesture that resumes audio
+        // Immediate confirmation so sound can be verified on demand without
+        // waiting for a real event — toggle off then on to retest.
+        playCue("done", true);
+      }
     });
   }
 
