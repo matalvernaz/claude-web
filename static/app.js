@@ -285,7 +285,27 @@
       // the louder three-note sine error.
       tone(ctx, 660, t, 0.16, "triangle", 0.13);
       tone(ctx, 440, t + 0.2, 0.28, "triangle", 0.13);
+    } else if (name === "tool") {
+      // A tool started — a soft, very short tick. clarus beeps on every tool
+      // (Boing on auto-approve); this is the web equivalent so a turn full of
+      // Bash/Read/Edit calls gives steady activity instead of silence until
+      // the end. Deliberately quiet and brief so many in a row read as gentle
+      // ticking, not an alarm.
+      tone(ctx, 1046, t, 0.05, "triangle", 0.1);
     }
+  }
+
+  // Per-tool ticks can arrive in bursts — parallel tool calls fire several
+  // within a few ms, and the overflow-recovery path can replay a run's whole
+  // history through this stream. Throttle so a burst collapses to a single
+  // audible tick rather than a machine-gun.
+  const TOOL_CUE_MIN_GAP_MS = 200;
+  let lastToolCueAt = 0;
+  function playToolCue() {
+    const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    if (now - lastToolCueAt < TOOL_CUE_MIN_GAP_MS) return;
+    lastToolCueAt = now;
+    playCue("tool");
   }
 
   if (soundToggle) {
@@ -1828,6 +1848,7 @@
           } else {
             insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
           }
+          playToolCue();
           // Track this tool as in-flight so the spinner can show the
           // concrete activity ("Bash: pytest -q · 2m 14s") instead of a
           // random gerund. Cleared when the matching tool_result arrives.
