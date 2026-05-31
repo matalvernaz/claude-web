@@ -186,17 +186,41 @@
   document.addEventListener("pointerdown", unlockAudio, { once: true });
   document.addEventListener("keydown", unlockAudio, { once: true });
 
-  // Schedule one note. `peak` is the gain envelope crest; a short attack +
-  // exponential release keeps it from clicking.
+  // One master gain so overall cue loudness lives in a single place and
+  // individual notes can sit near full scale without clipping when the tail
+  // of one note overlaps the attack of the next.
+  let soundGain = null;
+  function masterGain(ctx) {
+    if (soundGain) return soundGain;
+    soundGain = ctx.createGain();
+    soundGain.gain.value = 0.9;
+    soundGain.connect(ctx.destination);
+    return soundGain;
+  }
+
+  // Single knob to scale every cue's loudness. The per-cue `peak` values stay
+  // as relative balance between cues; this lifts them all. Capped at 0.9 so a
+  // boosted peak can't drive the oscillator into clipping.
+  const CUE_LOUDNESS = 2.6;
+
+  // Schedule one note with an attack-HOLD-release envelope: ramp up fast, sit
+  // at full level for the body of the note, then a short release. The old
+  // envelope decayed toward zero immediately after the attack, so each beep
+  // was a quiet fading ping — most of its duration was near-silent tail.
   function tone(ctx, freq, startAt, dur, type, peak) {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = type;
     osc.frequency.value = freq;
+    const level = Math.min(0.9, peak * CUE_LOUDNESS);
+    const attack = 0.008;
+    const release = Math.min(0.06, dur * 0.4);
+    const holdUntil = Math.max(startAt + attack, startAt + dur - release);
     gain.gain.setValueAtTime(0.0001, startAt);
-    gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.012);
+    gain.gain.exponentialRampToValueAtTime(level, startAt + attack);
+    gain.gain.setValueAtTime(level, holdUntil);
     gain.gain.exponentialRampToValueAtTime(0.0001, startAt + dur);
-    osc.connect(gain).connect(ctx.destination);
+    osc.connect(gain).connect(masterGain(ctx));
     osc.start(startAt);
     osc.stop(startAt + dur + 0.02);
   }
@@ -248,10 +272,11 @@
     } else if (name === "task_done") {
       // Background task settled OK — single high sine ping. Single-note rhythm
       // marks it as a minor/background event, not a turn.
-      tone(ctx, 1320, t, 0.12, "sine", 0.16);
+      tone(ctx, 1320, t, 0.2, "sine", 0.2);
     } else if (name === "task_error") {
       // Background task failed — single low sine thud. Mirror of task_done.
-      tone(ctx, 300, t, 0.16, "sine", 0.18);
+      // Low pitch reads quieter, so it carries a touch more level.
+      tone(ctx, 300, t, 0.24, "sine", 0.24);
     } else if (name === "timeout") {
       // A permission prompt expired or was discarded — soft, slow two-note
       // triangle descent. Triangle + quiet + only two notes keeps it clear of
