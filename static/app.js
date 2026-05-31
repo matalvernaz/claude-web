@@ -146,6 +146,85 @@
   }
   let announceTimer = null;
 
+  // --- Event sounds ----------------------------------------------------
+  // Audible cues so you can step away from the window and know when a turn
+  // finishes, a permission prompt is waiting, or something errored. Tones
+  // are synthesised with the Web Audio API (no asset files → nothing to ship
+  // in the frozen bundle, and the `default-src 'self'` CSP needs no
+  // exception). They only fire when the window is NOT focused — when you're
+  // looking at the page, NVDA's announcements already cover it and a chime
+  // over speech is just noise.
+  const SOUND_KEY = "claude-web.sounds";
+  const soundToggle = document.getElementById("sound-toggle");
+  let soundsEnabled = safeGet(localStorage, SOUND_KEY) !== "0"; // default on
+  let audioCtx = null;
+
+  function ensureAudioCtx() {
+    if (audioCtx) return audioCtx;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    try { audioCtx = new Ctor(); } catch { return null; }
+    return audioCtx;
+  }
+
+  // Browser autoplay policy suspends a context created outside a user
+  // gesture. Resume on the first real interaction so the first away-cue
+  // actually sounds.
+  function unlockAudio() {
+    const ctx = ensureAudioCtx();
+    if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+  }
+  document.addEventListener("pointerdown", unlockAudio, { once: true });
+  document.addEventListener("keydown", unlockAudio, { once: true });
+
+  // Schedule one note. `peak` is the gain envelope crest; a short attack +
+  // exponential release keeps it from clicking.
+  function tone(ctx, freq, startAt, dur, type, peak) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, startAt);
+    gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(startAt);
+    osc.stop(startAt + dur + 0.02);
+  }
+
+  // name: "done" | "permission" | "error". Distinct shapes so the cue is
+  // identifiable without looking — rising = finished, three-note = needs you,
+  // descending = error.
+  function playCue(name) {
+    if (!soundsEnabled) return;
+    if (document.hasFocus()) return;
+    const ctx = ensureAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+    const t = ctx.currentTime + 0.01;
+    if (name === "done") {
+      tone(ctx, 660, t, 0.14, "sine", 0.18);
+      tone(ctx, 880, t + 0.13, 0.18, "sine", 0.18);
+    } else if (name === "permission") {
+      tone(ctx, 880, t, 0.12, "triangle", 0.22);
+      tone(ctx, 880, t + 0.16, 0.12, "triangle", 0.22);
+      tone(ctx, 1175, t + 0.32, 0.22, "triangle", 0.22);
+    } else if (name === "error") {
+      tone(ctx, 440, t, 0.18, "sine", 0.2);
+      tone(ctx, 330, t + 0.16, 0.18, "sine", 0.2);
+      tone(ctx, 220, t + 0.32, 0.28, "sine", 0.2);
+    }
+  }
+
+  if (soundToggle) {
+    soundToggle.checked = soundsEnabled;
+    soundToggle.addEventListener("change", () => {
+      soundsEnabled = soundToggle.checked;
+      safeSet(localStorage, SOUND_KEY, soundsEnabled ? "1" : "0");
+      if (soundsEnabled) unlockAudio(); // the toggle click is the gesture
+    });
+  }
+
   // Format unix timestamp as a short human-friendly relative/absolute string.
   function formatTime(unixSec) {
     const n = Number(unixSec);
@@ -1701,6 +1780,7 @@
     } else if (obj.type === "permission_request") {
       ctx.currentAssistantBody = null;
       announce(`Permission needed for ${obj.tool}.`);
+      playCue("permission");
       renderPermissionCard(obj);
       markVisibleActivity();
     } else if (obj.type === "_overflow") {
@@ -1849,6 +1929,7 @@
       // Drain any client-side queued messages — the user submitted them
       // mid-turn and we promised we'd flush after the turn ends.
       drainQueueIfPossible();
+      playCue(obj.is_error ? "error" : "done");
       if (obj.is_error) {
         const lines = [obj.result || obj.subtype || "Error"];
         if (Array.isArray(obj.errors) && obj.errors.length) {
@@ -1879,6 +1960,7 @@
       setStatus("Error: " + summary);
       renderErrorBlock(detail ? String(detail) : null, { summary });
       announce("Error: " + (obj.message || ""));
+      playCue("error");
     }
   }
 
