@@ -13,6 +13,16 @@
     <a class="skip" href="#prompt">Skip to prompt</a>
   </div>
 
+  <div id="cli-banner" class="cli-banner" role="alert" aria-live="assertive" tabindex="-1" hidden>
+    <h2 class="cli-banner__title">Claude CLI not installed</h2>
+    <p id="cli-banner-msg">claude-web needs the Claude command-line tool to reach the model. Chat won’t work until it’s installed.</p>
+    <div class="cli-banner__actions">
+      <button type="button" id="cli-install-btn">Install Claude CLI</button>
+      <button type="button" id="cli-recheck-btn">Re-check</button>
+    </div>
+    <pre id="cli-log" class="cli-banner__log" tabindex="0" aria-label="Install output" hidden></pre>
+  </div>
+
   <header>
     <h1>{{ site_title }}</h1>
     <div class="header-actions">
@@ -160,5 +170,6 @@
   <script src="/static/marked.min.js?v={{ asset_version('marked.min.js') }}"></script>
   <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
   <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>
+  <script src="/static/cli-check.js?v={{ asset_version('cli-check.js') }}"></script>
 </body>
 </html>

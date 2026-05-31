@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import sqlite3
@@ -7927,6 +7928,199 @@ async def api_setup_signout(user: dict = Depends(auth.require_user)):
     _require_setup_access(user)
     await setup_flow.sign_out()
     return {"configured": setup_flow.is_configured()}
+
+
+# ─── claude CLI presence + one-click install ────────────────────────────────
+# The frozen desktop binary can boot without the `claude` Node CLI on PATH;
+# the Agent SDK then fails every chat turn with an opaque error. launcher.py's
+# _check_claude_cli() prints a console warning, but the windowed binary buries
+# it behind the webview. These endpoints surface the missing-CLI state in the
+# UI and offer a one-click install — the npm package directly when Node is
+# present, or Node itself first (via the platform package manager) when not.
+
+_CLAUDE_CLI_PACKAGE = "@anthropic-ai/claude-code"
+
+# A freshly-installed Node won't be on the current process's PATH until the
+# app restarts (Windows especially), so after an automated Node install we
+# also look for npm/claude in these well-known install locations.
+_NODE_HINT_DIRS = (
+    r"C:\Program Files\nodejs",
+    r"C:\Program Files (x86)\nodejs",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+)
+
+
+def _which_cli(*names: str) -> Optional[str]:
+    """``shutil.which`` across several names, falling back to the Node hint dirs."""
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    for d in _NODE_HINT_DIRS:
+        for name in names:
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _claude_cli_status() -> dict:
+    """Detect the `claude` CLI and what it would take to install it."""
+    system = platform.system()
+    if system == "Windows":
+        node_installer = "winget" if shutil.which("winget") else None
+    elif system == "Darwin":
+        node_installer = "brew" if shutil.which("brew") else None
+    else:
+        node_installer = None
+    return {
+        "cli_present": _which_cli("claude", "claude.cmd") is not None,
+        "npm_present": _which_cli("npm", "npm.cmd") is not None,
+        "node_present": _which_cli("node", "node.exe") is not None,
+        "platform": system,
+        "node_installer": node_installer,
+        "package": _CLAUDE_CLI_PACKAGE,
+    }
+
+
+# Module-level install state polled by the UI. One install at a time.
+_cli_install_lock = asyncio.Lock()
+_cli_install_state: dict = {"state": "idle", "error": None, "log": []}
+_CLI_INSTALL_LOG_CAP = 2000
+
+
+def _cli_log(line: str) -> None:
+    buf = _cli_install_state["log"]
+    if len(buf) < _CLI_INSTALL_LOG_CAP:
+        buf.append(line)
+
+
+async def _cli_run(argv: list[str], env: Optional[dict] = None) -> int:
+    """Run argv, streaming combined stdout/stderr into the install log."""
+    _cli_log("$ " + " ".join(argv))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+    except OSError as e:
+        _cli_log(f"error: could not start {argv[0]}: {e}")
+        return 127
+    assert proc.stdout is not None
+    async for raw in proc.stdout:
+        _cli_log(raw.decode("utf-8", "replace").rstrip("\n"))
+    return await proc.wait()
+
+
+async def _cli_install_worker() -> None:
+    """Install Node (when needed) then the claude CLI package; update state."""
+    st = _cli_install_state
+    try:
+        status = _claude_cli_status()
+        env = os.environ.copy()
+        if not status["npm_present"]:
+            installer = status["node_installer"]
+            if installer == "winget":
+                _cli_log("Node.js / npm not found — installing Node.js LTS via winget…")
+                rc = await _cli_run([
+                    "winget", "install", "-e", "--id", "OpenJS.NodeJS.LTS",
+                    "--accept-source-agreements", "--accept-package-agreements",
+                ])
+            elif installer == "brew":
+                _cli_log("Node.js / npm not found — installing Node via Homebrew…")
+                rc = await _cli_run(["brew", "install", "node"])
+            else:
+                st["error"] = (
+                    "Node.js isn't installed and there's no automated installer "
+                    "for this platform. Install Node.js from https://nodejs.org/, "
+                    "then click Re-check."
+                )
+                st["state"] = "error"
+                return
+            if rc != 0:
+                st["error"] = f"Node install failed (exit {rc}). See the log below."
+                st["state"] = "error"
+                return
+            # Newly-installed Node isn't on this process's PATH; widen it so the
+            # npm step below can find the binary without an app restart.
+            env["PATH"] = os.pathsep.join(
+                [d for d in _NODE_HINT_DIRS if os.path.isdir(d)]
+                + [env.get("PATH", "")],
+            )
+        npm = _which_cli("npm", "npm.cmd")
+        if not npm:
+            st["error"] = (
+                "Node is installed but npm isn't on PATH yet. Restart claude-web "
+                "and click Re-check."
+            )
+            st["state"] = "error"
+            return
+        _cli_log(f"Installing {_CLAUDE_CLI_PACKAGE} globally…")
+        rc = await _cli_run([npm, "install", "-g", _CLAUDE_CLI_PACKAGE], env=env)
+        if rc != 0:
+            st["error"] = f"npm install failed (exit {rc}). See the log below."
+            st["state"] = "error"
+            return
+        if _which_cli("claude", "claude.cmd"):
+            st["state"] = "done"
+        else:
+            # Package installed but the shim landed somewhere not yet on PATH.
+            st["state"] = "done"
+            st["error"] = (
+                "Install finished, but `claude` isn't visible on PATH yet. "
+                "Restart claude-web to pick it up."
+            )
+    except Exception as e:  # surface any failure to the UI, don't die silently
+        log.exception("claude CLI install failed")
+        st["error"] = f"unexpected error: {e}"
+        st["state"] = "error"
+
+
+def _require_cli_install_access(user: dict) -> None:
+    """Gate the host-mutating install. On a shared multi-user instance only an
+    admin may trigger it; the single-user/local binary trusts whoever logged
+    in — it's the owner's own machine."""
+    if ENABLE_SETUP == "false":
+        raise HTTPException(403, "install is locked (CLAUDE_WEB_ENABLE_SETUP=false)")
+    if PER_USER_SESSIONS:
+        email = (user.get("email") or "").lower()
+        if email not in ADMIN_EMAILS:
+            raise HTTPException(
+                403, "only an admin can install the CLI on a shared instance",
+            )
+
+
+@app.get("/api/claude-cli/status")
+async def api_claude_cli_status(user: dict = Depends(auth.require_user)):
+    return {**_claude_cli_status(), "install_state": _cli_install_state["state"]}
+
+
+@app.post("/api/claude-cli/install")
+async def api_claude_cli_install(user: dict = Depends(auth.require_user)):
+    _require_cli_install_access(user)
+    if _claude_cli_status()["cli_present"]:
+        return {"state": "done", "already_present": True}
+    async with _cli_install_lock:
+        if _cli_install_state["state"] == "running":
+            return {"state": "running"}
+        _cli_install_state.update(state="running", error=None, log=[])
+    asyncio.create_task(_cli_install_worker())
+    return {"state": "running"}
+
+
+@app.get("/api/claude-cli/install/status")
+async def api_claude_cli_install_status(user: dict = Depends(auth.require_user)):
+    st = _cli_install_state
+    return {
+        "state": st["state"],
+        "error": st["error"],
+        "log": st["log"][-300:],
+        "cli_present": _claude_cli_status()["cli_present"],
+    }
 
 
 def _require_roundtable() -> Any:

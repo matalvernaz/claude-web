@@ -826,3 +826,40 @@ details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
 .task-block.task-error { border-left-color: #d96868; }
 .task-block.task-error .task-summary { color: #d96868; }
 .task-block.task-success .task-summary { color: var(--user); }
+
+/* Missing-CLI banner: a prominent, accessible attention state shown when the
+   `claude` CLI isn't installed. Amber border signals "action needed" without
+   reading as an error/destructive state. */
+.cli-banner {
+  margin: 0.75rem;
+  padding: 1rem 1.25rem;
+  border: 2px solid #e0af68;
+  border-radius: 8px;
+  background: var(--bg-alt);
+  color: var(--fg);
+}
+.cli-banner:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.cli-banner__title { margin: 0 0 0.25rem; font-size: 1.1rem; color: #e0af68; }
+.cli-banner__actions { margin-top: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.cli-banner__actions button {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+.cli-banner__actions button:hover,
+.cli-banner__actions button:focus { border-color: var(--accent); outline: none; }
+.cli-banner__actions button[disabled] { opacity: 0.5; cursor: default; }
+.cli-banner__log {
+  margin-top: 0.75rem;
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0.5rem;
+  background: #111;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
