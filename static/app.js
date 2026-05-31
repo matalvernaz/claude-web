@@ -201,11 +201,15 @@
     osc.stop(startAt + dur + 0.02);
   }
 
-  // Distinct shapes so each cue is identifiable without looking. The base
-  // three — rising = turn finished, three-note = needs you, descending =
-  // error — keep their original tones; the rest are deliberately different
-  // in pitch register and timbre so background events don't get mistaken for
-  // the turn you're waiting on.
+  // Each cue is separated on THREE axes at once — timbre (waveform), rhythm
+  // (note count + spacing), and pitch contour (up / down / flat / alternating)
+  // — not just register, so the category is audible before you've memorised
+  // the exact tone. The grammar:
+  //   sine     = turn-level events (the thing you're waiting on)
+  //   single   = background events  (high ping = ok, low thud = failed)
+  //   triangle climbing = a prompt wants you to approve
+  //   sawtooth alternating = harsh alarm, you must act before anything continues
+  //   square staccato = the machine is acting on its own
   function playCue(name) {
     if (!soundsEnabled) return;
     if (soundsAwayOnly && document.hasFocus()) return;
@@ -214,44 +218,46 @@
     if (ctx.state === "suspended") ctx.resume().catch(() => {});
     const t = ctx.currentTime + 0.01;
     if (name === "done") {
-      // Turn finished OK — rising major third.
+      // Turn finished OK — two rising sine notes.
       tone(ctx, 660, t, 0.14, "sine", 0.18);
-      tone(ctx, 880, t + 0.13, 0.18, "sine", 0.18);
-    } else if (name === "permission") {
-      // A tool wants approval — insistent three-note climb, needs you.
-      tone(ctx, 880, t, 0.12, "triangle", 0.22);
-      tone(ctx, 880, t + 0.16, 0.12, "triangle", 0.22);
-      tone(ctx, 1175, t + 0.32, 0.22, "triangle", 0.22);
+      tone(ctx, 880, t + 0.13, 0.2, "sine", 0.18);
     } else if (name === "error") {
-      // Turn errored — slow descending minor.
+      // Turn errored — three slow descending sine notes.
       tone(ctx, 440, t, 0.18, "sine", 0.2);
       tone(ctx, 330, t + 0.16, 0.18, "sine", 0.2);
-      tone(ctx, 220, t + 0.32, 0.28, "sine", 0.2);
-    } else if (name === "task_done") {
-      // A background task settled OK — quick high double-blip, lighter than
-      // the main "done" so it reads as "one of several" not "the turn".
-      tone(ctx, 988, t, 0.08, "sine", 0.14);
-      tone(ctx, 1319, t + 0.1, 0.1, "sine", 0.14);
-    } else if (name === "task_error") {
-      // A background task failed — low descending double, darker than the
-      // full-turn error and shorter.
-      tone(ctx, 392, t, 0.12, "sine", 0.18);
-      tone(ctx, 262, t + 0.13, 0.18, "sine", 0.18);
-    } else if (name === "autofire") {
-      // Model is auto-firing a follow-up on its own — gentle low→mid swell,
-      // square timbre marks it as "Claude is talking unprompted".
-      tone(ctx, 523, t, 0.1, "square", 0.1);
-      tone(ctx, 698, t + 0.1, 0.14, "square", 0.1);
+      tone(ctx, 220, t + 0.32, 0.3, "sine", 0.2);
+    } else if (name === "permission") {
+      // A tool wants approval — three-note triangle climb, the only climbing
+      // cue, so "asking to go up/forward".
+      tone(ctx, 740, t, 0.12, "triangle", 0.22);
+      tone(ctx, 880, t + 0.16, 0.12, "triangle", 0.22);
+      tone(ctx, 1175, t + 0.32, 0.24, "triangle", 0.22);
     } else if (name === "attention") {
-      // Auto-followups paused / you must act — two equal mid notes, a polite
-      // alarm distinct from the climbing permission cue.
-      tone(ctx, 988, t, 0.12, "triangle", 0.2);
-      tone(ctx, 988, t + 0.2, 0.18, "triangle", 0.2);
+      // Auto-followups paused / you must act — harsh sawtooth alternating
+      // high-low-high. Different timbre AND contour from the permission climb
+      // so "blocked, act now" never sounds like "approve this".
+      tone(ctx, 880, t, 0.12, "sawtooth", 0.17);
+      tone(ctx, 587, t + 0.17, 0.12, "sawtooth", 0.17);
+      tone(ctx, 880, t + 0.34, 0.18, "sawtooth", 0.17);
+    } else if (name === "autofire") {
+      // Model is auto-firing a follow-up on its own — three fast equal-pitch
+      // square staccato blips, a deliberately "robotic" pulse.
+      tone(ctx, 600, t, 0.06, "square", 0.14);
+      tone(ctx, 600, t + 0.1, 0.06, "square", 0.14);
+      tone(ctx, 600, t + 0.2, 0.08, "square", 0.14);
+    } else if (name === "task_done") {
+      // Background task settled OK — single high sine ping. Single-note rhythm
+      // marks it as a minor/background event, not a turn.
+      tone(ctx, 1320, t, 0.12, "sine", 0.16);
+    } else if (name === "task_error") {
+      // Background task failed — single low sine thud. Mirror of task_done.
+      tone(ctx, 300, t, 0.16, "sine", 0.18);
     } else if (name === "timeout") {
-      // A permission prompt expired (or was discarded) — soft descending
-      // fizzle, quieter than a real error.
-      tone(ctx, 587, t, 0.12, "sine", 0.14);
-      tone(ctx, 392, t + 0.13, 0.2, "sine", 0.14);
+      // A permission prompt expired or was discarded — soft, slow two-note
+      // triangle descent. Triangle + quiet + only two notes keeps it clear of
+      // the louder three-note sine error.
+      tone(ctx, 660, t, 0.16, "triangle", 0.13);
+      tone(ctx, 440, t + 0.2, 0.28, "triangle", 0.13);
     }
   }
 
