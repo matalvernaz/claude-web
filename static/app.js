@@ -290,8 +290,10 @@
       // (Boing on auto-approve); this is the web equivalent so a turn full of
       // Bash/Read/Edit calls gives steady activity instead of silence until
       // the end. Deliberately quiet and brief so many in a row read as gentle
-      // ticking, not an alarm.
-      tone(ctx, 1046, t, 0.05, "triangle", 0.1);
+      // ticking, not an alarm. Long/loud enough to actually register over
+      // speech — a 50ms blip was inaudible — but a single note, so it stays
+      // clearly subordinate to the multi-note turn cues.
+      tone(ctx, 1046, t, 0.12, "triangle", 0.24);
     }
   }
 
