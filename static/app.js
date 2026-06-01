@@ -884,9 +884,9 @@
 
   // Cosmetic gerund cycler — same vibe as the CLI's "✻ Pondering…" animation.
   // Visual only; the sr-only announcer is what actually talks to screen readers.
-  // Base list mined from the Claude Code 2.1.126 binary (current latest mined
-  // version, all 187 entries present); locally appended entries are tagged
-  // "(local)" in this file.
+  // Base list mined from the Claude Code binary; verified unchanged through
+  // 2.1.158 (all 187 single-word entries present, no upstream additions or
+  // removals since 2.1.126); locally appended entries are tagged "(local)".
   const GERUNDS = [
     'Accomplishing', 'Actioning', 'Actualizing', 'Architecting', 'Baking',
     'Bamboozling' /*(local)*/, 'Beaming', "Beboppin'", 'Befuddling',
