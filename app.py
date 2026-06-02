@@ -4701,13 +4701,11 @@ class ActiveRun:
         # is baked in at SDK init, so a mid-conversation personality flip
         # has to respawn the run with the new append. Compared in api_chat.
         self.personality_id = personality_id
-        # Current SDK permission mode for this live run. Tracked so a
-        # plan-mode toggle on a resumed run can flip the CLI between
-        # "plan" and "default" via client.set_permission_mode() instead of
-        # respawning. Approving an ExitPlanMode plan transitions the CLI to
-        # "acceptEdits" on its own (upstream behavior); this field is the
-        # mode claude-web last *requested*, used only to avoid redundant
-        # control requests.
+        # Best-effort mirror of the CLI's permission mode for UI display.
+        # The model drives it: EnterPlanMode (handled inside the CLI) flips
+        # this to "plan"; approving the resulting ExitPlanMode plan moves the
+        # CLI to "acceptEdits". Not authoritative — purely for the
+        # plan-mode indicator/announcement.
         self.permission_mode: str = "default"
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
@@ -6255,7 +6253,6 @@ async def api_chat(
     project: str = Form(default=""),
     model: str = Form(default=""),
     personality_id: Optional[int] = Form(default=None),
-    plan_mode: bool = Form(default=False),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
@@ -6374,23 +6371,6 @@ async def api_chat(
             swap_respawn = True
         if existing is not None:
             _require_owner(existing, user)
-            # Honor a plan-mode toggle on a live/resumed run by flipping the
-            # CLI's permission mode in place (no respawn needed). A plain send
-            # resets to "default" so gating resumes after an acceptEdits
-            # implementation burst; a plan-mode send enters read-only planning.
-            desired_mode = "plan" if plan_mode else "default"
-            if (
-                existing.client is not None
-                and existing.permission_mode != desired_mode
-            ):
-                try:
-                    await existing.client.set_permission_mode(desired_mode)
-                    existing.permission_mode = desired_mode
-                except Exception as exc:  # control request can race a teardown
-                    log.warning(
-                        "set_permission_mode(%s) failed run=%s: %s",
-                        desired_mode, existing.run_id, exc,
-                    )
             file_metas = await _save_uploaded_files(files, existing.run_id)
             effective = _file_attachment_prefix(file_metas) + message
             # Subscribe BEFORE we emit the new user_prompt so the new subscriber
@@ -6446,7 +6426,6 @@ async def api_chat(
             account_slot=account["slot"],
             personality_id=active_personality_id,
         )
-        run.permission_mode = "plan" if plan_mode else "default"
         run.project_key = _sanitize_project_key(cwd)
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
@@ -6578,6 +6557,7 @@ async def api_chat(
             if decision.get("decision") == "allow":
                 log.info("plan approved run=%s owner=%s", run.run_id, owner)
                 run.permission_mode = "acceptEdits"
+                run.emit({"type": "plan_mode", "active": False})
                 return PermissionResultAllow()
             feedback = ""
             payload = decision.get("payload")
@@ -6695,9 +6675,7 @@ async def api_chat(
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
-        # Plan mode launches read-only; the model researches then presents a
-        # plan via ExitPlanMode (rendered as an accessible review card).
-        permission_mode="plan" if plan_mode else "default",
+        permission_mode="default",
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
         system_prompt=system_prompt_opt,
@@ -7490,6 +7468,13 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 if blk.name == "TodoWrite":
                     todos = (blk.input or {}).get("todos") or []
                     out.append({"type": "todos_update", "todos": todos})
+                # EnterPlanMode is handled inside the CLI — it never reaches
+                # can_use_tool — so this is the only place claude-web learns the
+                # model put itself into read-only planning. Reflect it for the
+                # UI; the matching ExitPlanMode surfaces the plan-review card.
+                elif blk.name == "EnterPlanMode" and run is not None:
+                    run.permission_mode = "plan"
+                    out.append({"type": "plan_mode", "active": True})
                 # The TaskCreate/TaskUpdate family replaced TodoWrite from CLI
                 # 2.1.126 onward. Same panel, different plumbing: the assigned
                 # task id arrives in the tool *result*, so TaskCreate parks a

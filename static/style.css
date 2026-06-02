@@ -353,6 +353,22 @@ main {
   padding: 0.25rem 0.4rem;
 }
 
+/* Plan-mode indicator (model is in read-only planning) */
+body[data-plan-mode="1"]::before {
+  content: "Plan mode — read-only";
+  position: fixed;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--accent);
+  color: #000;
+  padding: 2px 12px;
+  border-radius: 0 0 6px 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  z-index: 50;
+}
+
 /* ExitPlanMode card */
 .plan-body {
   background: var(--bg);

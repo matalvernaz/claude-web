@@ -479,16 +479,6 @@
     });
   }
 
-  // Plan-mode toggle: persisted so it stays on across the turns of a planning
-  // conversation. Its value rides on every /api/chat send (see sendOne).
-  const planModeToggle = document.getElementById("plan-mode");
-  const PLAN_KEY = "plan-mode";
-  if (planModeToggle) {
-    if (safeGet(localStorage, PLAN_KEY) === "true") planModeToggle.checked = true;
-    planModeToggle.addEventListener("change", () => {
-      safeSet(localStorage, PLAN_KEY, planModeToggle.checked ? "true" : "false");
-    });
-  }
   if (personalitySelect) {
     let lastPersonality = personalitySelect.value;
     personalitySelect.addEventListener("change", async () => {
@@ -1487,9 +1477,6 @@
       if (personalitySelect && personalitySelect.value) {
         fd.append("personality_id", personalitySelect.value);
       }
-      if (planModeToggle && planModeToggle.checked) {
-        fd.append("plan_mode", "true");
-      }
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
       }
@@ -1916,6 +1903,17 @@
       announce("Claude has a plan for you to review.");
       playCue("permission");
       renderPlanCard(obj);
+      markVisibleActivity();
+    } else if (obj.type === "plan_mode") {
+      // The model entered/left read-only planning. Announce for NVDA and flip
+      // a visual indicator; the plan itself arrives later as a plan_review.
+      if (obj.active) {
+        document.body.dataset.planMode = "1";
+        announce("Claude entered plan mode. It will research read-only and propose a plan for your approval before making any changes.");
+      } else {
+        delete document.body.dataset.planMode;
+        announce("Plan approved. Claude is now implementing.");
+      }
       markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from
