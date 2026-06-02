@@ -41,9 +41,14 @@ def roundtable_ask(
     thread_id: int, participant: str, prompt: str = "", effort: str = "",
     web_search: bool = False,
 ) -> str:
+    # Resolve any thread-bound repo context (Goal 4) into a ToolUseContext
+    # from its stored string policy. None when the thread isn't bound (or
+    # the policy needs an interactive callback we can't supply over stdio),
+    # which preserves the prior no-tools MCP behaviour.
     return core.roundtable_ask(
         thread_id=thread_id, participant=participant, prompt=prompt,
-        effort=effort, web_search=web_search, tool_use_context=None,
+        effort=effort, web_search=web_search,
+        tool_use_context=core._effective_tool_context(thread_id),
     )
 
 
@@ -56,7 +61,8 @@ def roundtable_ask_parallel(
 ) -> dict:
     return core.roundtable_ask_parallel(
         thread_id=thread_id, participants=participants, prompt=prompt,
-        effort=effort, web_search=web_search, tool_use_context=None,
+        effort=effort, web_search=web_search,
+        tool_use_context=core._effective_tool_context(thread_id),
     )
 
 
@@ -69,6 +75,8 @@ roundtable_ask_parallel.__doc__ = core.roundtable_ask_parallel.__doc__
 # Callable parameter pydantic can't serialise.
 for _fn in (
     core.roundtable_create,
+    core.roundtable_bind_repo,
+    core.roundtable_repo_context,
     core.roundtable_post,
     roundtable_ask,
     roundtable_ask_parallel,
@@ -87,6 +95,22 @@ del _fn
 def main() -> None:
     """Entry point used by ``server.py`` and ``python -m``."""
     logging.basicConfig(level=logging.INFO)
+    from importlib.metadata import PackageNotFoundError, version
+
+    def _v(pkg: str) -> str:
+        try:
+            return version(pkg)
+        except PackageNotFoundError:
+            return "n/a"
+
+    models = ", ".join(
+        f"{name}={info['model']}" for name, info in core.PARTICIPANTS.items()
+    )
+    logging.getLogger(__name__).info(
+        "roundtable starting: participants[%s] sdks[google-genai=%s "
+        "openai=%s anthropic=%s mcp=%s]",
+        models, _v("google-genai"), _v("openai"), _v("anthropic"), _v("mcp"),
+    )
     mcp.run()
 
 

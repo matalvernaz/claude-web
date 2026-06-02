@@ -41,6 +41,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -92,6 +93,11 @@ if _ANTHROPIC_TRANSPORT not in {"auto", "cli", "api"}:
         f"must be one of: auto, cli, api."
     )
 
+# Set true the first time transport=auto falls back from the (subscription)
+# CLI to the (per-token) API SDK, so the warning fires once per process
+# rather than on every Anthropic turn. See _call_anthropic_router.
+_warned_auto_api_fallback = False
+
 # At least one viable Anthropic path OR another provider must be set, or
 # the server has nothing to route to.
 _anthropic_available = bool(_anthropic_key) or _CLAUDE_CLI is not None
@@ -115,7 +121,11 @@ _anthropic = anthropic.Anthropic(api_key=_anthropic_key) if _anthropic_key else 
 # provider model bump applies automatically without redeploy. The
 # ``label`` shown in transcripts and to participants is intentionally
 # distinct from the model id — a roundtable participant identifies
-# itself by role ("Gemini Pro"), not by version string.
+# itself by role ("Gemini Pro"), not by version string. The KEYS are
+# likewise stable caller-facing handles, not model-version promises:
+# "gpt-5-mini" deliberately stays put across mini bumps (currently
+# gpt-5.4-mini), so don't rename a key on a model refresh — change only
+# the "model" value.
 PARTICIPANTS: dict[str, dict] = {
     "gemini-flash": {
         "provider": "gemini",
@@ -267,6 +277,21 @@ def _conn() -> sqlite3.Connection:
                 content TEXT NOT NULL,
                 ts REAL NOT NULL,
                 PRIMARY KEY (thread_id, name, version)
+            )"""
+        )
+        # A thread may be bound to a working directory so participants can
+        # read the real repo (Goal 4) instead of having code pasted in. The
+        # permission_policy is a SERIALIZABLE string (not a Callable) so the
+        # binding survives the MCP JSON boundary; core resolves it into a
+        # ToolUseContext + permission callback at turn time. One binding per
+        # thread (PK thread_id); rebinding REPLACEs.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS repo_contexts (
+                thread_id INTEGER PRIMARY KEY,
+                working_directory TEXT NOT NULL,
+                allowed_tools_json TEXT,
+                permission_policy TEXT NOT NULL DEFAULT 'readonly',
+                created_at REAL NOT NULL
             )"""
         )
         # Schema migrations: older DBs may predate columns added after
@@ -686,20 +711,122 @@ def _provider_call(what: str, fn):
 # then applies its own default.
 #   - OpenAI gpt-5.x: ``reasoning_effort`` accepts low/medium/high (plus
 #     minimal/none/xhigh on some models; we stick to the safe trio).
-#   - Gemini 2.5 Flash thinking budgets are 0–24576 tokens; 2.5 Pro has
-#     dynamic budget when set to -1. We pick conservative integer budgets
-#     that work on both tiers.
-#   - Anthropic Opus 4.8 / 4.7 / Sonnet 4.6 only support ``thinking={"type":
-#     "adaptive"}``; the deprecated ``enabled``+``budget_tokens`` form is
-#     scheduled for removal. So effort here is just an on/off toggle —
-#     anything ≥ medium turns thinking on, low disables it.
+#   - Gemini: family-dependent. Gemini 3+ uses the semantic
+#     ``thinking_level`` (low/medium/high); legacy Gemini-2.x uses the
+#     integer ``thinking_budget`` below (0–24576 tokens). See
+#     ``_gemini_uses_thinking_level`` — the two knobs are mutually
+#     exclusive (both → 400).
+#   - Anthropic: medium/high enable adaptive thinking (the only thinking
+#     mode on 4.6+; ``enabled``+``budget_tokens`` is deprecated). Opus 4.8+
+#     additionally takes a first-class ``output_config.effort`` knob — see
+#     ``_anthropic_supports_effort``; the CLI transport passes ``--effort``.
 _GEMINI_BUDGETS = {"low": 1024, "medium": 8192, "high": 24576}
+
+
+def _gemini_uses_thinking_level(model: str) -> bool:
+    """True if ``model`` takes the semantic ``thinking_level`` knob.
+
+    Gemini 3+ and the rolling ``-latest`` aliases (which now resolve to a
+    Gemini-3 tier) use ``thinking_level``. Only explicit Gemini-1.x/2.x
+    model ids fall back to the legacy integer ``thinking_budget``. We
+    default unknown/aliased names to the modern knob because that's what
+    the aliases resolve to today; an explicit ``gemini-2.x`` opts out.
+    """
+    m = model.lower()
+    return not ("gemini-1." in m or "gemini-2" in m)
+
+
+@dataclasses.dataclass
+class ProviderResult:
+    """Structured return from a single provider call.
+
+    ``_run_turn`` and every ``_call_*`` function return this instead of a
+    bare string so the caller can surface token usage, finish reason, and
+    (later) structured output / tool traces without changing the public
+    return shape — ``roundtable_ask`` still unwraps ``.text``.
+
+    ``usage`` is a provider-neutral dict (``input_tokens`` /
+    ``output_tokens`` / ``cached_tokens`` where the provider exposes them)
+    or None when the transport can't report it (the CLI ``-p`` path).
+    """
+    text: str
+    usage: Optional[dict] = None
+    finish_reason: Optional[str] = None
+    structured: Optional[object] = None
+    raw: Optional[object] = None
+
+
+def _extract_usage(provider: str, resp: object) -> Optional[dict]:
+    """Pull a provider-neutral usage dict off a raw SDK response.
+
+    Defensive by design: SDK response shapes drift across versions, so a
+    missing attribute yields None for that field rather than raising —
+    usage telemetry must never be able to fail a turn that otherwise
+    succeeded. ``cached_tokens`` surfaces prompt-cache hits once Phase 1
+    caching lands; it stays None until the provider reports it.
+    """
+    try:
+        if provider == "gemini":
+            u = getattr(resp, "usage_metadata", None)
+            if u is None:
+                return None
+            return {
+                "input_tokens": getattr(u, "prompt_token_count", None),
+                "output_tokens": getattr(u, "candidates_token_count", None),
+                "cached_tokens": getattr(u, "cached_content_token_count", None),
+            }
+        if provider == "openai":
+            u = getattr(resp, "usage", None)
+            if u is None:
+                return None
+            # Responses API uses input/output_tokens; chat.completions uses
+            # prompt/completion_tokens. Read both, prefer whichever is set.
+            inp = getattr(u, "input_tokens", None)
+            if inp is None:
+                inp = getattr(u, "prompt_tokens", None)
+            out = getattr(u, "output_tokens", None)
+            if out is None:
+                out = getattr(u, "completion_tokens", None)
+            details = getattr(u, "prompt_tokens_details", None) or getattr(
+                u, "input_tokens_details", None
+            )
+            cached = getattr(details, "cached_tokens", None) if details else None
+            return {"input_tokens": inp, "output_tokens": out, "cached_tokens": cached}
+        if provider == "anthropic":
+            u = getattr(resp, "usage", None)
+            if u is None:
+                return None
+            return {
+                "input_tokens": getattr(u, "input_tokens", None),
+                "output_tokens": getattr(u, "output_tokens", None),
+                "cached_tokens": getattr(u, "cache_read_input_tokens", None),
+            }
+    except Exception:  # noqa: BLE001 — telemetry must never break a turn
+        return None
+    return None
+
+
+def _log_usage(label: str, result: "ProviderResult") -> None:
+    """Emit a per-turn token-usage line to stderr (the MCP-safe log channel).
+
+    Phase 0 is log-only: usage is captured and logged but not persisted —
+    durable per-turn accounting rides Phase 6's run/event tables. A turn
+    whose transport can't report usage (the CLI path) logs nothing.
+    """
+    u = result.usage
+    if not u:
+        return
+    logger.info(
+        "usage participant=%s in=%s out=%s cached=%s finish=%s",
+        label, u.get("input_tokens"), u.get("output_tokens"),
+        u.get("cached_tokens"), result.finish_reason,
+    )
 
 
 def _call_gemini(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
-) -> str:
+) -> ProviderResult:
     """Send the rendered transcript + final instruction to Gemini.
 
     Gemini supports a separate ``system_instruction`` parameter, so we
@@ -711,7 +838,13 @@ def _call_gemini(
 
     When ``effort`` is provided we attach a ``ThinkingConfig`` so the
     model spends extra compute reasoning before producing its visible
-    reply. Thoughts themselves are not surfaced to the transcript.
+    reply. The knob is family-dependent: Gemini 3+ (and the rolling
+    ``-latest`` aliases, which now resolve to a Gemini-3 tier) take the
+    semantic ``thinking_level``; only legacy Gemini-2.x takes the integer
+    ``thinking_budget``. Passing the legacy budget to a Gemini-3 model
+    degrades its reasoning, and setting both at once is a 400 — see
+    ``_gemini_uses_thinking_level``. Thoughts are not surfaced to the
+    transcript.
 
     When ``web_search`` is True we attach Google Search grounding so
     the model can fetch current information instead of refusing on
@@ -729,10 +862,19 @@ def _call_gemini(
             timeout=int(PROVIDER_TIMEOUT_SEC * 1000),
         ),
     }
-    if effort and effort in _GEMINI_BUDGETS:
-        config["thinking_config"] = genai_types.ThinkingConfig(
-            thinking_budget=_GEMINI_BUDGETS[effort],
-        )
+    if effort:
+        if _gemini_uses_thinking_level(model):
+            # Gemini 3+: semantic level (low/medium/high map straight
+            # through). Never also set thinking_budget — the two together
+            # are a 400, and the budget alone degrades Gemini-3 reasoning.
+            config["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=effort,
+            )
+        elif effort in _GEMINI_BUDGETS:
+            # Legacy Gemini-2.x: integer token budget.
+            config["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=_GEMINI_BUDGETS[effort],
+            )
     if web_search:
         config["tools"] = [
             genai_types.Tool(google_search=genai_types.GoogleSearch()),
@@ -744,85 +886,95 @@ def _call_gemini(
         )
 
     resp = _provider_call(f"gemini/{model}", _do_call)
-    return resp.text or ""
+    return ProviderResult(
+        text=resp.text or "", usage=_extract_usage("gemini", resp), raw=resp,
+    )
 
 
 def _call_openai(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
-) -> str:
-    """Send the same conversation shape to OpenAI. gpt-5.x rejects
-    ``max_tokens`` and requires ``max_completion_tokens`` — we omit
-    both here and let the model use its default, matching the existing
-    openai-mcp server's pattern for review/brainstorm calls.
+) -> ProviderResult:
+    """Send the conversation to OpenAI via the Responses API.
 
-    When ``effort`` is provided we pass it through as ``reasoning_effort``;
-    gpt-5.x will then take more time on the turn before emitting its
-    response. Non-reasoning models would reject the parameter, but every
-    OpenAI participant in this registry is a gpt-5.x variant.
+    All OpenAI turns go through ``responses.create`` — the no-search and
+    web-search paths used to diverge (chat.completions vs Responses),
+    which meant two usage shapes, two output-extraction paths, and no
+    hosted-tool support on the default path. Unifying on Responses is
+    also the prerequisite for the Goal-1 OpenAI function-calling loop,
+    which only the Responses API exposes.
 
-    When ``web_search`` is True we switch to the Responses API and
-    attach the hosted ``web_search`` tool — chat.completions does not
-    surface OpenAI's hosted tools for gpt-5.x, only the Responses API
-    does. The response shape differs (``output_text`` instead of
-    ``choices[0].message.content``) so we branch the call sites; the
-    no-search path keeps using chat.completions to avoid disturbing the
-    well-trodden code path that drives every existing roundtable.
+    The system prompt rides the top-level ``instructions`` field and the
+    transcript + orchestrator turn ride ``input`` — mirroring how the
+    other providers receive system vs user content.
+
+    When ``effort`` is provided it passes through as
+    ``reasoning={"effort": ...}``; every OpenAI participant in the
+    registry is a gpt-5.x reasoning model. When ``web_search`` is True we
+    attach the hosted ``web_search`` tool so the model can fetch current
+    information instead of refusing on no-live-access grounds.
     """
     user_msg = transcript
     if instruction:
         user_msg += f"\n\n[orchestrator]:\n{instruction}"
 
-    if web_search:
-        kwargs: dict = {
-            "model": model,
-            "instructions": system_prompt,
-            "input": user_msg,
-            "tools": [{"type": "web_search"}],
-            "timeout": PROVIDER_TIMEOUT_SEC,
-        }
-        if effort:
-            kwargs["reasoning"] = {"effort": effort}
-
-        def _do_call_resp():
-            return _openai.responses.create(**kwargs)
-
-        resp = _provider_call(f"openai/{model}", _do_call_resp)
-        return resp.output_text or ""
-
-    kwargs = {
+    kwargs: dict = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
+        "instructions": system_prompt,
+        "input": user_msg,
         "timeout": PROVIDER_TIMEOUT_SEC,
+        # OpenAI prompt caching is automatic for >1024-token prefixes; the
+        # cache_key is a routing hint that raises hit-rate for requests
+        # sharing a prefix. The system prompt is stable per participant per
+        # thread (it embeds the label, topic, and house rules), so hashing
+        # it groups a participant's repeated turns onto the same cache
+        # lineage — which is where the long shared transcript prefix lives.
+        "prompt_cache_key": hashlib.sha256(
+            system_prompt.encode("utf-8")
+        ).hexdigest()[:32],
     }
     if effort:
-        kwargs["reasoning_effort"] = effort
+        kwargs["reasoning"] = {"effort": effort}
+    if web_search:
+        kwargs["tools"] = [{"type": "web_search"}]
 
     def _do_call():
-        return _openai.chat.completions.create(**kwargs)
+        return _openai.responses.create(**kwargs)
 
     resp = _provider_call(f"openai/{model}", _do_call)
-    return resp.choices[0].message.content or ""
+    return ProviderResult(
+        text=resp.output_text or "", usage=_extract_usage("openai", resp),
+        raw=resp,
+    )
 
 
-# Anthropic Messages API requires ``max_tokens`` even when nothing is being
-# truncated. We pick a generous cap so a thorough review (or a long
-# adaptive-thinking turn that has to fit thoughts + reply inside the same
-# budget) doesn't get clipped. Adaptive thinking shares this budget with
-# the final response, so it needs to be larger than the visible reply
-# would otherwise require.
+# Anthropic Messages API requires ``max_tokens``. Adaptive thinking shares
+# this budget with the visible reply, so a high-effort turn needs more
+# headroom or it gets clipped mid-thought. We scale the cap by effort; the
+# env var is the no-effort default and an explicit override.
 _ANTHROPIC_MAX_TOKENS = int(
     os.environ.get("CLAUDE_ROUNDTABLE_ANTHROPIC_MAX_TOKENS", "16384")
 )
+_ANTHROPIC_MAX_TOKENS_BY_EFFORT = {"low": 8192, "medium": 16384, "high": 32768}
+
+# Models that accept the Messages-API ``output_config.effort`` knob. The
+# feature shipped with Opus 4.8; Sonnet 4.6 predates it and isn't known to
+# accept it, so we gate rather than risk a 400. Extend as models gain it.
+# (The CLI transport handles effort itself via ``--effort`` and isn't gated
+# here — this gate only guards the SDK Messages path.)
+_ANTHROPIC_EFFORT_MODELS = ("opus-4-8",)
+
+
+def _anthropic_supports_effort(model: str) -> bool:
+    """True if ``model`` accepts the Messages-API ``output_config.effort``."""
+    m = model.lower()
+    return any(tag in m for tag in _ANTHROPIC_EFFORT_MODELS)
 
 
 def _call_anthropic(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
-) -> str:
+) -> ProviderResult:
     """Send the transcript to an Anthropic model via the Messages API.
 
     Anthropic's API keeps the system prompt as a top-level ``system``
@@ -832,29 +984,70 @@ def _call_anthropic(
     other two providers receive it.
 
     When ``effort`` is medium or high we enable adaptive extended
-    thinking, which lets Opus / Sonnet allocate their own internal
-    reasoning budget before producing the visible response. Adaptive is
-    the only supported thinking mode on 4.6 / 4.7 / 4.8 — the older
-    ``type=enabled`` with ``budget_tokens`` is deprecated. The visible
-    response is composed of ``text`` blocks; ``thinking`` blocks are
-    dropped before returning so the transcript stays human-readable.
+    thinking, which lets the model allocate its own internal reasoning
+    budget before producing the visible response. Adaptive is the only
+    supported thinking mode on 4.6+ — the older ``type=enabled`` with
+    ``budget_tokens`` is deprecated. The visible response is composed of
+    ``text`` blocks; ``thinking`` blocks are dropped before returning so
+    the transcript stays human-readable.
+
+    On models that support it (Opus 4.8+, see ``_anthropic_supports_effort``)
+    we also pass the first-class ``output_config.effort`` knob, and scale
+    ``max_tokens`` by effort so a high-effort turn isn't clipped. Sonnet
+    4.6 predates the effort knob and is left on adaptive-thinking only.
 
     When ``web_search`` is True we attach Anthropic's hosted
     ``web_search`` server tool (the 2026-02-09 revision the SDK ships)
     so the model can fetch current information mid-turn.
+
+    The system prompt and transcript are sent as cache-broken block
+    arrays so a thread's stable prefix is read from cache on later turns
+    — see the inline note. Cache hits surface as ``cached_tokens`` in the
+    logged usage.
     """
-    user_msg = transcript
+    # Prompt caching: mark the stable prefix (system prompt + the transcript
+    # so far) with ephemeral cache_control breakpoints. Anthropic matches the
+    # longest previously-cached prefix, so as the transcript grows each turn
+    # the earlier turns are read from cache (~90% cheaper input) and only the
+    # delta is processed. The orchestrator instruction, when present, is the
+    # one volatile piece and rides its own uncached tail block. Caching only
+    # engages above the provider's ~1024-token minimum; shorter threads just
+    # skip it. Two breakpoints here, well under Anthropic's limit of four.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+    content_blocks: list = [
+        {
+            "type": "text",
+            "text": transcript,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
     if instruction:
-        user_msg += f"\n\n[orchestrator]:\n{instruction}"
+        content_blocks.append(
+            {"type": "text", "text": f"\n\n[orchestrator]:\n{instruction}"}
+        )
+    max_tokens = (
+        _ANTHROPIC_MAX_TOKENS_BY_EFFORT.get(effort, _ANTHROPIC_MAX_TOKENS)
+        if effort else _ANTHROPIC_MAX_TOKENS
+    )
     kwargs: dict = {
         "model": model,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_msg}],
-        "max_tokens": _ANTHROPIC_MAX_TOKENS,
+        "system": system_blocks,
+        "messages": [{"role": "user", "content": content_blocks}],
+        "max_tokens": max_tokens,
         "timeout": PROVIDER_TIMEOUT_SEC,
     }
     if effort in {"medium", "high"}:
         kwargs["thinking"] = {"type": "adaptive"}
+    if effort and _anthropic_supports_effort(model):
+        # First-class effort knob (Opus 4.8+). low/medium/high pass straight
+        # through; the API also accepts xhigh/max but our enum stops at high.
+        kwargs["output_config"] = {"effort": effort}
     if web_search:
         kwargs["tools"] = [
             {"type": "web_search_20260209", "name": "web_search"},
@@ -868,13 +1061,16 @@ def _call_anthropic(
         block.text for block in resp.content
         if getattr(block, "type", None) == "text"
     ]
-    return "".join(text_parts)
+    return ProviderResult(
+        text="".join(text_parts), usage=_extract_usage("anthropic", resp),
+        finish_reason=getattr(resp, "stop_reason", None), raw=resp,
+    )
 
 
 def _call_anthropic_cli(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
-) -> str:
+) -> ProviderResult:
     """Subprocess to ``claude`` / ``claude-ha`` and read the response.
 
     This is the subscription-auth path for Anthropic participants: it
@@ -953,7 +1149,9 @@ def _call_anthropic_cli(
             )
         return proc.stdout
 
-    return _provider_call(f"anthropic-cli/{model}", _do_call)
+    out = _provider_call(f"anthropic-cli/{model}", _do_call)
+    # CLI -p text mode reports no token usage; usage stays None here.
+    return ProviderResult(text=out)
 
 
 # ─── Permission-gated tool use (Layer 1) ─────────────────────────────────
@@ -1026,6 +1224,113 @@ class ToolUseContext:
     max_turns: int = 8
 
 
+# ─── Thread-bound repo context (Goal 4) ──────────────────────────────────
+#
+# A thread can be bound to a working directory via ``roundtable_bind_repo``.
+# The binding is stored as plain serializable fields (path + a string
+# ``permission_policy``), so it survives the MCP JSON boundary that a
+# Callable can't cross. At turn time ``_effective_tool_context`` resolves
+# the binding into a ``ToolUseContext`` with a built-in permission callback
+# derived from the policy — that's what lets repo-grounded turns work over
+# stdio MCP, not just from the webapp (which can still pass its own
+# interactive callback explicitly).
+
+_READONLY_TOOLS = ["Read", "Grep", "Glob"]
+_VALID_TOOL_POLICIES = {"readonly", "deny", "ask"}
+
+# Optional allowlist of directory roots a thread may be bound to, from
+# ``ROUNDTABLE_REPO_ROOTS`` (os.pathsep-separated). Empty = no allowlist
+# configured; binding is then permitted anywhere (with a logged warning),
+# which suits a single-user host but should be set on a shared deployment.
+_REPO_ROOT_ALLOWLIST = [
+    str(Path(p).resolve())
+    for p in os.environ.get("ROUNDTABLE_REPO_ROOTS", "").split(os.pathsep)
+    if p.strip()
+]
+
+
+def _path_under_allowlist(path: str) -> bool:
+    """True if ``path`` is within an allowlisted root (or no allowlist set)."""
+    if not _REPO_ROOT_ALLOWLIST:
+        return True
+    rp = Path(path).resolve()
+    for root in _REPO_ROOT_ALLOWLIST:
+        try:
+            rp.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _readonly_permission_callback(
+    participant_label: str, tool_name: str, tool_input: dict,
+) -> PermissionDecision:
+    """Allow only read-only tools; deny anything that could mutate state."""
+    return "allow" if tool_name in _READONLY_TOOLS else "deny"
+
+
+def _deny_all_permission_callback(
+    participant_label: str, tool_name: str, tool_input: dict,
+) -> PermissionDecision:
+    return "deny"
+
+
+def _policy_callback(policy: str) -> Optional[PermissionCallback]:
+    """Map a stored string policy to a built-in permission callback.
+
+    ``readonly`` and ``deny`` resolve to self-contained callbacks. ``ask``
+    needs an interactive (e.g. browser) callback supplied by the caller —
+    there is no built-in for it, so this returns None and the resolver
+    falls back to the no-tools path rather than silently auto-allowing.
+    """
+    if policy == "readonly":
+        return _readonly_permission_callback
+    if policy == "deny":
+        return _deny_all_permission_callback
+    return None  # "ask" — must be supplied externally
+
+
+def _effective_tool_context(
+    thread_id: int, explicit: Optional[ToolUseContext] = None,
+) -> Optional[ToolUseContext]:
+    """Resolve the ToolUseContext for a turn from the thread's repo binding.
+
+    An ``explicit`` context with a working_directory always wins (the
+    webapp passing its own interactive callback). Otherwise we look up the
+    thread's stored binding and synthesize a context whose callback comes
+    from the string policy. Returns None (no tools) when there is no
+    binding, or when the policy is ``ask`` but no interactive callback was
+    supplied — never auto-allow a gated policy.
+    """
+    if explicit is not None and explicit.working_directory is not None:
+        return explicit
+    binding = roundtable_repo_context(thread_id)
+    if binding is None:
+        return explicit
+    policy = binding["permission_policy"]
+    callback = (
+        explicit.permission_callback
+        if explicit is not None and explicit.permission_callback is not None
+        else _policy_callback(policy)
+    )
+    if callback is None:
+        logger.warning(
+            "thread %s repo policy=%r needs an interactive permission "
+            "callback that wasn't supplied; tool use disabled for this turn.",
+            thread_id, policy,
+        )
+        return None
+    allowed = binding["allowed_tools"]
+    if allowed is None and policy == "readonly":
+        allowed = list(_READONLY_TOOLS)
+    return ToolUseContext(
+        permission_callback=callback,
+        working_directory=binding["working_directory"],
+        allowed_tools=allowed,
+    )
+
+
 # Resolved at import time so a missing claude_agent_sdk fails loudly the
 # first time a caller actually passes a ToolUseContext, rather than
 # poisoning normal no-tools routing.
@@ -1065,7 +1370,7 @@ def _call_anthropic_sdk_with_tools(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str], web_search: bool,
     tool_use_context: ToolUseContext, participant_label: str,
-) -> str:
+) -> ProviderResult:
     """Run an Anthropic participant turn via the agent SDK with real tools.
 
     Uses ``claude_agent_sdk.query`` (one-shot, stateless — the right
@@ -1224,7 +1529,10 @@ def _call_anthropic_sdk_with_tools(
         # tears down the loop cleanly, leaving no state behind.
         return asyncio.run(asyncio.wait_for(_drive(), timeout=PROVIDER_TIMEOUT_SEC))
 
-    return _provider_call(f"anthropic-sdk-tools/{model}", _do_call)
+    out = _provider_call(f"anthropic-sdk-tools/{model}", _do_call)
+    # TODO(usage): the agent SDK surfaces usage on ResultMessage; capture it
+    # when the tool-trace plumbing lands (Goal 1 / Phase 3). None for now.
+    return ProviderResult(text=out)
 
 
 def _call_anthropic_router(
@@ -1232,7 +1540,7 @@ def _call_anthropic_router(
     effort: Optional[str] = None, web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
     participant_label: str = "",
-) -> str:
+) -> ProviderResult:
     """Pick CLI vs SDK based on the transport setting and what's available.
 
     ``auto`` prefers CLI when a binary is on PATH (cheaper — uses
@@ -1272,6 +1580,21 @@ def _call_anthropic_router(
             model, system_prompt, transcript, instruction, effort, web_search,
         )
     if _anthropic is not None:
+        # Falling back to per-token API billing because no claude/claude-ha
+        # CLI was on PATH at startup. Warn once — silently metering the API
+        # key when the user expected their Pro/Team subscription is exactly
+        # the footgun this branch is here to surface.
+        global _warned_auto_api_fallback
+        if not _warned_auto_api_fallback:
+            _warned_auto_api_fallback = True
+            logger.warning(
+                "Anthropic transport=auto but no claude/claude-ha CLI on "
+                "PATH — falling back to the ANTHROPIC_API_KEY SDK path, "
+                "which bills per-token instead of using the Pro/Team "
+                "subscription. Put the claude CLI on the server's PATH to "
+                "use the subscription, or set "
+                "CLAUDE_ROUNDTABLE_ANTHROPIC_TRANSPORT=cli to fail loudly."
+            )
         return _call_anthropic(
             model, system_prompt, transcript, instruction, effort, web_search,
         )
@@ -1337,6 +1660,105 @@ def roundtable_create(
         "topic": topic,
         "participants": participants,
         "house_rules": house_rules,
+    }
+
+
+def roundtable_bind_repo(
+    thread_id: int, working_directory: str,
+    permission_policy: str = "readonly",
+    allowed_tools: Optional[list[str]] = None,
+) -> dict:
+    """Bind a thread to a working directory so participants can read the repo.
+
+    Once bound, ``roundtable_ask`` turns for tool-capable participants run
+    with real filesystem tools rooted at ``working_directory``, every call
+    gated by the policy. This is what lets the panel audit ground truth
+    instead of pasted excerpts — and it works over stdio MCP because the
+    binding is plain serializable data, resolved into a permission callback
+    server-side (see ``_effective_tool_context``).
+
+    ``permission_policy`` is one of:
+      - ``"readonly"`` (default): allow only Read/Grep/Glob under the root.
+      - ``"deny"``: register the binding but allow no tools (useful to
+        stage a path, or to hard-stop tool use on a thread).
+      - ``"ask"``: defer to an interactive callback the *caller* supplies
+        (e.g. the webapp's browser prompt). Over plain MCP, where no such
+        callback exists, ``ask`` turns run with tools disabled rather than
+        auto-allowing — bind ``readonly`` if you want MCP reads.
+
+    ``allowed_tools`` optionally clamps the toolset further; ``None`` uses
+    the policy default (the read-only trio for ``readonly``).
+
+    Only Anthropic participants consume the binding today; Gemini/OpenAI
+    repo access is Goal 1 (Layer 2), still to come.
+
+    Returns the stored binding dict.
+    """
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — cannot bind a repo.")
+    if permission_policy not in _VALID_TOOL_POLICIES:
+        raise ValueError(
+            f"permission_policy must be one of {sorted(_VALID_TOOL_POLICIES)}; "
+            f"got {permission_policy!r}"
+        )
+    resolved = Path(working_directory).expanduser().resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            f"working_directory {working_directory!r} is not an existing "
+            f"directory (resolved to {resolved})."
+        )
+    if not _path_under_allowlist(str(resolved)):
+        raise ValueError(
+            f"working_directory {resolved} is outside ROUNDTABLE_REPO_ROOTS "
+            f"({_REPO_ROOT_ALLOWLIST}). Add it to the allowlist to bind here."
+        )
+    if not _REPO_ROOT_ALLOWLIST:
+        logger.warning(
+            "binding thread %s to %s with no ROUNDTABLE_REPO_ROOTS allowlist "
+            "configured — any path is bindable. Set the env var on a shared "
+            "deployment.", thread_id, resolved,
+        )
+    with _db_lock:
+        _conn().execute(
+            "INSERT OR REPLACE INTO repo_contexts(thread_id, working_directory, "
+            "allowed_tools_json, permission_policy, created_at) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (
+                thread_id, str(resolved),
+                json.dumps(allowed_tools) if allowed_tools is not None else None,
+                permission_policy, time.time(),
+            ),
+        )
+    return {
+        "thread_id": thread_id,
+        "working_directory": str(resolved),
+        "permission_policy": permission_policy,
+        "allowed_tools": allowed_tools,
+    }
+
+
+def roundtable_repo_context(thread_id: int) -> Optional[dict]:
+    """Return the thread's repo binding, or None if it isn't bound.
+
+    Returns ``{"thread_id", "working_directory", "permission_policy",
+    "allowed_tools"}`` — ``allowed_tools`` is the stored clamp or None.
+    """
+    with _db_lock:
+        row = _conn().execute(
+            "SELECT working_directory, allowed_tools_json, permission_policy "
+            "FROM repo_contexts WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "thread_id": thread_id,
+        "working_directory": row[0],
+        "allowed_tools": json.loads(row[1]) if row[1] else None,
+        "permission_policy": row[2],
     }
 
 
@@ -1420,7 +1842,7 @@ def _run_turn(
     thread: dict, info: dict, messages: list[dict], instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
-) -> str:
+) -> ProviderResult:
     """Render the transcript for one participant and call its provider.
 
     Pure function over the inputs — no DB writes. Caller decides when to
@@ -1529,7 +1951,7 @@ def roundtable_ask(
         _append_message(thread_id, "orchestrator", prompt)
     messages = _thread_messages(thread_id)
     try:
-        response = _run_turn(
+        result = _run_turn(
             thread, info, messages, "", effort, web_search,
             tool_use_context=tool_use_context,
         )
@@ -1542,7 +1964,8 @@ def roundtable_ask(
         _append_message(thread_id, info["label"], err_msg)
         raise
 
-    response = response.strip()
+    _log_usage(info["label"], result)
+    response = (result.text or "").strip()
     if not response:
         response = "[empty response from provider]"
     if _thread_is_closed(thread_id):
@@ -1621,7 +2044,9 @@ def roundtable_ask_parallel(
     # Catch only Exception, NOT BaseException — swallowing
     # KeyboardInterrupt/SystemExit would prevent clean shutdown and
     # record signals as fake provider errors in the transcript.
-    def _one(name: str) -> tuple[str, str, Optional[Exception]]:
+    def _one(
+        name: str,
+    ) -> tuple[str, Optional[ProviderResult], Optional[Exception]]:
         info = infos[name]
         try:
             resp = _run_turn(
@@ -1631,9 +2056,9 @@ def roundtable_ask_parallel(
             )
             return name, resp, None
         except Exception as exc:
-            return name, "", exc
+            return name, None, exc
 
-    results: dict[str, tuple[str, Optional[Exception]]] = {}
+    results: dict[str, tuple[Optional[ProviderResult], Optional[Exception]]] = {}
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=len(participants)
     ) as pool:
@@ -1660,7 +2085,8 @@ def roundtable_ask_parallel(
             _append_message(thread_id, label, msg)
             errors[name] = f"{type(err).__name__}: {err}"
             continue
-        clean = resp.strip() or "[empty response from provider]"
+        _log_usage(label, resp)
+        clean = (resp.text or "").strip() or "[empty response from provider]"
         if closed_mid_flight:
             clean = clean + (
                 "\n\n[note: thread was closed during this call; response "
