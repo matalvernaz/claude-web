@@ -286,14 +286,17 @@ main {
   color: #ccc;
 }
 .msg.assistant .body strong { font-weight: 700; }
-.msg.permission {
+.msg.permission, .msg.question, .msg.plan {
   border: 1px solid var(--accent);
   border-radius: 6px;
   padding: 0.75rem 1rem;
   background: #1f2a3a;
   max-width: 75ch;
 }
-.msg.permission .role { color: var(--accent); margin-bottom: 0.5rem; }
+.msg.permission .role, .msg.question .role, .msg.plan .role {
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
 .permission-input {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -323,6 +326,52 @@ main {
   font-style: italic;
   border-left: 3px solid var(--border);
   padding-left: 0.5rem;
+}
+
+/* AskUserQuestion card */
+.question-form { display: flex; flex-direction: column; gap: 0.75rem; }
+.question-fieldset {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+}
+.question-fieldset legend { padding: 0 0.25rem; font-weight: 600; }
+.question-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+}
+.question-option label { flex: 1; }
+.question-other-text {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 0.25rem 0.4rem;
+}
+
+/* ExitPlanMode card */
+.plan-body {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin: 0 0 0.75rem 0;
+  max-height: 24rem;
+  overflow-y: auto;
+}
+.plan-feedback {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 0.4rem;
+  margin: 0.25rem 0 0.75rem 0;
+  font-family: inherit;
 }
 
 #todos-panel {

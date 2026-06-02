@@ -478,6 +478,17 @@
       safeSet(localStorage, APPLY_KEY, applyToCurrent.checked ? "true" : "false");
     });
   }
+
+  // Plan-mode toggle: persisted so it stays on across the turns of a planning
+  // conversation. Its value rides on every /api/chat send (see sendOne).
+  const planModeToggle = document.getElementById("plan-mode");
+  const PLAN_KEY = "plan-mode";
+  if (planModeToggle) {
+    if (safeGet(localStorage, PLAN_KEY) === "true") planModeToggle.checked = true;
+    planModeToggle.addEventListener("change", () => {
+      safeSet(localStorage, PLAN_KEY, planModeToggle.checked ? "true" : "false");
+    });
+  }
   if (personalitySelect) {
     let lastPersonality = personalitySelect.value;
     personalitySelect.addEventListener("change", async () => {
@@ -1476,6 +1487,9 @@
       if (personalitySelect && personalitySelect.value) {
         fd.append("personality_id", personalitySelect.value);
       }
+      if (planModeToggle && planModeToggle.checked) {
+        fd.append("plan_mode", "true");
+      }
       for (const img of entry.images) {
         fd.append("images", img.file, img.file.name);
       }
@@ -1891,6 +1905,18 @@
       playCue("permission");
       renderPermissionCard(obj);
       markVisibleActivity();
+    } else if (obj.type === "question_request") {
+      ctx.currentAssistantBody = null;
+      announce("Claude is asking you a question.");
+      playCue("permission");
+      renderQuestionCard(obj);
+      markVisibleActivity();
+    } else if (obj.type === "plan_review") {
+      ctx.currentAssistantBody = null;
+      announce("Claude has a plan for you to review.");
+      playCue("permission");
+      renderPlanCard(obj);
+      markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from
       // the start so we don't miss anything. tryResume's reconnect path
@@ -1923,11 +1949,13 @@
       // Iterate rather than building a CSS selector — request IDs are
       // server-side UUIDs today but a future change could include
       // characters that need escaping; .find() doesn't care.
-      const cards = document.querySelectorAll("article.msg.permission");
+      // Matches the generic permission card plus the question/plan cards,
+      // all of which carry data-request-id and may be awaiting a response.
+      const cards = document.querySelectorAll("article.msg.permission, article.msg.question, article.msg.plan");
       const card = [...cards].find((el) => el.dataset.requestId === String(obj.id));
       if (card) {
         card.dataset.state = "timed_out";
-        card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+        card.querySelectorAll("button, input, textarea").forEach((b) => (b.disabled = true));
         const note = document.createElement("p");
         note.className = "permission-timeout-note";
         note.textContent = restarted
@@ -2402,6 +2430,235 @@
       }
       setStatus("Failed to send decision: " + err.message);
     }
+  }
+
+  // Shared resolver POST for the question/plan cards. `payload` (object|null)
+  // is JSON-encoded into the `payload` form field; the backend hands it to the
+  // permission callback (answers for AskUserQuestion, feedback for plan).
+  async function postDecision(requestId, decision, payload) {
+    const fd = new FormData();
+    fd.append("decision", decision);
+    if (payload != null) fd.append("payload", JSON.stringify(payload));
+    const r = await fetch(
+      `/api/permission/${encodeURIComponent(requestId)}`,
+      { method: "POST", body: fd },
+    );
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  }
+
+  function replaceCardWithSummary(card, text) {
+    card.dataset.state = "resolved";
+    const summary = document.createElement("article");
+    summary.className = "msg permission-resolved";
+    summary.textContent = text;
+    card.replaceWith(summary);
+  }
+
+  // AskUserQuestion → accessible form. Each question is a <fieldset>/<legend>
+  // with radio (single-select) or checkbox (multiSelect) options plus an
+  // "Other" free-text row. Selections post back keyed by question text, the
+  // shape the bundled CLI reads from the tool's `answers` input.
+  function renderQuestionCard(req) {
+    const card = document.createElement("article");
+    card.className = "msg question";
+    card.setAttribute("role", "group");
+    card.dataset.requestId = req.id || "";
+    card.dataset.state = "pending";
+    const headingId = `q-heading-${req.id || Math.random().toString(36).slice(2)}`;
+    const heading = document.createElement("h3");
+    heading.className = "role";
+    heading.id = headingId;
+    heading.textContent = "Claude is asking";
+    card.appendChild(heading);
+    card.setAttribute("aria-labelledby", headingId);
+
+    const form = document.createElement("form");
+    form.className = "question-form";
+    const questions = Array.isArray(req.questions) ? req.questions : [];
+    const fieldMeta = [];
+    questions.forEach((q, qi) => {
+      const fs = document.createElement("fieldset");
+      fs.className = "question-fieldset";
+      const legend = document.createElement("legend");
+      legend.textContent = q.question || q.header || `Question ${qi + 1}`;
+      fs.appendChild(legend);
+      const multi = !!q.multiSelect;
+      const groupName = `q-${req.id}-${qi}`;
+      const opts = Array.isArray(q.options) ? q.options : [];
+      opts.forEach((opt, oi) => {
+        const row = document.createElement("div");
+        row.className = "question-option";
+        const input = document.createElement("input");
+        input.type = multi ? "checkbox" : "radio";
+        input.name = groupName;
+        input.id = `${groupName}-${oi}`;
+        input.value = opt.label;
+        const label = document.createElement("label");
+        label.setAttribute("for", input.id);
+        label.textContent = opt.description ? `${opt.label} — ${opt.description}` : opt.label;
+        row.appendChild(input);
+        row.appendChild(label);
+        fs.appendChild(row);
+      });
+      // Free-text "Other", matching the native tool's auto-provided option.
+      const otherRow = document.createElement("div");
+      otherRow.className = "question-option";
+      const otherInput = document.createElement("input");
+      otherInput.type = multi ? "checkbox" : "radio";
+      otherInput.name = groupName;
+      otherInput.id = `${groupName}-other`;
+      otherInput.value = "__other__";
+      const otherLabel = document.createElement("label");
+      otherLabel.setAttribute("for", otherInput.id);
+      otherLabel.textContent = "Other:";
+      const otherText = document.createElement("input");
+      otherText.type = "text";
+      otherText.className = "question-other-text";
+      otherText.setAttribute("aria-label", `Other answer for: ${q.question || q.header || "question"}`);
+      otherText.addEventListener("input", () => { if (otherText.value) otherInput.checked = true; });
+      otherRow.appendChild(otherInput);
+      otherRow.appendChild(otherLabel);
+      otherRow.appendChild(otherText);
+      fs.appendChild(otherRow);
+      form.appendChild(fs);
+      fieldMeta.push({ q, groupName, multi, otherText });
+    });
+
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "btn-primary";
+    submit.textContent = "Submit answers";
+    const skip = document.createElement("button");
+    skip.type = "button";
+    skip.className = "btn-secondary";
+    skip.textContent = "Skip";
+    actions.appendChild(submit);
+    actions.appendChild(skip);
+    form.appendChild(actions);
+    card.appendChild(form);
+    transcript.appendChild(card);
+    maybeAutoScroll(true);
+    const firstInput = form.querySelector("input");
+    if (firstInput) firstInput.focus();
+
+    function unlock() {
+      card.dataset.state = "pending";
+      card.querySelectorAll("button, input").forEach((el) => (el.disabled = false));
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (card.dataset.state !== "pending") return;
+      const answers = {};
+      for (const fm of fieldMeta) {
+        const qtext = fm.q.question || fm.q.header;
+        if (!qtext) continue;
+        const checked = [...form.querySelectorAll(`input[name="${fm.groupName}"]:checked`)];
+        const vals = [];
+        for (const c of checked) {
+          if (c.value === "__other__") {
+            const t = fm.otherText.value.trim();
+            if (t) vals.push(t);
+          } else {
+            vals.push(c.value);
+          }
+        }
+        if (vals.length) answers[qtext] = fm.multi ? vals : vals[0];
+      }
+      card.dataset.state = "deciding";
+      card.querySelectorAll("button, input").forEach((el) => (el.disabled = true));
+      try {
+        await postDecision(req.id, "answer", { answers });
+        const entries = Object.entries(answers);
+        replaceCardWithSummary(card, entries.length
+          ? `Answered — ${entries.map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("; ")}`
+          : "Question skipped");
+      } catch (err) {
+        unlock();
+        setStatus("Failed to send answer: " + err.message);
+      }
+    });
+    skip.addEventListener("click", async () => {
+      if (card.dataset.state !== "pending") return;
+      card.dataset.state = "deciding";
+      card.querySelectorAll("button, input").forEach((el) => (el.disabled = true));
+      try {
+        await postDecision(req.id, "dismiss", null);
+        replaceCardWithSummary(card, "Question skipped");
+      } catch (err) {
+        unlock();
+        setStatus("Failed: " + err.message);
+      }
+    });
+  }
+
+  // ExitPlanMode → plan review card. Approve lets the tool run (CLI exits plan
+  // mode and implements); Keep planning denies it with optional feedback so
+  // the model revises and presents again.
+  function renderPlanCard(req) {
+    const card = document.createElement("article");
+    card.className = "msg plan";
+    card.setAttribute("role", "group");
+    card.dataset.requestId = req.id || "";
+    card.dataset.state = "pending";
+    const headingId = `plan-heading-${req.id || Math.random().toString(36).slice(2)}`;
+    const heading = document.createElement("h3");
+    heading.className = "role";
+    heading.id = headingId;
+    heading.textContent = "Claude's plan — review";
+    card.appendChild(heading);
+    card.setAttribute("aria-labelledby", headingId);
+
+    const body = document.createElement("div");
+    body.className = "plan-body";
+    body.innerHTML = renderMarkdown(req.plan || "");
+    card.appendChild(body);
+
+    const fbId = `plan-fb-${req.id || Math.random().toString(36).slice(2)}`;
+    const fbLabel = document.createElement("label");
+    fbLabel.setAttribute("for", fbId);
+    fbLabel.textContent = "Feedback (used only if you keep planning):";
+    const fb = document.createElement("textarea");
+    fb.id = fbId;
+    fb.className = "plan-feedback";
+    fb.rows = 2;
+    card.appendChild(fbLabel);
+    card.appendChild(fb);
+
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "btn-primary";
+    approve.textContent = "Approve & proceed";
+    const keep = document.createElement("button");
+    keep.type = "button";
+    keep.className = "btn-secondary";
+    keep.textContent = "Keep planning";
+    actions.appendChild(approve);
+    actions.appendChild(keep);
+    card.appendChild(actions);
+    transcript.appendChild(card);
+    maybeAutoScroll(true);
+    approve.focus();
+
+    async function send(decision, payload, resolvedText) {
+      if (card.dataset.state !== "pending") return;
+      card.dataset.state = "deciding";
+      card.querySelectorAll("button, textarea").forEach((el) => (el.disabled = true));
+      try {
+        await postDecision(req.id, decision, payload);
+        replaceCardWithSummary(card, resolvedText);
+      } catch (err) {
+        card.dataset.state = "pending";
+        card.querySelectorAll("button, textarea").forEach((el) => (el.disabled = false));
+        setStatus("Failed: " + err.message);
+      }
+    }
+    approve.addEventListener("click", () => send("allow", null, "Plan approved — proceeding"));
+    keep.addEventListener("click", () => send("deny", { feedback: fb.value.trim() }, "Kept planning"));
   }
 
   // ─── Tasks panel ────────────────────────────────────────────────────────

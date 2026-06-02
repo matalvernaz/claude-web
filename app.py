@@ -367,6 +367,18 @@ NO_SESSION_ALLOWLIST_TOOLS: set[str] = set(
     t.strip() for t in os.getenv("NO_SESSION_ALLOWLIST_TOOLS", "Bash").split(",") if t.strip()
 )
 
+# Interactive tools that get a purpose-built, accessible card instead of the
+# generic allow/deny permission gate. Their answers are fed back through the
+# permission callback rather than the model guessing.
+#   AskUserQuestion — multiple-choice question(s); the user's selections are
+#     returned as the tool's `answers` input (keyed by question text), which
+#     the bundled CLI reads back via PermissionResultAllow.updated_input.
+#   ExitPlanMode — the model's plan; approval lets the tool run (the CLI then
+#     exits plan mode), rejection denies it with the user's feedback so the
+#     model revises.
+QUESTION_TOOL = "AskUserQuestion"
+PLAN_TOOL = "ExitPlanMode"
+
 # Cap on per-subscriber SSE event queue depth. A slow or stuck client used to
 # accumulate every event for the run forever; with this cap a 1000-event
 # backlog disconnects the slow subscriber instead of growing memory unbounded.
@@ -4689,6 +4701,14 @@ class ActiveRun:
         # is baked in at SDK init, so a mid-conversation personality flip
         # has to respawn the run with the new append. Compared in api_chat.
         self.personality_id = personality_id
+        # Current SDK permission mode for this live run. Tracked so a
+        # plan-mode toggle on a resumed run can flip the CLI between
+        # "plan" and "default" via client.set_permission_mode() instead of
+        # respawning. Approving an ExitPlanMode plan transitions the CLI to
+        # "acceptEdits" on its own (upstream behavior); this field is the
+        # mode claude-web last *requested*, used only to avoid redundant
+        # control requests.
+        self.permission_mode: str = "default"
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -5541,11 +5561,17 @@ async def api_commands(user: dict = Depends(auth.require_user)):
 async def api_permission(
     request_id: str,
     decision: str = Form(...),
+    payload: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
-    """Resolve a pending permission request from the browser.
+    """Resolve a pending permission / question / plan request from the browser.
 
-    Accepts decision in {"allow", "allow_session", "deny"}.
+    decision is one of:
+      - "allow" / "allow_session" / "deny"  — generic permission card
+      - "answer" / "dismiss"                — AskUserQuestion card
+      - "allow" (approve) / "deny" (keep planning) — ExitPlanMode card
+    `payload` is an optional JSON string carrying question answers
+    ({"answers": {...}, "annotations": {...}}) or plan feedback ({"feedback"}).
     """
     entry = PENDING.get(request_id)
     if entry is None:
@@ -5560,9 +5586,15 @@ async def api_permission(
     # "anonymous", so a None here means something went wrong upstream — refuse.
     if owner != user.get("sub"):
         raise HTTPException(403, "not your permission request")
-    if decision not in {"allow", "allow_session", "deny"}:
+    if decision not in {"allow", "allow_session", "deny", "answer", "dismiss"}:
         raise HTTPException(400, "bad decision")
-    fut.set_result({"decision": decision})
+    parsed_payload = None
+    if payload:
+        try:
+            parsed_payload = json.loads(payload)
+        except ValueError:
+            raise HTTPException(400, "bad payload") from None
+    fut.set_result({"decision": decision, "payload": parsed_payload})
     return {"ok": True}
 
 
@@ -6223,6 +6255,7 @@ async def api_chat(
     project: str = Form(default=""),
     model: str = Form(default=""),
     personality_id: Optional[int] = Form(default=None),
+    plan_mode: bool = Form(default=False),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
@@ -6341,6 +6374,23 @@ async def api_chat(
             swap_respawn = True
         if existing is not None:
             _require_owner(existing, user)
+            # Honor a plan-mode toggle on a live/resumed run by flipping the
+            # CLI's permission mode in place (no respawn needed). A plain send
+            # resets to "default" so gating resumes after an acceptEdits
+            # implementation burst; a plan-mode send enters read-only planning.
+            desired_mode = "plan" if plan_mode else "default"
+            if (
+                existing.client is not None
+                and existing.permission_mode != desired_mode
+            ):
+                try:
+                    await existing.client.set_permission_mode(desired_mode)
+                    existing.permission_mode = desired_mode
+                except Exception as exc:  # control request can race a teardown
+                    log.warning(
+                        "set_permission_mode(%s) failed run=%s: %s",
+                        desired_mode, existing.run_id, exc,
+                    )
             file_metas = await _save_uploaded_files(files, existing.run_id)
             effective = _file_attachment_prefix(file_metas) + message
             # Subscribe BEFORE we emit the new user_prompt so the new subscriber
@@ -6396,6 +6446,7 @@ async def api_chat(
             account_slot=account["slot"],
             personality_id=active_personality_id,
         )
+        run.permission_mode = "plan" if plan_mode else "default"
         run.project_key = _sanitize_project_key(cwd)
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
@@ -6445,6 +6496,106 @@ async def api_chat(
                 tool_name, run.run_id, owner,
             )
             return PermissionResultAllow()
+
+        # AskUserQuestion: render the question(s) as an accessible form rather
+        # than a yes/no gate, and feed the user's picks back as the tool's
+        # `answers` input. No allow/deny step — gating a question is friction
+        # with no security value.
+        if tool_name == QUESTION_TOOL:
+            request_id = str(uuid_mod.uuid4())
+            fut = asyncio.get_running_loop().create_future()
+            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
+            try:
+                run.emit({
+                    "type": "question_request",
+                    "id": request_id,
+                    "questions": tool_input.get("questions", []),
+                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                })
+                try:
+                    decision = await asyncio.wait_for(
+                        fut, timeout=PERMISSION_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    run.emit({
+                        "type": "permission_timeout", "id": request_id,
+                        "tool": tool_name,
+                        "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                    })
+                    # No answer in time — let the tool run with no answers so
+                    # the CLI emits its native "did not answer" result and the
+                    # model moves on, rather than hard-denying the turn.
+                    return PermissionResultAllow(updated_input=dict(tool_input))
+            finally:
+                PENDING.pop(request_id, None)
+            payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+            updated = dict(tool_input)
+            answers = (payload or {}).get("answers")
+            annotations = (payload or {}).get("annotations")
+            if answers:
+                updated["answers"] = answers
+            if annotations:
+                updated["annotations"] = annotations
+            log.info(
+                "question answered=%s tool=%s run=%s owner=%s",
+                bool(answers), tool_name, run.run_id, owner,
+            )
+            return PermissionResultAllow(updated_input=updated)
+
+        # ExitPlanMode: show the proposed plan for review. Approve -> allow the
+        # tool (the CLI exits plan mode and proceeds). Keep-planning -> deny
+        # with the user's feedback so the model revises and calls again.
+        if tool_name == PLAN_TOOL:
+            request_id = str(uuid_mod.uuid4())
+            fut = asyncio.get_running_loop().create_future()
+            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
+            try:
+                run.emit({
+                    "type": "plan_review",
+                    "id": request_id,
+                    "plan": tool_input.get("plan", ""),
+                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                })
+                try:
+                    decision = await asyncio.wait_for(
+                        fut, timeout=PERMISSION_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    run.emit({
+                        "type": "permission_timeout", "id": request_id,
+                        "tool": tool_name,
+                        "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                    })
+                    return PermissionResultDeny(
+                        message=(
+                            f"Plan review timed out after "
+                            f"{PERMISSION_TIMEOUT_SECONDS}s. Do not implement; "
+                            f"wait for the user."
+                        ),
+                    )
+            finally:
+                PENDING.pop(request_id, None)
+            if decision.get("decision") == "allow":
+                log.info("plan approved run=%s owner=%s", run.run_id, owner)
+                run.permission_mode = "acceptEdits"
+                return PermissionResultAllow()
+            feedback = ""
+            payload = decision.get("payload")
+            if isinstance(payload, dict):
+                feedback = (payload.get("feedback") or "").strip()
+            log.info(
+                "plan rejected run=%s owner=%s feedback=%s",
+                run.run_id, owner, bool(feedback),
+            )
+            return PermissionResultDeny(
+                message=(
+                    feedback
+                    or "The user chose to keep planning. Refine the plan based "
+                    "on their input and call ExitPlanMode again; do not start "
+                    "implementing yet."
+                ),
+            )
+
         sig = _tool_signature(tool_name, tool_input)
         # Tools in NO_SESSION_ALLOWLIST_TOOLS bypass the per-session allowlist
         # entirely — their signature is too coarse to be safe (e.g. Bash maps
@@ -6544,7 +6695,9 @@ async def api_chat(
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
-        permission_mode="default",
+        # Plan mode launches read-only; the model researches then presents a
+        # plan via ExitPlanMode (rendered as an accessible review card).
+        permission_mode="plan" if plan_mode else "default",
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
         system_prompt=system_prompt_opt,
