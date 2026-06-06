@@ -1248,19 +1248,30 @@
   }
 
   stopBtn.addEventListener("click", async () => {
-    // Tell the server to cancel the SDK task. The fetch will then end on
-    // its own when the run finishes; abort is fallback insurance. Also
-    // empty the outgoing queue — Stop means stop, not "stop just this one".
-    if (messageQueue.length) {
-      messageQueue.length = 0;
-      renderQueue();
+    // Stop interrupts the in-flight turn but keeps the run (and this SSE
+    // stream) alive, so the next message steers it. Queued messages are left
+    // in place — they ARE the steer and drain as the next turn once the
+    // interrupted result lands. Anyone wanting a hard stop interrupts, then
+    // clears the queue. The interrupted turn ends via a normal `result` event
+    // (flagged interrupted), which re-enables the composer.
+    if (!currentRunId) {
+      if (currentAbort) currentAbort.abort();
+      return;
     }
-    if (currentRunId) {
-      try {
-        await fetch(`/api/chat/stop/${encodeURIComponent(currentRunId)}`, { method: "POST" });
-      } catch { /* fall through to abort */ }
+    announce("Interrupting current turn.");
+    let interrupted = false;
+    try {
+      const r = await fetch(`/api/chat/stop/${encodeURIComponent(currentRunId)}`, { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      interrupted = !!j.interrupted;
+    } catch {
+      /* network failed — fall through to the abort fallback below */
     }
-    if (currentAbort) currentAbort.abort();
+    // Only tear the stream down when the server couldn't interrupt (no live
+    // client, interrupt unsupported, or the POST failed) and the run is
+    // therefore ending. On a real interrupt we must NOT abort, or we'd
+    // disconnect from a run that's still alive and ready to be steered.
+    if (!interrupted && currentAbort) currentAbort.abort();
   });
 
   form.addEventListener("submit", async (e) => {
@@ -2057,7 +2068,7 @@
       // activeForm into the next turn's spinner.
       setActiveTodoLabel(null);
       stopGerunds();
-      const summary = summariseResult(obj);
+      const summary = obj.interrupted ? "Turn interrupted." : summariseResult(obj);
       setStatus(summary);
       announce(summary);
       refreshSessions();

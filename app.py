@@ -4727,6 +4727,14 @@ class ActiveRun:
         # /api/chat to respawn under the new persona).
         self.accepting_input: bool = True
         self.superseded_reason: Optional[str] = None
+        # Set True by ``/api/chat/stop`` immediately before it calls
+        # ``client.interrupt()`` to halt the in-flight turn without tearing
+        # the run down (so the next message steers it). The driver uses it to
+        # reclassify the interrupted turn's ResultMessage — which the SDK
+        # reports as ``is_error=True subtype="error_during_execution"`` — as a
+        # clean interruption rather than a crash. Cleared when that result is
+        # consumed, and again at each turn start as a stale-flag guard.
+        self.interrupting: bool = False
         self.session_id: Optional[str] = None
         self.project_key: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
@@ -5908,6 +5916,29 @@ def _supersede_run(run: ActiveRun, reason: str) -> None:
         run.task.cancel()
 
 
+def _resolve_pending_permissions(run: ActiveRun, reason: str) -> int:
+    """Resolve every pending permission/question/plan prompt for ``run`` with
+    a deny, so its awaiting ``can_use_tool`` coroutine returns instead of
+    hanging until PERMISSION_TIMEOUT.
+
+    Called from the stop path before ``client.interrupt()``: interrupt aborts
+    the turn, but a tool whose permission Future is still unresolved would
+    otherwise leave that callback blocked on ``asyncio.wait_for(fut, ...)``,
+    wedging the turn's unwind. The deny just unblocks the callback — the
+    interrupt is what actually ends the turn, so the decision value is moot.
+    Returns the number of prompts resolved.
+    """
+    resolved = 0
+    for entry in list(PENDING.values()):
+        if entry.get("run_id") != run.run_id:
+            continue
+        fut = entry.get("future")
+        if fut is not None and not fut.done():
+            fut.set_result({"decision": "deny", "interrupted": True, "reason": reason})
+            resolved += 1
+    return resolved
+
+
 @app.get("/api/mcp")
 async def api_mcp_list(user: dict = Depends(auth.require_user)):
     """List MCP servers visible to spawned runs.
@@ -6483,7 +6514,7 @@ async def api_chat(
         if tool_name == QUESTION_TOOL:
             request_id = str(uuid_mod.uuid4())
             fut = asyncio.get_running_loop().create_future()
-            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
+            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
             try:
                 run.emit({
                     "type": "question_request",
@@ -6527,7 +6558,7 @@ async def api_chat(
         if tool_name == PLAN_TOOL:
             request_id = str(uuid_mod.uuid4())
             fut = asyncio.get_running_loop().create_future()
-            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
+            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
             try:
                 run.emit({
                     "type": "plan_review",
@@ -6591,7 +6622,7 @@ async def api_chat(
 
         request_id = str(uuid_mod.uuid4())
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub}
+        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
         try:
             run.emit({
                 "type": "permission_request",
@@ -7023,7 +7054,26 @@ async def api_chat(
                                     if is_bg and blk.id:
                                         run.bg_tool_use_ids.add(blk.id)
 
-                            for evt in _sdk_message_to_events(msg, run):
+                            evts = _sdk_message_to_events(msg, run)
+                            if run.interrupting and isinstance(msg, ResultMessage):
+                                # This ResultMessage is the in-flight turn
+                                # winding down in response to client.interrupt()
+                                # from /api/chat/stop. The SDK flags it
+                                # is_error=True / subtype="error_during_execution"
+                                # — indistinguishable from a real mid-turn
+                                # failure without our own flag. Rewrite it to a
+                                # clean interruption so the UI announces "Turn
+                                # interrupted" and re-enables input rather than
+                                # rendering a crash banner. Cost/usage logging
+                                # already happened inside _sdk_message_to_events.
+                                run.interrupting = False
+                                for evt in evts:
+                                    if evt.get("type") == "result":
+                                        evt["is_error"] = False
+                                        evt["interrupted"] = True
+                                        evt["subtype"] = "interrupted"
+                                log.info("turn interrupted for run %s", run.run_id)
+                            for evt in evts:
                                 # emit() also keeps ACTIVE_RUNS_BY_SESSION in
                                 # sync whenever an init event reveals (or
                                 # changes) the SDK session id, so follow-up
@@ -7111,6 +7161,10 @@ async def api_chat(
                         if popped_user_item is not None:
                             item = popped_user_item
                             run.consecutive_auto_fires = 0
+                            # A new turn is starting; drop any stale interrupt
+                            # flag left by a stop click that found nothing to
+                            # interrupt, so this turn's result isn't misread.
+                            run.interrupting = False
                             ack: Optional[asyncio.Future] = item.get("delivered")
                             try:
                                 await _send_user_message(
@@ -7160,6 +7214,7 @@ async def api_chat(
                             # Grace period elapsed with notifications buffered:
                             # auto-fire a synth user message.
                             action = _drain_pending_for_auto_fire()
+                            run.interrupting = False
                             async with run.client_write_lock:
                                 await client.query(action["synth"])
                             last_cli_activity = time.monotonic()
@@ -7377,7 +7432,20 @@ async def api_chat_stream(run_id: str, user: dict = Depends(auth.require_user)):
 
 @app.post("/api/chat/stop/{run_id}")
 async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
-    """Cancel the SDK task. Idempotent for runs already finished."""
+    """Interrupt the in-flight turn, keeping the run alive so the next message
+    steers it.
+
+    Calls ``ClaudeSDKClient.interrupt()`` to halt the current turn at a clean
+    boundary rather than cancelling the driver task. The run stays in
+    ACTIVE_RUNS, still ``accepting_input``, so a queued (or subsequently typed)
+    message runs as the next turn with the interrupted turn's partial output
+    retained in the transcript. Pending permission prompts for this run are
+    resolved first so interrupt can't strand the ``can_use_tool`` callback.
+
+    Falls back to the old hard cancel when there's no live client yet (initial
+    query still connecting) or interrupt raises, so Stop always does something.
+    Idempotent for runs already finished.
+    """
     _safe_id(run_id)
     run = ACTIVE_RUNS.get(run_id)
     if run is None:
@@ -7385,9 +7453,27 @@ async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
     _require_owner(run, user)
     if run.done:
         return {"ok": True, "already_done": True}
-    if run.task and not run.task.done():
-        run.task.cancel()
-    return {"ok": True}
+
+    client = run.client
+    if client is None:
+        # No live SDK client published yet — the only teardown available
+        # before the driver finishes its initial query is task cancellation.
+        if run.task and not run.task.done():
+            run.task.cancel()
+        return {"ok": True, "cancelled": True}
+
+    run.interrupting = True
+    _resolve_pending_permissions(run, "interrupted")
+    try:
+        async with run.client_write_lock:
+            await client.interrupt()
+    except Exception as e:
+        run.interrupting = False
+        log.warning("interrupt failed for run %s: %s — falling back to cancel", run.run_id, e)
+        if run.task and not run.task.done():
+            run.task.cancel()
+        return {"ok": True, "interrupt_failed": True}
+    return {"ok": True, "interrupted": True}
 
 
 def _denial_dict(d) -> dict:
