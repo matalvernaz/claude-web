@@ -9564,7 +9564,17 @@ async def api_roundtable_assistant(
         producer_task = asyncio.create_task(producer())
         try:
             while True:
-                item = await event_queue.get()
+                # SSE comment heartbeat, same as _stream_run_response:
+                # Cloudflare/cloudflared close response streams after ~100s
+                # of byte-level silence, and a high-effort panel/synth step
+                # routinely runs 90-150s+ with no events in between. Losing
+                # the connection also cancels the producer below, killing the
+                # synthesis step after the paid panel calls already ran.
+                try:
+                    item = await asyncio.wait_for(event_queue.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    yield b": ping\n\n"
+                    continue
                 if item is DONE_SENTINEL:
                     break
                 event_name, data = item
