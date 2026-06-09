@@ -199,6 +199,17 @@ This is a claude-web bug, not upstream Claude Code — the next-prompt picker af
   - `node --check static/app.js`
 - Tests live in `tests/` (pytest fixtures pre-set env vars at import time; smoke + CSRF + auth + setup_flow + helpers). CI workflow at `.github/workflows/ci.yml`.
 - No `--reload` in production — restart the service after edits.
+- **Restarting from inside a claude-web chat session**: do NOT run
+  `systemctl restart claude-web` directly — it SIGTERMs the whole cgroup,
+  including the CLI subprocess running your own conversation, killing the
+  in-flight turn (the command dies with exit 144 before the restart lands).
+  Instead request a drain-restart, which waits until every conversation is
+  between turns and then exits for systemd to revive:
+  `kill -USR1 $(systemctl show -p MainPID --value claude-web)`
+  (same-user signal, no sudo needed). Your turn finishes normally; the
+  restart fires after it ends. Cancel a pending drain with
+  `DELETE /api/admin/restart`. Requires `Restart=always` on the unit
+  (drop-in at `/etc/systemd/system/claude-web.service.d/self-restart.conf`).
 
 ## Source-file map
 

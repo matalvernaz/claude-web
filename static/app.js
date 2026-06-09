@@ -1529,7 +1529,14 @@
         fd.append("files", f.file, f.file.name);
       }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: myAbort.signal });
-      if (!r.ok) throw new Error("HTTP " + r.status);
+      if (!r.ok) {
+        let code = "";
+        try { code = (await r.json()).error || ""; } catch (_) { /* non-JSON body */ }
+        if (code === "restart_pending") {
+          throw new Error("Server restart in progress — wait a few seconds and resend.");
+        }
+        throw new Error("HTTP " + r.status);
+      }
       await drainStream(r, gen);
     } catch (err) {
       // Aborts from a Stop click or stall-recovery aren't user-facing

@@ -26,6 +26,12 @@ def launcher(monkeypatch, tmp_path):
     fake_exe.write_text("")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(fake_exe))
+    # _load_dotenv_files() reads Path.cwd()/.env too. When pytest runs from
+    # a checkout that has a real .env, that file would be loaded straight
+    # into os.environ (bypassing monkeypatch) and leak operator config —
+    # e.g. AUTH_MODE=oidc — into every later test module. Pin cwd to the
+    # tmp dir so the only .env in reach is the one a test writes itself.
+    monkeypatch.chdir(tmp_path)
     # Clear every var the bootstrap branches on so test order can't leak
     # a prior test's setenv into _looks_unconfigured.
     for var in (

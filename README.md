@@ -197,6 +197,23 @@ This drops the user into an interactive `claude /login` against their personal d
 | `CLAUDE_WEB_PERMISSION_TIMEOUT` | `900` (15m) | Pending permission requests deny themselves after this. |
 | `CLAUDE_WEB_MAX_AUTO_FIRES` | `3` | How many synth-message turns can chain off background tool notifications before the driver waits for a human. |
 
+### Self-restart
+
+`POST /api/admin/restart` (or `SIGUSR1` to the server process) requests a
+drain-restart: new turns get `503 restart_pending`, in-flight conversations
+finish their current turn, then the process exits cleanly for the supervisor
+to revive. `DELETE /api/admin/restart` cancels a pending drain. With
+`CLAUDE_WEB_ADMIN_EMAILS` set, only those users may call it; unset, any
+signed-in user can (single-operator default). **Requires a supervisor that
+restarts on clean exit** — systemd `Restart=always`, Docker
+`restart: unless-stopped`. Useful when Claude edits claude-web from inside a
+claude-web session and needs to pick the changes up without killing its own
+turn.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLAUDE_WEB_RESTART_MAX_WAIT` | `1800` (30m) | Drain ceiling: after this many seconds the restart fires even with busy runs (equivalent to today's hard restart — transcripts survive, mid-tool-call state doesn't). |
+
 ## Setting up OIDC
 
 You need a *confidential* OIDC client at your IdP with:

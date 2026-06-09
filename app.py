@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -4753,6 +4754,12 @@ class ActiveRun:
         # /api/chat to respawn under the new persona).
         self.accepting_input: bool = True
         self.superseded_reason: Optional[str] = None
+        # Turn state, written only by this run's driver loop. True when the
+        # CLI is idle between turns — the restart drain (_busy_runs) reads
+        # it. Starts False: a fresh run is spawned to serve an immediate
+        # first message, and "busy until proven idle" keeps the drain from
+        # killing a turn that hasn't produced its first event yet.
+        self.between_turns: bool = False
         # Set True by ``/api/chat/stop`` immediately before it calls
         # ``client.interrupt()`` to halt the in-flight turn without tearing
         # the run down (so the next message steers it). The driver uses it to
@@ -4800,7 +4807,7 @@ class ActiveRun:
         # initial query. Held only as a debug breadcrumb / capability
         # marker — handlers no longer write to it directly. All user input
         # flows through ``user_input_queue`` and is dequeued by the driver
-        # while ``between_turns`` is True, which serialises every CLI write
+        # while ``run.between_turns`` is True, which serialises every CLI write
         # through one writer (the driver). The previous direct-write
         # design caused queued messages to land in the CLI's stdin
         # mid-turn and be silently consumed/discarded.
@@ -5039,6 +5046,125 @@ class ActiveRun:
 
 ACTIVE_RUNS: dict[str, ActiveRun] = {}
 ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
+
+
+# ─── Self-restart: drain, then exit for the supervisor to revive ─────────────
+# Restarting the service from inside a chat SIGTERMs the whole cgroup,
+# including the CLI subprocess running the very conversation that asked for
+# the restart. Instead: flip RESTART_STATE (SIGUSR1 to the main process, or
+# POST /api/admin/restart), refuse new turns with 503 restart_pending, wait
+# until every run is between turns, then exit cleanly and let the supervisor
+# bring the process back. Requires a supervisor that restarts on clean exit
+# (systemd Restart=always; Docker restart: unless-stopped). Module-global
+# state is fine here for the same reason as ACTIVE_RUNS: single worker.
+RESTART_STATE: dict[str, Any] = {"pending": False, "requested_at": None, "source": None}
+RESTART_MAX_WAIT = int(os.getenv("CLAUDE_WEB_RESTART_MAX_WAIT", "1800"))
+_RESTART_POLL_SECONDS = 2.0
+
+
+# In-flight roundtable assistant streams. They aren't ActiveRuns, but a
+# drain has to wait for them too — a panel turn mid-flight is paid work.
+# Single-worker event loop, so a bare int is race-free.
+ASSISTANT_STREAMS_ACTIVE = 0
+
+
+def _busy_runs() -> list[str]:
+    """Run ids with a turn in flight, or input queued that would start one."""
+    busy = []
+    for run in ACTIVE_RUNS.values():
+        if run.done or run.task is None or run.task.done():
+            # Finished, or a restored row from state.db with no live CLI —
+            # nothing a drain needs to wait for.
+            continue
+        if not run.between_turns or not run.user_input_queue.empty():
+            busy.append(run.run_id)
+    if ASSISTANT_STREAMS_ACTIVE > 0:
+        busy.append(f"roundtable-assistant×{ASSISTANT_STREAMS_ACTIVE}")
+    return busy
+
+
+def request_restart(source: str) -> dict:
+    if not RESTART_STATE["pending"]:
+        RESTART_STATE.update(
+            pending=True, requested_at=time.monotonic(), source=source,
+        )
+        log.info(
+            "restart requested via %s; draining %d busy run(s)",
+            source, len(_busy_runs()),
+        )
+    return {
+        "status": "draining",
+        "busy_runs": len(_busy_runs()),
+        "max_wait_seconds": RESTART_MAX_WAIT,
+    }
+
+
+def cancel_restart() -> dict:
+    was = RESTART_STATE["pending"]
+    RESTART_STATE.update(pending=False, requested_at=None, source=None)
+    if was:
+        log.info("pending restart cancelled")
+    return {"status": "cancelled" if was else "idle"}
+
+
+async def _restart_watcher_loop() -> None:
+    """Poll while a restart is pending; exit the process once drained.
+
+    SIGTERM-to-self gives uvicorn its normal graceful shutdown, so the exit
+    code is 0 and the supervisor's restart policy revives us. After
+    RESTART_MAX_WAIT the restart fires even with busy runs — equivalent to
+    today's hard restart (mid-turn state lost, transcripts survive)."""
+    while True:
+        await asyncio.sleep(_RESTART_POLL_SECONDS)
+        if not RESTART_STATE["pending"]:
+            continue
+        busy = _busy_runs()
+        waited = time.monotonic() - (RESTART_STATE["requested_at"] or 0.0)
+        if busy and waited < RESTART_MAX_WAIT:
+            continue
+        if busy:
+            log.warning(
+                "restart drain exceeded %ss with %d busy run(s) — "
+                "restarting anyway", RESTART_MAX_WAIT, len(busy),
+            )
+        else:
+            log.info("restart drain complete — exiting for supervisor revive")
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+
+
+@app.on_event("startup")
+async def _install_restart_machinery() -> None:
+    asyncio.create_task(_restart_watcher_loop())
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            asyncio.get_running_loop().add_signal_handler(
+                signal.SIGUSR1, lambda: request_restart("SIGUSR1"),
+            )
+        except (NotImplementedError, RuntimeError):
+            # Windows / non-main-thread event loop: the API endpoint still
+            # works, only the signal trigger is unavailable.
+            pass
+
+
+def _require_restart_admin(user: dict) -> None:
+    """Empty ADMIN_EMAILS = single-operator install: any signed-in user."""
+    if not ADMIN_EMAILS:
+        return
+    if (user.get("email") or "").lower() not in ADMIN_EMAILS:
+        raise HTTPException(403, "admin only")
+
+
+@app.post("/api/admin/restart")
+async def api_request_restart(user: dict = Depends(auth.require_user)):
+    _require_restart_admin(user)
+    return request_restart(f"api:{user.get('email') or user.get('sub') or '?'}")
+
+
+@app.delete("/api/admin/restart")
+async def api_cancel_restart(user: dict = Depends(auth.require_user)):
+    _require_restart_admin(user)
+    return cancel_restart()
 # Per-session locks for /api/chat. The SDK only sets run.session_id once it
 # receives the init SystemMessage, so without this two near-simultaneous POSTs
 # for the same resumed session_id (multi-tab / fast double-submit) both miss
@@ -5070,7 +5196,7 @@ def _session_lock(session_id: str) -> asyncio.Lock:
 RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
 AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
 SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
-# Mid-turn silence cap: when the CLI is mid-turn (between_turns=False) the
+# Mid-turn silence cap: when the CLI is mid-turn (run.between_turns=False) the
 # normal idle timeout doesn't apply — a Bash that takes 20 min or a Monitor
 # watching a slow process emits nothing while it's working. But we still need
 # *some* upper bound so a genuinely wedged subprocess eventually surfaces an
@@ -6330,6 +6456,8 @@ async def api_chat(
     Permission requests come back as `permission_request` events, resolved
     via /api/permission/{id}. Reconnect via /api/chat/stream/{run_id}.
     """
+    if RESTART_STATE["pending"]:
+        return JSONResponse({"error": "restart_pending"}, status_code=503)
     if not setup_flow.is_configured():
         return JSONResponse(
             {"error": "claude_not_configured", "setup_url": "/setup"},
@@ -6910,20 +7038,20 @@ async def api_chat(
                         await _send_to_client(client, effective_message, image_blocks)
                         run.client = client
 
-                    # `between_turns` flips to True on each ResultMessage and
+                    # `run.between_turns` flips to True on each ResultMessage and
                     # back to False whenever we send something to the CLI
                     # (user input or auto-fire synth). Auto-fire only arms
-                    # while between_turns — we never auto-fire while an LLM
+                    # while run.between_turns — we never auto-fire while an LLM
                     # turn is still in flight, and we likewise never pop a
                     # queued user message into a busy CLI (writing to the
                     # CLI's stdin mid-turn caused the message to be silently
                     # consumed-and-discarded; queueing serialises everything
                     # through one writer so that bug can't recur).
-                    between_turns = False
+                    run.between_turns = False
 
                     # Mid-turn silence clock. Bumped whenever an SDK message
                     # arrives or we send something to the CLI. Used only when
-                    # between_turns is False, to bound how long a wedged
+                    # run.between_turns is False, to bound how long a wedged
                     # subprocess can pin the driver. time.monotonic() (not
                     # time.time()) so a wall-clock jump doesn't trip it.
                     last_cli_activity = time.monotonic()
@@ -6945,12 +7073,12 @@ async def api_chat(
                         #      slow process is silent by design. The cap is
                         #      a safety net for a wedged subprocess only.
                         #   4. Between turns, nothing pending → session idle.
-                        if (between_turns and run.pending_notifications
+                        if (run.between_turns and run.pending_notifications
                                 and run.notification_grace_started_at is not None
                                 and not cap_reached):
                             elapsed = time.monotonic() - run.notification_grace_started_at
                             timeout = max(0.0, AUTO_FIRE_GRACE_MS / 1000 - elapsed)
-                        elif not between_turns:
+                        elif not run.between_turns:
                             elapsed = time.monotonic() - last_cli_activity
                             timeout = max(0.0, MIDTURN_SILENCE_TIMEOUT_MS / 1000 - elapsed)
                         else:
@@ -6966,7 +7094,7 @@ async def api_chat(
                         # void failure mode the queue is designed to avoid.
                         waitables: set[asyncio.Task] = {msg_get}
                         user_get: Optional[asyncio.Task] = None
-                        if between_turns:
+                        if run.between_turns:
                             user_get = asyncio.create_task(run.user_input_queue.get())
                             waitables.add(user_get)
                         try:
@@ -7131,7 +7259,7 @@ async def api_chat(
                             # turn N that completes during turn N+1 still
                             # has its notification preserved for the next
                             # between-turns auto-fire window. The auto-fire
-                            # branch itself gates on between_turns + the
+                            # branch itself gates on run.between_turns + the
                             # grace timer, so a mid-turn completion just
                             # waits for the current dance to end.
                             #
@@ -7172,21 +7300,21 @@ async def api_chat(
                                     )
 
                             if isinstance(msg, ResultMessage):
-                                between_turns = True
+                                run.between_turns = True
                             elif isinstance(msg, (AssistantMessage, UserMessage)):
                                 # Active LLM turn / tool dance. We're not
                                 # between-turns again until the next Result.
-                                between_turns = False
+                                run.between_turns = False
                             # Task* and Init messages are out-of-band — they
-                            # don't change between_turns. A TaskNotification
-                            # arriving between turns must keep between_turns
+                            # don't change run.between_turns. A TaskNotification
+                            # arriving between turns must keep run.between_turns
                             # = True so the grace timer can arm.
 
-                        if popped_user_item is not None and not between_turns:
+                        if popped_user_item is not None and not run.between_turns:
                             # Race fix (2026-05-29): if msg_get just delivered
                             # a new UserMessage/AssistantMessage (commonly a
                             # ScheduleWakeup firing inside the CLI), the
-                            # between_turns block above flipped to False AFTER
+                            # run.between_turns block above flipped to False AFTER
                             # we'd already popped a queued user message. Sending
                             # it now would write to the CLI's stdin mid-turn,
                             # which (per the comment at the top of this loop)
@@ -7246,15 +7374,15 @@ async def api_chat(
                             # The send writes to the CLI's stdin, so the CLI
                             # is now mid-turn regardless of what msg_get just
                             # delivered (a TaskNotification can co-occur with
-                            # the user POST without flipping between_turns
+                            # the user POST without flipping run.between_turns
                             # itself).
-                            between_turns = False
+                            run.between_turns = False
 
                         if msg_done or user_done:
                             continue
 
                         # Timeout fired — four sub-cases:
-                        if (between_turns and run.pending_notifications
+                        if (run.between_turns and run.pending_notifications
                                 and not cap_reached):
                             # Grace period elapsed with notifications buffered:
                             # auto-fire a synth user message.
@@ -7263,14 +7391,14 @@ async def api_chat(
                             async with run.client_write_lock:
                                 await client.query(action["synth"])
                             last_cli_activity = time.monotonic()
-                            between_turns = False
+                            run.between_turns = False
                             continue
-                        if between_turns and run.pending_notifications:
+                        if run.between_turns and run.pending_notifications:
                             _drop_pending_capped()
                             # Don't exit yet — give the user another idle
                             # window to send something before tearing down.
                             continue
-                        if not between_turns:
+                        if not run.between_turns:
                             # Mid-turn silence cap fired. The subprocess is
                             # likely wedged (a Bash that's been hung for 30
                             # min, or a Monitor whose target died without
@@ -7375,6 +7503,8 @@ async def api_chat_send(
     /api/chat, which respawns under the current state.
     """
     _safe_id(run_id)
+    if RESTART_STATE["pending"]:
+        return JSONResponse({"error": "restart_pending"}, status_code=503)
     if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES:
         raise HTTPException(
             413,
@@ -9292,6 +9422,9 @@ async def api_roundtable_assistant(
     synthesizer overrides.
     """
     rt = _require_roundtable()
+    if RESTART_STATE["pending"]:
+        # A panel turn runs minutes; letting one start would stall the drain.
+        return JSONResponse({"error": "restart_pending"}, status_code=503)
     prompt_str = (prompt or "").strip()
     if not prompt_str:
         raise HTTPException(400, "prompt is required")
@@ -9561,6 +9694,8 @@ async def api_roundtable_assistant(
             finally:
                 await event_queue.put(DONE_SENTINEL)
 
+        global ASSISTANT_STREAMS_ACTIVE
+        ASSISTANT_STREAMS_ACTIVE += 1
         producer_task = asyncio.create_task(producer())
         try:
             while True:
@@ -9580,6 +9715,7 @@ async def api_roundtable_assistant(
                 event_name, data = item
                 yield _sse(event_name, data)
         finally:
+            ASSISTANT_STREAMS_ACTIVE -= 1
             if not producer_task.done():
                 producer_task.cancel()
                 try:
