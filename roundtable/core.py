@@ -109,9 +109,14 @@ if not (_gemini_key or _openai_key or _anthropic_available):
         "route to without one of these."
     )
 
+# max_retries=0: retry policy lives in _provider_call. The SDKs' internal
+# retries (OpenAI and Anthropic both default to 2) stack multiplicatively
+# with ours — a failing attempt became 3 SDK tries × 3 _provider_call
+# attempts, turning one slow/failed call into a multi-tens-of-minutes hang.
+# google-genai already defaults to no retries (tenacity stop_after_attempt(1)).
 _gemini = genai.Client(api_key=_gemini_key) if _gemini_key else None
-_openai = OpenAI(api_key=_openai_key) if _openai_key else None
-_anthropic = anthropic.Anthropic(api_key=_anthropic_key) if _anthropic_key else None
+_openai = OpenAI(api_key=_openai_key, max_retries=0) if _openai_key else None
+_anthropic = anthropic.Anthropic(api_key=_anthropic_key, max_retries=0) if _anthropic_key else None
 
 
 # ─── Participant registry ────────────────────────────────────────────────
@@ -630,6 +635,30 @@ PROVIDER_MAX_ATTEMPTS = int(
 PROVIDER_RETRY_BASE_SEC = float(
     os.environ.get("CLAUDE_ROUNDTABLE_PROVIDER_RETRY_BASE_SEC", "1.0")
 )
+# Hard WALL-CLOCK cap per provider attempt. PROVIDER_TIMEOUT_SEC above is an
+# IDLE timeout on the socket — and at least OpenAI's edge sends periodic
+# keepalive bytes during long non-streaming reasoning calls, resetting the
+# idle window, so a slow generation sails straight past it (observed: a
+# gpt-5.5 effort=high call on a large transcript holding the socket open
+# 30+ minutes, wedging roundtable_ask_parallel until the MCP client tore
+# the connection down). The wall cap converts that into a clean
+# per-participant failure. Big high-effort calls legitimately run ~9
+# minutes, so the default leaves headroom above that.
+PROVIDER_WALL_TIMEOUT_SEC = float(
+    os.environ.get("CLAUDE_ROUNDTABLE_PROVIDER_WALL_TIMEOUT_SEC", "900")
+)
+
+
+class ProviderWallTimeout(Exception):
+    """A provider call exceeded PROVIDER_WALL_TIMEOUT_SEC of wall clock.
+
+    Deliberately NOT a TimeoutError subclass: idle timeouts are transient
+    and worth retrying, but a generation that blew the wall cap would very
+    likely blow it again — surface immediately instead of paying for the
+    same near-half-hour twice. The abandoned worker thread is a daemon and
+    dies with the process; the underlying HTTP call is left to finish or
+    fail on its own.
+    """
 
 
 def _is_transient_provider_error(exc: BaseException) -> bool:
@@ -665,6 +694,39 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
     return False
 
 
+def _call_with_wall_cap(what: str, fn):
+    """Run ``fn()`` in a daemon thread, bounded by PROVIDER_WALL_TIMEOUT_SEC.
+
+    A plain daemon thread (not ThreadPoolExecutor) so an abandoned call
+    can't block interpreter shutdown — the executor's atexit hook joins
+    its threads, which would reintroduce the hang at exit.
+    """
+    outcome: list = []          # [("ok", result)] or [("err", exc)]
+    done = threading.Event()
+
+    def _runner():
+        try:
+            outcome.append(("ok", fn()))
+        except BaseException as exc:
+            outcome.append(("err", exc))
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_runner, daemon=True, name=f"wall-{what}")
+    t.start()
+    if not done.wait(PROVIDER_WALL_TIMEOUT_SEC):
+        raise ProviderWallTimeout(
+            f"{what} exceeded the {PROVIDER_WALL_TIMEOUT_SEC:.0f}s wall-clock "
+            f"cap (idle timeouts don't bound long reasoning generations; "
+            f"lower effort, shrink the thread, or raise "
+            f"CLAUDE_ROUNDTABLE_PROVIDER_WALL_TIMEOUT_SEC)"
+        )
+    kind, value = outcome[0]
+    if kind == "err":
+        raise value
+    return value
+
+
 def _provider_call(what: str, fn):
     """Run ``fn()`` with exponential-backoff retry on transient errors.
 
@@ -677,7 +739,7 @@ def _provider_call(what: str, fn):
     for attempt in range(1, PROVIDER_MAX_ATTEMPTS + 1):
         t0 = time.time()
         try:
-            result = fn()
+            result = _call_with_wall_cap(what, fn)
             elapsed = time.time() - t0
             logger.info(
                 "%s ok attempt=%d/%d elapsed=%.2fs",
