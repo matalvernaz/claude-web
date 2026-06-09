@@ -35,6 +35,15 @@
           {% endfor %}
         </select>
       </label>
+      <label class="header-select" for="effort-select" id="effort-select-label">
+        <span class="sr-only">Effort</span>
+        <select id="effort-select" aria-label="Effort level">
+          <option value="">Default effort</option>
+          {% for e in effort_levels %}
+            <option value="{{ e }}">{{ e }}</option>
+          {% endfor %}
+        </select>
+      </label>
       <label class="header-select" for="account-select">
         <span class="sr-only">Account</span>
         <select id="account-select" aria-label="Account">

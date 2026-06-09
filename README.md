@@ -131,6 +131,8 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `CLAUDE_WEB_STATE_DIR` | `$HOME/.claude-web` | Where this app keeps usage log, rate-limit cache, persisted runs, and uploads. |
 | `SAFE_TOOLS` | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
 | `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
+| `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-4-6`. Unset = no fallback. |
+| `CLAUDE_WEB_MAX_BUDGET_USD` | `0` (off) | Hard per-run API-spend ceiling in USD. Only meaningful for API-key credentials — subscription turns report synthetic costs. |
 
 #### Identity passed to the CLI
 

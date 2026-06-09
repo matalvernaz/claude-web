@@ -334,17 +334,38 @@ STATIC_DIR = Path(__file__).parent / "static"
 # (1M context, no beta). It is offered as an option but is NOT the default:
 # it is priced at 2x Opus 4.8 ($10/$50 vs $5/$25 per MTok) and has no `effort`
 # parameter (adaptive thinking is always on), so the default stays Opus 4.8.
+#
+# `efforts` lists the values accepted for the SDK's `effort` option (the
+# CLI's --effort flag). The knob shipped with Opus 4.8 (server default:
+# high); earlier models aren't known to accept it and Fable 5 has no effort
+# parameter at all, so those entries stay empty rather than risk a 400.
+EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 KNOWN_MODELS = [
-    {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": []},
-    {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": []},
-    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": []},
-    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": []},
+    {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
+     "efforts": []},
+    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
+     "efforts": []},
     {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
-     "context": 1000000, "betas": ["context-1m-2025-08-07"]},
-    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": []},
-    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": []},
+     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": []},
+    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": [],
+     "efforts": []},
+    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
+     "efforts": []},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
+
+# Optional reliability/cost knobs forwarded to the SDK on every fresh spawn.
+# CLAUDE_WEB_FALLBACK_MODEL: model id the CLI retries with when the primary
+# is overloaded (API 529) — e.g. "claude-sonnet-4-6". Unset = no fallback.
+# CLAUDE_WEB_MAX_BUDGET_USD: hard per-run API-spend ceiling. Only meaningful
+# for API-key credential slots — subscription (OAuth) turns report synthetic
+# costs that don't correspond to a bill. 0/unset = no cap.
+FALLBACK_MODEL = os.getenv("CLAUDE_WEB_FALLBACK_MODEL", "").strip()
+MAX_BUDGET_USD = float(os.getenv("CLAUDE_WEB_MAX_BUDGET_USD", "0") or 0)
 
 # Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
 # bay before using user input as a filename.
@@ -5317,9 +5338,11 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             "models": KNOWN_MODELS,
             # Drop SDK-internal fields and expose only what the JS needs.
             "models_json": json.dumps([
-                {"key": m["key"], "label": m["label"], "context": m.get("context")}
+                {"key": m["key"], "label": m["label"], "context": m.get("context"),
+                 "efforts": m.get("efforts") or []}
                 for m in KNOWN_MODELS
             ]),
+            "effort_levels": EFFORT_LEVELS,
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
             "personalities_payload": personalities_payload,
@@ -6288,6 +6311,7 @@ async def api_chat(
     session_id: str = Form(default=""),
     project: str = Form(default=""),
     model: str = Form(default=""),
+    effort: str = Form(default=""),
     personality_id: Optional[int] = Form(default=None),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
@@ -6330,6 +6354,13 @@ async def api_chat(
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, "unknown model")
     selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
+    # Effort rides the model's semantics: a spawn-time CLI flag, so it
+    # applies to fresh spawns and an existing run keeps its level. Validate
+    # against the picked variant (the "" key is the explicit default entry)
+    # so an unsupported level can't reach the CLI as a bad --effort arg.
+    effort = (effort or "").strip().lower()
+    if effort and effort not in (MODELS_BY_KEY.get(model or "", {}).get("efforts") or []):
+        raise HTTPException(400, "model does not support this effort level")
 
     image_blocks, _image_meta = await _read_uploaded_images(images)
 
@@ -6737,6 +6768,15 @@ async def api_chat(
         # only set this when the picked variant actually wants it (currently
         # only Opus 4.7's 1M-context option).
         options_kwargs["betas"] = sdk_betas
+    if effort:
+        # Validated upstream against the variant's `efforts` list; reaches
+        # the CLI as --effort. Unset leaves the model's server-side default
+        # (high on Opus 4.8).
+        options_kwargs["effort"] = effort
+    if FALLBACK_MODEL and FALLBACK_MODEL != sdk_model:
+        options_kwargs["fallback_model"] = FALLBACK_MODEL
+    if MAX_BUDGET_USD > 0:
+        options_kwargs["max_budget_usd"] = MAX_BUDGET_USD
     if account["env"]:
         # Identity (CLAUDE_WEB_USER_*) is always present so SessionStart
         # hooks can address the user by name; CLAUDE_CONFIG_DIR/

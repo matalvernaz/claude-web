@@ -12,6 +12,8 @@
   const sessionList = document.getElementById("session-list");
   const headerCostEl = document.getElementById("header-cost");
   const modelSelect = document.getElementById("model-select");
+  const effortSelect = document.getElementById("effort-select");
+  const effortSelectLabel = document.getElementById("effort-select-label");
   const projectSelect = document.getElementById("project-select");
   const attachInput = document.getElementById("attach-input");
   const attachmentsEl = document.getElementById("attachments");
@@ -44,6 +46,7 @@
   const renderedIdxByRun = new Map();
   const RUN_KEY = "claude-web.active-run";
   const MODEL_KEY = "claude-web.model";
+  const EFFORT_KEY = "claude-web.effort";
   const PROJECT_KEY = "claude-web.project";
 
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
@@ -107,17 +110,21 @@
   // server's KNOWN_MODELS so this list can't drift from what's offered in
   // the dropdown. Read from a <script type="application/json"> tag instead
   // of a global so a strict CSP without 'unsafe-inline' for scripts works.
-  const MODEL_CONTEXT = (() => {
-    const out = {};
+  const MODEL_CONTEXT = {};
+  // Effort levels each picker value accepts, keyed like MODEL_CONTEXT
+  // (including the "" default entry). Empty/missing = model has no effort
+  // knob and the effort picker hides itself.
+  const MODEL_EFFORTS = {};
+  (() => {
     let data = [];
     const dataEl = document.getElementById("models-data");
     if (dataEl) {
       try { data = JSON.parse(dataEl.textContent); } catch (_) { data = []; }
     }
     for (const m of data) {
-      if (m.key && m.context) out[m.key] = m.context;
+      if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
+      MODEL_EFFORTS[m.key || ""] = m.efforts || [];
     }
-    return out;
   })();
   let lastSeenModel = null;
   let lastInputTokens = null;
@@ -394,7 +401,20 @@
   let sessionId = params.get("session") || "";
   let sessionProject = params.get("project") || "";
 
-  // Restore model + project from localStorage so the picks persist across reloads.
+  // Hide the effort picker when the selected model has no effort knob and
+  // return whether it's usable right now. The stored pick survives a hide
+  // (localStorage), so Opus 4.8 → Fable 5 → Opus 4.8 round-trips keep the
+  // level; the send path re-checks support so a hidden pick is never sent.
+  function effortSupported() {
+    const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
+    return efforts.length > 0;
+  }
+  function syncEffortVisibility() {
+    if (!effortSelect || !effortSelectLabel) return;
+    effortSelectLabel.hidden = !effortSupported();
+  }
+
+  // Restore model + effort + project from localStorage so the picks persist across reloads.
   if (modelSelect) {
     const savedModel = safeGet(localStorage, MODEL_KEY);
     if (savedModel !== null && [...modelSelect.options].some((o) => o.value === savedModel)) {
@@ -404,7 +424,18 @@
       safeSet(localStorage, MODEL_KEY, modelSelect.value);
       lastSeenModel = modelSelect.value || lastSeenModel;
       renderContextMeter();
+      syncEffortVisibility();
     });
+  }
+  if (effortSelect) {
+    const savedEffort = safeGet(localStorage, EFFORT_KEY);
+    if (savedEffort !== null && [...effortSelect.options].some((o) => o.value === savedEffort)) {
+      effortSelect.value = savedEffort;
+    }
+    effortSelect.addEventListener("change", () => {
+      safeSet(localStorage, EFFORT_KEY, effortSelect.value);
+    });
+    syncEffortVisibility();
   }
   if (projectSelect) {
     const savedProject = safeGet(localStorage, PROJECT_KEY);
@@ -1480,6 +1511,9 @@
       const project = currentProject();
       if (project) fd.append("project", project);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+      if (effortSelect && effortSelect.value && effortSupported()) {
+        fd.append("effort", effortSelect.value);
+      }
       // Picker value as session-scoped personality override. Server uses
       // this to bind the session's personality on first send and to
       // detect mid-conversation switches on subsequent sends. Two tabs
@@ -3473,6 +3507,7 @@
     stop: { description: "Stop the current turn", run: () => { if (!stopBtn.hidden) stopBtn.click(); } },
     help: { description: "Show what slash commands work in claude-web", run: () => showSlashHelp() },
     model: { description: "Switch model: /model <id> (e.g. /model claude-sonnet-4-6)", run: (arg) => switchModel(arg) },
+    effort: { description: "Set effort for new turns: /effort low|medium|high|xhigh|max (no arg = default)", run: (arg) => switchEffort(arg) },
   };
 
   function showSlashHelp() {
@@ -3515,6 +3550,27 @@
     modelSelect.value = opt.value;
     modelSelect.dispatchEvent(new Event("change"));
     announce(`Model set to ${opt.text}.`);
+  }
+
+  function switchEffort(arg) {
+    if (!effortSelect) {
+      announce("Effort picker is not enabled in this UI.");
+      return;
+    }
+    if (!effortSupported()) {
+      renderErrorBlock("The selected model has no effort levels.");
+      return;
+    }
+    const target = (arg || "").trim().toLowerCase();
+    const opt = [...effortSelect.options].find((o) => o.value === target || (!target && !o.value));
+    if (!opt) {
+      const valid = [...effortSelect.options].map((o) => o.value || "(default)").join(", ");
+      renderErrorBlock(`Unknown effort "${target}". Try one of: ${valid}`);
+      return;
+    }
+    effortSelect.value = opt.value;
+    effortSelect.dispatchEvent(new Event("change"));
+    announce(`Effort set to ${opt.value || "default"}.`);
   }
 
   async function handleClientSlashCommand(text) {
