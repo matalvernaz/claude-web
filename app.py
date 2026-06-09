@@ -330,8 +330,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 # as a separate option because that model gates 1M behind a beta. The empty
 # key ("" → "Default") pins Opus 4.8 explicitly so the dropdown's default
 # does not silently fall back to whatever the CLI happens to choose.
+# Fable 5 (GA 2026-06-09) is Anthropic's most capable widely-released model
+# (1M context, no beta). It is offered as an option but is NOT the default:
+# it is priced at 2x Opus 4.8 ($10/$50 vs $5/$25 per MTok) and has no `effort`
+# parameter (adaptive thinking is always on), so the default stays Opus 4.8.
 KNOWN_MODELS = [
     {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": []},
+    {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": []},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": []},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": []},
     {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
