@@ -133,6 +133,14 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
 | `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-4-6`. Unset = no fallback. |
 | `CLAUDE_WEB_MAX_BUDGET_USD` | `0` (off) | Hard per-run API-spend ceiling in USD. Only meaningful for API-key credentials — subscription turns report synthetic costs. |
+| `CLAUDE_WEB_PUSHOVER_TOKEN` / `CLAUDE_WEB_PUSHOVER_USER` | (unset) | When both are set, a Pushover notification fires when a turn finishes after running longer than `CLAUDE_WEB_NOTIFY_MIN_SECONDS` (default `120`) — for the walked-away-during-a-long-turn case the in-page earcons can't cover. |
+| `CLAUDE_WEB_FILE_CHECKPOINTS` | `true` | The CLI snapshots files before edits so `/rewind [n]` can restore them to before your nth-last message (only while the conversation's CLI is alive, and only between turns). Set `false` to skip the snapshot overhead. |
+
+Chat extras: `/fork [message]` branches the conversation into a new session
+(the original stays intact and navigable), `/rewind [n]` undoes file changes,
+and assistant replies stream progressively as they're generated. Roundtable
+panel runs survive tab close: the work finishes server-side and the page
+rejoins (and replays) the run on reload.
 
 #### Identity passed to the CLI
 

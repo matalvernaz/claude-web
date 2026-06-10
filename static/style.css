@@ -928,3 +928,7 @@ details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
   font-size: 0.85rem;
   white-space: pre-wrap;
 }
+
+/* Provisional partial-text bubble: replaced wholesale by the durable
+   assistant message; slightly dimmed so an interrupted one reads as such. */
+.msg.partial .body { opacity: 0.75; }

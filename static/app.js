@@ -49,6 +49,11 @@
   const EFFORT_KEY = "claude-web.effort";
   const PROJECT_KEY = "claude-web.project";
 
+  // One-shot flag armed by /fork: the next send branches the conversation
+  // into a new session (server passes fork_session=True) instead of
+  // continuing the current one.
+  let forkNextSend = false;
+
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
   // Storage helpers that swallow the SecurityError some browsers throw on
   // localStorage access in private mode / cookie-blocked origins / embedded
@@ -857,6 +862,17 @@
   // detached, which `transcript.innerHTML = ""` does on session switch.
   const rawByBody = new WeakMap();
 
+  // Drop the provisional partial-text bubble. Called when the durable
+  // assistant event (which carries the same text) arrives, and on
+  // result/error/stop so an interrupted partial can't linger.
+  function discardPartial(ctx) {
+    if (ctx && ctx.partialBody) {
+      rawByBody.delete(ctx.partialBody);
+      (ctx.partialBody.closest("article") || ctx.partialBody).remove();
+      ctx.partialBody = null;
+    }
+  }
+
   function appendMessage(role, text) {
     const wasPinned = isPinnedToBottom();
     const el = document.createElement("article");
@@ -1328,6 +1344,20 @@
     const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice() };
     promptEl.value = "";
     clearAttachments();
+    if (forkNextSend) {
+      // /fork armed this send: it must go through /api/chat as a fresh
+      // spawn (sibling run, new session id), never into the live run.
+      forkNextSend = false;
+      entry.fork = true;
+      if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+      currentAbort = null;
+      currentRunId = null;
+      safeRemove(sessionStorage, RUN_KEY);
+      setStreaming(false);
+      await sendOne(entry);
+      await drainQueue();
+      return;
+    }
     if (isStreaming) {
       if (streamLooksStalled()) {
         // No SSE events in STREAM_STALL_MS — assume the stream is dead
@@ -1514,6 +1544,7 @@
       if (effortSelect && effortSelect.value && effortSupported()) {
         fd.append("effort", effortSelect.value);
       }
+      if (entry.fork) fd.append("fork", "true");
       // Picker value as session-scoped personality override. Server uses
       // this to bind the session's personality on first send and to
       // detect mid-conversation switches on subsequent sends. Two tabs
@@ -1802,6 +1833,7 @@
       if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
       if (obj.file_count) appendFilePlaceholder(body, obj.file_count);
     } else if (obj.type === "stopped") {
+      discardPartial(ctx);
       setActiveTodoLabel(null);
       setStatus("Stopped.");
       announce("Stopped.");
@@ -1861,7 +1893,26 @@
         updatePageTitle();
       }
       if (obj.model) lastSeenModel = obj.model;
+    } else if (obj.type === "partial_text") {
+      // Transient typing-feel frames (never persisted server-side, never
+      // replayed). Rendered as plain text into a provisional bubble; the
+      // durable "assistant" event below replaces it wholesale. #transcript
+      // is not a live region, so partial churn stays silent for NVDA —
+      // completion is announced through the explicit channels as before.
+      if (obj.text) {
+        const wasPinned = isPinnedToBottom();
+        if (!ctx.partialBody) {
+          ctx.partialBody = appendMessage("assistant", "");
+          (ctx.partialBody.closest("article") || ctx.partialBody).classList.add("partial");
+        }
+        const raw = (rawByBody.get(ctx.partialBody) || "") + obj.text;
+        rawByBody.set(ctx.partialBody, raw);
+        ctx.partialBody.textContent = raw;
+        maybeAutoScroll(wasPinned);
+        markVisibleActivity();
+      }
     } else if (obj.type === "assistant" && obj.message) {
+      discardPartial(ctx);
       const blocks = obj.message.content || [];
       for (const blk of blocks) {
         if (blk.type === "thinking") {
@@ -1938,6 +1989,12 @@
           markVisibleActivity();
         }
       }
+    } else if (obj.type === "files_rewound") {
+      const label = obj.preview
+        ? `Files rewound to before: ${obj.preview}`
+        : `Files rewound ${obj.back || 1} message(s) back`;
+      insertToolMessage("⟲ " + label, "Rewind");
+      announce(label + ".");
     } else if (obj.type === "permission_request") {
       ctx.currentAssistantBody = null;
       announce(`Permission needed for ${obj.tool}.`);
@@ -2092,6 +2149,7 @@
       announce("Auto-responding to background events.");
       playCue("autofire");
     } else if (obj.type === "result") {
+      discardPartial(ctx);
       ctx.lastResult = obj;
       if (typeof obj.input_tokens === "number") {
         lastInputTokens = obj.input_tokens;
@@ -2138,6 +2196,7 @@
         announce("Error: " + (obj.result || ""));
       }
     } else if (obj.type === "error") {
+      discardPartial(ctx);
       // Driver crashed mid-turn. The server will emit `_done` and close
       // the SSE shortly, but flip the local state now so the input isn't
       // trapped in "Queue" mode while we wait for the close to land.
@@ -2153,11 +2212,18 @@
     }
   }
 
+  // Wall-clock start per task block, so long-running subagents show a
+  // duration instead of an undated spinner arrow.
+  const taskStartedAt = new Map();
+
   function renderTaskEvent(kind, obj) {
     // Group all events for the same task_id under one collapsible block so
     // a chatty Monitor doesn't flood the transcript. The block updates in
     // place as later events arrive.
     const id = obj.task_id || "?";
+    if (kind === "started" && !taskStartedAt.has(id)) taskStartedAt.set(id, Date.now());
+    const startedAt = taskStartedAt.get(id);
+    const elapsed = startedAt ? formatElapsed(Date.now() - startedAt) : null;
     const blockId = `task-${id}`;
     let block = document.getElementById(blockId);
     if (!block) {
@@ -2180,10 +2246,15 @@
     // Update summary with latest description + status.
     if (kind === "started") {
       summary.textContent = "▶ " + (obj.description || "task " + id);
+    } else if (kind === "progress") {
+      const base = obj.description || "task " + id;
+      summary.textContent = "▶ " + base + (elapsed ? ` · ${elapsed}` : "");
     } else if (kind === "notification") {
       const status = obj.status || "done";
       const icon = status === "success" ? "✓" : status === "error" ? "✗" : "●";
-      summary.textContent = `${icon} ${obj.description || obj.summary || "task " + id} (${status})`;
+      const took = elapsed ? ` in ${elapsed}` : "";
+      summary.textContent = `${icon} ${obj.description || obj.summary || "task " + id} (${status}${took})`;
+      taskStartedAt.delete(id);
       block.classList.add("task-" + status);
     }
 
@@ -3515,6 +3586,8 @@
     help: { description: "Show what slash commands work in claude-web", run: () => showSlashHelp() },
     model: { description: "Switch model: /model <id> (e.g. /model claude-sonnet-4-6)", run: (arg) => switchModel(arg) },
     effort: { description: "Set effort for new turns: /effort low|medium|high|xhigh|max (no arg = default)", run: (arg) => switchEffort(arg) },
+    fork: { description: "Branch this chat into a new session: /fork [first message] — the original stays intact", run: (arg) => forkChat(arg) },
+    rewind: { description: "Undo file changes: /rewind [n] — restore files to before your nth-last message (default 1)", run: (arg) => rewindFiles(arg) },
   };
 
   function showSlashHelp() {
@@ -3557,6 +3630,44 @@
     modelSelect.value = opt.value;
     modelSelect.dispatchEvent(new Event("change"));
     announce(`Model set to ${opt.text}.`);
+  }
+
+  async function rewindFiles(arg) {
+    if (!sessionId) {
+      renderErrorBlock("No session yet — nothing to rewind.");
+      return;
+    }
+    const back = Math.max(1, parseInt((arg || "1").trim(), 10) || 1);
+    try {
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("back", String(back));
+      const r = await fetch("/api/chat/rewind", { method: "POST", body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        renderErrorBlock("Rewind failed: " + (j.detail || j.error || ("HTTP " + r.status)));
+        return;
+      }
+      // The files_rewound SSE event renders the transcript line + announce
+      // for every attached tab; nothing more to do here.
+    } catch (err) {
+      renderErrorBlock("Rewind failed: " + (err.message || err));
+    }
+  }
+
+  function forkChat(arg) {
+    if (!sessionId) {
+      announce("Nothing to fork yet — this chat has no session.");
+      return;
+    }
+    forkNextSend = true;
+    const text = (arg || "").trim();
+    if (text) {
+      promptEl.value = text;
+      form.requestSubmit();
+    } else {
+      announce("Fork armed: the next message starts a branched chat. This session stays intact.");
+    }
   }
 
   function switchEffort(arg) {

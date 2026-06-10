@@ -34,6 +34,8 @@ import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
 
+import httpx
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -41,6 +43,7 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
+    StreamEvent,
     SystemMessage,
     TaskNotificationMessage,
     TaskProgressMessage,
@@ -367,6 +370,14 @@ MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
 # costs that don't correspond to a bill. 0/unset = no cap.
 FALLBACK_MODEL = os.getenv("CLAUDE_WEB_FALLBACK_MODEL", "").strip()
 MAX_BUDGET_USD = float(os.getenv("CLAUDE_WEB_MAX_BUDGET_USD", "0") or 0)
+
+# File checkpointing: the CLI snapshots files before each edit so
+# /rewind (POST /api/chat/rewind) can restore them to a pre-turn state.
+# Checkpoints are local-disk; flip off if the snapshot overhead matters.
+FILE_CHECKPOINTS_ENABLED = (
+    os.getenv("CLAUDE_WEB_FILE_CHECKPOINTS", "true").strip().lower()
+    not in ("false", "0", "no")
+)
 
 # Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
 # bay before using user input as a filename.
@@ -4760,6 +4771,17 @@ class ActiveRun:
         # first message, and "busy until proven idle" keeps the drain from
         # killing a turn that hasn't produced its first event yet.
         self.between_turns: bool = False
+        # Monotonic timestamp of the current turn's start (idle→busy
+        # transition). Read by _notify_turn_complete for the long-turn
+        # push notification.
+        self.turn_started_at: float = time.monotonic()
+        # Coalescing buffer for partial-text stream deltas; flushed as
+        # transient partial_text SSE frames by _handle_partial_stream_event.
+        self.partial_text_buf: str = ""
+        # File-checkpoint anchors: one entry per real user message the CLI
+        # echoed ({uuid, preview}), newest last. /api/chat/rewind passes
+        # checkpoints[-back]["uuid"] to client.rewind_files().
+        self.checkpoints: list[dict] = []
         # Set True by ``/api/chat/stop`` immediately before it calls
         # ``client.interrupt()`` to halt the in-flight turn without tearing
         # the run down (so the next message steers it). The driver uses it to
@@ -4903,6 +4925,25 @@ class ActiveRun:
                     q.put_nowait({"type": "_overflow"})
                 except asyncio.QueueFull:
                     pass
+
+    def emit_transient(self, event: dict) -> None:
+        """Fan out to live subscribers without persisting or caching.
+
+        Used for partial-text deltas: the final AssistantMessage event is
+        the replayable record, so storing per-token deltas would bloat
+        state.db and the replay path for zero replay value. No _idx is
+        assigned — the browser treats _transient events as fire-and-forget
+        and skips its dedupe bookkeeping.
+        """
+        event["_transient"] = True
+        self.last_activity = time.time()
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                # Don't kick the subscriber over dropped partials — the
+                # durable events still arrive via emit(); just skip.
+                pass
 
     def subscribe(self, start_index: int = 0) -> asyncio.Queue:
         """Subscribe to events from `start_index` (an event _idx) onward.
@@ -5062,10 +5103,91 @@ RESTART_MAX_WAIT = int(os.getenv("CLAUDE_WEB_RESTART_MAX_WAIT", "1800"))
 _RESTART_POLL_SECONDS = 2.0
 
 
-# In-flight roundtable assistant streams. They aren't ActiveRuns, but a
-# drain has to wait for them too — a panel turn mid-flight is paid work.
-# Single-worker event loop, so a bare int is race-free.
-ASSISTANT_STREAMS_ACTIVE = 0
+# Detached roundtable assistant runs. The producer (create → attach →
+# panel → synth) runs as a free-standing task writing into an
+# AssistantStream; SSE readers subscribe for replay + tail and can
+# disconnect/rejoin without killing the paid panel work. In-memory only —
+# a process restart loses them, same as before the registry existed.
+_ASSISTANT_DONE = object()
+ASSISTANT_STREAMS: dict[str, "AssistantStream"] = {}
+_ASSISTANT_DONE_RETENTION = 600.0
+
+
+class AssistantStream:
+    """Buffer between one assistant producer and any number of SSE readers.
+
+    ``put`` is signature-compatible with ``asyncio.Queue.put`` so the
+    producer body and the threaded permission callback are unchanged."""
+
+    def __init__(self, stream_id: str, owner_sub: str):
+        self.stream_id = stream_id
+        self.owner_sub = owner_sub
+        self.events: list[tuple] = []
+        self.subscribers: set[asyncio.Queue] = set()
+        self.done = False
+        self.created_at = time.time()
+        self.finished_at: Optional[float] = None
+        self.task: Optional[asyncio.Task] = None
+
+    async def put(self, item) -> None:
+        if item is _ASSISTANT_DONE:
+            self.done = True
+            self.finished_at = time.time()
+        else:
+            self.events.append(item)
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(item)
+            except asyncio.QueueFull:
+                # Reader stalled; it can rejoin and replay. Never block
+                # the producer on a dead tab.
+                self.subscribers.discard(q)
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        for item in self.events:
+            q.put_nowait(item)
+        if self.done:
+            q.put_nowait(_ASSISTANT_DONE)
+        else:
+            self.subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self.subscribers.discard(q)
+
+
+def _gc_assistant_streams() -> None:
+    now = time.time()
+    for sid, st in list(ASSISTANT_STREAMS.items()):
+        if st.done and (st.finished_at or 0) < now - _ASSISTANT_DONE_RETENTION:
+            ASSISTANT_STREAMS.pop(sid, None)
+
+
+def _assistant_stream_response(stream: "AssistantStream") -> StreamingResponse:
+    """Replay-then-tail SSE for an assistant stream. Heartbeat keeps the
+    edge from dropping the connection during a multi-minute silent panel
+    step; disconnecting just unsubscribes — the producer is untouched."""
+    async def gen():
+        q = stream.subscribe()
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    yield b": ping\n\n"
+                    continue
+                if item is _ASSISTANT_DONE:
+                    break
+                yield _sse(item[0], item[1])
+        finally:
+            stream.unsubscribe(q)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
+    )
 
 
 def _busy_runs() -> list[str]:
@@ -5078,8 +5200,9 @@ def _busy_runs() -> list[str]:
             continue
         if not run.between_turns or not run.user_input_queue.empty():
             busy.append(run.run_id)
-    if ASSISTANT_STREAMS_ACTIVE > 0:
-        busy.append(f"roundtable-assistant×{ASSISTANT_STREAMS_ACTIVE}")
+    live_panels = sum(1 for s in ASSISTANT_STREAMS.values() if not s.done)
+    if live_panels:
+        busy.append(f"roundtable-assistant×{live_panels}")
     return busy
 
 
@@ -5165,6 +5288,45 @@ async def api_request_restart(user: dict = Depends(auth.require_user)):
 async def api_cancel_restart(user: dict = Depends(auth.require_user)):
     _require_restart_admin(user)
     return cancel_restart()
+
+
+# ─── Long-turn push notification ──────────────────────────────────────────────
+# Earcons and aria-live announcements only help while the tab has focus. A
+# multi-minute autonomous turn usually means the operator walked away, so
+# completion goes to Pushover when both env vars are set. Threshold filters
+# out quick conversational turns.
+PUSHOVER_TOKEN = os.getenv("CLAUDE_WEB_PUSHOVER_TOKEN", "").strip()
+PUSHOVER_USER = os.getenv("CLAUDE_WEB_PUSHOVER_USER", "").strip()
+NOTIFY_MIN_SECONDS = float(os.getenv("CLAUDE_WEB_NOTIFY_MIN_SECONDS", "120") or 0)
+_PUSHOVER_API = "https://api.pushover.net/1/messages.json"
+
+
+def _send_pushover_sync(title: str, message: str) -> None:
+    try:
+        resp = httpx.post(_PUSHOVER_API, data={
+            "token": PUSHOVER_TOKEN, "user": PUSHOVER_USER,
+            "title": title, "message": message,
+        }, timeout=10.0)
+        if resp.status_code != 200:
+            log.warning("pushover notify failed: HTTP %s %s",
+                        resp.status_code, resp.text[:200])
+    except Exception as exc:  # noqa: BLE001 — notify must never break a turn
+        log.warning("pushover notify failed: %s", exc)
+
+
+def _notify_turn_complete(run: "ActiveRun") -> None:
+    """Fire-and-forget push when a long turn ends. Called from the driver."""
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER) or NOTIFY_MIN_SECONDS <= 0:
+        return
+    elapsed = time.monotonic() - run.turn_started_at
+    if elapsed < NOTIFY_MIN_SECONDS:
+        return
+    where = run.project_key or "claude-web"
+    message = (
+        f"Turn finished after {int(elapsed // 60)}m{int(elapsed % 60):02d}s "
+        f"in {where} (session …{(run.session_id or run.run_id)[-8:]})"
+    )
+    asyncio.create_task(asyncio.to_thread(_send_pushover_sync, SITE_TITLE, message))
 # Per-session locks for /api/chat. The SDK only sets run.session_id once it
 # receives the init SystemMessage, so without this two near-simultaneous POSTs
 # for the same resumed session_id (multi-tab / fast double-submit) both miss
@@ -6438,6 +6600,7 @@ async def api_chat(
     project: str = Form(default=""),
     model: str = Form(default=""),
     effort: str = Form(default=""),
+    fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
     images: list[UploadFile] = File(default_factory=list),
     files: list[UploadFile] = File(default_factory=list),
@@ -6528,6 +6691,12 @@ async def api_chat(
                 session_id, user.get("sub"), active_personality_id,
             )
         existing = _existing_run_for_session(session_id) if session_id else None
+        if fork and existing is not None:
+            # User asked to branch the conversation. Leave the existing run
+            # (and its session) untouched and spawn a sibling run that
+            # resumes the same transcript; fork_session below gives it a
+            # fresh session id, so both branches stay navigable.
+            existing = None
         # Flag set when we supersede an in-flight run because the user toggled
         # credentials or personality between turns. The spawn below uses it to
         # pass ``fork_session=True`` to the SDK so the post-swap turns get a
@@ -6884,7 +7053,10 @@ async def api_chat(
         # whatever the CLI discovers from its own mcp.json. strict_mcp_config
         # stays False so the CLI's configured servers continue to load.
         mcp_servers=_in_process_mcp_servers_for_run(),
-        include_partial_messages=False,
+        # Partial deltas become transient partial_text SSE frames (typing
+        # feel); the durable transcript still comes from whole messages.
+        include_partial_messages=True,
+        enable_file_checkpointing=FILE_CHECKPOINTS_ENABLED,
         stderr=_capture_stderr,
     )
     sdk_model = selected_model.get("model") or ""
@@ -6912,8 +7084,9 @@ async def api_chat(
         # credential slot. The SDK merges this dict over inherited env, so
         # PATH/HOME/etc. survive.
         options_kwargs["env"] = account["env"]
-    if swap_respawn:
-        # Personality / credential toggles cancelled an in-flight run. Fork
+    if swap_respawn or fork:
+        # Personality / credential toggles cancelled an in-flight run (or
+        # the user explicitly asked to branch via the fork field). Fork
         # to a new session id so the pre-swap transcript stays bound to its
         # original voice/credentials while post-swap turns land on a fresh
         # session id. The SDK reports the new id via the system:init event,
@@ -7227,7 +7400,17 @@ async def api_chat(
                                     if is_bg and blk.id:
                                         run.bg_tool_use_ids.add(blk.id)
 
-                            evts = _sdk_message_to_events(msg, run)
+                            if isinstance(msg, StreamEvent):
+                                # Partial-message deltas. Transient-only:
+                                # the final AssistantMessage event is the
+                                # durable record; these just give the
+                                # browser typing-feel. evts stays empty so
+                                # every downstream branch (between_turns,
+                                # persistence, auto-fire) is untouched.
+                                _handle_partial_stream_event(run, msg)
+                                evts = []
+                            else:
+                                evts = _sdk_message_to_events(msg, run)
                             if run.interrupting and isinstance(msg, ResultMessage):
                                 # This ResultMessage is the in-flight turn
                                 # winding down in response to client.interrupt()
@@ -7301,10 +7484,14 @@ async def api_chat(
 
                             if isinstance(msg, ResultMessage):
                                 run.between_turns = True
+                                _notify_turn_complete(run)
                             elif isinstance(msg, (AssistantMessage, UserMessage)):
                                 # Active LLM turn / tool dance. We're not
                                 # between-turns again until the next Result.
+                                if run.between_turns:
+                                    run.turn_started_at = time.monotonic()
                                 run.between_turns = False
+                                _maybe_record_checkpoint(run, msg)
                             # Task* and Init messages are out-of-band — they
                             # don't change run.between_turns. A TaskNotification
                             # arriving between turns must keep run.between_turns
@@ -7376,6 +7563,8 @@ async def api_chat(
                             # delivered (a TaskNotification can co-occur with
                             # the user POST without flipping run.between_turns
                             # itself).
+                            if run.between_turns:
+                                run.turn_started_at = time.monotonic()
                             run.between_turns = False
 
                         if msg_done or user_done:
@@ -7391,6 +7580,7 @@ async def api_chat(
                             async with run.client_write_lock:
                                 await client.query(action["synth"])
                             last_cli_activity = time.monotonic()
+                            run.turn_started_at = time.monotonic()
                             run.between_turns = False
                             continue
                         if run.between_turns and run.pending_notifications:
@@ -7605,6 +7795,53 @@ async def api_chat_stream(run_id: str, user: dict = Depends(auth.require_user)):
     return _stream_run_response(run)
 
 
+@app.post("/api/chat/rewind")
+async def api_chat_rewind(
+    session_id: str = Form(...),
+    back: int = Form(default=1),
+    user: dict = Depends(auth.require_user),
+):
+    """Restore files to their state before the nth-last user message.
+
+    Wraps ``ClaudeSDKClient.rewind_files()`` on the session's live run.
+    Session-keyed (not run-keyed) because the browser drops its run handle
+    between turns while the run object stays alive in ACTIVE_RUNS. Only
+    works while the CLI subprocess is alive — checkpoints die with it —
+    and only between turns: rewinding under a mid-flight turn would yank
+    files out from under the model's in-progress edits.
+    """
+    if not FILE_CHECKPOINTS_ENABLED:
+        raise HTTPException(501, "file checkpointing is disabled "
+                                 "(CLAUDE_WEB_FILE_CHECKPOINTS=false)")
+    session_id = _safe_id(session_id)
+    run = _existing_run_for_session(session_id)
+    if run is None or run.done:
+        raise HTTPException(
+            404, "no live run for this session — files can only be rewound "
+                 "while the conversation's CLI is still alive",
+        )
+    _require_owner(run, user)
+    if not run.between_turns:
+        raise HTTPException(409, "turn in flight — stop it before rewinding")
+    client = run.client
+    if client is None:
+        raise HTTPException(409, "run is still starting; try again shortly")
+    if back < 1 or back > len(run.checkpoints):
+        raise HTTPException(
+            400, f"no checkpoint {back} message(s) back "
+                 f"(this run has {len(run.checkpoints)})",
+        )
+    cp = run.checkpoints[-back]
+    try:
+        async with run.client_write_lock:
+            await client.rewind_files(cp["uuid"])
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"rewind failed: {exc}") from exc
+    run.emit({"type": "files_rewound", "back": back, "preview": cp["preview"]})
+    log.info("files rewound run=%s back=%d uuid=%s", run.run_id, back, cp["uuid"])
+    return {"ok": True, "back": back, "preview": cp["preview"]}
+
+
 @app.post("/api/chat/stop/{run_id}")
 async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
     """Interrupt the in-flight turn, keeping the run alive so the next message
@@ -7687,6 +7924,66 @@ def _tasks_to_todos(run: "ActiveRun") -> list[dict]:
             "status": t.get("status") or "pending",
         })
     return items
+
+
+def _maybe_record_checkpoint(run: "ActiveRun", msg) -> None:
+    """Record a rewind anchor for each real user message the CLI echoes.
+
+    Tool-result echoes also arrive as UserMessage; rewinding to one is
+    meaningless, so anything carrying a ToolResultBlock (or riding a
+    parent_tool_use_id) is skipped."""
+    if not isinstance(msg, UserMessage) or not msg.uuid:
+        return
+    if msg.parent_tool_use_id is not None:
+        return
+    preview = ""
+    if isinstance(msg.content, str):
+        preview = msg.content
+    else:
+        for blk in msg.content or []:
+            if isinstance(blk, ToolResultBlock):
+                return
+            if isinstance(blk, TextBlock) and not preview:
+                preview = blk.text or ""
+    run.checkpoints.append({"uuid": msg.uuid, "preview": preview.strip()[:80]})
+    # Same bound philosophy as the event cache: old anchors are useless
+    # once the conversation has moved far past them.
+    if len(run.checkpoints) > 200:
+        del run.checkpoints[:100]
+
+
+# Coalesce partial text into ≥N-char SSE frames. Per-token frames would
+# flood slow tabs' bounded subscriber queues for no perceptual gain.
+_PARTIAL_FLUSH_CHARS = 64
+
+
+def _flush_partial(run: "ActiveRun") -> None:
+    if not run.partial_text_buf:
+        return
+    run.emit_transient({"type": "partial_text", "text": run.partial_text_buf})
+    run.partial_text_buf = ""
+
+
+def _handle_partial_stream_event(run: "ActiveRun", msg: StreamEvent) -> None:
+    """Turn raw API stream deltas into coalesced transient partial_text frames.
+
+    Top-level assistant text only: subagent partials carry
+    parent_tool_use_id and would interleave another conversation's tokens
+    into the transcript. Thinking deltas are skipped — claude-web doesn't
+    render thinking."""
+    if msg.parent_tool_use_id is not None:
+        return
+    ev = msg.event or {}
+    etype = ev.get("type")
+    if etype == "content_block_delta":
+        delta = ev.get("delta") or {}
+        if delta.get("type") == "text_delta":
+            run.partial_text_buf += delta.get("text") or ""
+            if (len(run.partial_text_buf) >= _PARTIAL_FLUSH_CHARS
+                    or "\n" in run.partial_text_buf):
+                _flush_partial(run)
+    elif etype in ("content_block_stop", "message_stop"):
+        _flush_partial(run)
 
 
 def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
@@ -9540,15 +9837,21 @@ async def api_roundtable_assistant(
         except HTTPException:
             bound_project_root = None
 
-    async def event_stream():
-        # Producer-task + queue: the producer runs the existing
-        # create/attach/post/panel/synth sequence and emits SSE events
-        # via the queue. The outer generator just relays. This shape
-        # lets the permission_callback (running on a worker thread
-        # during a blocking provider call) put `permission_request`
-        # events onto the same queue without fighting the generator's
-        # yield flow.
-        event_queue: asyncio.Queue = asyncio.Queue()
+    _gc_assistant_streams()
+    stream = AssistantStream(uuid_mod.uuid4().hex, user.get("sub") or "anonymous")
+    ASSISTANT_STREAMS[stream.stream_id] = stream
+
+    async def run_assistant():
+        # Producer detached from any one SSE reader: it writes into the
+        # AssistantStream buffer and tabs subscribe for replay + tail.
+        # Closing every tab no longer cancels the panel — the synthesis
+        # completes unattended and a rejoin (GET
+        # /api/roundtable/assistant/stream/{id}) replays it. The
+        # permission_callback (running on a worker thread during a
+        # blocking provider call) puts `permission_request` events into
+        # the same stream; ``event_queue`` keeps its name so the producer
+        # body and callback plumbing are unchanged.
+        event_queue = stream
         main_loop = asyncio.get_running_loop()
         session_allowlist: set = set()
         user_sub = user.get("sub") or "anonymous"
@@ -9563,7 +9866,7 @@ async def api_roundtable_assistant(
                 working_directory=str(bound_project_root),
             )
 
-        DONE_SENTINEL = object()
+        DONE_SENTINEL = _ASSISTANT_DONE
 
         async def producer():
             try:
@@ -9694,40 +9997,25 @@ async def api_roundtable_assistant(
             finally:
                 await event_queue.put(DONE_SENTINEL)
 
-        global ASSISTANT_STREAMS_ACTIVE
-        ASSISTANT_STREAMS_ACTIVE += 1
-        producer_task = asyncio.create_task(producer())
-        try:
-            while True:
-                # SSE comment heartbeat, same as _stream_run_response:
-                # Cloudflare/cloudflared close response streams after ~100s
-                # of byte-level silence, and a high-effort panel/synth step
-                # routinely runs 90-150s+ with no events in between. Losing
-                # the connection also cancels the producer below, killing the
-                # synthesis step after the paid panel calls already ran.
-                try:
-                    item = await asyncio.wait_for(event_queue.get(), timeout=25)
-                except asyncio.TimeoutError:
-                    yield b": ping\n\n"
-                    continue
-                if item is DONE_SENTINEL:
-                    break
-                event_name, data = item
-                yield _sse(event_name, data)
-        finally:
-            ASSISTANT_STREAMS_ACTIVE -= 1
-            if not producer_task.done():
-                producer_task.cancel()
-                try:
-                    await producer_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        # First replayable event so any reader (including a rejoin that
+        # missed the POST response) learns the stream id.
+        await stream.put(("stream", {"stream_id": stream.stream_id}))
+        await producer()
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"},
-    )
+    stream.task = asyncio.create_task(run_assistant())
+    return _assistant_stream_response(stream)
+
+
+@app.get("/api/roundtable/assistant/stream/{stream_id}")
+async def api_roundtable_assistant_rejoin(
+    stream_id: str, user: dict = Depends(auth.require_user),
+):
+    """Reattach to a detached assistant run: full replay, then live tail."""
+    _safe_id(stream_id)
+    st = ASSISTANT_STREAMS.get(stream_id)
+    if st is None or st.owner_sub != (user.get("sub") or "anonymous"):
+        raise HTTPException(404, "no such assistant stream")
+    return _assistant_stream_response(st)
 
 
 # Per-file backup suffix when applying patches; the user gets the

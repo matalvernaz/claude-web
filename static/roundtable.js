@@ -645,6 +645,84 @@
     };
   }
 
+  // Shared by the live POST stream and the rejoin path: one handler
+  // updating one assistant shell. state.doneSeen tells the read loop a
+  // clean `done` arrived (vs a dropped connection worth rejoining).
+  const RT_STREAM_KEY = "claude-web.rt-stream";
+  let assistantStreamId = null;
+
+  function assistantEventHandler(state, asstArticle, progress) {
+    return (event, data) => {
+      switch (event) {
+        case "created":
+          assistantThreadId = data.thread_id;
+          progress.textContent = data.thread_was_new
+            ? `Thread #${data.thread_id} created.`
+            : `Continuing thread #${data.thread_id}.`;
+          announce(progress.textContent);
+          break;
+        case "attached":
+          progress.textContent = `Attached ${data.name} (v${data.version}, ${data.bytes} bytes).`;
+          announce(progress.textContent);
+          break;
+        case "prompt_posted":
+          progress.textContent = "Prompt posted. Asking the panel…";
+          break;
+        case "panel_start": {
+          const labels = (data.participants || []).map(p => p.label).join(" + ");
+          const webBit = data.web_search ? ", web search on" : "";
+          progress.textContent = `Panel working: ${labels} (${data.effort || "default"} effort${webBit})…`;
+          announce(`Panel working: ${labels}.`);
+          break;
+        }
+        case "panel_done": {
+          const sizes = Object.entries(data.responses || {})
+            .map(([k, v]) => `${k} ${v.chars}c`)
+            .join(", ");
+          const errs = Object.keys(data.errors || {}).length;
+          progress.textContent = `Panel done: ${sizes || "(no panel)"}${errs ? ` — ${errs} errored` : ""}. Synthesizing…`;
+          announce(`Panel done. ${sizes || "no panel"}. Synthesizing now.`);
+          break;
+        }
+        case "synth_start":
+          progress.textContent = `Synthesizing with ${data.synthesizer.label}…`;
+          break;
+        case "stream":
+          // Server-side detached stream id: survives tab close. Saved so a
+          // reload can rejoin the run and replay what it missed.
+          assistantStreamId = data.stream_id;
+          try { sessionStorage.setItem(RT_STREAM_KEY, data.stream_id); } catch (_) {}
+          break;
+        case "done":
+          state.doneSeen = true;
+          try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
+          assistantThreadId = data.thread_id;
+          finalizeAssistantTurn(asstArticle, progress, data);
+          announce(
+            `Response from ${data.synthesizer.label} ready` +
+            ` (${data.synthesis.length} characters` +
+            (data.patches && data.patches.length ? `, ${data.patches.length} patches suggested` : "") +
+            `).`,
+          );
+          break;
+        case "permission_request":
+          progress.textContent = `${data.participant_label || "Panelist"} wants to use ${data.tool}. Awaiting your decision…`;
+          announce(`${data.participant_label || "A panelist"} wants to use ${data.tool}. Decide allow or deny.`);
+          renderRoundtablePermissionCard(data, asstArticle, progress);
+          break;
+        case "permission_timeout":
+          markRoundtablePermissionTimedOut(data.id, asstArticle, data.timeout_seconds);
+          progress.textContent = `Permission request for ${data.tool || "tool"} timed out.`;
+          break;
+        case "error":
+          try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
+          progress.textContent = `Error: ${data.message}`;
+          announce(`Assistant error: ${data.message}`);
+          break;
+      }
+    };
+  }
+
   asstForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     const prompt = asstInput.value.trim();
@@ -705,83 +783,35 @@
     }
 
     // SSE event handlers — update the placeholder article as events arrive.
-    let doneSeen = false;
-    const parser = makeSSEParser((event, data) => {
-      switch (event) {
-        case "created":
-          assistantThreadId = data.thread_id;
-          progress.textContent = data.thread_was_new
-            ? `Thread #${data.thread_id} created.`
-            : `Continuing thread #${data.thread_id}.`;
-          announce(progress.textContent);
-          break;
-        case "attached":
-          progress.textContent = `Attached ${data.name} (v${data.version}, ${data.bytes} bytes).`;
-          announce(progress.textContent);
-          break;
-        case "prompt_posted":
-          progress.textContent = "Prompt posted. Asking the panel…";
-          break;
-        case "panel_start": {
-          const labels = (data.participants || []).map(p => p.label).join(" + ");
-          const webBit = data.web_search ? ", web search on" : "";
-          progress.textContent = `Panel working: ${labels} (${data.effort || "default"} effort${webBit})…`;
-          announce(`Panel working: ${labels}.`);
-          break;
-        }
-        case "panel_done": {
-          const sizes = Object.entries(data.responses || {})
-            .map(([k, v]) => `${k} ${v.chars}c`)
-            .join(", ");
-          const errs = Object.keys(data.errors || {}).length;
-          progress.textContent = `Panel done: ${sizes || "(no panel)"}${errs ? ` — ${errs} errored` : ""}. Synthesizing…`;
-          announce(`Panel done. ${sizes || "no panel"}. Synthesizing now.`);
-          break;
-        }
-        case "synth_start":
-          progress.textContent = `Synthesizing with ${data.synthesizer.label}…`;
-          break;
-        case "done":
-          doneSeen = true;
-          assistantThreadId = data.thread_id;
-          finalizeAssistantTurn(asstArticle, progress, data);
-          announce(
-            `Response from ${data.synthesizer.label} ready` +
-            ` (${data.synthesis.length} characters` +
-            (data.patches && data.patches.length ? `, ${data.patches.length} patches suggested` : "") +
-            `).`,
-          );
-          break;
-        case "permission_request":
-          progress.textContent = `${data.participant_label || "Panelist"} wants to use ${data.tool}. Awaiting your decision…`;
-          announce(`${data.participant_label || "A panelist"} wants to use ${data.tool}. Decide allow or deny.`);
-          renderRoundtablePermissionCard(data, asstArticle, progress);
-          break;
-        case "permission_timeout":
-          markRoundtablePermissionTimedOut(data.id, asstArticle, data.timeout_seconds);
-          progress.textContent = `Permission request for ${data.tool || "tool"} timed out.`;
-          break;
-        case "error":
-          progress.textContent = `Error: ${data.message}`;
-          announce(`Assistant error: ${data.message}`);
-          break;
-      }
-    });
+    const state = { doneSeen: false };
+    const parser = makeSSEParser(assistantEventHandler(state, asstArticle, progress));
 
-    // Read the SSE stream.
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parser(decoder.decode(value, { stream: true }));
+    // Read the SSE stream. The producer is detached server-side, so a
+    // dropped connection is recoverable: rejoin by stream id and the
+    // replay catches us up. Three attempts, then give up loudly.
+    let lastResp = resp;
+    let rejoinAttempts = 0;
+    while (true) {
+      try {
+        const reader = lastResp.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parser(decoder.decode(value, { stream: true }));
+        }
+        parser(decoder.decode());
+      } catch (err) {
+        progress.textContent = `Stream error: ${err.message}`;
       }
-      // Flush any trailing partial.
-      parser(decoder.decode());
-    } catch (err) {
-      progress.textContent = `Stream error: ${err.message}`;
-      announce(`Stream error: ${err.message}`);
+      if (state.doneSeen || !assistantStreamId || rejoinAttempts >= 3) break;
+      rejoinAttempts += 1;
+      announce("Panel stream dropped — rejoining.");
+      try {
+        const r = await fetch(`/api/roundtable/assistant/stream/${encodeURIComponent(assistantStreamId)}`, { credentials: "same-origin" });
+        if (!r.ok) break;
+        lastResp = r;
+      } catch (_) { break; }
     }
 
     asstStatus.textContent = "";
@@ -790,7 +820,7 @@
     asstFile.value = "";
     updateFileList();
 
-    if (!doneSeen) {
+    if (!state.doneSeen) {
       progress.textContent = progress.textContent || "Stream ended before completion.";
     }
   });
@@ -1134,4 +1164,35 @@
   projectFilter.addEventListener("change", () => {
     if (body.classList.contains("mode-advanced")) loadThreads();
   });
+
+  // A panel run survives tab close server-side. If this page load follows
+  // one, rejoin it: full replay then live tail into a fresh shell.
+  (async function resumeDetachedAssistant() {
+    let sid = null;
+    try { sid = sessionStorage.getItem(RT_STREAM_KEY); } catch (_) {}
+    if (!sid || !asstForm) return;
+    let r;
+    try {
+      r = await fetch(`/api/roundtable/assistant/stream/${encodeURIComponent(sid)}`, { credentials: "same-origin" });
+    } catch (_) { return; }
+    if (!r.ok) {
+      try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
+      return;
+    }
+    announce("Rejoining a panel run that was still in flight.");
+    assistantStreamId = sid;
+    const { article, progress } = createAssistantShell();
+    const state = { doneSeen: false };
+    const parser = makeSSEParser(assistantEventHandler(state, article, progress));
+    try {
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parser(decoder.decode(value, { stream: true }));
+      }
+      parser(decoder.decode());
+    } catch (_) { /* dropped again; the saved id allows another reload */ }
+  })();
 })();

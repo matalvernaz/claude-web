@@ -47,11 +47,15 @@ def test_assistant_streams_count_as_busy(client):
     import app as app_module
 
     app_module.ACTIVE_RUNS.clear()
-    app_module.ASSISTANT_STREAMS_ACTIVE = 2
+    app_module.ASSISTANT_STREAMS.clear()
     try:
-        assert app_module._busy_runs() == ["roundtable-assistant×2"]
+        live = app_module.AssistantStream("s1", "tester")
+        finished = app_module.AssistantStream("s2", "tester")
+        finished.done = True
+        app_module.ASSISTANT_STREAMS.update({"s1": live, "s2": finished})
+        assert app_module._busy_runs() == ["roundtable-assistant×1"]
     finally:
-        app_module.ASSISTANT_STREAMS_ACTIVE = 0
+        app_module.ASSISTANT_STREAMS.clear()
 
 
 def test_chat_refused_while_draining(client):
