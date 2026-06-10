@@ -54,6 +54,10 @@
   // continuing the current one.
   let forkNextSend = false;
 
+  // Rate-limits handleStreamError's automatic rejoin so a down server
+  // can't loop reconnect attempts.
+  let lastAutoResumeAt = 0;
+
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
   // Storage helpers that swallow the SecurityError some browsers throw on
   // localStorage access in private mode / cookie-blocked origins / embedded
@@ -1700,6 +1704,26 @@
       announce("Session expired. Redirecting to sign-in.");
       const next = encodeURIComponent(location.pathname + location.search);
       window.location.assign(`/auth/login?next=${next}`);
+      return;
+    }
+    // A dropped response stream surfaces as a browser-flavored TypeError —
+    // Firefox literally says "Error in input stream", Chrome "Failed to
+    // fetch". Neither names the real cause: the connection died mid-turn
+    // (server restart, proxy idle-drop, network blip). Say that instead,
+    // and schedule ONE delayed rejoin — an immediate retry would land
+    // while a restarting server is still down, and tryResume's failure
+    // path burns the saved run id.
+    const dropped = (err instanceof TypeError)
+      || /input stream|failed to fetch|network ?error|load failed/i.test(err.message || "");
+    if (dropped) {
+      const msg = "Connection to the server dropped mid-turn (server restart, proxy timeout, or network blip) — reconnecting in a few seconds. Resend your last message if nothing arrives.";
+      setStatus(msg);
+      announce(msg);
+      const now = Date.now();
+      if (now - lastAutoResumeAt > 10000) {
+        lastAutoResumeAt = now;
+        setTimeout(() => { tryResume(); }, 5000);
+      }
       return;
     }
     setStatus("Error: " + err.message);

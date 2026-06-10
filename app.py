@@ -7330,9 +7330,31 @@ async def api_chat(
                                 if tail:
                                     detail_parts.append("--- CLI stderr ---\n" + tail)
                                 detail_parts.append("--- pump traceback ---\n" + msg.traceback)
+                                # Translate the two signal-death exit codes
+                                # into their almost-always cause, so the UI
+                                # shows "the server restarted" instead of
+                                # the SDK's bare exit-code string.
+                                exc_text = str(msg.exc)
+                                if "exit code 143" in exc_text:
+                                    summary = (
+                                        "Claude CLI was terminated mid-turn (SIGTERM) — "
+                                        "usually a claude-web restart landing during this "
+                                        "turn. Resend your message to continue."
+                                    )
+                                elif "exit code 137" in exc_text:
+                                    summary = (
+                                        "Claude CLI was killed mid-turn (SIGKILL — hard "
+                                        "restart or out-of-memory). Resend your message "
+                                        "to continue."
+                                    )
+                                else:
+                                    summary = (
+                                        f"SDK message stream failed: "
+                                        f"{type(msg.exc).__name__}: {msg.exc}"
+                                    )
                                 run.emit({
                                     "type": "error",
-                                    "message": f"SDK message stream failed: {type(msg.exc).__name__}: {msg.exc}",
+                                    "message": summary,
                                     "stderr": "\n\n".join(detail_parts),
                                 })
                                 terminal_kind = "pump_failed"
