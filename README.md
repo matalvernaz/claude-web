@@ -93,8 +93,11 @@ Environment=HOME=/home/claude
 # (where `npm install -g` places the claude binary). Include it explicitly.
 Environment=PATH=/home/claude/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/opt/claude-web/.env
-ExecStart=/opt/claude-web/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3001 --proxy-headers --forwarded-allow-ips=*
-Restart=on-failure
+ExecStart=/opt/claude-web/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 3001 --proxy-headers --forwarded-allow-ips=* --timeout-graceful-shutdown 3
+# always (not on-failure): the in-app drain-restart exits cleanly and relies
+# on the supervisor to revive it. --timeout-graceful-shutdown matters for the
+# same reason — open SSE streams otherwise block the exit indefinitely.
+Restart=always
 
 [Install]
 WantedBy=multi-user.target

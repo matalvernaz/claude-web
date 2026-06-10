@@ -209,7 +209,10 @@ This is a claude-web bug, not upstream Claude Code — the next-prompt picker af
   (same-user signal, no sudo needed). Your turn finishes normally; the
   restart fires after it ends. Cancel a pending drain with
   `DELETE /api/admin/restart`. Requires `Restart=always` on the unit
-  (drop-in at `/etc/systemd/system/claude-web.service.d/self-restart.conf`).
+  (drop-in at `/etc/systemd/system/claude-web.service.d/self-restart.conf`)
+  AND `--timeout-graceful-shutdown` on the uvicorn ExecStart — without it,
+  open SSE streams block uvicorn's graceful exit indefinitely and the site
+  502s until someone force-restarts (observed 2026-06-09: 9-minute hang).
 
 ## Source-file map
 
