@@ -54,9 +54,11 @@
   // continuing the current one.
   let forkNextSend = false;
 
-  // Rate-limits handleStreamError's automatic rejoin so a down server
-  // can't loop reconnect attempts.
-  let lastAutoResumeAt = 0;
+  // Retry schedule for rejoining a run after the SSE connection drops
+  // (phone lock, app switch, server restart, proxy idle-drop). First
+  // attempt is immediate — on mobile the network is usually back the
+  // moment the page resumes — with backoff to ride out a server restart.
+  const STREAM_RECOVERY_DELAYS_MS = [0, 2000, 5000, 10000];
 
   // Pending image attachments for the next send. Each entry is {file, dataUrl}.
   // Storage helpers that swallow the SecurityError some browsers throw on
@@ -587,7 +589,11 @@
   // load the session history from the URL. Doing both would race on
   // transcript.innerHTML and produce flicker/duplicates.
   (async () => {
-    const resumed = await tryResume();
+    let resumed = false;
+    // tryResume throws when the active-run probe can't reach the server;
+    // on boot we just loaded the page from it, so treat that rare race as
+    // "nothing to resume" and fall through to the URL's session history.
+    try { resumed = await tryResume(); } catch (_) { /* fall through */ }
     if (resumed) return;
     if (sessionId) {
       try {
@@ -1197,6 +1203,25 @@
     promptEl.focus();
   });
 
+  // Screen wake lock held while a turn is streaming, so a phone doesn't
+  // auto-lock (suspending the page and killing the SSE socket) in the
+  // middle of a long response. Best-effort: unsupported browsers and
+  // denied requests just fall back to the reconnect-on-resume path. The
+  // OS releases the lock whenever the page is hidden; the visibilitychange
+  // handler re-requests it if a turn is still in flight.
+  let wakeLock = null;
+  function acquireWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    navigator.wakeLock.request("screen")
+      .then((lock) => { wakeLock = lock; })
+      .catch(() => {});
+  }
+  function releaseWakeLock() {
+    if (!wakeLock) return;
+    try { wakeLock.release(); } catch (_) {}
+    wakeLock = null;
+  }
+
   function setStreaming(on) {
     // "on" means: a turn is currently in progress (between submit/auto-fire
     // and the next ResultMessage). The SSE may stay open across multiple
@@ -1206,8 +1231,10 @@
     if (on) {
       streamStartedAt = Date.now();
       startStallWatchdog();
+      acquireWakeLock();
     } else {
       stopStallWatchdog();
+      releaseWakeLock();
     }
     sendBtn.hidden = false;
     sendBtn.disabled = false;
@@ -1585,7 +1612,7 @@
           announce("Stopped.");
         }
       } else if (gen === streamGeneration) {
-        handleStreamError(err);
+        if (!maybeRecoverFromDrop(err)) handleStreamError(err);
       }
     } finally {
       // Only clean up if we're still the current turn. If a stall-recovery
@@ -1670,8 +1697,7 @@
       // we need for tryResume to find the run.
       currentAbort = null;
       currentRunId = null;
-      safeSet(sessionStorage, RUN_KEY, rid);
-      setTimeout(() => { tryResume().catch(() => {}); }, 0);
+      scheduleStreamRecovery(rid);
       return;
     }
     stopGerunds();
@@ -1708,40 +1734,104 @@
     }
     // A dropped response stream surfaces as a browser-flavored TypeError —
     // Firefox literally says "Error in input stream", Chrome "Failed to
-    // fetch". Neither names the real cause: the connection died mid-turn
-    // (server restart, proxy idle-drop, network blip). Say that instead,
-    // and schedule ONE delayed rejoin — an immediate retry would land
-    // while a restarting server is still down, and tryResume's failure
-    // path burns the saved run id.
-    const dropped = (err instanceof TypeError)
-      || /input stream|failed to fetch|network ?error|load failed/i.test(err.message || "");
-    if (dropped) {
-      const msg = "Connection to the server dropped mid-turn (server restart, proxy timeout, or network blip) — reconnecting in a few seconds. Resend your last message if nothing arrives.";
+    // fetch", Safari "Load failed". Neither names the real cause: the
+    // connection died mid-turn (server restart, proxy idle-drop, network
+    // blip). Say that instead. Drops with a live run id never reach here —
+    // maybeRecoverFromDrop intercepts them — so this is the no-run-to-
+    // rejoin case (the POST died before run_started) and resending is the
+    // only recovery.
+    if (isNetworkDropError(err)) {
+      const msg = "Connection to the server dropped (server restart, proxy timeout, or network blip). Resend your last message.";
       setStatus(msg);
       announce(msg);
-      const now = Date.now();
-      if (now - lastAutoResumeAt > 10000) {
-        lastAutoResumeAt = now;
-        setTimeout(() => { tryResume(); }, 5000);
-      }
       return;
     }
     setStatus("Error: " + err.message);
     announce("Error: " + err.message);
   }
 
+  function isNetworkDropError(err) {
+    return (err instanceof TypeError)
+      || /input stream|failed to fetch|network ?error|load failed/i.test(err.message || "");
+  }
+
+  // Shared recovery for a stream that died mid-turn while a run was live:
+  // preserve the run id, then rejoin via tryResume on a backoff schedule.
+  // Mobile browsers kill the SSE socket whenever the page is locked or
+  // backgrounded, so this is the COMMON path on phones, not an edge case.
+  // Callers must have already detached the run from the live globals
+  // (currentAbort = null / currentRunId = null) so the owning finally
+  // block skips its RUN_KEY wipe.
+  function scheduleStreamRecovery(rid, attempt = 0) {
+    if (attempt >= STREAM_RECOVERY_DELAYS_MS.length) {
+      stopGerunds();
+      setStreaming(false);
+      const msg = "Couldn't reconnect to the running task. Reload the page to retry, or send a new message.";
+      setStatus(msg);
+      announce(msg);
+      return;
+    }
+    const myGen = streamGeneration;
+    setTimeout(async () => {
+      // A newer send/resume has taken over while we waited — it owns the
+      // UI now and a stale rejoin would clobber its transcript.
+      if (streamGeneration !== myGen) return;
+      safeSet(sessionStorage, RUN_KEY, rid);
+      let ok;
+      try {
+        ok = await tryResume();
+      } catch (err) {
+        if (/^HTTP (40[13])$/.test(err.message || "")) {
+          // Auth expired while we were away — retrying can't fix that.
+          // handleStreamError owns the redirect-to-IdP dance.
+          handleStreamError(err);
+          return;
+        }
+        // Server unreachable (still restarting, network not back yet) —
+        // the run may well be alive server-side, so keep trying.
+        scheduleStreamRecovery(rid, attempt + 1);
+        return;
+      }
+      if (!ok && streamGeneration === myGen) {
+        // The server answered but doesn't know the run (event retention
+        // expired or state lost across restart). Terminal: clear the
+        // streaming UI rather than leaving a spinner that never resolves.
+        stopGerunds();
+        setStreaming(false);
+        const msg = "The previous response ended while you were away. Reload the page to see it, or send a new message.";
+        setStatus(msg);
+        announce(msg);
+      }
+    }, STREAM_RECOVERY_DELAYS_MS[attempt]);
+  }
+
+  // Network-drop intercept for sendOne/tryResume catch blocks. When the
+  // stream died but we still hold a run id, detach it from the globals
+  // (so the caller's finally guard skips the RUN_KEY wipe) and start the
+  // recovery schedule. Returns true when recovery was started; false
+  // means the caller should fall through to handleStreamError.
+  function maybeRecoverFromDrop(err) {
+    if (!isNetworkDropError(err) || !currentRunId) return false;
+    const rid = currentRunId;
+    renderedIdxByRun.delete(rid);
+    currentAbort = null;
+    currentRunId = null;
+    setStatus("Connection dropped — reconnecting.");
+    announce("Connection dropped. Reconnecting.");
+    scheduleStreamRecovery(rid);
+    return true;
+  }
+
+  // Returns true after a successful rejoin, false when the server says the
+  // run is gone (terminal — RUN_KEY is cleared). THROWS when the active
+  // probe itself fails (server unreachable): the run may still be alive,
+  // so RUN_KEY is kept and the caller decides whether to retry.
   async function tryResume() {
     const savedRunId = safeGet(sessionStorage, RUN_KEY);
     if (!savedRunId) return false;
-    let info;
-    try {
-      const r = await fetch(`/api/chat/active?run_id=${encodeURIComponent(savedRunId)}`);
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      info = await r.json();
-    } catch {
-      safeRemove(sessionStorage, RUN_KEY);
-      return false;
-    }
+    const r = await fetch(`/api/chat/active?run_id=${encodeURIComponent(savedRunId)}`);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const info = await r.json();
     if (!info.active && !info.buffered_events) {
       safeRemove(sessionStorage, RUN_KEY);
       return false;
@@ -1771,7 +1861,7 @@
           announce("Stopped.");
         }
       } else if (gen === streamGeneration) {
-        handleStreamError(err);
+        if (!maybeRecoverFromDrop(err)) handleStreamError(err);
       }
     } finally {
       // Same generation guard as sendOne — only clear globals if this resume
@@ -2062,10 +2152,9 @@
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
-        safeSet(sessionStorage, RUN_KEY, rid);
-        // Schedule the resume on the next microtask so the in-flight reader
-        // can unwind cleanly before we open a new fetch.
-        setTimeout(() => { tryResume().catch(() => {}); }, 0);
+        // First recovery attempt is a zero-delay timeout, so the in-flight
+        // reader unwinds cleanly before we open a new fetch.
+        scheduleStreamRecovery(rid);
       }
       return;
     } else if (obj.type === "permission_timeout") {
@@ -3861,18 +3950,19 @@
   promptEl.addEventListener("blur", () => setTimeout(hideSlashMenu, 150));
 
   // Chrome's intensive throttling / tab freezing pauses the SSE fetch
-  // reader on backgrounded tabs after a few minutes. If the connection
-  // dies during the freeze (cloudflared/Traefik idle timeout while
-  // pings can't be drained) the UI stays stuck on stale state until the
-  // user manually pokes the page. On visibility return, if we have an
-  // in-flight run and the network has been quiet long enough that the
-  // server's 25s pings clearly haven't been arriving, abort and rejoin
-  // via tryResume() so the transcript catches up from the event store.
+  // reader on backgrounded tabs after a few minutes, and mobile browsers
+  // suspend the page outright on screen lock / app switch. If the
+  // connection dies during the freeze (cloudflared/Traefik idle timeout
+  // while pings can't be drained) the UI stays stuck on stale state until
+  // the user manually pokes the page. On return, if we have an in-flight
+  // run and the network has been quiet long enough that the server's 25s
+  // pings clearly haven't been arriving (or `force`, when the socket is
+  // known-dead), abort and rejoin so the transcript catches up from the
+  // event store.
   const VISIBILITY_STALE_MS = 35_000;
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
+  function rejoinAfterFreeze(force) {
     if (!isStreaming || !currentRunId) return;
-    if (Date.now() - lastNetworkActivityAt < VISIBILITY_STALE_MS) return;
+    if (!force && Date.now() - lastNetworkActivityAt < VISIBILITY_STALE_MS) return;
     const rid = currentRunId;
     announce("Reconnecting to running task.");
     renderedIdxByRun.delete(rid);
@@ -3884,10 +3974,24 @@
     if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
     // Same finally-guard trick as the _overflow handler: nulling
     // currentAbort makes the in-flight sendOne/tryResume skip its
-    // RUN_KEY wipe so tryResume below can find the run.
+    // RUN_KEY wipe so the recovery rejoin can find the run.
     currentAbort = null;
     currentRunId = null;
-    safeSet(sessionStorage, RUN_KEY, rid);
-    setTimeout(() => { tryResume().catch(() => {}); }, 0);
+    scheduleStreamRecovery(rid);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    // The OS drops the screen wake lock whenever the page is hidden;
+    // re-request it if a turn is still in flight.
+    if (isStreaming) acquireWakeLock();
+    rejoinAfterFreeze(false);
+  });
+  // bfcache restore (mobile Safari especially): the page comes back with
+  // all JS state intact but every socket dead, and no error ever fires on
+  // the frozen reader. Rejoin unconditionally.
+  window.addEventListener("pageshow", (e) => {
+    if (!e.persisted) return;
+    if (isStreaming) acquireWakeLock();
+    rejoinAfterFreeze(true);
   });
 })();
