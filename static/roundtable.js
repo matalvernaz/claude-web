@@ -564,13 +564,34 @@
 
     // Focus Deny by default — every permission request asks the user to
     // make an active choice, and "approve by inertia" is the wrong default.
-    const denyBtn = actions.querySelector(".rt-permission-deny");
-    if (denyBtn) denyBtn.focus();
+    // Skipped when the approval modal will host this request moments later;
+    // double focus reads twice on a screen reader.
+    if (!ensureRtPermDialog()) {
+      const denyBtn = actions.querySelector(".rt-permission-deny");
+      if (denyBtn) denyBtn.focus();
+    }
     return card;
   }
 
+  // Collapse a pending card into its decision note. Shared by the decide
+  // path and permission_resolved replays (the latter must NOT announce —
+  // a rejoin would otherwise speak every historical decision). Returns
+  // the announcement text for the deciding surface to use.
+  function resolveRtPermCard(card, decision) {
+    card.dataset.state = "resolved";
+    const labels = { allow: "Allowed", allow_session: "Allowed (this turn)", deny: "Denied" };
+    const note = document.createElement("p");
+    note.className = "rt-permission-resolved";
+    const heading = card.querySelector(".rt-permission-heading")?.textContent || "tool";
+    note.textContent = `${labels[decision] || decision} — ${heading}`;
+    card.replaceWith(note);
+    rtPermDequeue(card.dataset.requestId);
+    return `${labels[decision] || decision} ${heading}.`;
+  }
+
+  // Returns true when the decision was accepted by the server.
   async function decideRoundtablePermission(requestId, decision, card) {
-    if (!card || card.dataset.state !== "pending") return;
+    if (!card || card.dataset.state !== "pending") return false;
     card.dataset.state = "deciding";
     card.querySelectorAll("button").forEach(b => (b.disabled = true));
     try {
@@ -582,14 +603,8 @@
         body: fd,
       });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      card.dataset.state = "resolved";
-      const labels = { allow: "Allowed", allow_session: "Allowed (this turn)", deny: "Denied" };
-      const note = document.createElement("p");
-      note.className = "rt-permission-resolved";
-      const heading = card.querySelector(".rt-permission-heading")?.textContent || "tool";
-      note.textContent = `${labels[decision] || decision} — ${heading}`;
-      card.replaceWith(note);
-      announce(`${labels[decision] || decision} ${heading}.`);
+      announce(resolveRtPermCard(card, decision));
+      return true;
     } catch (err) {
       card.dataset.state = "pending";
       card.querySelectorAll("button").forEach(b => (b.disabled = false));
@@ -598,6 +613,7 @@
       errLine.textContent = `Decision failed: ${err.message}`;
       card.appendChild(errLine);
       announce(`Decision failed: ${err.message}`);
+      return false;
     }
   }
 
@@ -612,6 +628,144 @@
     note.textContent = `Timed out after ${timeoutSeconds || "?"}s — treated as denied.`;
     card.appendChild(note);
     announce("Permission request timed out.");
+  }
+
+  // ── Approval modal ────────────────────────────────────────────────────
+  // Same pattern as the main chat: pending permission requests open a
+  // native <dialog> via showModal() so the swipe order on a mobile screen
+  // reader collapses to just the prompt. The inline rt-permission card
+  // stays as the record and fallback; Esc / "Decide later" closes without
+  // deciding and the card remains usable. Reuses the #perm-dialog id so
+  // style.css covers both pages (one page per document, no collision).
+  const rtPermQueue = [];
+  let rtPermDialog = null;
+  let rtPermShowingId = null;
+  let rtPermOpenTimer = null;
+  // Rejoin replays deliver a request and its resolution back-to-back;
+  // deferring the open keeps stale requests from flashing a dialog.
+  const RT_PERM_OPEN_DELAY_MS = 250;
+
+  function ensureRtPermDialog() {
+    if (rtPermDialog) return rtPermDialog;
+    const dlg = document.createElement("dialog");
+    if (typeof dlg.showModal !== "function") return null; // inline cards still work
+    dlg.id = "perm-dialog";
+    dlg.setAttribute("aria-labelledby", "perm-dialog-title");
+    dlg.addEventListener("close", () => { rtPermShowingId = null; });
+    document.body.appendChild(dlg);
+    rtPermDialog = dlg;
+    return dlg;
+  }
+
+  function findRtPermCard(requestId) {
+    const cards = document.querySelectorAll("article.rt-permission");
+    return [...cards].find(el => el.dataset.requestId === String(requestId)) || null;
+  }
+
+  // Populate for the front of the queue; false when nothing renderable
+  // remains (entries whose card is gone or already decided are dropped).
+  function renderRtPermDialog() {
+    if (!rtPermDialog) return false;
+    while (rtPermQueue.length) {
+      const card = findRtPermCard(rtPermQueue[0].id);
+      if (card && card.dataset.state === "pending") break;
+      rtPermQueue.shift();
+    }
+    if (!rtPermQueue.length) {
+      if (rtPermDialog.open) rtPermDialog.close();
+      return false;
+    }
+    const req = rtPermQueue[0];
+    rtPermShowingId = req.id;
+    rtPermDialog.innerHTML = "";
+
+    const title = document.createElement("h2");
+    title.id = "perm-dialog-title";
+    const who = req.participant_label || "A panelist";
+    const countSuffix = rtPermQueue.length > 1 ? ` — 1 of ${rtPermQueue.length} waiting` : "";
+    title.textContent = `${who} wants to use ${req.tool}${countSuffix}`;
+    rtPermDialog.appendChild(title);
+
+    const pre = document.createElement("pre");
+    pre.className = "rt-permission-input";
+    pre.textContent = JSON.stringify(req.input || {}, null, 2);
+    rtPermDialog.appendChild(pre);
+
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    const allowSessionSupported = req.allow_session_supported !== false;
+    const sig = req.signature ? ` "${(req.signature.length > 30 ? req.signature.slice(0, 27) + "…" : req.signature)}"` : "";
+    const buttons = [
+      { decision: "deny", label: "Deny", variant: "danger" },
+      { decision: "allow", label: "Allow once", variant: "primary" },
+    ];
+    if (allowSessionSupported) {
+      buttons.push({ decision: "allow_session", label: `Allow this turn${sig}`, variant: "secondary" });
+    }
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = b.label;
+      btn.className = "btn-" + b.variant;
+      btn.addEventListener("click", () => decideFromRtDialog(req, b.decision));
+      actions.appendChild(btn);
+    }
+    const later = document.createElement("button");
+    later.type = "button";
+    later.textContent = "Decide later";
+    later.className = "btn-secondary";
+    later.addEventListener("click", () => rtPermDialog.close());
+    actions.appendChild(later);
+    rtPermDialog.appendChild(actions);
+    return true;
+  }
+
+  function openRtPermDialogNow() {
+    if (!rtPermQueue.length) return;
+    const dlg = ensureRtPermDialog();
+    if (!dlg || dlg.open) return;
+    if (!renderRtPermDialog()) return;
+    dlg.showModal();
+    const deny = dlg.querySelector(".btn-danger");
+    if (deny) deny.focus();
+  }
+
+  function enqueueRtPerm(req) {
+    if (!req.id || rtPermQueue.some(q => String(q.id) === String(req.id))) return;
+    rtPermQueue.push(req);
+    if (rtPermOpenTimer) return;
+    rtPermOpenTimer = setTimeout(() => {
+      rtPermOpenTimer = null;
+      openRtPermDialogNow();
+    }, RT_PERM_OPEN_DELAY_MS);
+  }
+
+  function rtPermDequeue(requestId) {
+    const i = rtPermQueue.findIndex(q => String(q.id) === String(requestId));
+    if (i === -1) return;
+    const wasShowing = String(rtPermShowingId) === String(requestId);
+    rtPermQueue.splice(i, 1);
+    if (rtPermDialog && rtPermDialog.open && wasShowing) {
+      if (renderRtPermDialog()) {
+        const deny = rtPermDialog.querySelector(".btn-danger");
+        if (deny) deny.focus();
+        announce(`Next approval: ${rtPermQueue[0].tool}.`);
+      }
+    }
+  }
+
+  async function decideFromRtDialog(req, decision) {
+    const card = findRtPermCard(req.id);
+    if (!card) {
+      rtPermDequeue(req.id);
+      return;
+    }
+    const btns = rtPermDialog.querySelectorAll("button");
+    btns.forEach(b => (b.disabled = true));
+    const ok = await decideRoundtablePermission(req.id, decision, card);
+    // Success funnels through resolveRtPermCard → rtPermDequeue, which
+    // advances or closes the dialog.
+    if (!ok) btns.forEach(b => (b.disabled = false));
   }
 
   // Parse a chunk of an SSE stream and dispatch events.
@@ -709,11 +863,23 @@
           progress.textContent = `${data.participant_label || "Panelist"} wants to use ${data.tool}. Awaiting your decision…`;
           announce(`${data.participant_label || "A panelist"} wants to use ${data.tool}. Decide allow or deny.`);
           renderRoundtablePermissionCard(data, asstArticle, progress);
+          enqueueRtPerm(data);
           break;
         case "permission_timeout":
           markRoundtablePermissionTimedOut(data.id, asstArticle, data.timeout_seconds);
+          rtPermDequeue(data.id);
           progress.textContent = `Permission request for ${data.tool || "tool"} timed out.`;
           break;
+        case "permission_resolved": {
+          // Decided on another surface or replayed during a rejoin —
+          // collapse the pending card silently and drop the queue entry.
+          const resolvedCard = findRtPermCard(data.id);
+          if (resolvedCard && resolvedCard.dataset.state === "pending") {
+            resolveRtPermCard(resolvedCard, data.decision);
+          }
+          rtPermDequeue(data.id);
+          break;
+        }
         case "error":
           try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
           progress.textContent = `Error: ${data.message}`;

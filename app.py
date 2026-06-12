@@ -6871,6 +6871,14 @@ async def api_chat(
                     return PermissionResultAllow(updated_input=dict(tool_input))
             finally:
                 PENDING.pop(request_id, None)
+            # Persist the resolution so replays collapse the question card
+            # instead of re-rendering a live form whose submit would 404.
+            run.emit({
+                "type": "permission_resolved",
+                "id": request_id,
+                "tool": tool_name,
+                "decision": decision.get("decision"),
+            })
             payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
             updated = dict(tool_input)
             answers = (payload or {}).get("answers")
@@ -6918,6 +6926,13 @@ async def api_chat(
                     )
             finally:
                 PENDING.pop(request_id, None)
+            # Persist the resolution so replays collapse the plan card.
+            run.emit({
+                "type": "permission_resolved",
+                "id": request_id,
+                "tool": tool_name,
+                "decision": decision.get("decision"),
+            })
             if decision.get("decision") == "allow":
                 log.info("plan approved run=%s owner=%s", run.run_id, owner)
                 run.permission_mode = "acceptEdits"
@@ -9680,6 +9695,14 @@ def _make_roundtable_permission_callback(
             "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
             d, tool_name, sig, participant_label, user_sub,
         )
+        # Persist the resolution so a stream rejoin collapses the card
+        # instead of replaying it as pending (clicks would 404).
+        await event_queue.put(("permission_resolved", {
+            "id": request_id,
+            "tool": tool_name,
+            "decision": d,
+            "participant_label": participant_label,
+        }))
         if d == "allow_session" and allow_session_supported:
             session_allowlist.add((tool_name, sig))
             return "allow"
