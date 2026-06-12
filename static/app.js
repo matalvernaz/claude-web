@@ -789,6 +789,7 @@
     lastContextThresholdAnnounced = 0;
     renderContextMeter();
     transcript.innerHTML = "";
+    clearPermQueue();
     // Switching sessions: any prior run's dedup state belongs to a different
     // conversation now and shouldn't influence rendering of the new one.
     renderedIdxByRun.clear();
@@ -1169,6 +1170,7 @@
     // even after the user picked a different one and clicked New chat.
     sessionProject = "";
     transcript.innerHTML = "";
+    clearPermQueue();
     updateTodosPanel([]);
     history.replaceState({}, "", location.pathname);
     markActive("");
@@ -1841,6 +1843,7 @@
     // frame where the spinner is overlaid on the stale transcript. Replay
     // is from index 0, so this run's dedup watermark must reset too.
     transcript.innerHTML = "";
+    clearPermQueue();
     renderedIdxByRun.delete(savedRunId);
     const gen = ++streamGeneration;
     const myAbort = new AbortController();
@@ -2114,6 +2117,7 @@
       announce(`Permission needed for ${obj.tool}.`);
       playCue("permission");
       renderPermissionCard(obj);
+      enqueuePermRequest(obj);
       markVisibleActivity();
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
@@ -2183,10 +2187,22 @@
           : `Timed out after ${obj.timeout_seconds || "?"}s — Claude was told the request was denied.`;
         card.appendChild(note);
       }
+      removeFromPermQueue(obj.id);
       announce(restarted
         ? `Permission request for ${obj.tool || "tool"} discarded due to server restart.`
         : `Permission request for ${obj.tool || "tool"} timed out.`);
       playCue("timeout");
+    } else if (obj.type === "permission_resolved") {
+      // The request was decided on another surface (other tab, modal vs
+      // inline card) or this is a replay of a decision already made.
+      // Collapse the pending card into the decision summary and drop it
+      // from the modal queue. The deciding surface already replaced its
+      // own card, so a missing card here is the common same-tab case.
+      const resolvedCard = findPermCard(obj.id);
+      if (resolvedCard && resolvedCard.dataset.state !== "resolved") {
+        resolvePermCardDom(resolvedCard, obj.decision);
+      }
+      removeFromPermQueue(obj.id);
     } else if (obj.type === "todos_update") {
       updateTodosPanel(obj.todos || []);
       markVisibleActivity();
@@ -2483,6 +2499,181 @@
     return parts.join(" · ");
   }
 
+  // ── Permission modal ──────────────────────────────────────────────────
+  // Pending permission requests funnel through one native <dialog> shown
+  // with showModal(), in arrival order. The inline transcript card stays
+  // as the scrollable record and fallback input surface, but the modal is
+  // the primary one: mobile screen readers largely ignore programmatic
+  // focus() into the transcript, while a modal dialog makes the rest of
+  // the page inert so the swipe order collapses to heading → payload →
+  // buttons. Esc / "Decide later" closes without deciding; the header
+  // "N approvals waiting" button reopens.
+  const permQueue = [];
+  let permDialog = null;
+  let permDialogShowingId = null;
+  let permOpenTimer = null;
+  // Replay of an already-decided request delivers permission_request and
+  // its permission_resolved in quick succession; deferring the open lets
+  // the resolution land first so the modal never flashes for stale
+  // requests. Live requests just open a beat later.
+  const PERM_DIALOG_OPEN_DELAY_MS = 250;
+  const permWaitingBtn = document.getElementById("perm-waiting");
+  if (permWaitingBtn) {
+    permWaitingBtn.addEventListener("click", () => openPermDialogNow());
+  }
+
+  function ensurePermDialog() {
+    if (permDialog) return permDialog;
+    const dlg = document.createElement("dialog");
+    if (typeof dlg.showModal !== "function") return null; // inline cards still work
+    dlg.id = "perm-dialog";
+    dlg.setAttribute("aria-labelledby", "perm-dialog-title");
+    // Esc (the native cancel) means "decide later" — the inline card stays
+    // pending and the header badge keeps the count. Deny is explicit only.
+    dlg.addEventListener("close", () => {
+      permDialogShowingId = null;
+      updatePermBadge();
+    });
+    document.body.appendChild(dlg);
+    permDialog = dlg;
+    return dlg;
+  }
+
+  function updatePermBadge() {
+    if (!permWaitingBtn) return;
+    const n = permQueue.length;
+    permWaitingBtn.hidden = n === 0;
+    if (n) permWaitingBtn.textContent = `${n} approval${n === 1 ? "" : "s"} waiting`;
+  }
+
+  function renderPermDialog() {
+    const req = permQueue[0];
+    if (!permDialog || !req) return;
+    permDialogShowingId = req.id;
+    permDialog.innerHTML = "";
+
+    const title = document.createElement("h2");
+    title.id = "perm-dialog-title";
+    title.textContent = permQueue.length > 1
+      ? `Claude wants to use ${req.tool} — approval 1 of ${permQueue.length}`
+      : `Claude wants to use ${req.tool}`;
+    permDialog.appendChild(title);
+
+    const detail = document.createElement("div");
+    detail.className = "permission-input-wrap";
+    appendPermissionPayload(detail, req.tool, req.input || {});
+    permDialog.appendChild(detail);
+
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    const allowSessionSupported = req.allow_session_supported !== false;
+    const sigLabel = req.signature ? ` "${truncate(req.signature, 30)}"` : "";
+    const buttons = [
+      { decision: "deny", label: "Deny", variant: "danger" },
+      { decision: "allow", label: "Allow once", variant: "primary" },
+    ];
+    if (allowSessionSupported) {
+      buttons.push({
+        decision: "allow_session",
+        label: `Allow this session${sigLabel}`,
+        variant: "secondary",
+      });
+    }
+    for (const b of buttons) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = b.label;
+      btn.className = "btn-" + b.variant;
+      btn.addEventListener("click", () => decideFromDialog(req, b.decision));
+      actions.appendChild(btn);
+    }
+    const later = document.createElement("button");
+    later.type = "button";
+    later.textContent = "Decide later";
+    later.className = "btn-secondary";
+    later.addEventListener("click", () => permDialog.close());
+    actions.appendChild(later);
+    permDialog.appendChild(actions);
+  }
+
+  function focusPermDefault() {
+    if (!permDialog) return;
+    const req = permQueue[0];
+    // Safest button first for high-risk tools — same policy as the card.
+    const isHighRisk = req && (req.tool === "Bash" || req.tool === "Write");
+    const btn = permDialog.querySelector(isHighRisk ? ".btn-danger" : ".btn-primary");
+    if (btn) btn.focus();
+  }
+
+  function openPermDialogNow() {
+    if (!permQueue.length) return;
+    const dlg = ensurePermDialog();
+    if (!dlg || dlg.open) return;
+    renderPermDialog();
+    dlg.showModal();
+    focusPermDefault();
+  }
+
+  function openPermDialogSoon() {
+    if (permOpenTimer) return;
+    permOpenTimer = setTimeout(() => {
+      permOpenTimer = null;
+      openPermDialogNow();
+    }, PERM_DIALOG_OPEN_DELAY_MS);
+  }
+
+  function enqueuePermRequest(req) {
+    if (!req.id || permQueue.some((q) => String(q.id) === String(req.id))) return;
+    permQueue.push(req);
+    updatePermBadge();
+    openPermDialogSoon();
+  }
+
+  function removeFromPermQueue(requestId) {
+    const i = permQueue.findIndex((q) => String(q.id) === String(requestId));
+    if (i === -1) return;
+    const wasShowing = String(permDialogShowingId) === String(requestId);
+    permQueue.splice(i, 1);
+    updatePermBadge();
+    if (permDialog && permDialog.open && wasShowing) {
+      if (!permQueue.length) {
+        permDialog.close();
+      } else {
+        renderPermDialog();
+        focusPermDefault();
+        announce(`Next approval: ${permQueue[0].tool}.`);
+      }
+    }
+  }
+
+  function clearPermQueue() {
+    permQueue.length = 0;
+    updatePermBadge();
+    if (permOpenTimer) { clearTimeout(permOpenTimer); permOpenTimer = null; }
+    if (permDialog && permDialog.open) permDialog.close();
+  }
+
+  function findPermCard(requestId) {
+    const cards = document.querySelectorAll("article.msg.permission");
+    return [...cards].find((el) => el.dataset.requestId === String(requestId)) || null;
+  }
+
+  async function decideFromDialog(req, decision) {
+    const card = findPermCard(req.id);
+    if (!card) {
+      // Card gone (resolved from another surface, transcript rewritten by
+      // a resume) — nothing to decide against; drop the queue entry.
+      removeFromPermQueue(req.id);
+      return;
+    }
+    const btns = permDialog.querySelectorAll("button");
+    btns.forEach((b) => (b.disabled = true));
+    const ok = await decide(req.id, decision, card);
+    // Success funnels through removeFromPermQueue (via decide), which
+    // advances to the next request or closes the dialog.
+    if (!ok) btns.forEach((b) => (b.disabled = false));
+  }
+
   function renderPermissionCard(req) {
     const card = document.createElement("article");
     card.className = "msg permission";
@@ -2551,9 +2742,14 @@
     // Force-scroll: a permission card needs to be on screen, full stop.
     maybeAutoScroll(true);
 
-    // Focus the safest button by default for high-risk tools.
-    const focusBtn = isHighRisk ? actions.querySelector(".btn-danger") : actions.querySelector(".btn-primary");
-    if (focusBtn) focusBtn.focus();
+    // Focus the safest button by default for high-risk tools — but only
+    // when the modal can't open (no <dialog> support): otherwise the modal
+    // grabs focus moments later and the double move reads twice on a
+    // screen reader.
+    if (!ensurePermDialog()) {
+      const focusBtn = isHighRisk ? actions.querySelector(".btn-danger") : actions.querySelector(".btn-primary");
+      if (focusBtn) focusBtn.focus();
+    }
 
     // Esc denies. Enter is intentionally NOT bound to "allow once" — that
     // would over-ride the focused-button default, so a user with focus on
@@ -2619,13 +2815,33 @@
     parent.appendChild(block);
   }
 
+  // Replace a pending card with a compact record of the decision. Prefer a
+  // semantic summary line (the heading already says "Claude wants to use
+  // {tool}", and the path is in .permission-input-path for Edit/Write)
+  // over the first line of the diff body.
+  function resolvePermCardDom(card, decision) {
+    card.dataset.state = "resolved";
+    const summary = document.createElement("article");
+    summary.className = "msg permission-resolved";
+    const labels = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
+    const heading = card.querySelector(".role")?.textContent?.replace(/^Claude wants to use\s+/, "") || "tool";
+    const path = card.querySelector(".permission-input-path")?.textContent?.trim();
+    const firstInput = card.querySelector(".permission-input")?.textContent?.split("\n")[0]?.trim();
+    const detail = path || firstInput || "";
+    summary.textContent = detail
+      ? `${labels[decision] || decision} — ${heading}: ${detail}`
+      : `${labels[decision] || decision} — ${heading}`;
+    card.replaceWith(summary);
+  }
+
+  // Returns true when the decision was accepted by the server.
   async function decide(requestId, decision, card) {
     // State machine: pending → deciding → (resolved | timed_out).
     // A second click while a fetch is in flight, or an Esc keypress while
     // the click is mid-POST, would otherwise issue a duplicate decision.
     // Once timed_out arrives, the card is locked even if a request fails.
     if (!card || card.dataset.state === "deciding" || card.dataset.state === "timed_out" || card.dataset.state === "resolved") {
-      return;
+      return false;
     }
     card.dataset.state = "deciding";
     card.querySelectorAll("button").forEach((b) => (b.disabled = true));
@@ -2637,22 +2853,9 @@
         { method: "POST", body: fd },
       );
       if (!r.ok) throw new Error("HTTP " + r.status);
-      card.dataset.state = "resolved";
-      // Replace card with a compact record of the decision. Prefer a
-      // semantic summary line (the heading already says "Claude wants to
-      // use {tool}", and the path is in .permission-input-path for
-      // Edit/Write) over the first line of the diff body.
-      const summary = document.createElement("article");
-      summary.className = "msg permission-resolved";
-      const labels = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
-      const heading = card.querySelector(".role")?.textContent?.replace(/^Claude wants to use\s+/, "") || "tool";
-      const path = card.querySelector(".permission-input-path")?.textContent?.trim();
-      const firstInput = card.querySelector(".permission-input")?.textContent?.split("\n")[0]?.trim();
-      const detail = path || firstInput || "";
-      summary.textContent = detail
-        ? `${labels[decision] || decision} — ${heading}: ${detail}`
-        : `${labels[decision] || decision} — ${heading}`;
-      card.replaceWith(summary);
+      resolvePermCardDom(card, decision);
+      removeFromPermQueue(requestId);
+      return true;
     } catch (err) {
       // Only re-enable if no terminal state arrived during the in-flight
       // fetch. A late permission_timeout would have flipped state to
@@ -2663,6 +2866,7 @@
         card.querySelectorAll("button").forEach((b) => (b.disabled = false));
       }
       setStatus("Failed to send decision: " + err.message);
+      return false;
     }
   }
 
@@ -3351,6 +3555,7 @@
         sessionId = "";
         sessionProject = "";
         transcript.innerHTML = "";
+        clearPermQueue();
         updateTodosPanel([]);
         history.replaceState({}, "", location.pathname);
         setStatus("Session deleted.");

@@ -4337,7 +4337,7 @@ def _restore_persisted_runs() -> None:
             eid = evt.get("id")
             if etype == "permission_request" and eid:
                 unresolved_perms[eid] = len(run.events) - 1
-            elif etype == "permission_timeout" and eid:
+            elif etype in ("permission_timeout", "permission_resolved") and eid:
                 unresolved_perms.pop(eid, None)
         # Append a synthetic timeout for each orphaned request so the
         # browser disables its card on resume instead of letting a click
@@ -6993,6 +6993,15 @@ async def api_chat(
             "perm decision=%s tool=%s sig=%r run=%s owner=%s",
             d, tool_name, sig, run.run_id, owner,
         )
+        # Persist the resolution so replays render this card as decided.
+        # Without it a reconnect re-renders the request as pending and a
+        # click 404s (PENDING is in-process and long gone).
+        run.emit({
+            "type": "permission_resolved",
+            "id": request_id,
+            "tool": tool_name,
+            "decision": d,
+        })
         if d == "allow":
             return PermissionResultAllow()
         if d == "allow_session":

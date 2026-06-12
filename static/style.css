@@ -432,6 +432,31 @@ body[data-plan-mode="1"]::before {
 }
 #usage-dialog::backdrop { background: rgba(0,0,0,0.6); }
 #usage-dialog h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
+
+#perm-dialog {
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  max-width: 36rem;
+  width: 92%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+#perm-dialog::backdrop { background: rgba(0,0,0,0.6); }
+#perm-dialog h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
+#perm-dialog .permission-actions { margin-top: 0.75rem; }
+
+#perm-waiting {
+  background: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: #000;
+  font-weight: 600;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
 #usage-body table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
 #usage-body th, #usage-body td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border); text-align: left; }
 #usage-body th { color: #aaa; font-weight: 600; font-size: 0.8rem; }
