@@ -65,3 +65,39 @@ def test_expected_origin_falls_back_to_base_url(monkeypatch: pytest.MonkeyPatch)
             return _B()
 
     assert auth.expected_origin(_Req()) == "http://127.0.0.1:3001"
+
+
+# ─── email allowlist requires a verified email ───────────────────────────
+
+def _allowed(monkeypatch, user, emails=("ok@x.com",), require=True, mode="all", groups=()):
+    monkeypatch.setattr(auth, "ALLOWED_EMAILS", set(emails))
+    monkeypatch.setattr(auth, "ALLOWED_GROUPS", set(groups))
+    monkeypatch.setattr(auth, "REQUIRE_VERIFIED_EMAIL", require)
+    monkeypatch.setattr(auth, "ALLOWLIST_MODE", mode)
+    return auth._user_allowed(user)
+
+
+def test_allowlisted_email_unverified_rejected(monkeypatch) -> None:
+    user = {"email": "ok@x.com", "email_verified": False}
+    assert _allowed(monkeypatch, user) is False
+
+
+def test_allowlisted_email_verified_accepted(monkeypatch) -> None:
+    user = {"email": "ok@x.com", "email_verified": True}
+    assert _allowed(monkeypatch, user) is True
+
+
+def test_allowlisted_email_missing_verified_claim_rejected_by_default(monkeypatch) -> None:
+    # No email_verified claim at all → treated as unverified when required.
+    user = {"email": "ok@x.com"}
+    assert _allowed(monkeypatch, user) is False
+
+
+def test_verified_requirement_can_be_disabled(monkeypatch) -> None:
+    user = {"email": "ok@x.com"}  # no claim
+    assert _allowed(monkeypatch, user, require=False) is True
+
+
+def test_non_allowlisted_email_rejected_even_if_verified(monkeypatch) -> None:
+    user = {"email": "nope@y.com", "email_verified": True}
+    assert _allowed(monkeypatch, user) is False

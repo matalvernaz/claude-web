@@ -525,6 +525,24 @@ def _run_headless_mode(host: str, port: int,
     return 0
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True if binding to ``host`` only accepts connections from this machine.
+
+    Covers the literal names and the whole 127.0.0.0/8 range plus the IPv6
+    loopback. An empty/"0.0.0.0"/"::" bind is explicitly NOT loopback.
+    """
+    h = (host or "").strip().lower()
+    if h in ("localhost", "::1", "[::1]"):
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        # A hostname we can't classify — treat as non-loopback (fail safe).
+        return False
+
+
 def _run(argv: list[str] | None) -> int:
     args = _parse_args(list(sys.argv[1:] if argv is None else argv))
 
@@ -542,6 +560,21 @@ def _run(argv: list[str] | None) -> int:
     ui_mode = _resolve_ui_mode(args, first_run)
 
     if first_run:
+        # First run with no config drops auth, secure cookies, and CSRF so the
+        # operator can reach /setup. That combination is only safe bound to
+        # loopback — on a routable interface it's an unauthenticated box that
+        # can run shell tools (RCE). If the operator pointed --host/
+        # CLAUDE_WEB_HOST at a non-loopback address, override it back to
+        # 127.0.0.1 and say so, rather than silently exposing it.
+        if not _is_loopback_host(args.host):
+            print(
+                f"\nWARNING: first run is unauthenticated (no .env yet), so "
+                f"binding to {args.host!r} would expose an open box to the "
+                f"network. Forcing host to 127.0.0.1 — configure auth in "
+                f"/setup, then set CLAUDE_WEB_HOST to re-expose.",
+                flush=True,
+            )
+            args.host = "127.0.0.1"
         os.environ["AUTH_MODE"] = "none"
         os.environ.setdefault("SESSION_COOKIE_INSECURE", "true")
         os.environ.setdefault("CLAUDE_WEB_CSRF_STRICT", "false")

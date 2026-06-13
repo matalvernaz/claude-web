@@ -228,3 +228,20 @@ def test_open_browser_when_ready_times_out_quietly(launcher, monkeypatch) -> Non
     monkeypatch.setattr(launcher.webbrowser, "open", lambda url, new=0: calls.append(url) or True)
     launcher._open_browser_when_ready("127.0.0.1", 3001, "/setup", timeout_s=0.5)
     assert calls == []
+
+
+# ─── first-run loopback safety ───────────────────────────────────────────
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "[::1]", "127.5.6.7"])
+def test_is_loopback_host_true(host) -> None:
+    import launcher
+    assert launcher._is_loopback_host(host) is True
+
+
+@_pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "claude.example.com", ""])
+def test_is_loopback_host_false(host) -> None:
+    import launcher
+    assert launcher._is_loopback_host(host) is False

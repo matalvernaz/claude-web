@@ -234,6 +234,10 @@ _db: Optional[sqlite3.Connection] = None
 # message append, fork). RLock lets the same thread re-enter without
 # deadlocking; other threads still block.
 _db_lock = threading.RLock()
+# Bound on retries when a cross-process writer grabs the (thread, idx) or
+# (thread, name, version) slot we just computed. A handful is plenty — the
+# loser just reads the new MAX and takes the next free slot.
+_IDX_COLLISION_RETRIES = 8
 
 
 def _conn() -> sqlite3.Connection:
@@ -252,6 +256,13 @@ def _conn() -> sqlite3.Connection:
         c = sqlite3.connect(str(DB_PATH), check_same_thread=False, isolation_level=None)
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
+        # This store is shared with the standalone roundtable-mcp process. WAL
+        # allows one writer at a time across processes; without a busy_timeout
+        # a concurrent write from the other process returns SQLITE_BUSY
+        # immediately (default 0ms) and surfaces as "database is locked". Wait
+        # out the other writer's lock instead. _db_lock only serialises threads
+        # within THIS process, so it can't help here.
+        c.execute("PRAGMA busy_timeout=5000")
         c.execute(
             """CREATE TABLE IF NOT EXISTS threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -371,17 +382,29 @@ def _thread_messages(thread_id: int) -> list[dict]:
 def _append_message(thread_id: int, speaker: str, content: str) -> int:
     """Allocate the next message index and INSERT it atomically.
 
-    The read-then-insert pair is held under ``_db_lock`` so concurrent
-    callers can't both observe the same MAX(idx) and race the INSERT.
+    ``_db_lock`` serialises this process's threads, but the standalone
+    roundtable-mcp process shares the same DB and can allocate the same idx
+    between our MAX read and INSERT. That collides on the (thread_id, idx)
+    primary key, so retry on IntegrityError with a freshly-read idx — the
+    other writer is committed by then, so MAX advances and the retry takes
+    the next slot.
     """
-    with _db_lock:
-        idx = _next_idx(thread_id)
-        _conn().execute(
-            "INSERT INTO messages(thread_id, idx, speaker, content, ts) "
-            "VALUES(?, ?, ?, ?, ?)",
-            (thread_id, idx, speaker, content, time.time()),
-        )
-    return idx
+    for _attempt in range(_IDX_COLLISION_RETRIES):
+        with _db_lock:
+            idx = _next_idx(thread_id)
+            try:
+                _conn().execute(
+                    "INSERT INTO messages(thread_id, idx, speaker, content, ts) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (thread_id, idx, speaker, content, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            return idx
+    raise RuntimeError(
+        f"could not allocate a message idx for thread {thread_id} after "
+        f"{_IDX_COLLISION_RETRIES} attempts (cross-process contention)"
+    )
 
 
 def _thread_is_closed(thread_id: int) -> bool:
@@ -2250,60 +2273,70 @@ def roundtable_set_artifact(
     if not name:
         raise ValueError("Artifact name must be a non-empty string.")
 
-    # Compute diff/body OUTSIDE the lock — it's pure work over inputs +
-    # the already-stored prior version (which is immutable once written).
-    # Then take the lock just for the version-bump + INSERT + transcript
-    # append so two concurrent set_artifact calls on the same name don't
-    # both compute new_v = prev_v + 1 and collide on the artifacts PK.
-    with _db_lock:
-        prev_v = _latest_artifact_version(thread_id, name)
-        new_v = prev_v + 1
-        old = (
-            _get_artifact_content(thread_id, name, prev_v) or ""
-            if prev_v > 0 else ""
-        )
-
-        diff_omitted = False
-        if prev_v == 0:
-            body = (
-                f"=== Artifact {name!r} (v{new_v}) ===\n"
-                f"{content}\n"
-                f"=== End artifact ==="
+    # Take the lock for the version-bump + INSERT + transcript append so two
+    # concurrent set_artifact calls on the same name don't both compute
+    # new_v = prev_v + 1 and collide on the artifacts PK. The standalone
+    # roundtable-mcp process shares this DB and isn't covered by _db_lock, so
+    # retry on IntegrityError with a freshly-read version — the body embeds
+    # new_v, so it's recomputed each attempt.
+    for _attempt in range(_IDX_COLLISION_RETRIES):
+        with _db_lock:
+            prev_v = _latest_artifact_version(thread_id, name)
+            new_v = prev_v + 1
+            old = (
+                _get_artifact_content(thread_id, name, prev_v) or ""
+                if prev_v > 0 else ""
             )
-        else:
-            diff_text = _render_artifact_diff(old, content, name, prev_v, new_v)
-            if len(diff_text) > ARTIFACT_DIFF_CHAR_CAP:
-                diff_omitted = True
-                diff_block = (
-                    f"[diff vs v{prev_v} omitted — exceeded "
-                    f"{ARTIFACT_DIFF_CHAR_CAP}-char cap, treat as a full "
-                    f"rewrite]"
+
+            diff_omitted = False
+            if prev_v == 0:
+                body = (
+                    f"=== Artifact {name!r} (v{new_v}) ===\n"
+                    f"{content}\n"
+                    f"=== End artifact ==="
                 )
             else:
-                diff_block = f"--- Diff vs v{prev_v} ---\n{diff_text}".rstrip()
-            body = (
-                f"=== Artifact {name!r} updated to v{new_v} ===\n"
-                f"{diff_block}\n\n"
-                f"--- Full v{new_v} content ---\n"
-                f"{content}\n"
-                f"=== End artifact ==="
-            )
+                diff_text = _render_artifact_diff(old, content, name, prev_v, new_v)
+                if len(diff_text) > ARTIFACT_DIFF_CHAR_CAP:
+                    diff_omitted = True
+                    diff_block = (
+                        f"[diff vs v{prev_v} omitted — exceeded "
+                        f"{ARTIFACT_DIFF_CHAR_CAP}-char cap, treat as a full "
+                        f"rewrite]"
+                    )
+                else:
+                    diff_block = f"--- Diff vs v{prev_v} ---\n{diff_text}".rstrip()
+                body = (
+                    f"=== Artifact {name!r} updated to v{new_v} ===\n"
+                    f"{diff_block}\n\n"
+                    f"--- Full v{new_v} content ---\n"
+                    f"{content}\n"
+                    f"=== End artifact ==="
+                )
 
-        _conn().execute(
-            "INSERT INTO artifacts(thread_id, name, version, content, ts) "
-            "VALUES(?, ?, ?, ?, ?)",
-            (thread_id, name, new_v, content, time.time()),
-        )
-        # We're already inside _db_lock so the nested acquire inside
-        # _append_message is harmless (RLock allows re-entry). Calling
-        # _append_message keeps the next-idx logic in one place.
-        _append_message(thread_id, "orchestrator", body)
-    return {
-        "thread_id": thread_id,
-        "name": name,
-        "version": new_v,
-        "diff_omitted": diff_omitted,
-    }
+            try:
+                _conn().execute(
+                    "INSERT INTO artifacts(thread_id, name, version, content, ts) "
+                    "VALUES(?, ?, ?, ?, ?)",
+                    (thread_id, name, new_v, content, time.time()),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            # We're already inside _db_lock so the nested acquire inside
+            # _append_message is harmless (RLock allows re-entry). Calling
+            # _append_message keeps the next-idx logic in one place.
+            _append_message(thread_id, "orchestrator", body)
+            return {
+                "thread_id": thread_id,
+                "name": name,
+                "version": new_v,
+                "diff_omitted": diff_omitted,
+            }
+    raise RuntimeError(
+        f"could not allocate an artifact version for {name!r} on thread "
+        f"{thread_id} after {_IDX_COLLISION_RETRIES} attempts (cross-process "
+        f"contention)"
+    )
 
 
 def roundtable_get_artifact(

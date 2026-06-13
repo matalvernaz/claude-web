@@ -1137,6 +1137,10 @@ def _state_db() -> sqlite3.Connection:
         conn = sqlite3.connect(str(STATE_DB_PATH), check_same_thread=False, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # Wait out a WAL write-lock rather than erroring immediately. Single
+        # process today, but cheap insurance against checkpoint contention and
+        # any future second connection.
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("""CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
             owner_sub TEXT,

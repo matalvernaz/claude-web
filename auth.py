@@ -42,6 +42,15 @@ def _split_csv(value: str) -> set[str]:
 
 ALLOWED_EMAILS = _split_csv(os.getenv("OIDC_ALLOWED_EMAILS", ""))
 ALLOWED_GROUPS = _split_csv(os.getenv("OIDC_ALLOWED_GROUPS", ""))
+# When gating on the email allowlist, ignore an unverified email claim by
+# default — otherwise an IdP that allows self-service signup with an
+# unverified address lets an attacker claim an allowlisted email and get in.
+# Set OIDC_REQUIRE_VERIFIED_EMAIL=false only if your IdP omits the
+# email_verified claim entirely (and you trust it not to issue unverified
+# emails). Group-based allowlisting is unaffected.
+REQUIRE_VERIFIED_EMAIL = os.getenv(
+    "OIDC_REQUIRE_VERIFIED_EMAIL", "true",
+).strip().lower() not in ("false", "0", "no")
 # How to combine the two allowlists when both are set:
 #   "all" (default) — user must pass *every* configured list (fail-closed).
 #                     Pick this when each list is an independent dimension of
@@ -157,7 +166,11 @@ def _user_allowed(user: dict) -> bool:
         return True
     email_ok: Optional[bool] = None
     if ALLOWED_EMAILS:
-        email_ok = (user.get("email") or "").lower() in {
+        # An unverified email must never satisfy the allowlist (see
+        # REQUIRE_VERIFIED_EMAIL) — otherwise a self-service IdP signup
+        # claiming an allowlisted address would be admitted.
+        verified = (not REQUIRE_VERIFIED_EMAIL) or bool(user.get("email_verified"))
+        email_ok = verified and (user.get("email") or "").lower() in {
             e.lower() for e in ALLOWED_EMAILS
         }
     groups_ok: Optional[bool] = None
@@ -224,6 +237,7 @@ def install_routes(app) -> None:
         user = {
             "sub": userinfo.get("sub"),
             "email": userinfo.get("email"),
+            "email_verified": userinfo.get("email_verified"),
             "name": userinfo.get("name") or userinfo.get("preferred_username"),
             "groups": userinfo.get("groups") or [],
         }
