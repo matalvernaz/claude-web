@@ -87,6 +87,7 @@ for _fn in (
     core.roundtable_list,
     core.roundtable_close,
     core.roundtable_participants,
+    core.roundtable_usage,
 ):
     mcp.tool()(_fn)
 del _fn

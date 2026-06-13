@@ -402,6 +402,21 @@
         label.className = "asst-patch-target";
         label.textContent = patch.target;
         row.appendChild(label);
+        // Preview first (dry-run, no write): confirms which file the diff
+        // actually resolves to and that it applies cleanly, before Apply
+        // mutates anything.
+        const previewBtn = document.createElement("button");
+        previewBtn.type = "button";
+        previewBtn.className = "asst-preview-btn";
+        previewBtn.textContent = "Preview";
+        const status = document.createElement("span");
+        status.className = "asst-patch-status";
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        previewBtn.addEventListener("click", () =>
+          handlePreviewPatch(payload.thread_id, patch.target, patch.diff, previewBtn, status),
+        );
+        row.appendChild(previewBtn);
         const applyBtn = document.createElement("button");
         applyBtn.type = "button";
         applyBtn.className = "asst-apply-btn";
@@ -410,10 +425,6 @@
           handleApplyPatch(payload.thread_id, patch.target, patch.diff, applyBtn, row),
         );
         row.appendChild(applyBtn);
-        const status = document.createElement("span");
-        status.className = "asst-patch-status";
-        status.setAttribute("role", "status");
-        status.setAttribute("aria-live", "polite");
         row.appendChild(status);
         patchPanel.appendChild(row);
       }
@@ -476,6 +487,26 @@
       });
       audit.appendChild(a);
       article.appendChild(audit);
+    }
+  }
+
+  async function handlePreviewPatch(threadId, target, diff, btn, status) {
+    btn.disabled = true;
+    status.textContent = "Checking…";
+    announce(`Previewing patch for ${target}.`);
+    try {
+      const result = await jsonFetch("/api/roundtable/assistant/preview", {
+        method: "POST",
+        body: { thread_id: threadId, target, diff },
+      });
+      const msg = `Applies cleanly to ${result.target} (strip -p${result.strip_level}).`;
+      status.textContent = msg;
+      announce(msg);
+    } catch (err) {
+      status.textContent = `Preview: ${err.message}`;
+      announce(`Preview failed: ${err.message}`);
+    } finally {
+      btn.disabled = false;
     }
   }
 
