@@ -2341,7 +2341,7 @@ class _RepoTools:
         out: list[str] = []
         for f in files:
             try:
-                rp = f.relative_to(self.root)
+                rp = f.relative_to(self.root).as_posix()  # '/' on every host; see _glob
                 with f.open(encoding="utf-8", errors="replace") as fh:
                     for n, line in enumerate(fh, 1):
                         if rx.search(line):
@@ -2357,8 +2357,10 @@ class _RepoTools:
         if not pattern:
             return "[glob: empty pattern]"
         try:
+            # as_posix() so repo-relative paths shown to the LLM use '/' on
+            # every host; str() would emit backslashes on Windows.
             hits = sorted(
-                str(p.relative_to(self.root))
+                p.relative_to(self.root).as_posix()
                 for p in self.root.glob(pattern) if p.is_file()
             )
         except (ValueError, OSError) as exc:
