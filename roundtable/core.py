@@ -163,11 +163,6 @@ PARTICIPANTS: dict[str, dict] = {
         "model": "claude-opus-4-8",
         "label": "Claude Opus",
     },
-    "claude-fable": {
-        "provider": "anthropic",
-        "model": "claude-fable-5",
-        "label": "Claude Fable",
-    },
 }
 
 

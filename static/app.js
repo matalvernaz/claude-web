@@ -417,7 +417,7 @@
 
   // Hide the effort picker when the selected model has no effort knob and
   // return whether it's usable right now. The stored pick survives a hide
-  // (localStorage), so Opus 4.8 → Fable 5 → Opus 4.8 round-trips keep the
+  // (localStorage), so Opus 4.8 → Sonnet 4.6 → Opus 4.8 round-trips keep the
   // level; the send path re-checks support so a hidden pick is never sent.
   function effortSupported() {
     const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
