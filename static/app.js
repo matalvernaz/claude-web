@@ -1474,10 +1474,10 @@
         fd.append("personality_id", personalitySelect.value);
       }
       for (const img of entry.images) {
-        fd.append("images", img.file, img.file.name);
+        fd.append("images", img.file, sendName(img.file));
       }
       for (const f of (entry.files || [])) {
-        fd.append("files", f.file, f.file.name);
+        fd.append("files", f.file, sendName(f.file));
       }
       const r = await fetch(
         `/api/chat/send/${encodeURIComponent(currentRunId)}`,
@@ -1606,10 +1606,10 @@
         fd.append("personality_id", personalitySelect.value);
       }
       for (const img of entry.images) {
-        fd.append("images", img.file, img.file.name);
+        fd.append("images", img.file, sendName(img.file));
       }
       for (const f of (entry.files || [])) {
-        fd.append("files", f.file, f.file.name);
+        fd.append("files", f.file, sendName(f.file));
       }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: myAbort.signal });
       if (!r.ok) {
@@ -3862,6 +3862,22 @@
 
   function attachmentSignature(file) {
     return `${file.name}:${file.size}:${file.lastModified || 0}:${file.type || ""}`;
+  }
+
+  // A File from the clipboard or some drag sources can have an empty .name.
+  // Appended as-is, its multipart part carries filename="" and the server
+  // decodes it as a string, not a file — which 422s the whole request
+  // (message and valid files included). Always put a non-empty filename on
+  // the wire; derive a sensible extension from the MIME type when we can.
+  function sendName(file) {
+    if (file && file.name) return file.name;
+    const t = ((file && file.type) || "").toLowerCase();
+    const ext = t.startsWith("text/") ? ".txt"
+      : t === "application/json" ? ".json"
+      : t === "application/pdf" ? ".pdf"
+      : t.startsWith("image/") ? "." + t.slice(6).split(/[;+]/)[0]
+      : "";
+    return "attachment" + ext;
   }
 
   function renderAttachments() {

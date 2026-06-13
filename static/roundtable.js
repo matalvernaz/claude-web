@@ -982,7 +982,9 @@
     if (overrideWebSearch && overrideWebSearch.checked) {
       formData.append("web_search", "true");
     }
-    for (const f of asstFile.files || []) formData.append("files", f);
+    // A nameless File (filename="") is decoded server-side as a string, not
+    // a file; guarantee a name so the upload isn't silently dropped.
+    for (const f of asstFile.files || []) formData.append("files", f, f.name || "attachment");
 
     asstSubmit.disabled = true;
     asstStatus.textContent = "Asking the panel…";

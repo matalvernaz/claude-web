@@ -57,7 +57,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -6588,6 +6588,24 @@ def _safe_filename(name: str) -> str:
     return cleaned[:120]
 
 
+def _form_uploads(form, field: str) -> list[UploadFile]:
+    """Real file parts (UploadFile with a filename) for ``field`` in ``form``.
+
+    A multipart part sent without a filename is parsed by Starlette as a
+    plain string. Declaring the param as ``list[UploadFile]`` then makes
+    FastAPI reject the ENTIRE request with 422 "Expected UploadFile,
+    received str" — so one nameless attachment sinks the whole turn, the
+    user's message and every valid file along with it. Pulling uploads from
+    the already-parsed form and keeping only real, named files lets a bogus
+    part be skipped instead of fataling the request.
+    """
+    out: list[UploadFile] = []
+    for value in form.getlist(field):
+        if isinstance(value, UploadFile) and value.filename:
+            out.append(value)
+    return out
+
+
 async def _save_uploaded_files(files: list[UploadFile], run_id: str) -> list[dict]:
     """Persist non-image attachments under uploads/<run_id>/ and return metadata.
 
@@ -6736,8 +6754,6 @@ async def api_chat(
     effort: str = Form(default=""),
     fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
-    images: list[UploadFile] = File(default_factory=list),
-    files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -6767,6 +6783,14 @@ async def api_chat(
             f"Split into multiple turns or attach as a file.",
         )
     _gc_runs()
+
+    # Uploads are read from the parsed form rather than declared as
+    # list[UploadFile] params: a nameless part (which Starlette decodes as a
+    # string) is then skipped here instead of 422-ing the whole request
+    # before the handler ever runs. See _form_uploads.
+    form = await request.form()
+    images = _form_uploads(form, "images")
+    files = _form_uploads(form, "files")
 
     # Validate any provided session_id: it ends up as `resume=<id>` on the
     # bundled CLI subprocess and as part of dict keys and audit logs. A
@@ -7905,11 +7929,10 @@ async def api_chat(
 
 @app.post("/api/chat/send/{run_id}")
 async def api_chat_send(
+    request: Request,
     run_id: str,
     message: str = Form(...),
     personality_id: Optional[int] = Form(default=None),
-    images: list[UploadFile] = File(default_factory=list),
-    files: list[UploadFile] = File(default_factory=list),
     user: dict = Depends(auth.require_user),
 ):
     """Inject a user message into an already-running long-lived run.
@@ -7973,6 +7996,9 @@ async def api_chat_send(
         return JSONResponse(
             {"ok": False, "error": "account_changed"}, status_code=409,
         )
+    form = await request.form()
+    images = _form_uploads(form, "images")
+    files = _form_uploads(form, "files")
     image_blocks, _meta = await _read_uploaded_images(images)
     file_metas = await _save_uploaded_files(files, run_id)
     effective = _file_attachment_prefix(file_metas) + message
@@ -10015,7 +10041,6 @@ async def api_roundtable_assistant(
     effort: str = Form("medium"),
     synthesizer: str = Form(""),
     web_search: bool = Form(False),
-    files: list[UploadFile] = File(default=[]),
     user: dict = Depends(auth.require_user),
 ):
     """Stream the 'ask the panel' flow as Server-Sent Events.
@@ -10089,6 +10114,7 @@ async def api_roundtable_assistant(
     # we do the validation here and stash the decoded content for the
     # generator to commit at the appropriate event.
     pending_artifacts: list[tuple[str, str, int]] = []  # (name, content, bytes)
+    files = _form_uploads(await request.form(), "files")
     for upload in files or []:
         if not upload or not upload.filename:
             continue
