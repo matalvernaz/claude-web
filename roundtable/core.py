@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -577,6 +578,7 @@ def _trim_messages_to_cap(
 def _build_system_prompt(
     thread: dict, participant_label: str, all_participants: list[str],
     web_search: bool = False, tools_enabled: bool = False,
+    readonly_tools: bool = False,
 ) -> str:
     """The system prompt orients the participant: who they are, who the
     other participants are, what the topic is, and what behaviour is
@@ -618,6 +620,17 @@ def _build_system_prompt(
         "refuse on 'I have no live web access' grounds; that is no longer "
         "true." if web_search else ""
     )
+    readonly_tools_clause = (
+        " You have read-only tools for this turn — Read, Grep, and Glob — "
+        "scoped to the project this thread is bound to. Every call is gated by "
+        "a user-approval prompt in the browser, so use them deliberately (one "
+        "Grep to find the right file beats ten exploratory Reads). If other "
+        "panellists make claims the code contradicts, verify against the "
+        "source and correct them with file:line references — that's the point "
+        "of having tools. You cannot modify files; if a change is warranted, "
+        "propose it as a unified diff in your reply."
+        if (tools_enabled and readonly_tools) else ""
+    )
     tools_clause = (
         " You have the full Claude Code tool set wired up for this turn — "
         "Read, Grep, Glob, Bash, Edit, Write, plus whatever MCP servers and "
@@ -633,7 +646,7 @@ def _build_system_prompt(
         "assistant: avoid taking destructive actions unprompted; if a "
         "concrete change is warranted, propose it (and the unified diff) in "
         "your reply rather than running Edit / Write / git on your own."
-        if tools_enabled else ""
+        if (tools_enabled and not readonly_tools) else ""
     )
     base = (
         f"You are {participant_label}, participating in a multi-AI roundtable. "
@@ -647,7 +660,7 @@ def _build_system_prompt(
         f"any other participant. Address other participants by name when you "
         f"want to agree, disagree, or build on their points. Be concrete and "
         f"substantive; this is a working session, not a status meeting."
-        f"{web_clause}{tools_clause}"
+        f"{web_clause}{tools_clause}{readonly_tools_clause}"
     )
     house_rules = (thread.get("house_rules") or "").strip()
     if house_rules:
@@ -2172,6 +2185,304 @@ def _normalise_effort(effort: Optional[str]) -> Optional[str]:
     return effort
 
 
+# ─── Layer 2: read-only repo tools for Gemini / OpenAI participants ───────
+#
+# Anthropic participants get filesystem tools for free (the bundled Claude
+# CLI / agent SDK). Gemini and OpenAI don't, so on a repo-bound thread they
+# debate blind. This gives them a permission-gated, read-only,
+# working-directory-jailed Read/Grep/Glob toolset via each provider's
+# function-calling loop. Every call routes through the same
+# ToolUseContext.permission_callback the Anthropic path uses, so the webapp's
+# approval card and the readonly/deny policies work identically. Gated by
+# CLAUDE_ROUNDTABLE_PANEL_TOOLS (default off) AND requires a bound
+# working_directory — never grants ambient filesystem access.
+
+PANEL_TOOLS_ENABLED = os.environ.get(
+    "CLAUDE_ROUNDTABLE_PANEL_TOOLS", "",
+).strip().lower() in ("1", "true", "yes")
+
+_TOOL_READ_MAX_BYTES = 64 * 1024
+_TOOL_GREP_MAX_MATCHES = 200
+_TOOL_GLOB_MAX_RESULTS = 200
+# Hard cap on tool-call rounds, independent of ToolUseContext.max_turns, so a
+# provider stuck in a tool-call loop can't burn unbounded tokens/quota.
+_PANEL_TOOL_MAX_ROUNDS = 12
+
+# Provider-neutral declarations. Tool names match the Anthropic convention
+# ("Read"/"Grep"/"Glob") so _readonly_permission_callback and the webapp
+# permission UI treat panel tool calls exactly like Claude's.
+_PANEL_TOOL_DECLS = [
+    {
+        "name": "Read",
+        "description": "Read a UTF-8 text file from the bound repository. "
+                       "Returns the file contents (truncated if very large).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Repo-relative file path."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "Grep",
+        "description": "Search the bound repository for a regular expression. "
+                       "Returns matching lines prefixed with file:line.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Python regular expression."},
+                "path": {"type": "string", "description": "Optional repo-relative file or dir to limit the search."},
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "Glob",
+        "description": "List repo-relative paths matching a glob (e.g. '**/*.py').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern, repo-relative."},
+            },
+            "required": ["pattern"],
+        },
+    },
+]
+
+
+class _RepoTools:
+    """Permission-gated, read-only, working-directory-jailed tool executor.
+
+    One instance per turn. ``execute(name, args)`` runs a single tool call:
+    it asks the permission callback, resolves+jails the path under the
+    working directory (``resolve()`` collapses symlinks, so an escaping
+    symlink fails the ``relative_to`` check), and returns a STRING result
+    suitable for feeding back to the model. Never raises for a denied/invalid
+    call — returns an explanatory string so the model can adapt.
+    """
+
+    def __init__(self, root: Path, permission_callback: PermissionCallback, label: str):
+        self.root = root.resolve()
+        self.permission_callback = permission_callback
+        self.label = label
+
+    def _resolve(self, rel: str) -> Optional[Path]:
+        if rel is None:
+            return None
+        try:
+            p = (self.root / rel).resolve()
+            p.relative_to(self.root)
+        except (ValueError, OSError):
+            return None
+        return p
+
+    def execute(self, name: str, args: dict) -> str:
+        args = args if isinstance(args, dict) else {}
+        try:
+            decision = (self.permission_callback(self.label, name, args) or "deny").strip().lower()
+        except Exception as exc:  # noqa: BLE001 — callback fault → deny
+            logger.warning("panel-tools permission callback raised %s: %s (deny)",
+                           type(exc).__name__, exc)
+            decision = "deny"
+        if decision not in ("allow", "allow_session"):
+            return f"[permission denied for {name}]"
+        try:
+            if name == "Read":
+                return self._read(args.get("path"))
+            if name == "Grep":
+                return self._grep(args.get("pattern"), args.get("path"))
+            if name == "Glob":
+                return self._glob(args.get("pattern"))
+        except Exception as exc:  # noqa: BLE001 — tool fault → message, not crash
+            return f"[{name} error: {type(exc).__name__}: {exc}]"
+        return f"[unknown tool {name!r}]"
+
+    def _read(self, rel: str) -> str:
+        p = self._resolve(rel)
+        if p is None or not p.is_file():
+            return f"[no such file: {rel}]"
+        data = p.read_bytes()[: _TOOL_READ_MAX_BYTES + 1]
+        text = data.decode("utf-8", errors="replace")
+        if len(text) > _TOOL_READ_MAX_BYTES:
+            text = text[:_TOOL_READ_MAX_BYTES] + "\n[… truncated]"
+        return text
+
+    def _grep(self, pattern: str, rel: Optional[str]) -> str:
+        if not pattern:
+            return "[grep: empty pattern]"
+        try:
+            rx = re.compile(pattern)
+        except re.error as exc:
+            return f"[grep: bad regex: {exc}]"
+        base = self._resolve(rel) if rel else self.root
+        if base is None:
+            return f"[grep: path outside repo: {rel}]"
+        files = [base] if base.is_file() else [
+            f for f in base.rglob("*") if f.is_file()
+        ]
+        out: list[str] = []
+        for f in files:
+            try:
+                rp = f.relative_to(self.root)
+                with f.open(encoding="utf-8", errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        if rx.search(line):
+                            out.append(f"{rp}:{n}:{line.rstrip()[:300]}")
+                            if len(out) >= _TOOL_GREP_MAX_MATCHES:
+                                out.append("[… more matches truncated]")
+                                return "\n".join(out)
+            except (OSError, ValueError):
+                continue
+        return "\n".join(out) if out else "[no matches]"
+
+    def _glob(self, pattern: str) -> str:
+        if not pattern:
+            return "[glob: empty pattern]"
+        try:
+            hits = sorted(
+                str(p.relative_to(self.root))
+                for p in self.root.glob(pattern) if p.is_file()
+            )
+        except (ValueError, OSError) as exc:
+            return f"[glob error: {exc}]"
+        if not hits:
+            return "[no matches]"
+        if len(hits) > _TOOL_GLOB_MAX_RESULTS:
+            hits = hits[:_TOOL_GLOB_MAX_RESULTS] + ["[… more truncated]"]
+        return "\n".join(hits)
+
+
+def _call_gemini_with_tools(
+    model: str, system_prompt: str, transcript: str, instruction: str,
+    effort: Optional[str], web_search: bool,
+    tools: _RepoTools,
+) -> ProviderResult:
+    """Gemini participant turn with a manual (permission-gated) function-calling
+    loop over the read-only repo tools. Automatic function calling is disabled
+    so every call goes through ``tools.execute`` (and thus the permission gate).
+    """
+    decls = [
+        genai_types.FunctionDeclaration(
+            name=d["name"], description=d["description"], parameters=d["parameters"],
+        )
+        for d in _PANEL_TOOL_DECLS
+    ]
+    tool_list = [genai_types.Tool(function_declarations=decls)]
+    if web_search:
+        tool_list.append(genai_types.Tool(google_search=genai_types.GoogleSearch()))
+    config: dict = {
+        "system_instruction": system_prompt,
+        "tools": tool_list,
+        # Manual loop — never let the SDK auto-execute (it'd bypass the gate).
+        "automatic_function_calling": genai_types.AutomaticFunctionCallingConfig(
+            disable=True,
+        ),
+        "http_options": genai_types.HttpOptions(timeout=int(PROVIDER_TIMEOUT_SEC * 1000)),
+    }
+    if effort and _gemini_uses_thinking_level(model):
+        config["thinking_config"] = genai_types.ThinkingConfig(thinking_level=effort)
+    elif effort in _GEMINI_BUDGETS:
+        config["thinking_config"] = genai_types.ThinkingConfig(
+            thinking_budget=_GEMINI_BUDGETS[effort],
+        )
+
+    user_text = transcript + (f"\n\n[orchestrator]:\n{instruction}" if instruction else "")
+    contents = [genai_types.Content(role="user", parts=[genai_types.Part(text=user_text)])]
+
+    def _do_call() -> ProviderResult:
+        last = None
+        for _round in range(_PANEL_TOOL_MAX_ROUNDS):
+            resp = _gemini.models.generate_content(
+                model=model, contents=contents, config=config,
+            )
+            last = resp
+            cand = (resp.candidates or [None])[0]
+            parts = getattr(getattr(cand, "content", None), "parts", None) or []
+            calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
+            if not calls:
+                break
+            # Echo the model's function-call turn, then answer each call.
+            contents.append(genai_types.Content(role="model", parts=parts))
+            resp_parts = []
+            for fc in calls:
+                result = tools.execute(fc.name, dict(fc.args or {}))
+                resp_parts.append(genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        name=fc.name, response={"result": result},
+                    ),
+                ))
+            contents.append(genai_types.Content(role="user", parts=resp_parts))
+        text = getattr(last, "text", None) or ""
+        return ProviderResult(
+            text=text, usage=_extract_usage("gemini", last) if last else None, raw=last,
+        )
+
+    return _call_with_wall_cap(f"gemini-tools/{model}", _do_call)
+
+
+def _call_openai_with_tools(
+    model: str, system_prompt: str, transcript: str, instruction: str,
+    effort: Optional[str], web_search: bool,
+    tools: _RepoTools,
+) -> ProviderResult:
+    """OpenAI participant turn with a manual function-calling loop over the
+    read-only repo tools, via the Responses API. Every function call routes
+    through ``tools.execute`` (permission-gated)."""
+    tool_specs = [
+        {
+            "type": "function", "name": d["name"], "description": d["description"],
+            "parameters": d["parameters"],
+        }
+        for d in _PANEL_TOOL_DECLS
+    ]
+    if web_search:
+        tool_specs.append({"type": "web_search"})
+    user_text = transcript + (f"\n\n[orchestrator]:\n{instruction}" if instruction else "")
+    input_items: list = [{"role": "user", "content": user_text}]
+    base_kwargs: dict = {
+        "model": model,
+        "instructions": system_prompt,
+        "tools": tool_specs,
+        "timeout": PROVIDER_TIMEOUT_SEC,
+    }
+    if effort:
+        base_kwargs["reasoning"] = {"effort": effort}
+
+    def _do_call() -> ProviderResult:
+        last = None
+        for _round in range(_PANEL_TOOL_MAX_ROUNDS):
+            resp = _openai.responses.create(input=input_items, **base_kwargs)
+            last = resp
+            fn_calls = [
+                item for item in (getattr(resp, "output", None) or [])
+                if getattr(item, "type", None) == "function_call"
+            ]
+            if not fn_calls:
+                break
+            # Carry the model's reasoning/function-call items forward, then
+            # append each function_call_output keyed by call_id. Mutate in
+            # place (not +=) so input_items stays the closure variable.
+            input_items.extend(getattr(resp, "output", []) or [])
+            for call in fn_calls:
+                try:
+                    args = json.loads(getattr(call, "arguments", "") or "{}")
+                except ValueError:
+                    args = {}
+                result = tools.execute(getattr(call, "name", ""), args)
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": getattr(call, "call_id", None),
+                    "output": result,
+                })
+        text = (getattr(last, "output_text", None) or "") if last else ""
+        return ProviderResult(
+            text=text, usage=_extract_usage("openai", last) if last else None, raw=last,
+        )
+
+    return _call_with_wall_cap(f"openai-tools/{model}", _do_call)
+
+
 def _run_turn(
     thread: dict, info: dict, messages: list[dict], instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
@@ -2193,16 +2504,38 @@ def _run_turn(
         messages, PROMPT_CHAR_CAP, for_participant_label=info["label"],
     )
     transcript = _format_transcript(trimmed, for_participant_label=info["label"])
+    provider = info["provider"]
+    have_repo = (
+        tool_use_context is not None
+        and tool_use_context.working_directory is not None
+    )
+    # Layer 2: read-only repo tools for Gemini/OpenAI on a bound thread, gated
+    # by the env flag. Tool-use turns are not streamed (the text arrives
+    # interleaved with tool calls), so on_delta is ignored on this path.
+    panel_tools = (
+        have_repo and PANEL_TOOLS_ENABLED and provider in ("gemini", "openai")
+    )
     system_prompt = _build_system_prompt(
         thread, info["label"], thread.get("participants") or [],
         web_search=web_search,
-        tools_enabled=(
-            tool_use_context is not None
-            and tool_use_context.working_directory is not None
-            and info["provider"] == "anthropic"
-        ),
+        tools_enabled=have_repo and (provider == "anthropic" or panel_tools),
+        readonly_tools=panel_tools,
     )
-    provider = info["provider"]
+    if panel_tools:
+        repo_tools = _RepoTools(
+            Path(tool_use_context.working_directory),
+            tool_use_context.permission_callback,
+            info["label"],
+        )
+        if provider == "gemini":
+            return _call_gemini_with_tools(
+                info["model"], system_prompt, transcript, instruction,
+                effort, web_search, repo_tools,
+            )
+        return _call_openai_with_tools(
+            info["model"], system_prompt, transcript, instruction,
+            effort, web_search, repo_tools,
+        )
     if provider == "gemini":
         return _call_gemini(
             info["model"], system_prompt, transcript, instruction,
