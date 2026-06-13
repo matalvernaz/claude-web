@@ -95,6 +95,7 @@ del _fn
 def main() -> None:
     """Entry point used by ``server.py`` and ``python -m``."""
     logging.basicConfig(level=logging.INFO)
+    core.ensure_routable()  # refuse to start the stdio server with nothing to route to
     from importlib.metadata import PackageNotFoundError, version
 
     def _v(pkg: str) -> str:

@@ -152,7 +152,21 @@ _configure_app_logging()
 # created via MCP are immediately visible here and vice versa.
 try:
     from roundtable import core as roundtable_core  # type: ignore
-    ROUNDTABLE_AVAILABLE = True
+    # Importing the package no longer implies it's usable: the credential guard
+    # moved out of import, so the module imports cleanly even with no provider
+    # keys. Evaluate routability here, at startup, and treat "installed but no
+    # provider" the same as "not installed" (nav hides, routes 503) by
+    # collapsing both to roundtable_core=None.
+    if roundtable_core.providers_configured():
+        ROUNDTABLE_AVAILABLE = True
+    else:
+        log.info(
+            "roundtable installed but no provider configured (set "
+            "GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY or a "
+            "claude/claude-ha binary); /roundtable disabled"
+        )
+        roundtable_core = None  # type: ignore[assignment]
+        ROUNDTABLE_AVAILABLE = False
 except Exception as _rt_exc:  # pragma: no cover — optional dependency
     roundtable_core = None  # type: ignore[assignment]
     ROUNDTABLE_AVAILABLE = False

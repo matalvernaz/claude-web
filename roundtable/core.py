@@ -100,15 +100,32 @@ if _ANTHROPIC_TRANSPORT not in {"auto", "cli", "api"}:
 _warned_auto_api_fallback = False
 
 # At least one viable Anthropic path OR another provider must be set, or
-# the server has nothing to route to.
+# there's nothing to route to. This is a runtime/startup concern, not an
+# import-time one — importing this module stays side-effect-free so the webapp
+# can import it to introspect PARTICIPANTS and run the deterministic repo-tool
+# tests on a host with no provider credentials. Callers gate explicitly:
+# providers_configured() (webapp degrades the route to 503) or ensure_routable()
+# (the MCP stdio server refuses to start).
 _anthropic_available = bool(_anthropic_key) or _CLAUDE_CLI is not None
-if not (_gemini_key or _openai_key or _anthropic_available):
-    raise RuntimeError(
-        "Need at least one of: GEMINI_API_KEY, OPENAI_API_KEY, "
-        "ANTHROPIC_API_KEY, or a 'claude'/'claude-ha' binary on PATH "
-        "(for the subscription-auth transport). Server has nothing to "
-        "route to without one of these."
-    )
+
+
+def providers_configured() -> bool:
+    """True if at least one provider is routable: a Gemini/OpenAI/Anthropic API
+    key, or a ``claude``/``claude-ha`` binary on PATH for the subscription
+    transport."""
+    return bool(_gemini_key or _openai_key or _anthropic_available)
+
+
+def ensure_routable() -> None:
+    """Raise unless at least one provider is configured. For entrypoints that
+    should refuse to start with nothing to route to."""
+    if not providers_configured():
+        raise RuntimeError(
+            "Need at least one of: GEMINI_API_KEY, OPENAI_API_KEY, "
+            "ANTHROPIC_API_KEY, or a 'claude'/'claude-ha' binary on PATH "
+            "(for the subscription-auth transport). Nothing to route to "
+            "without one of these."
+        )
 
 # max_retries=0: retry policy lives in _provider_call. The SDKs' internal
 # retries (OpenAI and Anthropic both default to 2) stack multiplicatively
