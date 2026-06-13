@@ -172,10 +172,11 @@
     }
     assistantThreadId = threadId;
     // Clear any prior assistant history before redrawing — we're now
-    // showing a different conversation.
-    while (asstHistory.firstChild !== asstEmpty) {
-      asstHistory.removeChild(asstHistory.firstChild);
-    }
+    // showing a different conversation. Remove only turn <article>s: the
+    // turns are appended AFTER #assistant-empty, while the section's sr-only
+    // <h2> sits before it, so the old "remove until asstEmpty" loop deleted
+    // the heading (breaking aria-labelledby + H-nav) and left every turn.
+    asstHistory.querySelectorAll(".asst-turn").forEach((el) => el.remove());
     asstEmpty.hidden = true;
 
     const messages = payload.messages || [];
@@ -239,9 +240,7 @@
   // ── Assistant flow ──────────────────────────────────────────────
   newConvBtn.addEventListener("click", () => {
     assistantThreadId = null;
-    while (asstHistory.firstChild !== asstEmpty) {
-      asstHistory.removeChild(asstHistory.firstChild);
-    }
+    asstHistory.querySelectorAll(".asst-turn").forEach((el) => el.remove());
     asstEmpty.hidden = false;
     asstInput.value = "";
     asstFile.value = "";
@@ -299,6 +298,18 @@
   // global from the script tags in the template. If either is missing
   // (e.g. CDN cached fail), fall back to plain pre-rendered text so
   // we never insert unsanitized markup.
+  // Open synthesis links in a new tab with a hardened rel, so a click doesn't
+  // replace the page mid-panel-run (app.js's identical hook isn't loaded here).
+  // Registered once; addHook accumulates, so it must not run per-render.
+  if (window.DOMPurify && typeof window.DOMPurify.addHook === "function") {
+    window.DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+      if (node.tagName === "A" && node.getAttribute("href")) {
+        node.setAttribute("target", "_blank");
+        node.setAttribute("rel", "noopener noreferrer");
+      }
+    });
+  }
+
   function renderMarkdown(text) {
     if (typeof window.marked === "undefined" || typeof window.DOMPurify === "undefined") {
       const pre = document.createElement("pre");
@@ -309,7 +320,11 @@
     const wrapper = document.createElement("div");
     wrapper.className = "asst-turn-body asst-turn-md";
     const html = window.marked.parse(text || "", { breaks: true, gfm: true });
-    wrapper.innerHTML = window.DOMPurify.sanitize(html);
+    // Strip interactive form controls — synthesis echoes model output that
+    // could otherwise forge a fake permission/login control (see app.js).
+    wrapper.innerHTML = window.DOMPurify.sanitize(html, {
+      FORBID_TAGS: ["form", "input", "button", "select", "textarea", "option"],
+    });
     return wrapper;
   }
 
@@ -496,8 +511,9 @@
   function renderRoundtablePermissionCard(req, hostArticle, progress) {
     const card = document.createElement("article");
     card.className = "rt-permission";
-    card.setAttribute("role", "alertdialog");
-    card.setAttribute("aria-modal", "false");
+    // role="group", not alertdialog — inline article, not a modal dialog.
+    // Urgency comes from announce()/earcon; labelling via the ids below.
+    card.setAttribute("role", "group");
     if (req.id) card.dataset.requestId = req.id;
     card.dataset.state = "pending";
 
@@ -988,6 +1004,12 @@
 
     if (!state.doneSeen) {
       progress.textContent = progress.textContent || "Stream ended before completion.";
+      // #progress isn't a live region, so a transport-level death (rejoin
+      // budget exhausted, fetch threw) was silent — the user heard "Asking the
+      // panel…" and then nothing. The 'error' SSE event announces itself; this
+      // covers the case where the stream just dies without one.
+      announce("The panel run ended before completion. Try asking again.");
+      asstSubmit.disabled = false;
     }
   });
 

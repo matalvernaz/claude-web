@@ -89,6 +89,9 @@
   const messageQueue = [];
   const MAX_QUEUE_LENGTH = 10;
   let isStreaming = false;
+  // Guards drainQueueIfPossible against re-entry while its fallback awaits a
+  // full sendOne (see drainQueueIfPossible).
+  let queueDraining = false;
   const queueArea = document.getElementById("queue-area");
 
   // Stream stall watchdog. Two clocks:
@@ -486,13 +489,11 @@
           throw new Error(detail);
         }
         lastAccount = target;
-        if (announcer) {
-          const label = accountSelect.options[accountSelect.selectedIndex]?.text || target;
-          announcer.textContent = `Account switched to ${label}. Takes effect on your next message.`;
-        }
+        const label = accountSelect.options[accountSelect.selectedIndex]?.text || target;
+        announce(`Account switched to ${label}. Takes effect on your next message.`);
       } catch (err) {
         accountSelect.value = lastAccount;
-        if (announcer) announcer.textContent = `Could not switch account: ${err.message}`;
+        announce(`Could not switch account: ${err.message}`);
       }
     });
   }
@@ -554,23 +555,19 @@
           // starts a fresh chat in the new voice with no resumed
           // history fighting the persona.
           newChatBtn.click();
-          if (announcer) {
-            announcer.textContent = `Personality switched to ${label}. Started a fresh chat in the new voice.`;
-          }
+          announce(`Personality switched to ${label}. Started a fresh chat in the new voice.`);
         } else if (hasLiveChat && applyMode) {
           // Opt-in mid-conversation apply: the existing session keeps
           // its session_id, the next /api/chat send carries the new
           // personality_id which the server compares to the run's and
           // respawns the CLI under the new persona.
-          if (announcer) {
-            announcer.textContent = `Personality switched to ${label}. Applied to current chat — voice may carry over from prior turns.`;
-          }
-        } else if (announcer) {
-          announcer.textContent = `Personality switched to ${label}. Takes effect on your next message.`;
+          announce(`Personality switched to ${label}. Applied to current chat — voice may carry over from prior turns.`);
+        } else {
+          announce(`Personality switched to ${label}. Takes effect on your next message.`);
         }
       } catch (err) {
         personalitySelect.value = lastPersonality;
-        if (announcer) announcer.textContent = `Could not switch personality: ${err.message}`;
+        announce(`Could not switch personality: ${err.message}`);
       }
     });
   }
@@ -600,6 +597,7 @@
         await loadSession(sessionId, sessionProject);
       } catch (err) {
         setStatus("Could not load session: " + err.message);
+        announce("Could not load the session: " + err.message);
       }
       markActive(sessionId);
     }
@@ -694,8 +692,9 @@
     safeSet(localStorage, SIDEBAR_KEY, willCollapse ? "1" : "0");
   });
 
-  // Enter to send, Shift+Enter for newline. Skip when the Send button is
-  // disabled so we don't fire a second /api/chat over a still-streaming one.
+  // Enter to send, Shift+Enter for newline. A submit while a turn is still
+  // streaming is absorbed by the queue path in the form handler (it doesn't
+  // open a second /api/chat), so Enter doesn't gate on Send being disabled.
   // When the slash menu is open, Up/Down/Enter/Tab navigate it.
   promptEl.addEventListener("keydown", (e) => {
     if (slashMenu && !slashMenu.hidden && slashItems.length) {
@@ -859,7 +858,14 @@
       window.DOMPurify &&
       typeof window.DOMPurify.sanitize === "function"
     ) {
-      return window.DOMPurify.sanitize(window.marked.parse(text || ""));
+      // Strip interactive form controls: assistant output echoes web pages,
+      // so without this a prompt-injected page could render a counterfeit
+      // "Allow/Deny" button or login field indistinguishable from real UI —
+      // especially convincing to a screen-reader user. No legitimate
+      // assistant markdown needs form elements.
+      return window.DOMPurify.sanitize(window.marked.parse(text || ""), {
+        FORBID_TAGS: ["form", "input", "button", "select", "textarea", "option"],
+      });
     }
     const div = document.createElement("div");
     div.textContent = text || "";
@@ -1262,8 +1268,12 @@
     stallWatchdogHandle = setInterval(() => {
       if (!streamLooksStalled()) return;
       stopStallWatchdog();
-      announce("Stream looks stalled. Cancelling.");
+      announce("Stream looks stalled — send a new message to start a fresh run.");
       setStatus("Stream looks stalled — send a new message to start a fresh run.");
+      // Bump the generation before aborting so the in-flight sendOne's
+      // AbortError catch stays silent instead of overwriting the stall
+      // guidance above with "Stopped." (announce() cancels the pending timer).
+      streamGeneration++;
       if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
       currentAbort = null;
       currentRunId = null;
@@ -1535,6 +1545,13 @@
 
   async function drainQueueIfPossible() {
     if (!messageQueue.length || !currentRunId || isStreaming) return;
+    // Re-entrancy guard: sendInExistingRun's fallback path awaits a full
+    // sendOne (a fresh run that streams to completion). That run's `result`
+    // event calls drainQueueIfPossible again while we're still parked here
+    // with the entry un-shifted — without this guard the same message gets
+    // sent twice (dangerous when it's an instruction like "yes, delete it").
+    if (queueDraining) return;
+    queueDraining = true;
     // Peek-then-shift: leave the entry in the queue until the server has
     // acknowledged it, so a network blip doesn't silently drop the message
     // (and any attachments). The next drainQueueIfPossible call will retry
@@ -1548,6 +1565,8 @@
     } catch (err) {
       handleStreamError(err);
       ok = false;
+    } finally {
+      queueDraining = false;
     }
     if (ok && messageQueue[0] === entry) {
       messageQueue.shift();
@@ -1836,6 +1855,13 @@
     const info = await r.json();
     if (!info.active && !info.buffered_events) {
       safeRemove(sessionStorage, RUN_KEY);
+      return false;
+    }
+    // If the URL explicitly names a different session than the active run's,
+    // the user navigated there deliberately (clicked the sidebar mid-run).
+    // Honor that instead of silently resuming — and re-rewriting the URL to —
+    // the old run. The old run stays alive and resumable from its own session.
+    if (sessionId && info.session_id && info.session_id !== sessionId) {
       return false;
     }
     if (info.project) sessionProject = info.project;
@@ -2155,6 +2181,12 @@
         announce("Stream backlog overflowed; reconnecting from start.");
         const rid = currentRunId;
         renderedIdxByRun.delete(rid);
+        // Bump the generation BEFORE aborting so the abort rejection in the
+        // in-flight sendOne sees gen !== streamGeneration and stays silent —
+        // otherwise its catch runs announce("Stopped.") which cancels the
+        // "reconnecting" announcement queued just above (announce() clears any
+        // pending timer). rejoinAfterFreeze does the same for the same reason.
+        streamGeneration++;
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
@@ -2331,7 +2363,7 @@
         const detail = lines.join("\n");
         const summary = obj.result || obj.subtype || "see technical details";
         setStatus("Error: " + summary);
-        renderErrorBlock(detail, { summary });
+        renderErrorBlock(detail, { summary, announce: false });
         announce("Error: " + (obj.result || ""));
       }
     } else if (obj.type === "error") {
@@ -2345,7 +2377,7 @@
       const summary = obj.message || obj.exit_code || "see technical details";
       const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : null;
       setStatus("Error: " + summary);
-      renderErrorBlock(detail ? String(detail) : null, { summary });
+      renderErrorBlock(detail ? String(detail) : null, { summary, announce: false });
       announce("Error: " + (obj.message || ""));
       playCue("error");
     }
@@ -2448,6 +2480,16 @@
       article.appendChild(det);
     }
     transcript.appendChild(article);
+    // Announce so screen-reader users hear the error. #status is aria-hidden
+    // and #transcript isn't a live region, so without this every slash-command
+    // error (/model typo, /effort, /rewind, /help) and inline error block is
+    // silent. Callers that announce richer text themselves pass announce:false.
+    if (opts.announce !== false) {
+      const spoken = opts.summary
+        || (detail ? String(detail).split("\n")[0] : "")
+        || opts.heading || "Error";
+      announce(String(spoken).slice(0, 200));
+    }
     // Force-scroll on errors — the user almost always wants to see them.
     maybeAutoScroll(true);
   }
@@ -2770,8 +2812,11 @@
   function renderPermissionCard(req) {
     const card = document.createElement("article");
     card.className = "msg permission";
-    card.setAttribute("role", "alertdialog");
-    card.setAttribute("aria-modal", "false"); // inline, not a screen-blocking modal
+    // role="group" (not alertdialog): the card is an inline transcript article,
+    // not a focus-containing dialog, so alertdialog+aria-modal=false is an ARIA
+    // mismatch NVDA can mis-frame. Urgency is already carried by the explicit
+    // announce() + earcon; the heading/detail labelling stays via the ids below.
+    card.setAttribute("role", "group");
     if (req.id) card.dataset.requestId = req.id;
     card.dataset.state = "pending";
 
@@ -2958,7 +3003,10 @@
         card.dataset.state = "pending";
         card.querySelectorAll("button").forEach((b) => (b.disabled = false));
       }
+      // #status is aria-hidden, so a screen-reader user gets no feedback that
+      // the decision failed and Claude is still blocked — announce it.
       setStatus("Failed to send decision: " + err.message);
+      announce("Failed to send decision. Claude is still waiting — try again.");
       return false;
     }
   }
@@ -3114,15 +3162,23 @@
       }
       card.dataset.state = "deciding";
       card.querySelectorAll("button, input").forEach((el) => (el.disabled = true));
+      const entries = Object.entries(answers);
       try {
-        await postDecision(req.id, "answer", { answers });
-        const entries = Object.entries(answers);
-        replaceCardWithSummary(card, entries.length
-          ? `Answered — ${entries.map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("; ")}`
-          : "Question skipped");
+        // Nothing selected is a genuine skip — send `dismiss` so the model
+        // gets the same signal the Skip button sends, instead of an empty
+        // `answer` payload while the UI claims "Question skipped".
+        if (entries.length) {
+          await postDecision(req.id, "answer", { answers });
+          replaceCardWithSummary(card,
+            `Answered — ${entries.map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("; ")}`);
+        } else {
+          await postDecision(req.id, "dismiss", null);
+          replaceCardWithSummary(card, "Question skipped");
+        }
       } catch (err) {
         unlock();
         setStatus("Failed to send answer: " + err.message);
+        announce("Failed to send answer. Claude is still waiting — try again.");
       }
     });
     skip.addEventListener("click", async () => {
@@ -3135,6 +3191,7 @@
       } catch (err) {
         unlock();
         setStatus("Failed: " + err.message);
+        announce("Failed to skip the question. Claude is still waiting — try again.");
       }
     });
   }
@@ -3200,6 +3257,7 @@
         card.dataset.state = "pending";
         card.querySelectorAll("button, textarea").forEach((el) => (el.disabled = false));
         setStatus("Failed: " + err.message);
+        announce("Failed to send your plan decision. Claude is still waiting — try again.");
       }
     }
     approve.addEventListener("click", () => send("allow", null, "Plan approved — proceeding"));
@@ -3832,6 +3890,7 @@
     }
     if (pendingImages.length >= MAX_IMAGES) {
       setStatus(`At most ${MAX_IMAGES} images per message`);
+      announce(`At most ${MAX_IMAGES} images per message.`);
       return;
     }
     const sig = attachmentSignature(file);
@@ -3850,6 +3909,7 @@
       announce(`Attached ${file.name}.`);
     } catch (err) {
       setStatus("Could not read image: " + err.message);
+      announce("Could not read image: " + err.message);
     }
   }
 
@@ -3932,6 +3992,7 @@
     }
     if (pendingFiles.length >= MAX_FILES) {
       setStatus(`At most ${MAX_FILES} files per message`);
+      announce(`At most ${MAX_FILES} files per message.`);
       return;
     }
     const sig = attachmentSignature(file);

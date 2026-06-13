@@ -20,7 +20,7 @@
       <button type="button" id="cli-install-btn">Install Claude CLI</button>
       <button type="button" id="cli-recheck-btn">Re-check</button>
     </div>
-    <pre id="cli-log" class="cli-banner__log" tabindex="0" aria-label="Install output" hidden></pre>
+    <pre id="cli-log" class="cli-banner__log" tabindex="0" aria-label="Install output" aria-live="off" aria-atomic="false" hidden></pre>
   </div>
 
   <header>
@@ -167,7 +167,7 @@
               aria-controls="slash-menu" aria-haspopup="listbox"></textarea>
             <div id="slash-menu" class="slash-menu" role="listbox" aria-label="Slash command suggestions" hidden></div>
           </div>
-          <div id="attachments" class="attachments" hidden aria-label="Attached images"></div>
+          <div id="attachments" class="attachments" role="group" hidden aria-label="Attached images"></div>
           <div id="file-attachments" class="attachments file-attachments" hidden aria-label="Attached files"></div>
           <div class="row">
             <button type="submit" id="send">Send</button>
@@ -178,7 +178,7 @@
             </label>
             <span id="status" aria-hidden="true"></span>
           </div>
-          <div id="queue-area" class="queue-area" hidden aria-label="Queued messages"></div>
+          <div id="queue-area" class="queue-area" role="group" hidden aria-label="Queued messages"></div>
         </form>
       </section>
     </main>
