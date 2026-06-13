@@ -4225,17 +4225,30 @@ def _fetch_persisted_events_range(
 
 def _purge_old_persisted(now: float) -> None:
     cutoff = now - PERSIST_RETENTION_SECONDS
+    # Never purge a run that's still live in memory. A long-lived conversation
+    # (messages arriving inside the idle window for a workday) only refreshes
+    # its runs.last_activity row on meta_changed/finish, so its persisted
+    # cutoff can age past PERSIST_RETENTION_SECONDS while the run is mid-flight.
+    # Deleting its events here would make a reconnect below the in-memory trim
+    # replay an empty transcript and lose the whole run on a restart.
+    live_ids = [rid for rid, r in ACTIVE_RUNS.items() if not r.done]
+    keep_clause = ""
+    params: list[Any] = [cutoff]
+    if live_ids:
+        placeholders = ",".join("?" * len(live_ids))
+        keep_clause = f" AND run_id NOT IN ({placeholders})"
+        params.extend(live_ids)
     try:
         db = _state_db()
         db.execute(
             "DELETE FROM events WHERE run_id IN ("
-            " SELECT run_id FROM runs WHERE COALESCE(finished_at, last_activity) < ?"
+            f" SELECT run_id FROM runs WHERE COALESCE(finished_at, last_activity) < ?{keep_clause}"
             ")",
-            (cutoff,),
+            tuple(params),
         )
         db.execute(
-            "DELETE FROM runs WHERE COALESCE(finished_at, last_activity) < ?",
-            (cutoff,),
+            f"DELETE FROM runs WHERE COALESCE(finished_at, last_activity) < ?{keep_clause}",
+            tuple(params),
         )
     except sqlite3.Error as e:
         logging.getLogger("claude-web").warning("purge_old_persisted failed: %s", e)
@@ -4809,6 +4822,11 @@ class ActiveRun:
         self._task_order: int = 0
         # Long-lived conversation state.
         self.user_input_queue: asyncio.Queue = asyncio.Queue()
+        # One-slot holdover for a message popped from the queue that couldn't
+        # be delivered this wait round (CLI started a new turn). Kept out of
+        # the queue so it stays ahead of anything queued afterward. Drained by
+        # finish() like the queue itself.
+        self._deferred_user_item: Optional[dict] = None
         self.pending_notifications: list[dict] = []
         self.notification_grace_started_at: Optional[float] = None
         # Tool notifications that arrive between turns auto-fire a synth user
@@ -5054,11 +5072,18 @@ class ActiveRun:
         # done is flipped AFTER the drain so emit() still routes to live
         # subscribers (rather than skipping the fan-out as a finished run
         # would).
+        strays = []
+        if self._deferred_user_item is not None:
+            # The held-over item is older than anything in the queue, so it
+            # comes first when we report what was lost.
+            strays.append(self._deferred_user_item)
+            self._deferred_user_item = None
         while True:
             try:
-                stray = self.user_input_queue.get_nowait()
+                strays.append(self.user_input_queue.get_nowait())
             except asyncio.QueueEmpty:
                 break
+        for stray in strays:
             _emit_lost_input(
                 self,
                 stray.get("text") or "",
@@ -5356,6 +5381,9 @@ def _session_lock(session_id: str) -> asyncio.Lock:
 # Match PERSIST_RETENTION_SECONDS so a finished run that's still on disk is
 # also still in memory — saves a "load on demand from sqlite" code path.
 RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
+# A run registered in ACTIVE_RUNS but never given a driver task (api_chat
+# raised between registration and create_task) is evicted once it's this old.
+_ZOMBIE_RUN_GRACE_SECONDS = 30.0
 AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
 SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
 # Mid-turn silence cap: when the CLI is mid-turn (run.between_turns=False) the
@@ -5378,7 +5406,13 @@ def _gc_runs() -> None:
     now = time.time()
     stale = [
         rid for rid, r in ACTIVE_RUNS.items()
-        if r.done and r.finished_at and (now - r.finished_at) > RUN_RETENTION_SECONDS
+        if (r.done and r.finished_at and (now - r.finished_at) > RUN_RETENTION_SECONDS)
+        # Zombie: a run whose driver never spawned (api_chat raised post-
+        # registration). done stays False so the retention branch never
+        # catches it, and it shadows the session in ACTIVE_RUNS_BY_SESSION.
+        # The grace keeps the (proven impossible, but cheap to guard) case
+        # of a freshly-registered run from being swept before create_task.
+        or (not r.done and r.task is None and (now - r.created_at) > _ZOMBIE_RUN_GRACE_SECONDS)
     ]
     for rid in stale:
         run = ACTIVE_RUNS.pop(rid, None)
@@ -5397,7 +5431,13 @@ def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
     if not session_id:
         return None
     run = ACTIVE_RUNS_BY_SESSION.get(session_id)
-    if run is None or run.done or (run.task and run.task.done()):
+    # ``run.task is None`` on a non-done run is a zombie: api_chat raised
+    # between registering the run (under the session lock) and spawning its
+    # driver task, so no CLI is attached and never will be. A healthy run is
+    # never observable in this state (registration → create_task is a single
+    # await-free stretch). Treat it as not-live so the next POST spawns a
+    # fresh run instead of queueing input into a driver-less queue forever.
+    if run is None or run.done or run.task is None or run.task.done():
         return None
     return run
 
@@ -5658,6 +5698,54 @@ async def api_sessions(user: dict = Depends(auth.require_user)):
     return list_sessions(user)
 
 
+def _scan_sessions_for_query(
+    query: str, candidates: list[tuple[int, Path, str]],
+) -> list[dict]:
+    """Scan ``candidates`` (newest-first (mtime, path, project_key) tuples)
+    for ``query`` and return up to MAX_SEARCH_RESULTS hits.
+
+    Pure file I/O — no sqlite — so it's safe to run on a worker thread. The
+    per-session visibility check (which reads state.db) is done by the caller
+    on the event loop before building ``candidates``. Scanning in newest-first
+    order means the cap keeps the most-recent matches, not the first ones the
+    directory glob happened to yield.
+    """
+    hits: list[dict] = []
+    for mtime, path, key in candidates:
+        for obj in _iter_jsonl(path):
+            kind = obj.get("type")
+            if kind not in ("user", "assistant"):
+                continue
+            if kind == "user" and obj.get("isMeta"):
+                continue
+            text = _extract_text(obj.get("message")) or ""
+            if not text:
+                continue
+            low = text.lower()
+            idx = low.find(query)
+            if idx < 0:
+                continue
+            start = max(0, idx - 40)
+            end = min(len(text), idx + len(query) + SEARCH_SNIPPET_CHARS - 40)
+            snippet = text[start:end].replace("\n", " ").strip()
+            if start > 0:
+                snippet = "…" + snippet
+            if end < len(text):
+                snippet = snippet + "…"
+            hits.append({
+                "id": path.stem,
+                "project": key,
+                "title": session_title_from(path) or path.stem[:8],
+                "mtime": mtime,
+                "snippet": snippet,
+                "role": kind,
+            })
+            break
+        if len(hits) >= MAX_SEARCH_RESULTS:
+            break
+    return hits
+
+
 @app.get("/api/sessions/search")
 async def api_sessions_search(
     q: str = "",
@@ -5665,15 +5753,19 @@ async def api_sessions_search(
 ):
     """Substring search across every configured project's session transcripts.
 
-    Cheap-and-cheerful: line-by-line, case-insensitive, capped at
-    MAX_SEARCH_RESULTS hits. The frontend always shows titles for matched
-    sessions even when the hit was inside an assistant or tool message.
+    Line-by-line, case-insensitive, capped at MAX_SEARCH_RESULTS hits. The
+    frontend always shows titles for matched sessions even when the hit was
+    inside an assistant or tool message.
     """
     query = (q or "").strip().lower()
     if len(query) < 2:
         return {"query": q, "hits": []}
 
-    hits: list[dict] = []
+    # Build the candidate list (with the DB-backed visibility check) on the
+    # event loop, sorted newest-first, then hand the file-scanning — which
+    # can read every byte of every transcript and would otherwise freeze all
+    # SSE streams and permission resolutions — to a worker thread.
+    candidates: list[tuple[int, Path, str]] = []
     for project in PROJECTS:
         d = _sessions_dir(project)
         if not d.exists():
@@ -5683,47 +5775,13 @@ async def api_sessions_search(
             if not _user_can_see_session(path.stem, user):
                 continue
             try:
-                mtime = path.stat().st_mtime
+                mtime = int(path.stat().st_mtime)
             except FileNotFoundError:
                 continue
-            session_hit: Optional[dict] = None
-            for obj in _iter_jsonl(path):
-                kind = obj.get("type")
-                if kind not in ("user", "assistant"):
-                    continue
-                if kind == "user" and obj.get("isMeta"):
-                    continue
-                text = _extract_text(obj.get("message")) or ""
-                if not text:
-                    continue
-                low = text.lower()
-                idx = low.find(query)
-                if idx < 0:
-                    continue
-                start = max(0, idx - 40)
-                end = min(len(text), idx + len(query) + SEARCH_SNIPPET_CHARS - 40)
-                snippet = text[start:end].replace("\n", " ").strip()
-                if start > 0:
-                    snippet = "…" + snippet
-                if end < len(text):
-                    snippet = snippet + "…"
-                session_hit = {
-                    "id": path.stem,
-                    "project": key,
-                    "title": session_title_from(path) or path.stem[:8],
-                    "mtime": int(mtime),
-                    "snippet": snippet,
-                    "role": kind,
-                }
-                break
-            if session_hit:
-                hits.append(session_hit)
-            if len(hits) >= MAX_SEARCH_RESULTS:
-                break
-        if len(hits) >= MAX_SEARCH_RESULTS:
-            break
+            candidates.append((mtime, path, key))
+    candidates.sort(key=lambda c: c[0], reverse=True)
 
-    hits.sort(key=lambda h: h["mtime"], reverse=True)
+    hits = await asyncio.to_thread(_scan_sessions_for_query, query, candidates)
     return {"query": q, "hits": hits}
 
 
@@ -6691,7 +6749,17 @@ async def api_chat(
                 session_id, user.get("sub"), active_personality_id,
             )
         existing = _existing_run_for_session(session_id) if session_id else None
-        if fork and existing is not None:
+        # True when we're spawning a fork sibling of a still-live run. The
+        # fork gets a fresh session id from the SDK (``fork_session=True``
+        # below), so it must NOT eager-claim the original session_id — doing
+        # so steals the mapping from the original (still-running) run, and
+        # once the fork's init re-indexes to its new sid the original session
+        # is left mapped to nothing. A later POST for the original session
+        # would then miss the live run and spawn a second CLI subprocess
+        # resuming the same jsonl (the exact corruption the session lock
+        # exists to prevent).
+        forking_live_run = bool(fork and existing is not None)
+        if forking_live_run:
             # User asked to branch the conversation. Leave the existing run
             # (and its session) untouched and spawn a sibling run that
             # resumes the same transcript; fork_session below gives it a
@@ -6804,11 +6872,17 @@ async def api_chat(
         # silently disappears when the original request raises.
         file_metas = await _save_uploaded_files(files, run_id)
         ACTIVE_RUNS[run_id] = run
-        if session_id:
+        if session_id and not forking_live_run:
             # Eager-claim the session id so a concurrent POST sees this run
             # and reuses it instead of spawning a parallel one. The driver
             # may overwrite this with whatever the SDK reports in init —
             # usually the same value but the resume protocol allows new ids.
+            #
+            # Skipped for a fork of a live run: the fork resumes the original
+            # transcript but gets a fresh sid on init, so claiming the
+            # original sid here would orphan the still-running original run
+            # (see ``forking_live_run`` above). The fork registers its own
+            # sid via emit()'s init hook instead.
             run.session_id = session_id
             ACTIVE_RUNS_BY_SESSION[session_id] = run
             _claim_session_owner(session_id, user.get("sub"), run.project_key)
@@ -7291,7 +7365,13 @@ async def api_chat(
                         # void failure mode the queue is designed to avoid.
                         waitables: set[asyncio.Task] = {msg_get}
                         user_get: Optional[asyncio.Task] = None
-                        if run.between_turns:
+                        # A previously-popped message that had to be deferred
+                        # (the CLI started a new turn in the same wait round)
+                        # waits in this one-slot field, NOT at the tail of
+                        # user_input_queue — re-queueing reordered it behind
+                        # any messages queued in the meantime. Prefer it here so
+                        # delivery stays FIFO.
+                        if run.between_turns and run._deferred_user_item is None:
                             user_get = asyncio.create_task(run.user_input_queue.get())
                             waitables.add(user_get)
                         try:
@@ -7330,9 +7410,16 @@ async def api_chat(
                         # queue had already given it up, the next driver
                         # iteration never ran, and the user's message
                         # vanished with no UI signal at all.
-                        popped_user_item: Optional[dict] = (
-                            user_get.result() if user_done else None
-                        )
+                        # A deferred item (held over from a prior round because
+                        # the CLI was mid-turn) takes precedence over a fresh
+                        # queue pop, keeping delivery order stable.
+                        if run.between_turns and run._deferred_user_item is not None:
+                            popped_user_item: Optional[dict] = run._deferred_user_item
+                            run._deferred_user_item = None
+                        else:
+                            popped_user_item = (
+                                user_get.result() if user_done else None
+                            )
                         if msg_done:
                             msg = msg_get.result()
                             terminal_kind: Optional[str] = None
@@ -7530,6 +7617,10 @@ async def api_chat(
 
                             if isinstance(msg, ResultMessage):
                                 run.between_turns = True
+                                # Drop any sub-flush-threshold partial text left
+                                # over from an interrupted block, so it can't be
+                                # prepended to the next turn's first partial frame.
+                                run.partial_text_buf = ""
                                 _notify_turn_complete(run)
                             elif isinstance(msg, (AssistantMessage, UserMessage)):
                                 # Active LLM turn / tool dance. We're not
@@ -7561,7 +7652,10 @@ async def api_chat(
                                 "CLI started a new turn in the same wait round",
                                 run.run_id,
                             )
-                            await run.user_input_queue.put(popped_user_item)
+                            # Hold it in the one-slot deferred field rather than
+                            # re-queueing at the tail (which would let a message
+                            # queued meanwhile jump ahead of it).
+                            run._deferred_user_item = popped_user_item
                             popped_user_item = None
 
                         if popped_user_item is not None:
@@ -7572,6 +7666,23 @@ async def api_chat(
                             # interrupt, so this turn's result isn't misread.
                             run.interrupting = False
                             ack: Optional[asyncio.Future] = item.get("delivered")
+                            if ack is not None and ack.cancelled():
+                                # The POST handler's _confirm_and_emit_user_prompt
+                                # already timed out (USER_INPUT_DELIVERY_TIMEOUT)
+                                # and emitted a lost_input error to the UI, then
+                                # wait_for cancelled this ack. Sending now would
+                                # execute a prompt the user was told was lost,
+                                # with no user_prompt event — Claude would answer
+                                # an invisible message. Honor the reported failure:
+                                # drop it. The transcript on disk is intact, so the
+                                # user can resend.
+                                log.info(
+                                    "dropping queued input for run %s — delivery "
+                                    "already timed out and was reported lost",
+                                    run.run_id,
+                                )
+                                popped_user_item = None
+                                continue
                             try:
                                 await _send_user_message(
                                     client,
@@ -7880,7 +7991,19 @@ async def api_chat_rewind(
     cp = run.checkpoints[-back]
     try:
         async with run.client_write_lock:
+            # Re-check after acquiring the lock: a queued user message could
+            # have been delivered (the driver takes the same lock to write to
+            # the CLI) between the between_turns check above and here, starting
+            # a new turn. Rewinding now would yank files out from under the
+            # in-progress edits — the exact case the 409 guards. The empty-queue
+            # check covers a message queued but not yet delivered.
+            if not run.between_turns or not run.user_input_queue.empty():
+                raise HTTPException(
+                    409, "turn started while preparing the rewind — retry once it's idle",
+                )
             await client.rewind_files(cp["uuid"])
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
         raise HTTPException(500, f"rewind failed: {exc}") from exc
     run.emit({"type": "files_rewound", "back": back, "preview": cp["preview"]})
@@ -8341,6 +8464,15 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
         ts = row.get("ts")
         if ts is None or ts < start or ts >= end:
             continue
+        # In multi-user mode the per-session breakdown (titles, turn counts,
+        # spend) would otherwise leak every user's activity to every other
+        # user. Keep only rows the caller owns plus ownerless rows (host-shell
+        # `claude` turns, which the README treats as shared). The single-user
+        # default keeps the full picture.
+        if PER_USER_SESSIONS and user_sub is not None:
+            owner = row.get("owner_sub")
+            if owner is not None and owner != user_sub:
+                continue
         today_rows.append(row)
 
     by_session: dict[str, dict] = {}
@@ -8748,13 +8880,25 @@ async def _cli_run(argv: list[str], env: Optional[dict] = None) -> int:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
+            # npm/winget can emit progress lines longer than the StreamReader's
+            # 64 KiB default; a longer line would raise LimitOverrunError out of
+            # the read loop and orphan the installer subprocess. 1 MiB is ample.
+            limit=1024 * 1024,
         )
     except OSError as e:
         _cli_log(f"error: could not start {argv[0]}: {e}")
         return 127
     assert proc.stdout is not None
-    async for raw in proc.stdout:
-        _cli_log(raw.decode("utf-8", "replace").rstrip("\n"))
+    try:
+        async for raw in proc.stdout:
+            _cli_log(raw.decode("utf-8", "replace").rstrip("\n"))
+    except (ValueError, asyncio.LimitOverrunError) as e:
+        # Defensive: a pathological line past the raised limit still shouldn't
+        # leave the process running detached after we report failure.
+        _cli_log(f"error: output stream overflowed: {e}")
+        proc.kill()
+        await proc.wait()
+        return proc.returncode if proc.returncode is not None else 1
     return await proc.wait()
 
 
@@ -9019,6 +9163,18 @@ def _require_roundtable_thread_access(
             raise HTTPException(404, f"No such thread: {thread_id}")
         return
     if owner and owner != user.get("sub") and not _is_roundtable_admin(user):
+        raise HTTPException(404, f"No such thread: {thread_id}")
+    # Multi-user isolation: an ownerless thread (created over MCP/CLI, or
+    # predating owner tracking) has no established owner, so in a per-user
+    # deployment it must not be readable/postable/attachable by arbitrary
+    # signed-in users — that would leak transcripts and let one user spend
+    # another's provider quota (and, via attach, read files in any configured
+    # project). The single-user homelab keeps the open interop these threads
+    # were designed for. Admins always pass.
+    if (
+        PER_USER_SESSIONS and not owner
+        and not _is_roundtable_admin(user)
+    ):
         raise HTTPException(404, f"No such thread: {thread_id}")
 
 
@@ -9995,12 +10151,11 @@ async def api_roundtable_assistant(
                 )
                 # Also check pre-existing artifacts on a continued thread.
                 if not has_artifacts and not thread_was_new:
-                    # Cheap check: any artifact rows for this thread at all?
-                    has_artifacts = bool(
-                        rt._conn().execute(
-                            "SELECT 1 FROM artifacts WHERE thread_id = ? LIMIT 1",
-                            (tid,),
-                        ).fetchone()
+                    # Via the locked core helper on a worker thread — the core
+                    # connection is shared with core's own ask/post threads and
+                    # must not be touched unsynchronised from the event loop.
+                    has_artifacts = await asyncio.to_thread(
+                        rt.roundtable_has_artifacts, tid,
                     )
                 synth_framing = _assistant_synth_prompt(
                     panel, synth_info["label"], has_artifacts,
@@ -10051,12 +10206,21 @@ async def api_roundtable_assistant(
             finally:
                 await event_queue.put(DONE_SENTINEL)
 
-        # First replayable event so any reader (including a rejoin that
-        # missed the POST response) learns the stream id.
-        await stream.put(("stream", {"stream_id": stream.stream_id}))
-        await producer()
+        # Guarantee the DONE sentinel even if setup before producer() raises
+        # (e.g. the initial stream.put). Without it stream.done stays False,
+        # every SSE reader loops on heartbeats forever, and _gc_assistant_streams
+        # (which only reaps done streams) never collects it.
+        try:
+            # First replayable event so any reader (including a rejoin that
+            # missed the POST response) learns the stream id.
+            await stream.put(("stream", {"stream_id": stream.stream_id}))
+            await producer()
+        finally:
+            if not stream.done:
+                await stream.put(_ASSISTANT_DONE)
 
     stream.task = asyncio.create_task(run_assistant())
+    stream.task.add_done_callback(_log_task_exception)
     return _assistant_stream_response(stream)
 
 
@@ -10112,6 +10276,9 @@ async def api_roundtable_apply(
     # test cycle to RCE. Demand a bound thread with a known owner and
     # refuse unbound threads outright.
     _require_roundtable_thread_access(thread_id, user, for_apply=True)
+    # Apply spawns a `patch` subprocess and mutates the project tree; bound it
+    # by the same token bucket as the paid panel routes so it can't be hammered.
+    _roundtable_rate_limit_check(user)
 
     # Resolve target to an absolute path inside the thread's bound
     # project. ``_require_roundtable_thread_access(..., for_apply=True)``
@@ -10166,9 +10333,19 @@ async def api_roundtable_apply(
         if dry.returncode != 0:
             # Try -p1 (strips one leading path component) — synthesizers
             # often produce a/foo.py b/foo.py style headers.
+            #
+            # SECURITY: always pass the validated ``candidate`` as an explicit
+            # positional operand. Without it, ``patch -p1 -d <dir>`` derives the
+            # file to write from the (model-authored) ``+++`` header, so a diff
+            # whose header names a different in-project file silently rewrites
+            # *that* file instead of the one the user reviewed — and the backup
+            # below would snapshot the wrong file, making the real change
+            # unrecoverable. With an explicit operand, patch applies the hunks
+            # to ``candidate`` and ignores the header path entirely (the strip
+            # level only governs header parsing, which we no longer rely on).
             dry = await asyncio.to_thread(
                 subprocess.run,
-                ["patch", "--dry-run", "--silent", "-p1", "-d", str(candidate.parent), "-i", patch_path],
+                ["patch", "--dry-run", "--silent", "-p1", str(candidate), "-i", patch_path],
                 capture_output=True, text=True,
             )
             if dry.returncode != 0:
@@ -10194,9 +10371,12 @@ async def api_roundtable_apply(
                 capture_output=True, text=True,
             )
         else:
+            # Explicit operand (not -d): pin the write to the validated
+            # candidate so the diff header can't redirect it elsewhere. See
+            # the dry-run fallback above for the full rationale.
             result = await asyncio.to_thread(
                 subprocess.run,
-                ["patch", "--silent", "-p1", "-d", str(candidate.parent), "-i", patch_path],
+                ["patch", "--silent", "-p1", str(candidate), "-i", patch_path],
                 capture_output=True, text=True,
             )
 

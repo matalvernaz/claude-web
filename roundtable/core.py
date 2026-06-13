@@ -2187,6 +2187,18 @@ def _latest_artifact_version(thread_id: int, name: str) -> int:
     return int(row[0])
 
 
+def roundtable_has_artifacts(thread_id: int) -> bool:
+    """True if the thread has any artifact rows. Public + lock-held so callers
+    in other processes/threads (e.g. the claude-web assistant producer) don't
+    touch the shared connection unsynchronised."""
+    with _db_lock:
+        row = _conn().execute(
+            "SELECT 1 FROM artifacts WHERE thread_id = ? LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+    return row is not None
+
+
 def _get_artifact_content(thread_id: int, name: str, version: int) -> Optional[str]:
     with _db_lock:
         row = _conn().execute(
