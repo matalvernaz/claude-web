@@ -198,3 +198,22 @@ def test_gemini_tool_loop_executes_then_finishes(tmp_path, monkeypatch):
     )
     assert calls["n"] == 2
     assert "imports os" in result.text
+
+
+def test_grep_symlink_escape_blocked(tmp_path):
+    """Grep must not read through an in-repo symlink whose target is outside
+    the repo (the rglob enumeration would otherwise leak external content)."""
+    import os
+    secret = tmp_path.parent / "grep_secret.txt"
+    secret.write_text("GREP_LEAKED_SECRET", encoding="utf-8")
+    (tmp_path / "real.txt").write_text("nothing here", encoding="utf-8")
+    link = tmp_path / "leak.txt"
+    try:
+        os.symlink(secret, link)
+    except OSError:
+        return  # no symlink perms — skip
+    try:
+        out = _mk(tmp_path).execute("Grep", {"pattern": "SECRET"})
+        assert "GREP_LEAKED_SECRET" not in out
+    finally:
+        secret.unlink()

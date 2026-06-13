@@ -1008,6 +1008,28 @@ def roundtable_usage(thread_id: int) -> dict:
 StreamDelta = Callable[[str], None]
 
 
+def _gemini_response_text(resp: object) -> str:
+    """Visible text off a genai response, tolerant of the ``.text`` property
+    *raising* (it does when the final candidate holds only function-call parts,
+    e.g. the tool loop hit its round cap) rather than just being absent."""
+    if resp is None:
+        return ""
+    try:
+        return resp.text or ""
+    except Exception:  # noqa: BLE001 — fall back to manual part extraction
+        pass
+    try:
+        out = []
+        for cand in (getattr(resp, "candidates", None) or []):
+            for part in (getattr(getattr(cand, "content", None), "parts", None) or []):
+                t = getattr(part, "text", None)
+                if t:
+                    out.append(t)
+        return "".join(out)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _call_gemini(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
@@ -1348,11 +1370,19 @@ def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") ->
     caller must NOT fall back then, or it'd re-emit). Parses defensively across
     a few event shapes so CLI output-format drift degrades to fewer deltas.
     """
+    # Merge stderr INTO stdout. With --verbose the CLI can write more to stderr
+    # than the ~64KB pipe buffer holds; since we drain stdout in a loop and only
+    # read stderr after it, a separate stderr PIPE would fill, block the child,
+    # stall the stdout loop, and deadlock until the wall-cap (leaking the proc,
+    # because the kill() in finally is itself blocked in the loop). Interleaved
+    # diagnostic lines aren't JSON, so the parser skips them; we keep the last
+    # few for the error tail.
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True,
+        stderr=subprocess.STDOUT, text=True,
     )
     parts: list[str] = []
+    noise_tail: list[str] = []  # recent non-JSON lines, for the error message
 
     def _emit_from(obj: dict) -> None:
         # Shape 1: partial-message stream_event wrapping a raw Anthropic event.
@@ -1381,6 +1411,9 @@ def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") ->
             try:
                 obj = json.loads(line)
             except ValueError:
+                # Non-JSON diagnostic (stderr merged in / --verbose noise).
+                noise_tail.append(line)
+                del noise_tail[:-40]
                 continue
             if isinstance(obj, dict):
                 _emit_from(obj)
@@ -1390,8 +1423,8 @@ def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") ->
             proc.kill()
             proc.wait()
     if rc != 0:
-        tail = (proc.stderr.read() if proc.stderr else "")[-2000:]
-        msg = f"claude CLI (stream-json) exit={rc}; stderr tail: {tail!r}"
+        tail = "\n".join(noise_tail)[-2000:]
+        msg = f"claude CLI (stream-json) exit={rc}; output tail: {tail!r}"
         if not parts:
             raise _StreamFailedBeforeOutput(msg)
         raise RuntimeError(msg)
@@ -2341,6 +2374,15 @@ class _RepoTools:
         out: list[str] = []
         for f in files:
             try:
+                # Re-jail by REAL path before opening: rglob yields symlink
+                # paths whose .relative_to(root) succeeds even when the link
+                # target is outside the repo, so opening f would read through
+                # the link and leak external content. resolve() collapses the
+                # link; reject anything that lands outside root. (_read is
+                # already safe via _resolve; this closes the same hole here.)
+                real = f.resolve()
+                if not real.is_relative_to(self.root):
+                    continue
                 rp = f.relative_to(self.root).as_posix()  # '/' on every host; see _glob
                 with f.open(encoding="utf-8", errors="replace") as fh:
                     for n, line in enumerate(fh, 1):
@@ -2432,9 +2474,9 @@ def _call_gemini_with_tools(
                     ),
                 ))
             contents.append(genai_types.Content(role="user", parts=resp_parts))
-        text = getattr(last, "text", None) or ""
         return ProviderResult(
-            text=text, usage=_extract_usage("gemini", last) if last else None, raw=last,
+            text=_gemini_response_text(last),
+            usage=_extract_usage("gemini", last) if last else None, raw=last,
         )
 
     return _call_with_wall_cap(f"gemini-tools/{model}", _do_call)

@@ -10291,13 +10291,14 @@ async def api_roundtable_assistant(
                     loop = asyncio.get_running_loop()
 
                     def on_delta(text: str) -> None:
+                        coro = event_queue.put(("synth_delta", {"text": text}))
                         try:
-                            asyncio.run_coroutine_threadsafe(
-                                event_queue.put(("synth_delta", {"text": text})),
-                                loop,
-                            )
+                            asyncio.run_coroutine_threadsafe(coro, loop)
                         except RuntimeError:
-                            pass  # loop gone (client vanished) — drop the delta
+                            # Loop gone (client vanished) — close the coroutine
+                            # so it isn't flagged "never awaited" at GC, and
+                            # drop the delta.
+                            coro.close()
 
                 try:
                     synthesis = await asyncio.to_thread(
