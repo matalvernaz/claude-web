@@ -319,6 +319,24 @@ def _conn() -> sqlite3.Connection:
         # initial release. Symmetric ALTERs so any column added later is
         # backfilled with its CREATE TABLE default rather than crashing
         # _thread_row / roundtable_create on a missing column.
+        # Durable per-turn token/cost accounting. One row per provider call
+        # that reported usage; the CLI transport reports none and writes
+        # nothing. Lets roundtable_usage() total a thread's spend instead of
+        # the numbers only existing in a log line.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS usage (
+                thread_id INTEGER NOT NULL,
+                ts REAL NOT NULL,
+                participant TEXT NOT NULL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cached_tokens INTEGER,
+                finish_reason TEXT
+            )"""
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_thread ON usage(thread_id)"
+        )
         cols = {row[1] for row in c.execute("PRAGMA table_info(threads)").fetchall()}
         if "participants_json" not in cols:
             c.execute(
@@ -896,12 +914,11 @@ def _extract_usage(provider: str, resp: object) -> Optional[dict]:
     return None
 
 
-def _log_usage(label: str, result: "ProviderResult") -> None:
-    """Emit a per-turn token-usage line to stderr (the MCP-safe log channel).
+def _log_usage(label: str, result: "ProviderResult", thread_id: Optional[int] = None) -> None:
+    """Log a per-turn token-usage line and, when ``thread_id`` is given,
+    persist it to the ``usage`` table for durable per-thread accounting.
 
-    Phase 0 is log-only: usage is captured and logged but not persisted —
-    durable per-turn accounting rides Phase 6's run/event tables. A turn
-    whose transport can't report usage (the CLI path) logs nothing.
+    A turn whose transport can't report usage (the CLI path) records nothing.
     """
     u = result.usage
     if not u:
@@ -911,6 +928,47 @@ def _log_usage(label: str, result: "ProviderResult") -> None:
         label, u.get("input_tokens"), u.get("output_tokens"),
         u.get("cached_tokens"), result.finish_reason,
     )
+    if thread_id is None:
+        return
+    try:
+        with _db_lock:
+            _conn().execute(
+                "INSERT INTO usage(thread_id, ts, participant, input_tokens, "
+                "output_tokens, cached_tokens, finish_reason) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    thread_id, time.time(), label,
+                    u.get("input_tokens"), u.get("output_tokens"),
+                    u.get("cached_tokens"), result.finish_reason,
+                ),
+            )
+    except sqlite3.Error as e:  # telemetry must never break a turn
+        logger.warning("usage persist failed for thread %s: %s", thread_id, e)
+
+
+def roundtable_usage(thread_id: int) -> dict:
+    """Per-participant and total token usage recorded for a thread."""
+    with _db_lock:
+        rows = _conn().execute(
+            "SELECT participant, COUNT(*), "
+            "COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            "COALESCE(SUM(cached_tokens),0) "
+            "FROM usage WHERE thread_id = ? GROUP BY participant",
+            (thread_id,),
+        ).fetchall()
+    by_participant = [
+        {
+            "participant": r[0], "turns": r[1],
+            "input_tokens": r[2], "output_tokens": r[3], "cached_tokens": r[4],
+        }
+        for r in rows
+    ]
+    return {
+        "thread_id": thread_id,
+        "by_participant": by_participant,
+        "total_input_tokens": sum(p["input_tokens"] for p in by_participant),
+        "total_output_tokens": sum(p["output_tokens"] for p in by_participant),
+    }
 
 
 def _call_gemini(
@@ -2054,7 +2112,7 @@ def roundtable_ask(
         _append_message(thread_id, info["label"], err_msg)
         raise
 
-    _log_usage(info["label"], result)
+    _log_usage(info["label"], result, thread_id=thread_id)
     response = (result.text or "").strip()
     if not response:
         response = "[empty response from provider]"
@@ -2175,7 +2233,7 @@ def roundtable_ask_parallel(
             _append_message(thread_id, label, msg)
             errors[name] = f"{type(err).__name__}: {err}"
             continue
-        _log_usage(label, resp)
+        _log_usage(label, resp, thread_id=thread_id)
         clean = (resp.text or "").strip() or "[empty response from provider]"
         if closed_mid_flight:
             clean = clean + (

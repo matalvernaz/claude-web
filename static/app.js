@@ -2579,6 +2579,36 @@
   const permWaitingBtn = document.getElementById("perm-waiting");
   if (permWaitingBtn) {
     permWaitingBtn.addEventListener("click", () => openPermDialogNow());
+    permWaitingBtn.setAttribute("aria-keyshortcuts", "Alt+A");
+  }
+
+  // Global hotkeys, Alt-modified so they never collide with composer typing.
+  //   Alt+A — open the pending-approval dialog from anywhere (the most
+  //           latency-sensitive interaction; otherwise it's a tab-hunt).
+  //   Alt+J — move focus to the latest assistant reply so a screen-reader
+  //           user lands on it directly after "Response complete".
+  document.addEventListener("keydown", (e) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    const k = (e.key || "").toLowerCase();
+    if (k === "a" && permQueue.length) {
+      e.preventDefault();
+      openPermDialogNow();
+    } else if (k === "j") {
+      e.preventDefault();
+      focusLastReply();
+    }
+  });
+
+  function focusLastReply() {
+    const replies = transcript.querySelectorAll(".msg.assistant .role");
+    const last = replies[replies.length - 1];
+    if (!last) {
+      announce("No reply yet.");
+      return;
+    }
+    last.setAttribute("tabindex", "-1");
+    last.focus();
+    last.scrollIntoView({ block: "start" });
   }
 
   function ensurePermDialog() {
@@ -4083,6 +4113,10 @@
     const lines = [
       "Slash commands handled by claude-web:",
       supported,
+      "",
+      "Keyboard shortcuts:",
+      "Alt+A — open the pending approval dialog from anywhere",
+      "Alt+J — jump focus to the latest reply",
       "",
       "Anything else (e.g. /security-review, /init, /loop, /skill <name>) is",
       "sent to Claude as text. The model recognises the convention and runs",

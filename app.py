@@ -298,6 +298,13 @@ PERSIST_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_PERSIST_RETENTION", "86400
 # file they uploaded yesterday after the conversation has rolled off.
 UPLOAD_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_UPLOAD_RETENTION", str(7 * 86400)))
 
+# usage.jsonl is append-only and scanned in full per /api/usage call (the
+# endpoint only ever reports *today*). Without bounding it, the file grows
+# forever and every dialog open re-reads the whole history. Prune rows older
+# than this on a throttled schedule. Default 30 days keeps room for any future
+# multi-day reporting while staying small.
+USAGE_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_USAGE_RETENTION", str(30 * 86400)))
+
 # Pending permission requests deny themselves after this if the browser never
 # answers (closed tab, lost network). Without this the SDK turn pins forever.
 PERMISSION_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_WEB_PERMISSION_TIMEOUT", "900"))
@@ -4262,6 +4269,55 @@ _LAST_UPLOAD_PURGE = 0.0
 _UPLOAD_PURGE_INTERVAL_SECONDS = 600  # don't rescan the dir on every request
 _LAST_DB_PURGE = 0.0
 _DB_PURGE_INTERVAL_SECONDS = 3600  # one sqlite DELETE pass per hour is plenty
+_LAST_USAGE_PURGE = 0.0
+_USAGE_PURGE_INTERVAL_SECONDS = 3600  # rewrite usage.jsonl at most hourly
+
+
+def _purge_old_usage_rows(now: float) -> None:
+    """Rewrite usage.jsonl keeping only rows newer than USAGE_RETENTION_SECONDS.
+
+    Throttled hourly. Atomic via temp + os.replace so a concurrent reader
+    (the to_thread /api/usage scan) sees either the old or new file whole.
+    Single-worker + event-loop single-thread means no lock is needed against
+    _log_usage appends (this runs synchronously from _gc_runs on the loop).
+    """
+    global _LAST_USAGE_PURGE
+    if now - _LAST_USAGE_PURGE < _USAGE_PURGE_INTERVAL_SECONDS:
+        return
+    _LAST_USAGE_PURGE = now
+    if not USAGE_LOG.exists():
+        return
+    cutoff = now - USAGE_RETENTION_SECONDS
+    kept: list[str] = []
+    dropped = 0
+    try:
+        with USAGE_LOG.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    ts = json.loads(line).get("ts")
+                except (TypeError, ValueError):
+                    continue  # drop unparseable rows
+                if ts is None or ts >= cutoff:
+                    kept.append(line)
+                else:
+                    dropped += 1
+    except OSError as e:
+        log.warning("usage purge read failed: %s", e)
+        return
+    if dropped == 0:
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(USAGE_DIR), suffix=".jsonl")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if kept:
+                f.write("\n".join(kept) + "\n")
+        os.replace(tmp, USAGE_LOG)
+        log.info("usage purge: dropped %d row(s) older than retention", dropped)
+    except OSError as e:
+        log.warning("usage purge rewrite failed: %s", e)
 
 
 def _purge_old_uploads(now: float) -> None:
@@ -5425,6 +5481,7 @@ def _gc_runs() -> None:
             if existing is run:
                 ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
     _purge_old_uploads(now)
+    _purge_old_usage_rows(now)
     if now - _LAST_DB_PURGE >= _DB_PURGE_INTERVAL_SECONDS:
         _LAST_DB_PURGE = now
         _purge_old_persisted(now)
@@ -9408,8 +9465,10 @@ async def api_roundtable_thread_detail(
         "messages": len(messages),
     })
     summary["project_key"] = _roundtable_get_project(thread_id)
+    usage = await asyncio.to_thread(rt.roundtable_usage, thread_id)
     return {
         "thread": summary,
+        "usage": usage,
         "messages": [
             {
                 "idx": m["idx"],
@@ -10245,24 +10304,13 @@ async def api_roundtable_assistant_rejoin(
 _PATCH_BACKUP_SUFFIX = ".rt-orig"
 
 
-@app.post("/api/roundtable/assistant/apply")
-async def api_roundtable_apply(
-    request: Request, user: dict = Depends(auth.require_user),
-):
-    """Apply a unified diff from a synthesis turn to a project file.
+def _resolve_apply_candidate(body: dict, user: dict) -> tuple[Path, str, str]:
+    """Validate an apply/preview request and resolve its target file.
 
-    Body: ``{"thread_id": int, "target": "relative/path.py", "diff": "..."}``.
-
-    Safety rails:
-      - Target path must resolve inside the bound project (or, for
-        unbound threads, inside ANY configured project root).
-      - ``patch --dry-run`` runs first; if it fails, no write happens.
-      - The original file is renamed to ``<target>.rt-orig`` before the
-        patch is applied, so the user can revert without diff-math.
-        Re-applying overwrites any previous backup — only one rollback
-        slot per file at a time.
+    Returns ``(candidate, project_key, diff_text)``. Raises HTTPException on
+    any validation, authz, or rate-limit failure. Shared by the preview and
+    apply endpoints so they enforce identical rails.
     """
-    body = await request.json()
     thread_id = body.get("thread_id")
     target = (body.get("target") or "").strip()
     diff_text = body.get("diff") or ""
@@ -10274,22 +10322,14 @@ async def api_roundtable_apply(
         raise HTTPException(400, "diff body is required")
     if target.startswith("/") or ".." in Path(target).parts:
         raise HTTPException(400, "target path must be relative and inside a configured project")
-    # Patch-apply is the highest-impact roundtable route: a missing
-    # ownership check here lets any signed-in user rewrite files in
-    # another user's bound project, then ride that user's next build /
-    # test cycle to RCE. Demand a bound thread with a known owner and
-    # refuse unbound threads outright.
+    # Highest-impact roundtable route: a missing ownership check lets any
+    # signed-in user rewrite files in another user's bound project, then ride
+    # that user's next build/test cycle to RCE. Demand a bound, owned thread.
     _require_roundtable_thread_access(thread_id, user, for_apply=True)
-    # Apply spawns a `patch` subprocess and mutates the project tree; bound it
-    # by the same token bucket as the paid panel routes so it can't be hammered.
     _roundtable_rate_limit_check(user)
 
-    # Resolve target to an absolute path inside the thread's bound
-    # project. ``_require_roundtable_thread_access(..., for_apply=True)``
-    # already refused unbound threads above, so ``project_key`` is
-    # guaranteed non-None here.
     project_key = _roundtable_get_project(thread_id)
-    assert project_key is not None  # guaranteed by access check above
+    assert project_key is not None  # guaranteed by the access check above
     project_root = _resolve_project_path(project_key)
     candidate = (project_root / target).resolve()
     try:
@@ -10299,95 +10339,126 @@ async def api_roundtable_apply(
             400,
             f"target {target!r} is outside the bound project ({project_key}).",
         ) from exc
-
     if not candidate.is_file():
         raise HTTPException(404, f"target file does not exist: {target}")
-
-    # GNU patch is the apply engine. On Windows it isn't installed by
-    # default — surface a clear 501 rather than a generic 500 from the
-    # subprocess FileNotFoundError so the UI can explain.
     if shutil.which("patch") is None:
         raise HTTPException(
             501,
             "GNU patch is required for click-to-apply but isn't on PATH. "
             "Install it (e.g. via Git for Windows) and retry.",
         )
+    return candidate, project_key, diff_text
 
-    # Write the diff to a temp file. We use `patch` rather than a pure-
-    # Python apply because GNU patch is robust to fuzz, mixed line
-    # endings, slightly stale hunks, etc. — every edge case I'd
-    # otherwise reinvent badly.
+
+def _write_temp_patch(diff_text: str) -> str:
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".patch", delete=False, encoding="utf-8",
     ) as tf:
         tf.write(diff_text)
         if not diff_text.endswith("\n"):
             tf.write("\n")
-        patch_path = tf.name
+        return tf.name
 
-    try:
-        # Dry-run first — patch's --dry-run validates the hunks would
-        # apply cleanly without mutating the file. If it fails the user
-        # gets the stderr verbatim.
+
+async def _patch_dry_run(candidate: Path, patch_path: str) -> int:
+    """Return the strip level (0 or 1) at which the diff applies cleanly to
+    ``candidate``, or raise HTTPException 422 if it doesn't apply at all.
+
+    SECURITY: the validated ``candidate`` is always passed as an explicit
+    positional operand. Without it, ``patch -p1 -d <dir>`` derives the file to
+    write from the (model-authored) ``+++`` header, so a diff whose header
+    names a different in-project file would rewrite *that* file. With an
+    operand, patch applies the hunks to ``candidate`` and ignores the header.
+    """
+    for strip in (0, 1):
         dry = await asyncio.to_thread(
             subprocess.run,
-            ["patch", "--dry-run", "--silent", "-p0", str(candidate), "-i", patch_path],
+            ["patch", "--dry-run", "--silent", f"-p{strip}", str(candidate), "-i", patch_path],
             capture_output=True, text=True,
         )
-        if dry.returncode != 0:
-            # Try -p1 (strips one leading path component) — synthesizers
-            # often produce a/foo.py b/foo.py style headers.
-            #
-            # SECURITY: always pass the validated ``candidate`` as an explicit
-            # positional operand. Without it, ``patch -p1 -d <dir>`` derives the
-            # file to write from the (model-authored) ``+++`` header, so a diff
-            # whose header names a different in-project file silently rewrites
-            # *that* file instead of the one the user reviewed — and the backup
-            # below would snapshot the wrong file, making the real change
-            # unrecoverable. With an explicit operand, patch applies the hunks
-            # to ``candidate`` and ignores the header path entirely (the strip
-            # level only governs header parsing, which we no longer rely on).
-            dry = await asyncio.to_thread(
-                subprocess.run,
-                ["patch", "--dry-run", "--silent", "-p1", str(candidate), "-i", patch_path],
-                capture_output=True, text=True,
-            )
-            if dry.returncode != 0:
-                raise HTTPException(
-                    422,
-                    f"diff doesn't apply cleanly. patch said: "
-                    f"{(dry.stderr or dry.stdout)[-1000:]}",
-                )
-            strip_level = 1
-        else:
-            strip_level = 0
+        if dry.returncode == 0:
+            return strip
+    raise HTTPException(
+        422,
+        f"diff doesn't apply cleanly. patch said: {(dry.stderr or dry.stdout)[-1000:]}",
+    )
 
-        # Back up the original. Same suffix every time — only one slot,
-        # second apply on the same file overwrites it.
-        backup_path = candidate.with_name(candidate.name + _PATCH_BACKUP_SUFFIX)
+
+def _next_backup_path(candidate: Path) -> Path:
+    """First free ``<name>.rt-orig`` / ``<name>.rt-orig.2`` / ``.3`` … path.
+
+    Numbered (never overwritten) so a second apply on the same file can't
+    destroy the true original captured by the first apply.
+    """
+    base = candidate.with_name(candidate.name + _PATCH_BACKUP_SUFFIX)
+    if not base.exists():
+        return base
+    n = 2
+    while True:
+        cand = candidate.with_name(f"{candidate.name}{_PATCH_BACKUP_SUFFIX}.{n}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+@app.post("/api/roundtable/assistant/preview")
+async def api_roundtable_preview(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Dry-run a synthesis diff without writing.
+
+    Same rails as apply (bound+owned thread, in-project target, rate limit),
+    but mutates nothing — returns the file the diff would actually touch and
+    whether it applies cleanly, so the user can confirm BEFORE committing.
+    Body: ``{"thread_id": int, "target": "relative/path.py", "diff": "..."}``.
+    """
+    body = await request.json()
+    candidate, project_key, diff_text = _resolve_apply_candidate(body, user)
+    patch_path = _write_temp_patch(diff_text)
+    try:
+        strip_level = await _patch_dry_run(candidate, patch_path)
+    finally:
+        os.unlink(patch_path)
+    return {
+        "applies": True,
+        "target": str(candidate),
+        "project": project_key,
+        "strip_level": strip_level,
+    }
+
+
+@app.post("/api/roundtable/assistant/apply")
+async def api_roundtable_apply(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Apply a unified diff from a synthesis turn to a project file.
+
+    Body: ``{"thread_id": int, "target": "relative/path.py", "diff": "..."}``.
+
+    Safety rails:
+      - Target path must resolve inside the bound, owned project.
+      - ``patch --dry-run`` runs first; if it fails, no write happens.
+      - The diff is pinned to the validated target file (header can't redirect).
+      - The original is backed up to a numbered ``<target>.rt-orig[.N]`` before
+        the patch lands, so no apply ever destroys an earlier backup.
+    """
+    body = await request.json()
+    candidate, project_key, diff_text = _resolve_apply_candidate(body, user)
+    patch_path = _write_temp_patch(diff_text)
+    try:
+        strip_level = await _patch_dry_run(candidate, patch_path)
+
+        # Numbered backup so a second apply can't clobber the true original.
+        backup_path = _next_backup_path(candidate)
         backup_path.write_bytes(candidate.read_bytes())
 
-        # Real apply.
-        if strip_level == 0:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["patch", "--silent", "-p0", str(candidate), "-i", patch_path],
-                capture_output=True, text=True,
-            )
-        else:
-            # Explicit operand (not -d): pin the write to the validated
-            # candidate so the diff header can't redirect it elsewhere. See
-            # the dry-run fallback above for the full rationale.
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["patch", "--silent", "-p1", str(candidate), "-i", patch_path],
-                capture_output=True, text=True,
-            )
-
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["patch", "--silent", f"-p{strip_level}", str(candidate), "-i", patch_path],
+            capture_output=True, text=True,
+        )
         if result.returncode != 0:
-            # Restore from backup so we don't leave the file in a half-
-            # applied state. patch normally doesn't leave a mess on
-            # failure but a corrupted backup file would be worse.
+            # Restore from backup so we don't leave a half-applied file.
             candidate.write_bytes(backup_path.read_bytes())
             raise HTTPException(
                 500,

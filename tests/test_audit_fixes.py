@@ -110,3 +110,47 @@ def test_finish_drains_deferred_user_item() -> None:
         e.get("type") == "error" and "held message" in (e.get("lost_input") or "")
         for e in run.events
     )
+
+
+def test_next_backup_path_never_overwrites(tmp_path) -> None:
+    """Numbered backups: a second apply on the same file must not clobber the
+    first backup (which holds the true original)."""
+    import app as app_module
+    f = tmp_path / "foo.py"
+    f.write_text("orig", encoding="utf-8")
+    b1 = app_module._next_backup_path(f)
+    assert b1.name == "foo.py.rt-orig"
+    b1.write_bytes(b"first-backup")
+    b2 = app_module._next_backup_path(f)
+    assert b2.name == "foo.py.rt-orig.2"
+    assert b2 != b1
+    b2.write_bytes(b"second-backup")
+    b3 = app_module._next_backup_path(f)
+    assert b3.name == "foo.py.rt-orig.3"
+
+
+def test_roundtable_usage_totals(tmp_path, monkeypatch) -> None:
+    """roundtable_usage aggregates persisted per-turn rows by participant."""
+    import importlib
+    import roundtable.core as core
+    # Point the core DB at a temp file and reset the cached connection.
+    monkeypatch.setattr(core, "DB_PATH", tmp_path / "rt.db")
+    monkeypatch.setattr(core, "_db", None)
+    tid = 4242
+    fake = type("R", (), {})()
+    fake.usage = {"input_tokens": 100, "output_tokens": 20, "cached_tokens": 5}
+    fake.finish_reason = "stop"
+    core._log_usage("gemini", fake, thread_id=tid)
+    fake2 = type("R", (), {})()
+    fake2.usage = {"input_tokens": 50, "output_tokens": 10, "cached_tokens": 0}
+    fake2.finish_reason = "stop"
+    core._log_usage("gemini", fake2, thread_id=tid)
+    fake3 = type("R", (), {})()
+    fake3.usage = {"input_tokens": 200, "output_tokens": 40, "cached_tokens": 0}
+    fake3.finish_reason = "stop"
+    core._log_usage("openai", fake3, thread_id=tid)
+    usage = core.roundtable_usage(tid)
+    assert usage["total_input_tokens"] == 350
+    assert usage["total_output_tokens"] == 70
+    gem = next(p for p in usage["by_participant"] if p["participant"] == "gemini")
+    assert gem["turns"] == 2 and gem["input_tokens"] == 150
