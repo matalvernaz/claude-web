@@ -341,14 +341,21 @@ STATIC_DIR = Path(__file__).parent / "static"
 # as a separate option because that model gates 1M behind a beta. The empty
 # key ("" → "Default") pins Opus 4.8 explicitly so the dropdown's default
 # does not silently fall back to whatever the CLI happens to choose.
+# Fable 5 is a real model (1M context, 128K output, all effort levels). Its
+# availability is access-gated upstream and was suspended 2026-06-12 by a US
+# government directive; while suspended, picking it makes the CLI return a
+# model-not-available error that the run lifecycle now surfaces as a failed
+# turn (see _looks_like_model_rejection) instead of a silent reply.
 #
 # `efforts` lists the values accepted for the SDK's `effort` option (the
-# CLI's --effort flag). The knob shipped with Opus 4.8 (server default:
-# high); earlier models aren't known to accept it, so those entries stay
-# empty rather than risk a 400.
+# CLI's --effort flag). Opus 4.8 and Fable 5 accept the full set; earlier
+# models aren't known to accept it, so those entries stay empty rather than
+# risk a 400.
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 KNOWN_MODELS = [
     {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
@@ -8210,6 +8217,22 @@ def _handle_partial_stream_event(run: "ActiveRun", msg: StreamEvent) -> None:
         _flush_partial(run)
 
 
+def _looks_like_model_rejection(text: str) -> bool:
+    """True when a turn's result text is the CLI's model-unavailable notice.
+
+    A model the API lists but the credential can't actually invoke (no access,
+    a typo, or — like Fable 5 on 2026-06-12 — suspended upstream) is reported
+    by the bundled CLI as an ordinary assistant turn whose ResultMessage is
+    flagged ``is_error=True``. Match the stable phrasing so the run lifecycle
+    can surface it as a visible failure instead of a silent reply.
+    """
+    low = (text or "").lower()
+    return (
+        "issue with the selected model" in low
+        or "may not exist or you may not have access" in low
+    )
+
+
 def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
     """Translate one SDK message into one or more SSE-payload dicts.
 
@@ -8379,7 +8402,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         cred_mode = _resolve_credential_mode(slot, owner)
         usage = msg.usage or {}
         creation = usage.get("cache_creation") or {}
-        return [{
+        events: list[dict] = [{
             "type": "result",
             "is_error": msg.is_error,
             "result": msg.result,
@@ -8399,6 +8422,18 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "cache_1h_input_tokens": creation.get("ephemeral_1h_input_tokens"),
             "permission_denials": [_denial_dict(d) for d in (msg.permission_denials or [])],
         }]
+        # The bundled CLI reports an unusable model (no access / suspended /
+        # typo) as a normal assistant turn with is_error=True — which renders
+        # as a reply, not a failure. Promote it to the dedicated error channel
+        # so the picked model's rejection is an unmistakable banner, not a
+        # silent "Claude said …" that looks like the app broke.
+        if msg.is_error and _looks_like_model_rejection(msg.result or ""):
+            events.append({
+                "type": "error",
+                "message": msg.result,
+                "model_unavailable": True,
+            })
+        return events
     return []
 
 

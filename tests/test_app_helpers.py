@@ -690,3 +690,57 @@ def test_task_create_error_result_does_not_add() -> None:
     assert run.tasks == {}
     assert "tu_z" not in run.pending_task_creates
     assert _todos_payloads(events) == []
+
+
+# ─── Model-rejection detection ─────────────────────────────────────────────
+
+_REJECTION_TEXT = (
+    "There's an issue with the selected model (claude-fable-5). It may not "
+    "exist or you may not have access to it. Run --model to pick a different model."
+)
+
+
+@pytest.mark.parametrize("text", [
+    _REJECTION_TEXT,
+    "ISSUE WITH THE SELECTED MODEL (x)",  # case-insensitive
+    "It may not exist or you may not have access to it.",  # second phrasing alone
+])
+def test_looks_like_model_rejection_matches(text: str) -> None:
+    assert app_module._looks_like_model_rejection(text)
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    None,
+    "Here is the summary you asked for.",
+    "The turn was interrupted.",
+])
+def test_looks_like_model_rejection_rejects_normal_text(text) -> None:
+    assert not app_module._looks_like_model_rejection(text)
+
+
+def _result(is_error: bool, result: str):
+    from claude_agent_sdk import ResultMessage
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=is_error,
+        num_turns=1, session_id="s1", result=result, usage={},
+    )
+
+
+def test_model_rejection_result_promoted_to_error_event(monkeypatch) -> None:
+    """A model the CLI can't invoke comes back as is_error=True with the
+    rejection notice — the serializer adds a dedicated error event so the UI
+    shows a failure banner, not a silent reply."""
+    monkeypatch.setattr(app_module, "_log_usage", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_resolve_credential_mode", lambda *a, **k: "oauth")
+    events = app_module._sdk_message_to_events(_result(True, _REJECTION_TEXT))
+    errors = [e for e in events if e.get("type") == "error"]
+    assert errors and errors[0]["model_unavailable"] is True
+    assert "selected model" in errors[0]["message"]
+
+
+def test_normal_result_emits_no_error_event(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "_log_usage", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_resolve_credential_mode", lambda *a, **k: "oauth")
+    events = app_module._sdk_message_to_events(_result(False, "All done."))
+    assert not [e for e in events if e.get("type") == "error"]
