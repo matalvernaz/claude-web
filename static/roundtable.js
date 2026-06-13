@@ -855,8 +855,24 @@
           break;
         }
         case "synth_start":
+          state.synthLabel = data.synthesizer.label;
           progress.textContent = `Synthesizing with ${data.synthesizer.label}…`;
           break;
+        case "synth_delta": {
+          // Live synthesis text. Visual streaming only — not an aria-live
+          // region (token-by-token announcement would flood NVDA); the
+          // "response ready" announcement on `done` is the audible signal,
+          // and the streamed text is immediately navigable once it lands.
+          // The placeholder is removed in `done` before the markdown render.
+          if (!state.synthStreamBody) {
+            const live = document.createElement("div");
+            live.className = "asst-turn-body asst-turn-stream";
+            asstArticle.appendChild(live);
+            state.synthStreamBody = live;
+          }
+          state.synthStreamBody.textContent += data.text || "";
+          break;
+        }
         case "stream":
           // Server-side detached stream id: survives tab close. Saved so a
           // reload can rejoin the run and replay what it missed.
@@ -867,6 +883,12 @@
           state.doneSeen = true;
           try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
           assistantThreadId = data.thread_id;
+          // Drop the streamed plain-text placeholder before finalize renders
+          // the markdown body, so we don't show the synthesis twice.
+          if (state.synthStreamBody) {
+            state.synthStreamBody.remove();
+            state.synthStreamBody = null;
+          }
           finalizeAssistantTurn(asstArticle, progress, data);
           announce(
             `Response from ${data.synthesizer.label} ready` +

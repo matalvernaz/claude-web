@@ -154,3 +154,50 @@ def test_roundtable_usage_totals(tmp_path, monkeypatch) -> None:
     assert usage["total_output_tokens"] == 70
     gem = next(p for p in usage["by_participant"] if p["participant"] == "gemini")
     assert gem["turns"] == 2 and gem["input_tokens"] == 150
+
+
+def test_gemini_streaming_emits_and_accumulates(monkeypatch) -> None:
+    """on_delta fires per chunk and the ProviderResult carries the full text."""
+    import roundtable.core as core
+
+    class _Chunk:
+        def __init__(self, text):
+            self.text = text
+            self.usage_metadata = None
+
+    class _Models:
+        def generate_content_stream(self, **kw):
+            for t in ["Hel", "lo ", "world"]:
+                yield _Chunk(t)
+
+    class _FakeGemini:
+        models = _Models()
+
+    monkeypatch.setattr(core, "_gemini", _FakeGemini())
+    got = []
+    result = core._call_gemini(
+        "gemini-pro-latest", "sys", "transcript", "",
+        on_delta=lambda t: got.append(t),
+    )
+    assert got == ["Hel", "lo ", "world"]
+    assert result.text == "Hello world"
+
+
+def test_gemini_non_streaming_unchanged(monkeypatch) -> None:
+    """on_delta=None keeps the single-shot generate_content path."""
+    import roundtable.core as core
+
+    class _Resp:
+        text = "one shot"
+        usage_metadata = None
+
+    class _Models:
+        def generate_content(self, **kw):
+            return _Resp()
+
+    class _FakeGemini:
+        models = _Models()
+
+    monkeypatch.setattr(core, "_gemini", _FakeGemini())
+    result = core._call_gemini("gemini-pro-latest", "sys", "t", "")
+    assert result.text == "one shot"

@@ -9733,6 +9733,12 @@ _ASSISTANT_DEFAULT_SYNTHESIZER = "claude-opus"
 # topic from the first user turn. Topics longer than this get squashed
 # into a single-line preview.
 _ASSISTANT_TOPIC_PREVIEW_CHARS = 80
+# Stream the synthesizer turn token-by-token (synth_delta SSE) instead of one
+# opaque wait. Default off so the deploy is safe and the CLI stream-json path
+# (the subscription transport) can be smoke-tested before it's the default.
+ROUNDTABLE_STREAM_SYNTH = os.getenv(
+    "CLAUDE_WEB_ROUNDTABLE_STREAM_SYNTH", "",
+).strip().lower() in ("1", "true", "yes")
 
 # Per-assistant-call file upload cap (per file). Larger than the
 # attach-endpoint cap on purpose — uploaded files in the conversation
@@ -10229,7 +10235,26 @@ async def api_roundtable_assistant(
                 )
                 await event_queue.put(("synth_start", {
                     "synthesizer": {"key": synth_key, "label": synth_info["label"]},
+                    "streaming": ROUNDTABLE_STREAM_SYNTH,
                 }))
+
+                # Stream the synthesis token-by-token when enabled. roundtable_ask
+                # runs on a worker thread (to_thread), so the per-chunk callback
+                # bridges back to this event loop via run_coroutine_threadsafe —
+                # the same cross-thread pattern the permission callback uses.
+                # Fire-and-forget + guarded so a delta can never break the turn.
+                on_delta = None
+                if ROUNDTABLE_STREAM_SYNTH:
+                    loop = asyncio.get_running_loop()
+
+                    def on_delta(text: str) -> None:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                event_queue.put(("synth_delta", {"text": text})),
+                                loop,
+                            )
+                        except RuntimeError:
+                            pass  # loop gone (client vanished) — drop the delta
 
                 try:
                     synthesis = await asyncio.to_thread(
@@ -10237,6 +10262,7 @@ async def api_roundtable_assistant(
                         thread_id=tid, participant=synth_key, prompt="",
                         effort=effort_norm, web_search=web_search,
                         tool_use_context=tool_use_context,
+                        on_delta=on_delta,
                     )
                 except (ValueError, RuntimeError) as exc:
                     await event_queue.put(("error", {"message": f"synth: {exc}"}))

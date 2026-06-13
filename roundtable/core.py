@@ -971,9 +971,17 @@ def roundtable_usage(thread_id: int) -> dict:
     }
 
 
+# Per-text-chunk callback for streamed turns. Invoked from whatever thread
+# the provider call runs on (a roundtable_ask worker thread); the webapp
+# bridges it back to its event loop via run_coroutine_threadsafe. None =
+# non-streaming (the default for every panel ask).
+StreamDelta = Callable[[str], None]
+
+
 def _call_gemini(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Send the rendered transcript + final instruction to Gemini.
 
@@ -1028,6 +1036,30 @@ def _call_gemini(
             genai_types.Tool(google_search=genai_types.GoogleSearch()),
         ]
 
+    if on_delta is not None:
+        # Streamed: iterate chunks, emit each chunk's text, accumulate the
+        # full reply. No _provider_call retry wrapper — a mid-stream retry
+        # would re-emit already-streamed text. The SDK's http_options timeout
+        # still bounds the call.
+        def _do_stream() -> ProviderResult:
+            parts: list[str] = []
+            last = None
+            for chunk in _gemini.models.generate_content_stream(
+                model=model, contents=user_msg, config=config,
+            ):
+                last = chunk
+                t = getattr(chunk, "text", None)
+                if t:
+                    parts.append(t)
+                    on_delta(t)
+            return ProviderResult(
+                text="".join(parts),
+                usage=_extract_usage("gemini", last) if last is not None else None,
+                raw=last,
+            )
+
+        return _call_with_wall_cap(f"gemini/{model}/stream", _do_stream)
+
     def _do_call():
         return _gemini.models.generate_content(
             model=model, contents=user_msg, config=config,
@@ -1042,6 +1074,7 @@ def _call_gemini(
 def _call_openai(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Send the conversation to OpenAI via the Responses API.
 
@@ -1086,6 +1119,37 @@ def _call_openai(
     if web_search:
         kwargs["tools"] = [{"type": "web_search"}]
 
+    if on_delta is not None:
+        # Streamed via the Responses API. ``response.output_text.delta`` events
+        # carry the visible text; ``response.completed`` carries the final
+        # response (with usage). No retry wrapper (would re-emit).
+        def _do_stream() -> ProviderResult:
+            parts: list[str] = []
+            final = None
+            with _openai.responses.stream(**kwargs) as stream:
+                for event in stream:
+                    etype = getattr(event, "type", "")
+                    if etype == "response.output_text.delta":
+                        d = getattr(event, "delta", "") or ""
+                        if d:
+                            parts.append(d)
+                            on_delta(d)
+                    elif etype == "response.completed":
+                        final = getattr(event, "response", None)
+                if final is None:
+                    final = stream.get_final_response()
+            text = (
+                getattr(final, "output_text", None)
+                if final is not None else None
+            ) or "".join(parts)
+            return ProviderResult(
+                text=text,
+                usage=_extract_usage("openai", final) if final is not None else None,
+                raw=final,
+            )
+
+        return _call_with_wall_cap(f"openai/{model}/stream", _do_stream)
+
     def _do_call():
         return _openai.responses.create(**kwargs)
 
@@ -1122,6 +1186,7 @@ def _anthropic_supports_effort(model: str) -> bool:
 def _call_anthropic(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Send the transcript to an Anthropic model via the Messages API.
 
@@ -1201,6 +1266,28 @@ def _call_anthropic(
             {"type": "web_search_20260209", "name": "web_search"},
         ]
 
+    if on_delta is not None:
+        # Streamed via Messages API. ``text_stream`` yields visible-text
+        # deltas only (thinking blocks are excluded), which is exactly what
+        # we want to surface. The final message (for usage/stop_reason) comes
+        # from get_final_message(). No retry wrapper (would re-emit).
+        def _do_stream() -> ProviderResult:
+            parts: list[str] = []
+            with _anthropic.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    if text:
+                        parts.append(text)
+                        on_delta(text)
+                final = stream.get_final_message()
+            return ProviderResult(
+                text="".join(parts),
+                usage=_extract_usage("anthropic", final),
+                finish_reason=getattr(final, "stop_reason", None),
+                raw=final,
+            )
+
+        return _call_with_wall_cap(f"anthropic/{model}/stream", _do_stream)
+
     def _do_call():
         return _anthropic.messages.create(**kwargs)
 
@@ -1215,9 +1302,76 @@ def _call_anthropic(
     )
 
 
+class _StreamFailedBeforeOutput(RuntimeError):
+    """The CLI stream-json subprocess failed without emitting any text (e.g.
+    the bundled version rejects a streaming flag). Signals the caller it's
+    safe to fall back to a plain non-streaming call — nothing was emitted, so
+    the fallback won't double up."""
+
+
+def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") -> str:
+    """Run the claude CLI in stream-json mode, emitting visible text deltas.
+
+    Returns the full accumulated text. Raises ``_StreamFailedBeforeOutput`` if
+    the subprocess fails before emitting anything (caller falls back to
+    non-streaming); a plain RuntimeError if it dies AFTER partial output (the
+    caller must NOT fall back then, or it'd re-emit). Parses defensively across
+    a few event shapes so CLI output-format drift degrades to fewer deltas.
+    """
+    proc = subprocess.Popen(
+        args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    parts: list[str] = []
+
+    def _emit_from(obj: dict) -> None:
+        # Shape 1: partial-message stream_event wrapping a raw Anthropic event.
+        ev = obj.get("event") if obj.get("type") == "stream_event" else None
+        if isinstance(ev, dict):
+            delta = ev.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                parts.append(delta["text"])
+                on_delta(delta["text"])
+            return
+        # Shape 2: a complete assistant message (no partial-message flag).
+        if obj.get("type") == "assistant":
+            msg = obj.get("message") or {}
+            for blk in msg.get("content") or []:
+                if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
+                    parts.append(blk["text"])
+                    on_delta(blk["text"])
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(user_msg)
+        proc.stdin.close()
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                _emit_from(obj)
+        rc = proc.wait(timeout=PROVIDER_TIMEOUT_SEC)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if rc != 0:
+        tail = (proc.stderr.read() if proc.stderr else "")[-2000:]
+        msg = f"claude CLI (stream-json) exit={rc}; stderr tail: {tail!r}"
+        if not parts:
+            raise _StreamFailedBeforeOutput(msg)
+        raise RuntimeError(msg)
+    return "".join(parts)
+
+
 def _call_anthropic_cli(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Subprocess to ``claude`` / ``claude-ha`` and read the response.
 
@@ -1279,6 +1433,31 @@ def _call_anthropic_cli(
         # validates against.
         args.extend(["--effort", effort])
     # No positional prompt — user_msg goes via stdin (see docstring).
+
+    if on_delta is not None:
+        # Streamed path: re-run with stream-json + partial messages and parse
+        # text deltas. If the bundled CLI rejects the streaming flags (older
+        # version) the subprocess exits before emitting anything — fall back
+        # to the plain capture below so synthesis still completes. A failure
+        # AFTER emitting partial text re-raises (surfaced as an error event).
+        stream_args = args + [
+            "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages",
+        ]
+        try:
+            out = _call_with_wall_cap(
+                f"anthropic-cli/{model}/stream",
+                lambda: _cli_stream_json(stream_args, user_msg, on_delta),
+            )
+            return ProviderResult(text=out)
+        except _StreamFailedBeforeOutput as exc:
+            # Streaming flags rejected (older CLI) and nothing was emitted —
+            # safe to retry without streaming below.
+            logger.warning(
+                "anthropic-cli stream unsupported (%s); falling back to "
+                "non-streaming capture", exc,
+            )
+            # Fall through to the non-streaming path below.
 
     def _do_call() -> str:
         proc = subprocess.run(
@@ -1688,6 +1867,7 @@ def _call_anthropic_router(
     effort: Optional[str] = None, web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
     participant_label: str = "",
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Pick CLI vs SDK based on the transport setting and what's available.
 
@@ -1706,6 +1886,8 @@ def _call_anthropic_router(
     """
     if (tool_use_context is not None
             and tool_use_context.working_directory is not None):
+        # Tool-use turns aren't streamed (the agent loop's text arrives
+        # interleaved with tool calls); on_delta is ignored here by design.
         return _call_anthropic_sdk_with_tools(
             model, system_prompt, transcript, instruction, effort, web_search,
             tool_use_context, participant_label,
@@ -1713,6 +1895,7 @@ def _call_anthropic_router(
     if _ANTHROPIC_TRANSPORT == "cli":
         return _call_anthropic_cli(
             model, system_prompt, transcript, instruction, effort, web_search,
+            on_delta=on_delta,
         )
     if _ANTHROPIC_TRANSPORT == "api":
         if _anthropic is None:
@@ -1721,11 +1904,13 @@ def _call_anthropic_router(
             )
         return _call_anthropic(
             model, system_prompt, transcript, instruction, effort, web_search,
+            on_delta=on_delta,
         )
     # auto: prefer CLI (subscription) if available, else SDK (API).
     if _CLAUDE_CLI is not None:
         return _call_anthropic_cli(
             model, system_prompt, transcript, instruction, effort, web_search,
+            on_delta=on_delta,
         )
     if _anthropic is not None:
         # Falling back to per-token API billing because no claude/claude-ha
@@ -1745,6 +1930,7 @@ def _call_anthropic_router(
             )
         return _call_anthropic(
             model, system_prompt, transcript, instruction, effort, web_search,
+            on_delta=on_delta,
         )
     raise RuntimeError(
         "No Anthropic transport available: neither claude CLI on PATH "
@@ -1990,6 +2176,7 @@ def _run_turn(
     thread: dict, info: dict, messages: list[dict], instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> ProviderResult:
     """Render the transcript for one participant and call its provider.
 
@@ -2019,12 +2206,12 @@ def _run_turn(
     if provider == "gemini":
         return _call_gemini(
             info["model"], system_prompt, transcript, instruction,
-            effort, web_search,
+            effort, web_search, on_delta=on_delta,
         )
     if provider == "openai":
         return _call_openai(
             info["model"], system_prompt, transcript, instruction,
-            effort, web_search,
+            effort, web_search, on_delta=on_delta,
         )
     if provider == "anthropic":
         # Routes between CLI (subscription), SDK (API), and SDK-with-tools
@@ -2035,6 +2222,7 @@ def _run_turn(
             effort, web_search,
             tool_use_context=tool_use_context,
             participant_label=info["label"],
+            on_delta=on_delta,
         )
     raise RuntimeError(f"Unknown provider {provider!r} for model {info['model']!r}")
 
@@ -2043,6 +2231,7 @@ def roundtable_ask(
     thread_id: int, participant: str, prompt: str = "", effort: str = "",
     web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
+    on_delta: "Optional[StreamDelta]" = None,
 ) -> str:
     """Route a turn to a named AI participant.
 
@@ -2101,7 +2290,7 @@ def roundtable_ask(
     try:
         result = _run_turn(
             thread, info, messages, "", effort, web_search,
-            tool_use_context=tool_use_context,
+            tool_use_context=tool_use_context, on_delta=on_delta,
         )
     except Exception as exc:
         # Surface the provider error to the caller AND record it in the
