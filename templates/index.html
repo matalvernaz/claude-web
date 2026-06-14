@@ -169,7 +169,9 @@
           <span class="context-label">Context</span>
           <span id="context-text" class="context-text">—</span>
           <span class="context-bar" aria-hidden="true"><span id="context-fill" class="context-fill"></span></span>
+          <button type="button" id="context-details-btn" class="context-details-btn" aria-expanded="false" aria-controls="context-breakdown" aria-label="Show exact context usage breakdown">Details</button>
         </div>
+        <div id="context-breakdown" class="context-breakdown" hidden></div>
         <form id="chat-form" autocomplete="off">
           <label for="prompt">Message <span class="hint">(Enter to send, Shift+Enter for newline, / for commands, paste or drop files)</span></label>
           <div class="prompt-wrap">

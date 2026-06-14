@@ -2496,6 +2496,20 @@
       summary.className = "task-summary";
       summary.textContent = "▶ " + (obj.description || "task " + id);
       block.appendChild(summary);
+      // Stop control for a still-running background task. Lives in the summary
+      // so it's reachable without expanding; stopPropagation keeps the click
+      // from toggling the <details>. Removed once the task reports done.
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "task-stop";
+      stopBtn.textContent = "Stop";
+      stopBtn.setAttribute("aria-label", "Stop background task " + (obj.description || id));
+      stopBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        stopTask(id, stopBtn);
+      });
+      summary.appendChild(stopBtn);
       const log = document.createElement("div");
       log.className = "task-log";
       block.appendChild(log);
@@ -2517,6 +2531,8 @@
       summary.textContent = `${icon} ${obj.description || obj.summary || "task " + id} (${status}${took})`;
       taskStartedAt.delete(id);
       block.classList.add("task-" + status);
+      const sb = block.querySelector(".task-stop");
+      if (sb) sb.remove();
     }
 
     // Append log line.
@@ -2535,6 +2551,31 @@
     if (kind === "notification") {
       announce(`Background task ${id}: ${obj.status || "done"}`);
       playCue(obj.status === "error" ? "task_error" : "task_done");
+    }
+  }
+
+  // Stop one running background task via the stop_task verb. The CLI then
+  // emits a task_notification with status 'stopped', which renderTaskEvent
+  // renders (and which removes this button).
+  async function stopTask(taskId, btn) {
+    if (!sessionId) return;
+    btn.disabled = true;
+    btn.textContent = "Stopping…";
+    announce("Stopping background task " + taskId + ".");
+    try {
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("task_id", taskId);
+      const r = await fetch("/api/chat/stop-task", { method: "POST", body: fd });
+      if (!r.ok) {
+        announce("Couldn't stop task (" + r.status + ").");
+        btn.disabled = false;
+        btn.textContent = "Stop";
+      }
+    } catch (e) {
+      announce("Couldn't stop task: network error.");
+      btn.disabled = false;
+      btn.textContent = "Stop";
     }
   }
 
@@ -2616,6 +2657,74 @@
       contextText.textContent = pretty(lastInputTokens);
       contextFill.style.width = "0%";
     }
+  }
+
+  // Exact context breakdown via the get_context_usage verb. The always-on
+  // meter above is an estimate from last-turn input tokens; this fetches the
+  // CLI's real per-category numbers (the /context view) on demand and both
+  // renders and speaks them.
+  const contextDetailsBtn = document.getElementById("context-details-btn");
+  const contextBreakdown = document.getElementById("context-breakdown");
+  if (contextDetailsBtn) {
+    contextDetailsBtn.addEventListener("click", async () => {
+      if (contextDetailsBtn.getAttribute("aria-expanded") === "true") {
+        contextDetailsBtn.setAttribute("aria-expanded", "false");
+        if (contextBreakdown) contextBreakdown.hidden = true;
+        return;
+      }
+      if (!sessionId) {
+        announce("Exact context usage needs a running conversation.");
+        return;
+      }
+      contextDetailsBtn.disabled = true;
+      try {
+        const r = await fetch("/api/chat/context/" + encodeURIComponent(sessionId));
+        if (!r.ok) {
+          announce("Couldn't load context usage (" + r.status + ").");
+          return;
+        }
+        const data = await r.json();
+        renderContextBreakdown((data && data.usage) || {});
+      } catch (e) {
+        announce("Couldn't load context usage: network error.");
+      } finally {
+        contextDetailsBtn.disabled = false;
+      }
+    });
+  }
+
+  function renderContextBreakdown(usage) {
+    if (!contextBreakdown) return;
+    const cats = Array.isArray(usage.categories) ? usage.categories : [];
+    const total = usage.totalTokens || 0;
+    const max = usage.maxTokens || 0;
+    const pct = typeof usage.percentage === "number"
+      ? Math.round(usage.percentage)
+      : (max ? Math.round((total / max) * 100) : 0);
+    const pretty = (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+    contextBreakdown.textContent = "";
+    const heading = document.createElement("p");
+    heading.className = "context-breakdown-total";
+    heading.textContent = `${pct}% used · ${pretty(total)} of ${pretty(max)} tokens`
+      + (usage.model ? ` · ${usage.model}` : "");
+    contextBreakdown.appendChild(heading);
+    if (cats.length) {
+      const ul = document.createElement("ul");
+      ul.className = "context-breakdown-list";
+      for (const c of cats) {
+        if (!c || !c.tokens) continue;
+        const li = document.createElement("li");
+        li.textContent = `${c.name || "?"}: ${pretty(c.tokens)}`;
+        ul.appendChild(li);
+      }
+      contextBreakdown.appendChild(ul);
+    }
+    contextBreakdown.hidden = false;
+    contextDetailsBtn.setAttribute("aria-expanded", "true");
+    const topCats = cats.filter((c) => c && c.tokens).slice(0, 3)
+      .map((c) => `${c.name} ${pretty(c.tokens)}`).join(", ");
+    announce(`Context ${pct}% used, ${pretty(total)} of ${pretty(max)} tokens.`
+      + (topCats ? ` Top: ${topCats}.` : ""));
   }
 
   function summariseResult(r) {
