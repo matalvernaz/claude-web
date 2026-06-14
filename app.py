@@ -9032,11 +9032,27 @@ async def mcp_page(
     spends time on stdio-server health checks.
     """
     payload = await asyncio.to_thread(_mcp_payload)
+    # Live per-server status needs a running CLI, so offer the user's own live
+    # conversations as queryable sources (the /api/chat/mcp/* verbs are
+    # session-keyed). Empty when nothing's running — the page then shows only
+    # the static config above.
+    live_sessions: list[dict[str, str]] = []
+    seen_sids: set[str] = set()
+    for r in ACTIVE_RUNS.values():
+        if r.done or r.client is None or not r.session_id:
+            continue
+        if r.owner_sub not in (None, user.get("sub")):
+            continue
+        if r.session_id in seen_sids:
+            continue
+        seen_sids.add(r.session_id)
+        live_sessions.append({"session_id": r.session_id, "project": r.project_key or ""})
     response = templates.TemplateResponse(
         request, "mcp.html", {
             "user": user,
             "mcp_payload": payload,
             "site_title": SITE_TITLE,
+            "live_sessions": live_sessions,
         },
     )
     response.headers["Cache-Control"] = "no-store"

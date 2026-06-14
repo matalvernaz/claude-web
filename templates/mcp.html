@@ -98,11 +98,39 @@
       {% endif %}
     </section>
 
+    <section aria-labelledby="live-heading" class="setup-card">
+      <h2 id="live-heading">Live status (running conversation)</h2>
+      {% if live_sessions %}
+        <p>
+          Live connection state for the MCP servers in your running
+          conversation, with enable / disable and reconnect. Changes apply to
+          that conversation's CLI from its next turn.
+        </p>
+        {% if live_sessions|length > 1 %}
+          <label class="header-select" for="live-session-select">
+            <span>Conversation</span>
+            <select id="live-session-select" aria-label="Conversation to inspect">
+              {% for s in live_sessions %}
+                <option value="{{ s.session_id }}">{{ s.project or s.session_id }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        {% endif %}
+        <div id="live-status-feedback" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+        <div id="live-mcp-status" aria-busy="true">Loading live status…</div>
+      {% else %}
+        <p>No running conversation. Start a chat to see live MCP connection
+          state and manage servers here.</p>
+      {% endif %}
+    </section>
+
     <p class="setup-note">
       Add / remove / re-auth still happens via the bundled
       <code>claude mcp</code> CLI — its storage format is opaque to this
       app and editing while a run is live would race the CLI's own writes.
     </p>
   </main>
+  <script type="application/json" id="live-sessions-data">{{ live_sessions|tojson }}</script>
+  <script src="/static/mcp.js?v={{ asset_version('mcp.js') }}"></script>
 </body>
 </html>
