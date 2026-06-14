@@ -4833,6 +4833,11 @@ class ActiveRun:
         # CLI to "acceptEdits". Not authoritative — purely for the
         # plan-mode indicator/announcement.
         self.permission_mode: str = "default"
+        # The live model *key* (see KNOWN_MODELS) the run is currently on, or
+        # None for "as spawned". Updated by /api/chat/model when the user
+        # switches model live via ClaudeSDKClient.set_model() — no respawn,
+        # the conversation continues on the new model from the next turn.
+        self.model: Optional[str] = None
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -8157,6 +8162,221 @@ async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
             run.task.cancel()
         return {"ok": True, "interrupt_failed": True}
     return {"ok": True, "interrupted": True}
+
+
+# ─── Live control-verb routes (SDK control protocol) ─────────────────────────
+# These wrap ClaudeSDKClient control verbs the SDK exposes but the UI didn't
+# previously drive. All session-keyed (like /api/chat/rewind): the browser
+# drops its run handle between turns while the run stays alive in ACTIVE_RUNS.
+# Mutating verbs take client_write_lock to serialise against the driver's
+# per-message CLI write (held only during the brief write, not the whole turn);
+# read-only getters skip it so they stay responsive mid-turn.
+
+_VALID_PERMISSION_MODES = {
+    "default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto",
+}
+
+
+def _live_run_or_400(session_id: str, user: dict) -> tuple["ActiveRun", Any]:
+    """Resolve (run, client) for a control-verb call, or raise.
+
+    Centralises the session-keyed lookup + ownership + liveness checks every
+    verb route shares: 404 when there's no live run, 409 while the run's CLI
+    subprocess is still starting (client not yet published). The client is
+    captured into a local so a concurrent teardown nulling ``run.client``
+    can't strand the caller between this check and the verb call.
+    """
+    sid = _safe_id(session_id)
+    run = _existing_run_for_session(sid)
+    if run is None or run.done:
+        raise HTTPException(404, "no live run for this session")
+    _require_owner(run, user)
+    client = run.client
+    if client is None:
+        raise HTTPException(409, "run is still starting; try again shortly")
+    return run, client
+
+
+@app.post("/api/chat/permission-mode")
+async def api_chat_permission_mode(
+    session_id: str = Form(...),
+    mode: str = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Switch the live CLI's permission mode mid-conversation via
+    ``ClaudeSDKClient.set_permission_mode()``.
+
+    Modes: ``default`` (prompt for dangerous tools), ``plan`` (no execution),
+    ``acceptEdits`` (auto-accept file edits), ``dontAsk`` (deny anything not
+    pre-allowed), ``auto`` (model classifier decides), ``bypassPermissions``
+    (allow everything — this **disables** the in-browser permission prompt,
+    since the CLI stops calling ``can_use_tool``; expose it deliberately).
+
+    ``run.permission_mode`` was until now a read-only mirror the model drove
+    (EnterPlanMode → "plan", approved ExitPlanMode → "acceptEdits"); this lets
+    the user drive it too.
+    """
+    if mode not in _VALID_PERMISSION_MODES:
+        raise HTTPException(400, f"invalid permission mode {mode!r}")
+    run, client = _live_run_or_400(session_id, user)
+    try:
+        async with run.client_write_lock:
+            await client.set_permission_mode(mode)
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"set permission mode failed: {exc}") from exc
+    run.permission_mode = mode
+    run.emit({"type": "permission_mode_changed", "mode": mode, "source": "user"})
+    log.info("permission mode set run=%s mode=%s", run.run_id, mode)
+    return {"ok": True, "mode": mode}
+
+
+@app.post("/api/chat/model")
+async def api_chat_set_model(
+    session_id: str = Form(...),
+    model: str = Form(default=""),
+    user: dict = Depends(auth.require_user),
+):
+    """Switch the live CLI's model mid-conversation via
+    ``ClaudeSDKClient.set_model()`` — no respawn, the conversation continues on
+    the new model from the next turn. ``model`` is a claude-web model *key*
+    (see KNOWN_MODELS); empty selects the CLI default.
+
+    Caveat: ``set_model`` changes only the model string, not the request
+    betas. Switching between two keys whose ``betas`` differ (e.g. the
+    1M-context variant) still needs a respawn through ``/api/chat`` to apply
+    the beta — the browser picks the path based on whether betas change.
+    """
+    if model and model not in MODELS_BY_KEY:
+        raise HTTPException(400, f"unknown model {model!r}")
+    run, client = _live_run_or_400(session_id, user)
+    sdk_model = (MODELS_BY_KEY.get(model, {}).get("model") or None) if model else None
+    try:
+        async with run.client_write_lock:
+            await client.set_model(sdk_model)
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"set model failed: {exc}") from exc
+    run.model = model
+    label = MODELS_BY_KEY.get(model, {}).get("label") or "Default"
+    run.emit({"type": "model_changed", "model": model, "label": label})
+    log.info("model set run=%s model=%s", run.run_id, model or "(default)")
+    return {"ok": True, "model": model, "label": label}
+
+
+@app.post("/api/chat/stop-task")
+async def api_chat_stop_task(
+    session_id: str = Form(...),
+    task_id: str = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Stop one background task by id via ``ClaudeSDKClient.stop_task()``.
+
+    The CLI emits a ``task_notification`` with status ``'stopped'`` into the
+    message stream once it resolves, which the driver renders like any other
+    task update — so the panel reflects the stop without extra wiring here.
+    """
+    if not task_id:
+        raise HTTPException(400, "task_id required")
+    run, client = _live_run_or_400(session_id, user)
+    try:
+        async with run.client_write_lock:
+            await client.stop_task(task_id)
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"stop task failed: {exc}") from exc
+    run.emit({"type": "task_stop_requested", "task_id": task_id})
+    log.info("stop task run=%s task=%s", run.run_id, task_id)
+    return {"ok": True, "task_id": task_id}
+
+
+@app.get("/api/chat/context/{session_id}")
+async def api_chat_context_usage(
+    session_id: str, user: dict = Depends(auth.require_user),
+):
+    """Live context-window usage via ``ClaudeSDKClient.get_context_usage()`` —
+    the same breakdown the CLI's ``/context`` command shows (per-category
+    tokens, total, max, percentage, model). Read-only, so no write lock: it
+    stays responsive even mid-turn.
+    """
+    _, client = _live_run_or_400(session_id, user)
+    try:
+        usage = await client.get_context_usage()
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"context usage query failed: {exc}") from exc
+    return {"ok": True, "usage": usage}
+
+
+@app.get("/api/chat/mcp/{session_id}")
+async def api_chat_mcp_status(
+    session_id: str, user: dict = Depends(auth.require_user),
+):
+    """Live MCP server status via ``ClaudeSDKClient.get_mcp_status()`` —
+    per-server name/status/tools/error. Read-only; no write lock.
+    """
+    _, client = _live_run_or_400(session_id, user)
+    try:
+        status = await client.get_mcp_status()
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"mcp status query failed: {exc}") from exc
+    return {"ok": True, **(status or {})}
+
+
+@app.post("/api/chat/mcp/toggle")
+async def api_chat_mcp_toggle(
+    session_id: str = Form(...),
+    server: str = Form(...),
+    enabled: bool = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Enable/disable an MCP server live via ``toggle_mcp_server()`` — disabling
+    disconnects it and removes its tools; enabling reconnects.
+    """
+    if not server:
+        raise HTTPException(400, "server required")
+    run, client = _live_run_or_400(session_id, user)
+    try:
+        async with run.client_write_lock:
+            await client.toggle_mcp_server(server, enabled)
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"toggle mcp server failed: {exc}") from exc
+    run.emit({"type": "mcp_toggled", "server": server, "enabled": enabled})
+    log.info("mcp toggle run=%s server=%s enabled=%s", run.run_id, server, enabled)
+    return {"ok": True, "server": server, "enabled": enabled}
+
+
+@app.post("/api/chat/mcp/reconnect")
+async def api_chat_mcp_reconnect(
+    session_id: str = Form(...),
+    server: str = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Reconnect a failed/disconnected MCP server via ``reconnect_mcp_server()``."""
+    if not server:
+        raise HTTPException(400, "server required")
+    run, client = _live_run_or_400(session_id, user)
+    try:
+        async with run.client_write_lock:
+            await client.reconnect_mcp_server(server)
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"reconnect mcp server failed: {exc}") from exc
+    run.emit({"type": "mcp_reconnected", "server": server})
+    log.info("mcp reconnect run=%s server=%s", run.run_id, server)
+    return {"ok": True, "server": server}
+
+
+@app.get("/api/chat/server-info/{session_id}")
+async def api_chat_server_info(
+    session_id: str, user: dict = Depends(auth.require_user),
+):
+    """Server init info via ``ClaudeSDKClient.get_server_info()`` — available
+    commands + output styles + capabilities, captured at connect (no
+    round-trip). Lets the command palette reflect what the live CLI actually
+    offers instead of only the hardcoded builtin list.
+    """
+    _, client = _live_run_or_400(session_id, user)
+    try:
+        info = await client.get_server_info()
+    except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
+        raise HTTPException(500, f"server info query failed: {exc}") from exc
+    return {"ok": True, "info": info or {}}
 
 
 def _denial_dict(d) -> dict:
