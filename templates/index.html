@@ -36,6 +36,17 @@
           {% endfor %}
         </select>
       </label>
+      <label class="header-select" for="permission-mode-select">
+        <span class="sr-only">Permission mode</span>
+        <select id="permission-mode-select" aria-label="Permission mode" title="How Claude handles permission before running each tool">
+          <option value="default">Ask permission</option>
+          <option value="plan">Plan mode (read-only)</option>
+          <option value="acceptEdits">Auto-accept edits</option>
+          <option value="dontAsk">Deny unlisted</option>
+          <option value="auto">Auto-decide</option>
+          <option value="bypassPermissions">Bypass all prompts</option>
+        </select>
+      </label>
       <label class="header-select" for="effort-select" id="effort-select-label">
         <span class="sr-only">Effort</span>
         <select id="effort-select" aria-label="Effort level">

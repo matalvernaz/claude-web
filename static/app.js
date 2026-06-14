@@ -12,6 +12,7 @@
   const sessionList = document.getElementById("session-list");
   const headerCostEl = document.getElementById("header-cost");
   const modelSelect = document.getElementById("model-select");
+  const permModeSelect = document.getElementById("permission-mode-select");
   const effortSelect = document.getElementById("effort-select");
   const effortSelectLabel = document.getElementById("effort-select-label");
   const projectSelect = document.getElementById("project-select");
@@ -47,6 +48,7 @@
   const RUN_KEY = "claude-web.active-run";
   const MODEL_KEY = "claude-web.model";
   const EFFORT_KEY = "claude-web.effort";
+  const PERM_MODE_KEY = "claude-web.permission-mode";
   const PROJECT_KEY = "claude-web.project";
 
   // One-shot flag armed by /fork: the next send branches the conversation
@@ -439,7 +441,68 @@
       lastSeenModel = modelSelect.value || lastSeenModel;
       renderContextMeter();
       syncEffortVisibility();
+      // With a live conversation, switch the running CLI's model in place via
+      // set_model so it takes effect from the next turn. Without one, the pick
+      // rides the next /api/chat spawn (which reads the model field).
+      pushModelChange(modelSelect.value);
     });
+  }
+
+  // POST a live model switch to the running session. No-op when there's no
+  // live conversation yet (the spawn path reads the picker instead). Success
+  // is announced via the model_changed SSE event, not here, so a programmatic
+  // realignment of the picker can't double-announce. Caveat: set_model changes
+  // only the model string, not request betas, so switching to the 1M-context
+  // variant still needs a fresh chat to pick up the beta.
+  async function pushModelChange(modelKey) {
+    if (!sessionId) return;
+    try {
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("model", modelKey || "");
+      const r = await fetch("/api/chat/model", { method: "POST", body: fd });
+      if (!r.ok) console.warn("live model switch failed", r.status, await r.text());
+    } catch (e) {
+      console.warn("live model switch error", e);
+    }
+  }
+
+  // Permission-mode picker: drives set_permission_mode on a live run, or seeds
+  // the next spawn (the value also rides the /api/chat form field). Kept in
+  // sync with model-driven changes via the permission_mode_changed / plan_mode
+  // SSE events below.
+  if (permModeSelect) {
+    const savedMode = safeGet(localStorage, PERM_MODE_KEY);
+    if (savedMode !== null && [...permModeSelect.options].some((o) => o.value === savedMode)) {
+      permModeSelect.value = savedMode;
+    }
+    permModeSelect.addEventListener("change", async () => {
+      const mode = permModeSelect.value;
+      safeSet(localStorage, PERM_MODE_KEY, mode);
+      if (!sessionId) {
+        announce(`Permission mode set to ${permModeLabel(mode)} for your next chat.`);
+        return;
+      }
+      try {
+        const fd = new FormData();
+        fd.append("session_id", sessionId);
+        fd.append("mode", mode);
+        const r = await fetch("/api/chat/permission-mode", { method: "POST", body: fd });
+        if (!r.ok) {
+          announce(`Couldn't change permission mode (${r.status}).`);
+          console.warn("permission-mode change failed", r.status, await r.text());
+        }
+        // Success announcement comes from the permission_mode_changed SSE.
+      } catch (e) {
+        announce("Couldn't change permission mode: network error.");
+        console.warn("permission-mode change error", e);
+      }
+    });
+  }
+
+  function permModeLabel(mode) {
+    const opt = permModeSelect && [...permModeSelect.options].find((o) => o.value === mode);
+    return (opt && opt.textContent) || mode || "default";
   }
   if (effortSelect) {
     const savedEffort = safeGet(localStorage, EFFORT_KEY);
@@ -1593,6 +1656,7 @@
       const project = currentProject();
       if (project) fd.append("project", project);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+      if (permModeSelect && permModeSelect.value) fd.append("permission_mode", permModeSelect.value);
       if (effortSelect && effortSelect.value && effortSupported()) {
         fd.append("effort", effortSelect.value);
       }
@@ -2164,11 +2228,37 @@
       // a visual indicator; the plan itself arrives later as a plan_review.
       if (obj.active) {
         document.body.dataset.planMode = "1";
+        if (permModeSelect) permModeSelect.value = "plan";
         announce("Claude entered plan mode. It will research read-only and propose a plan for your approval before making any changes.");
       } else {
         delete document.body.dataset.planMode;
+        // Approving a plan moves the CLI to acceptEdits; reflect that in the picker.
+        if (permModeSelect && permModeSelect.value === "plan") permModeSelect.value = "acceptEdits";
         announce("Plan approved. Claude is now implementing.");
       }
+      markVisibleActivity();
+    } else if (obj.type === "permission_mode_changed") {
+      // Server confirmed a permission-mode change (user picker or model-driven).
+      // Keep the picker in sync and announce for NVDA.
+      if (permModeSelect && obj.mode) permModeSelect.value = obj.mode;
+      if (obj.mode === "plan") {
+        document.body.dataset.planMode = "1";
+      } else {
+        delete document.body.dataset.planMode;
+      }
+      announce(`Permission mode is now ${permModeLabel(obj.mode)}.`);
+      markVisibleActivity();
+    } else if (obj.type === "model_changed") {
+      // Server confirmed a live model switch. Align the picker + context meter
+      // and announce; the switch applies from the next turn.
+      if (modelSelect && typeof obj.model === "string" &&
+          [...modelSelect.options].some((o) => o.value === obj.model)) {
+        modelSelect.value = obj.model;
+        lastSeenModel = obj.model || lastSeenModel;
+        renderContextMeter();
+        syncEffortVisibility();
+      }
+      announce(`Model switched to ${obj.label || "default"} for the rest of this conversation.`);
       markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from

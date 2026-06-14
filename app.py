@@ -6757,6 +6757,7 @@ async def api_chat(
     project: str = Form(default=""),
     model: str = Form(default=""),
     effort: str = Form(default=""),
+    permission_mode: str = Form(default="default"),
     fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
     user: dict = Depends(auth.require_user),
@@ -6808,6 +6809,12 @@ async def api_chat(
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, "unknown model")
     selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
+    # Clamp the picker's initial permission mode; an unknown value (or none)
+    # falls back to prompt-on-dangerous. Used to spawn the run in the chosen
+    # mode (e.g. starting straight in plan mode) and to seed the mirror.
+    _init_permission_mode = (
+        permission_mode if permission_mode in _VALID_PERMISSION_MODES else "default"
+    )
     # Effort rides the model's semantics: a spawn-time CLI flag, so it
     # applies to fresh spawns and an existing run keeps its level. Validate
     # against the picked variant (the "" key is the explicit default entry)
@@ -6963,6 +6970,11 @@ async def api_chat(
             account_slot=account["slot"],
             personality_id=active_personality_id,
         )
+        # Seed the permission-mode mirror with the user's initial pick and
+        # record the spawn model key, so both are accurate from the first turn
+        # rather than only after the model drives EnterPlanMode.
+        run.permission_mode = _init_permission_mode
+        run.model = model or None
         run.project_key = _sanitize_project_key(cwd)
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
@@ -7242,7 +7254,7 @@ async def api_chat(
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
-        permission_mode="default",
+        permission_mode=_init_permission_mode,
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
         system_prompt=system_prompt_opt,
