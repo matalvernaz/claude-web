@@ -528,11 +528,19 @@
   }
 
   // Account slot toggle (shared vs one of the user's personal credentials).
-  // The select value is "shared" or "cred:<id>". The server stores the
-  // preference per OIDC user; switching here POSTs that change. The next
-  // /api/chat call notices the new slot and respawns the CLI with the right
-  // CLAUDE_CONFIG_DIR — a turn already in flight keeps using the old slot
-  // since its CLI subprocess loaded its credentials at startup.
+  // The select value is "shared" or "cred:<id>". Mirrors the personality
+  // picker's per-session model: the slot is bound to the session via the
+  // ``account_slot`` form field on every /api/chat send, so two tabs on two
+  // sessions can run under two different Claude accounts at once. The POST
+  // to /api/account/active here only sets the *default* for new chats — it
+  // no longer drives resolution for live sessions, which is what used to
+  // make a switch in one tab silently respawn every other tab onto the same
+  // slot. Mid-conversation the switch takes effect on the next message: the
+  // server sees account_slot differ from the run's slot, 409s
+  // account_changed, and the browser respawns the CLI under the new
+  // CLAUDE_CONFIG_DIR (the in-flight turn keeps the old slot — its
+  // subprocess loaded credentials at startup). Respawn-in-place, not fork:
+  // the conversation continues on the new account.
   const accountSelect = document.getElementById("account-select");
   if (accountSelect) {
     let lastAccount = accountSelect.value;
@@ -1536,6 +1544,11 @@
       if (personalitySelect && personalitySelect.value) {
         fd.append("personality_id", personalitySelect.value);
       }
+      // Same for the credential slot: a mid-conversation switch 409s
+      // account_changed and the browser respawns under the new account.
+      if (accountSelect && accountSelect.value) {
+        fd.append("account_slot", accountSelect.value);
+      }
       for (const img of entry.images) {
         fd.append("images", img.file, sendName(img.file));
       }
@@ -1668,6 +1681,11 @@
       // voices without racing on a user-global pick.
       if (personalitySelect && personalitySelect.value) {
         fd.append("personality_id", personalitySelect.value);
+      }
+      // Picker value as session-scoped account override — same per-session
+      // binding as personality, so two tabs run under two accounts at once.
+      if (accountSelect && accountSelect.value) {
+        fd.append("account_slot", accountSelect.value);
       }
       for (const img of entry.images) {
         fd.append("images", img.file, sendName(img.file));

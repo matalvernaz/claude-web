@@ -61,6 +61,7 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
@@ -1274,6 +1275,26 @@ def _state_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session_personality_user "
             "ON session_personality(user_sub)"
+        )
+        # Per-session active credential slot. Mirrors session_personality:
+        # ``user_account.active`` (above) is only the DEFAULT for *new* chats;
+        # an existing session binds its slot here so two chats can run under
+        # two different Claude accounts at once. The old design resolved the
+        # account purely from the user-global ``user_account`` row, which
+        # forced last-writer-wins across every tab — switching the account in
+        # one tab silently respawned every other tab onto the same slot.
+        # ``slot`` is the same free string the run carries: 'shared' or
+        # 'cred:<id>'.
+        conn.execute("""CREATE TABLE IF NOT EXISTS session_account (
+            session_id TEXT PRIMARY KEY,
+            user_sub TEXT,
+            slot TEXT NOT NULL DEFAULT 'shared',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_account_user "
+            "ON session_account(user_sub)"
         )
         # Skills hidden from the model. A row here is a directory name under
         # ``~/.claude/skills/`` (or the per-user equivalent once that exists)
@@ -4116,20 +4137,102 @@ def _identity_env_for(user: dict) -> dict[str, str]:
     }
 
 
-def _resolve_account_for_run(user: dict) -> dict:
+def _session_account_slot(session_id: Optional[str]) -> Optional[str]:
+    """Return the credential slot bound to this session, or None."""
+    if not session_id:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT slot FROM session_account WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def _bind_session_account(
+    session_id: str, user_sub: Optional[str], slot: str,
+) -> None:
+    """Upsert the session→credential-slot binding.
+
+    Best-effort, exactly like ``_bind_session_personality``: a lost write
+    only means a *future* request resolving by session_id falls back to the
+    user-default slot rather than the bound one — the in-flight run already
+    carries ``run.account_slot``.
+    """
+    if not session_id:
+        return
+    now = time.time()
+    try:
+        _state_db().execute(
+            "INSERT INTO session_account"
+            "(session_id, user_sub, slot, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "slot = excluded.slot, "
+            "user_sub = excluded.user_sub, "
+            "updated_at = excluded.updated_at",
+            (session_id, user_sub, slot, now, now),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "_bind_session_account failed session=%s slot=%s: %s",
+            session_id, slot, e,
+        )
+
+
+def _account_slot_visible(user_sub: Optional[str], slot: Optional[str]) -> bool:
+    """True if ``slot`` is a usable pick for this user: the literal 'shared'
+    or a 'cred:<id>' row they own. Used to decide whether a client-sent
+    override or a stale session binding is honoured; an unowned/garbage slot
+    is ignored so resolution falls through rather than resolving to it. (The
+    deeper "does the credential home actually have a .credentials.json" check
+    still happens below — this is only the ownership gate.)
+    """
+    if slot == "shared":
+        return True
+    cred_id = _parse_cred_active(slot or "")
+    return cred_id is not None and bool(user_sub) and _get_credential(user_sub, cred_id) is not None
+
+
+def _resolve_account_for_run(
+    user: dict,
+    session_id: Optional[str] = None,
+    override_slot: Optional[str] = None,
+) -> dict:
     """Pick the credential slot for the user's next run.
+
+    Resolution order mirrors ``_resolve_personality_for_run``:
+
+    1. ``override_slot`` — the picker value the client sent on *this*
+       request, if it's a slot the user owns. Authoritative for the request;
+       the caller persists it into ``session_account`` once session_id is known.
+    2. ``session_account.slot`` for this ``session_id``, if a row exists and
+       still resolves to an owned slot. Sessions are independent — switching
+       the account in one tab doesn't move another tab's bound slot.
+    3. ``user_account.active`` — the user-global default, used only for a
+       brand-new session whose picker wasn't touched on this request.
 
     Returns ``{"slot": "shared"|"cred:<id>", "env": dict[str,str], "label": str}``.
     ``env`` always carries the CLAUDE_WEB_USER_* identity vars; for a
     per-user credential it additionally carries CLAUDE_CONFIG_DIR (and
-    possibly ANTHROPIC_API_KEY). If the user's active credential is missing
+    possibly ANTHROPIC_API_KEY). If the resolved credential is missing
     its .credentials.json (deleted out-of-band, or a setup flow was reserved
     but never completed), falls back to shared rather than spawning a CLI
     that would crash on first API call.
     """
     identity_env = _identity_env_for(user)
     sub = (user or {}).get("sub")
-    active = _user_active_slot(sub)
+    active: Optional[str] = None
+    if override_slot is not None and _account_slot_visible(sub, override_slot):
+        active = override_slot
+    if active is None:
+        bound = _session_account_slot(session_id)
+        if bound is not None and _account_slot_visible(sub, bound):
+            active = bound
+    if active is None:
+        active = _user_active_slot(sub)
     cred_id = _parse_cred_active(active)
     if cred_id is not None and sub:
         cred = _get_credential(sub, cred_id)
@@ -4970,6 +5073,13 @@ class ActiveRun:
                 if self.personality_id is not None:
                     _bind_session_personality(
                         sid, self.owner_sub, self.personality_id,
+                    )
+                # Same for the credential slot — a tab opening this resumed
+                # session must resolve to the account it actually spawned
+                # under, not the user-global default.
+                if self.account_slot:
+                    _bind_session_account(
+                        sid, self.owner_sub, self.account_slot,
                     )
         if event.get("type") == "run_started":
             meta_changed = True
@@ -6606,7 +6716,11 @@ def _form_uploads(form, field: str) -> list[UploadFile]:
     """
     out: list[UploadFile] = []
     for value in form.getlist(field):
-        if isinstance(value, UploadFile) and value.filename:
+        # request.form() yields starlette.datastructures.UploadFile, which is
+        # NOT an instance of fastapi.UploadFile (its subclass) — Starlette 1.0
+        # split the classes. Check the base type so real file parts aren't
+        # silently dropped as if they were plain string fields.
+        if isinstance(value, StarletteUploadFile) and value.filename:
             out.append(value)
     return out
 
@@ -6760,6 +6874,7 @@ async def api_chat(
     permission_mode: str = Form(default="default"),
     fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
+    account_slot: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -6841,7 +6956,11 @@ async def api_chat(
         # HTTPException from a bad active slot, etc.) still releases the
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
-        account = _resolve_account_for_run(user)
+        account = _resolve_account_for_run(
+            user,
+            session_id=session_id or None,
+            override_slot=account_slot or None,
+        )
         personality_for_run = _resolve_personality_for_run(
             user,
             session_id=session_id or None,
@@ -6859,6 +6978,13 @@ async def api_chat(
         ):
             _bind_session_personality(
                 session_id, user.get("sub"), active_personality_id,
+            )
+        # Same for an explicit account pick — bind the resolved slot to this
+        # session so a concurrent reader (refresh, second tab) sees it. emit()
+        # also binds on SDK init; this closes the pre-init gap.
+        if session_id and account_slot:
+            _bind_session_account(
+                session_id, user.get("sub"), account["slot"],
             )
         existing = _existing_run_for_session(session_id) if session_id else None
         # True when we're spawning a fork sibling of a still-live run. The
@@ -7950,6 +8076,7 @@ async def api_chat_send(
     run_id: str,
     message: str = Form(...),
     personality_id: Optional[int] = Form(default=None),
+    account_slot: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
     """Inject a user message into an already-running long-lived run.
@@ -8002,7 +8129,11 @@ async def api_chat_send(
         session_id=run.session_id,
         override_personality_id=personality_id,
     )
-    account = _resolve_account_for_run(user)
+    account = _resolve_account_for_run(
+        user,
+        session_id=run.session_id,
+        override_slot=account_slot or None,
+    )
     if run.personality_id != personality_for_run["id"]:
         _supersede_run(run, "personality_changed")
         return JSONResponse(

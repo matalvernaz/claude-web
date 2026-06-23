@@ -291,6 +291,83 @@ def test_resolve_account_for_run_shared_carries_identity() -> None:
     assert "CLAUDE_CONFIG_DIR" not in account["env"]
 
 
+# ─── per-session credential slot (two accounts at once) ────────────────────
+
+def _make_owned_credential(monkeypatch, tmp_path, sub: str, label: str):
+    """Create a usable per-user credential for ``sub`` under a tmp homes dir
+    and return ``(slot_str, home_path)``. The credential home gets a stub
+    .credentials.json so the resolver doesn't fall back to shared."""
+    monkeypatch.setattr(app_module, "PERSONAL_HOMES_DIR", tmp_path / "personal-homes")
+    cred_id = app_module._insert_credential_row(app_module._state_db(), sub, label)
+    home = app_module._ensure_credential_home(sub, cred_id)
+    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    return f"cred:{cred_id}", home
+
+
+def test_resolve_account_per_session_binding(tmp_path, monkeypatch) -> None:
+    """Two sessions under one user resolve to two different credential slots
+    at the same time. This is the fix for "can't run two accounts at once":
+    the slot is bound per-session, not as a single user-global value, so a
+    switch in one tab no longer drags every other tab onto the same account.
+    """
+    sub = "acct-sess-u1"
+    cred_slot, home = _make_owned_credential(monkeypatch, tmp_path, sub, "Work")
+    user = {"sub": sub, "email": "u1@example.com", "name": "User One"}
+
+    # Session bound to the personal slot resolves to it...
+    app_module._bind_session_account("acct-sess-work", sub, cred_slot)
+    work = app_module._resolve_account_for_run(user, session_id="acct-sess-work")
+    assert work["slot"] == cred_slot
+    assert work["env"]["CLAUDE_CONFIG_DIR"] == str(home)
+
+    # ...while a different, unbound session resolves to the user-global
+    # default (shared) concurrently. Two accounts live at the same time.
+    shared = app_module._resolve_account_for_run(user, session_id="acct-sess-other")
+    assert shared["slot"] == "shared"
+    assert "CLAUDE_CONFIG_DIR" not in shared["env"]
+
+
+def test_resolve_account_session_binding_beats_user_default(tmp_path, monkeypatch) -> None:
+    """A session pinned to 'shared' stays shared even after the user flips
+    their global default to a personal slot — the exact cross-tab bug. The
+    user-global value is only the default for *new* sessions now."""
+    sub = "acct-sess-u2"
+    cred_slot, _home = _make_owned_credential(monkeypatch, tmp_path, sub, "Work")
+    user = {"sub": sub, "email": "u2@example.com", "name": "User Two"}
+
+    # A second tab sitting on the shared slot binds its session to shared.
+    app_module._bind_session_account("acct-sess-pinned", sub, "shared")
+    # Another tab flips the user-global default to the personal slot.
+    app_module._set_user_active(sub, cred_slot)
+
+    pinned = app_module._resolve_account_for_run(user, session_id="acct-sess-pinned")
+    assert pinned["slot"] == "shared", "session binding must win over user-global default"
+
+
+def test_resolve_account_override_wins_and_unowned_falls_through(tmp_path, monkeypatch) -> None:
+    """An explicit picker override on the request wins over the session
+    binding; an override for a slot the user doesn't own is ignored and
+    resolution falls through to the binding, mirroring the personality
+    resolver (never resolve to an unowned slot)."""
+    sub = "acct-sess-u3"
+    cred_slot, _home = _make_owned_credential(monkeypatch, tmp_path, sub, "Work")
+    user = {"sub": sub, "email": "u3@example.com", "name": "User Three"}
+    app_module._bind_session_account("acct-sess-ov", sub, "shared")
+
+    # Override to the owned personal slot wins over the shared binding.
+    ov = app_module._resolve_account_for_run(
+        user, session_id="acct-sess-ov", override_slot=cred_slot,
+    )
+    assert ov["slot"] == cred_slot
+
+    # Override to a slot the user does NOT own is ignored; resolution falls
+    # back to the session binding (shared), never to the unowned slot.
+    bogus = app_module._resolve_account_for_run(
+        user, session_id="acct-sess-ov", override_slot="cred:999999",
+    )
+    assert bogus["slot"] == "shared"
+
+
 # ─── restart-marker idempotence ────────────────────────────────────────────
 
 def test_restarted_during_run_does_not_duplicate() -> None:
