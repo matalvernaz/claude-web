@@ -50,6 +50,31 @@ def test_bash_in_no_session_allowlist_set() -> None:
     assert "Bash" in app_module.NO_SESSION_ALLOWLIST_TOOLS
 
 
+def test_tool_signature_webfetch_keys_on_host() -> None:
+    """WebFetch allowlists per host, so different paths / query strings on the
+    same site collapse to one signature and don't each re-prompt."""
+    sig = app_module._tool_signature("WebFetch", {"url": "https://x.com/a?b=1"})
+    assert sig == "x.com"
+    assert sig == app_module._tool_signature("WebFetch", {"url": "https://x.com/other"})
+
+
+def test_tool_signature_webfetch_distinguishes_subdomain() -> None:
+    """Sibling subdomains stay distinct — approving one host must not bless
+    another."""
+    assert app_module._tool_signature("WebFetch", {"url": "https://a.x.com/"}) == "a.x.com"
+    assert app_module._tool_signature("WebFetch", {"url": "https://b.x.com/"}) == "b.x.com"
+
+
+def test_tool_signature_webfetch_lowercases_host() -> None:
+    assert app_module._tool_signature("WebFetch", {"url": "https://X.COM/Path"}) == "x.com"
+
+
+def test_tool_signature_webfetch_unparseable_falls_back_to_url() -> None:
+    """A url with no parseable host must not collapse to the empty signature
+    (which would match every WebFetch); fall back to the raw string."""
+    assert app_module._tool_signature("WebFetch", {"url": "not a url"}) == "not a url"
+
+
 # ─── Upload helpers ────────────────────────────────────────────────────────
 
 def _png_bytes() -> bytes:

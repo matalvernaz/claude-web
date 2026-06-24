@@ -33,6 +33,7 @@ import uuid as uuid_mod
 import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -57,7 +58,7 @@ from claude_agent_sdk.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -427,6 +428,15 @@ SAFE_TOOLS = set(
 NO_SESSION_ALLOWLIST_TOOLS: set[str] = set(
     t.strip() for t in os.getenv("NO_SESSION_ALLOWLIST_TOOLS", "Bash").split(",") if t.strip()
 )
+
+# SSE event types that open an interactive prompt whose pending future lives in
+# PENDING (keyed by the event's request id). Once the prompt is resolved
+# (answered / denied / timed out / interrupted) the id is popped from PENDING.
+# A reconnect replays backlog events from the persisted store, so without a
+# guard an already-decided prompt would be re-sent and the UI would re-prompt.
+# _stream_run_response drops a replayed prompt event whose id is no longer in
+# PENDING; a still-pending one (id present) is delivered so it can be answered.
+PROMPT_REQUEST_EVENT_TYPES = {"permission_request", "question_request", "plan_review"}
 
 # Interactive tools that get a purpose-built, accessible card instead of the
 # generic allow/deny permission gate. Their answers are fed back through the
@@ -1131,6 +1141,13 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
     if tool == "Bash":
         cmd = tool_input.get("command", "")
         return cmd.strip().split()[0] if cmd.strip() else ""
+    if tool == "WebFetch":
+        # Allowlist per host, not per full URL: query strings, redirects and
+        # trailing-slash variants of the same site should not each re-prompt.
+        # Fall back to the full url if unparseable so the signature is never
+        # the empty string (which would match every WebFetch).
+        url = str(tool_input.get("url", ""))
+        return urlparse(url).netloc.lower() or url
     for key in ("file_path", "path", "url", "pattern"):
         if key in tool_input:
             return str(tool_input[key])
@@ -6611,6 +6628,17 @@ def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingRespo
                     # firing tryResume() in a loop on restart-killed runs.
                     yield b'data: {"type":"_done"}\n\n'
                     break
+                # Drop a replayed prompt whose decision already happened: its
+                # future is gone from PENDING, so the client could only 404 on
+                # it. A live or still-pending prompt has its id in PENDING and
+                # passes through. The matching permission_resolved event (not a
+                # prompt type) still flows, so the watermark advances and any
+                # rendered card collapses.
+                if (
+                    evt.get("type") in PROMPT_REQUEST_EVENT_TYPES
+                    and evt.get("id") not in PENDING
+                ):
+                    continue
                 yield f"data: {json.dumps(evt)}\n\n".encode()
         finally:
             run.unsubscribe(q)
@@ -8192,14 +8220,26 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
 
 
 @app.get("/api/chat/stream/{run_id}")
-async def api_chat_stream(run_id: str, user: dict = Depends(auth.require_user)):
-    """Reconnect to an in-flight or recently-finished run."""
+async def api_chat_stream(
+    run_id: str,
+    start_index: int = Query(0, ge=0),
+    user: dict = Depends(auth.require_user),
+):
+    """Reconnect to an in-flight or recently-finished run.
+
+    `start_index` resumes from just past the last event the client already
+    rendered (its per-run high-watermark + 1) instead of replaying the whole
+    history from 0. Omitted / 0 means full replay (fresh page load, sidebar
+    open). subscribe() services any value: >= _next_idx replays nothing then
+    tails live; below the in-memory trim boundary it reads from sqlite, so
+    there is never a gap.
+    """
     _safe_id(run_id)
     run = ACTIVE_RUNS.get(run_id)
     if run is None:
         raise HTTPException(404, "no such run")
     _require_owner(run, user)
-    return _stream_run_response(run)
+    return _stream_run_response(run, start_index=start_index)
 
 
 @app.post("/api/chat/rewind")

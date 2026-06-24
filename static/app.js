@@ -1794,7 +1794,8 @@
     if (isStreaming && currentRunId) {
       const rid = currentRunId;
       announce("Stream dropped; reconnecting.");
-      renderedIdxByRun.delete(rid);
+      // Keep this run's watermark: the transcript DOM is intact, so tryResume
+      // resumes incrementally from watermark+1 rather than replaying from 0.
       // Null currentAbort so the caller's finally guard
       // (`currentAbort === myAbort`) fails and skips the RUN_KEY wipe
       // we need for tryResume to find the run.
@@ -1916,7 +1917,8 @@
   function maybeRecoverFromDrop(err) {
     if (!isNetworkDropError(err) || !currentRunId) return false;
     const rid = currentRunId;
-    renderedIdxByRun.delete(rid);
+    // Keep this run's watermark so tryResume resumes incrementally — the
+    // transcript DOM is intact across a network drop.
     currentAbort = null;
     currentRunId = null;
     setStatus("Connection dropped — reconnecting.");
@@ -1947,12 +1949,22 @@
       return false;
     }
     if (info.project) sessionProject = info.project;
-    // Wipe and announce BEFORE flipping streaming UI on, so there's never a
-    // frame where the spinner is overlaid on the stale transcript. Replay
-    // is from index 0, so this run's dedup watermark must reset too.
-    transcript.innerHTML = "";
-    clearPermQueue();
-    renderedIdxByRun.delete(savedRunId);
+    // Incremental resume: if we still hold this run's high-watermark (the
+    // highest _idx already rendered), resume from watermark+1 and keep the
+    // transcript/queue/watermark — we append only what we missed while
+    // disconnected, and already-answered permission prompts are never replayed
+    // back into the queue. A fresh page load or sidebar-open has no watermark,
+    // so we fall back to a full replay from 0, which needs the wipe (otherwise
+    // the replayed events dedup against the stale watermark and nothing
+    // renders). Wipe BEFORE flipping streaming UI on so there's never a frame
+    // with the spinner over a stale transcript.
+    const wm = renderedIdxByRun.get(savedRunId);
+    const incremental = typeof wm === "number";
+    if (!incremental) {
+      transcript.innerHTML = "";
+      clearPermQueue();
+      renderedIdxByRun.delete(savedRunId);
+    }
     const gen = ++streamGeneration;
     const myAbort = new AbortController();
     currentRunId = savedRunId;
@@ -1961,7 +1973,9 @@
     startGerunds();
     announce("Reconnecting to previous response.");
     try {
-      const r = await fetch(`/api/chat/stream/${encodeURIComponent(savedRunId)}`, { signal: myAbort.signal });
+      const streamUrl = `/api/chat/stream/${encodeURIComponent(savedRunId)}`
+        + (incremental ? `?start_index=${wm + 1}` : "");
+      const r = await fetch(streamUrl, { signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
       await drainStream(r, gen);
     } catch (err) {
@@ -3238,6 +3252,16 @@
         `/api/permission/${encodeURIComponent(requestId)}`,
         { method: "POST", body: fd },
       );
+      if (r.status === 404) {
+        // The server already resolved this request (decided on another tab, or
+        // a stale prompt replayed after a reconnect). Its future is gone, so
+        // retrying would only 404 again — collapse the card instead of
+        // re-enabling the buttons and telling the user to try again.
+        resolvePermCardDom(card, decision);
+        removeFromPermQueue(requestId);
+        announce("Already handled.");
+        return false;
+      }
       if (!r.ok) throw new Error("HTTP " + r.status);
       resolvePermCardDom(card, decision);
       return true;
@@ -4605,7 +4629,8 @@
     if (!force && Date.now() - lastNetworkActivityAt < VISIBILITY_STALE_MS) return;
     const rid = currentRunId;
     announce("Reconnecting to running task.");
-    renderedIdxByRun.delete(rid);
+    // Keep this run's watermark so tryResume resumes incrementally from
+    // watermark+1 — the transcript DOM survives a tab freeze.
     // Bump streamGeneration BEFORE abort so the old sendOne/tryResume's
     // AbortError catch sees gen !== streamGeneration and skips the
     // "Stopped." setStatus/announce — otherwise NVDA gets two contradictory
