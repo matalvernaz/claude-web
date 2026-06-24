@@ -1369,6 +1369,69 @@
     return bits.length ? `[${bits.join(", ")}]` : "(empty)";
   }
 
+  function newQueueId() {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+    return "q-" + Date.now() + "-" + Math.round(Math.random() * 1e9);
+  }
+
+  function removeQueueEntry(entry) {
+    const idx = messageQueue.indexOf(entry);
+    if (idx !== -1) {
+      messageQueue.splice(idx, 1);
+      renderQueue();
+    }
+  }
+
+  function clearQueueEntryById(qid) {
+    const idx = messageQueue.findIndex((e) => e.queue_id === qid);
+    if (idx === -1) return false;
+    messageQueue.splice(idx, 1);
+    renderQueue();
+    return true;
+  }
+
+  // Cancel a queued message. Three states:
+  //   - not yet POSTed (status undefined): drop the local copy; the server
+  //     never saw it.
+  //   - POSTed into the run (status "sending"): ask the server to recall it.
+  //     If it hadn't reached the CLI the server drops it; if it already
+  //     committed to delivery we fall back to interrupting the turn it's now
+  //     running as, since there's nothing left to recall.
+  async function cancelQueuedEntry(entry) {
+    if (messageQueue.indexOf(entry) === -1) return;
+    if (entry.status !== "sending" || !entry.queue_id || !currentRunId) {
+      removeQueueEntry(entry);
+      announce("Queued message cancelled.");
+      return;
+    }
+    try {
+      const fd = new FormData();
+      fd.append("queue_id", entry.queue_id);
+      const r = await fetch(
+        `/api/chat/cancel-queued/${encodeURIComponent(currentRunId)}`,
+        { method: "POST", body: fd },
+      );
+      if (r.status === 404) {
+        removeQueueEntry(entry);  // run gone — it can't run, so clear it
+        announce("Queued message cancelled.");
+        return;
+      }
+      const j = await r.json().catch(() => ({}));
+      if (j && j.cancelled) {
+        // Dropped before the CLI saw it. A matching queued_input_cancelled
+        // event also arrives and is idempotent via clearQueueEntryById.
+        removeQueueEntry(entry);
+        announce("Cancelled before Claude saw it.");
+      } else {
+        // already_delivered: it's running. Interrupt the turn — the chip
+        // clears when the interrupted result lands.
+        stopBtn.click();
+      }
+    } catch (_) {
+      announce("Cancel failed — try again.");
+    }
+  }
+
   function renderQueue() {
     if (!queueArea) return;
     queueArea.innerHTML = "";
@@ -1387,21 +1450,19 @@
       const label = document.createElement("span");
       label.className = "queue-text";
       const previewText = queuePreview(entry);
-      label.textContent = previewText.length > 60 ? previewText.slice(0, 60) + "…" : previewText;
+      const shown = previewText.length > 60 ? previewText.slice(0, 60) + "…" : previewText;
+      // A "sending" entry has been POSTed into the run; its × recalls it
+      // server-side rather than just dropping the local copy (which the
+      // server would otherwise still run).
+      label.textContent = entry.status === "sending" ? shown + " (sending…)" : shown;
       const del = document.createElement("button");
       del.type = "button";
       del.className = "queue-cancel";
       del.textContent = "×";
       del.setAttribute("aria-label", `Cancel queued message: ${previewText}`);
-      // Identify the entry by reference so a concurrent shift() (when a
-      // turn ends mid-render) doesn't make us splice the wrong index.
-      del.addEventListener("click", () => {
-        const idx = messageQueue.indexOf(entry);
-        if (idx === -1) return;  // already drained, nothing to cancel
-        messageQueue.splice(idx, 1);
-        renderQueue();
-        announce("Queued message cancelled.");
-      });
+      // Identify the entry by reference so a concurrent shift() (when a turn
+      // ends mid-render) doesn't make us act on the wrong index.
+      del.addEventListener("click", () => { cancelQueuedEntry(entry); });
       chip.appendChild(label);
       chip.appendChild(del);
       queueArea.appendChild(chip);
@@ -1455,7 +1516,7 @@
         return;
       }
     }
-    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice() };
+    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId() };
     promptEl.value = "";
     clearAttachments();
     if (forkNextSend) {
@@ -1520,7 +1581,7 @@
   async function sendInExistingRun(entry) {
     if (!currentRunId) {
       await sendOne(entry);
-      return true;
+      return { ok: true, mode: "fresh" };
     }
     setStreaming(true);
     startGerunds();
@@ -1535,6 +1596,7 @@
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
+      if (entry.queue_id) fd.append("queue_id", entry.queue_id);
       // Carry the picker's current value so the server can compare it to
       // the run's spawned personality. If they disagree (mid-conversation
       // switch) the server rejects with 409 personality_changed; the
@@ -1566,7 +1628,7 @@
         // post-login reload can flush it.
         handleStreamError(new Error("HTTP " + r.status));
         setStreaming(false);
-        return false;
+        return { ok: false, mode: "failed" };
       }
       if (!r.ok) {
         // Any other non-2xx — 404 (run gone), 409 (run superseded by a
@@ -1594,16 +1656,16 @@
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
         await sendOne(entry);
-        return true;
+        return { ok: true, mode: "fresh" };
       }
       // The existing SSE stream will deliver the new turn's events; nothing
       // else to do here. setStreaming(false) happens on the next result.
-      return true;
+      return { ok: true, mode: "injected" };
     } catch (err) {
       if (err.name === "AbortError") {
         // Stop fired during the POST. The SSE side is being torn down by the
         // same Stop click; nothing further to do here.
-        return false;
+        return { ok: false, mode: "failed" };
       }
       // Network failure (fetch threw). Abort the dead stream, drop the
       // run handle, surface the error. Caller decides whether to retry.
@@ -1613,39 +1675,51 @@
       safeRemove(sessionStorage, RUN_KEY);
       handleStreamError(err);
       setStreaming(false);
-      return false;
+      return { ok: false, mode: "failed" };
     } finally {
       if (currentAbort) currentAbort.signal.removeEventListener("abort", onStopForSend);
     }
   }
 
   async function drainQueueIfPossible() {
-    if (!messageQueue.length || !currentRunId || isStreaming) return;
+    if (!currentRunId || isStreaming) return;
     // Re-entrancy guard: sendInExistingRun's fallback path awaits a full
     // sendOne (a fresh run that streams to completion). That run's `result`
-    // event calls drainQueueIfPossible again while we're still parked here
-    // with the entry un-shifted — without this guard the same message gets
-    // sent twice (dangerous when it's an instruction like "yes, delete it").
+    // event calls drainQueueIfPossible again while we're still parked here —
+    // without this guard the same message gets sent twice (dangerous when
+    // it's an instruction like "yes, delete it").
     if (queueDraining) return;
+    // Drain the first entry we haven't POSTed yet. An already-"sending" entry
+    // is in the server's queue (or running) and clears itself on its
+    // user_prompt / queued_input_cancelled event — re-sending it here would
+    // double it up.
+    const entry = messageQueue.find((e) => e.status !== "sending");
+    if (!entry) return;
     queueDraining = true;
-    // Peek-then-shift: leave the entry in the queue until the server has
-    // acknowledged it, so a network blip doesn't silently drop the message
-    // (and any attachments). The next drainQueueIfPossible call will retry
-    // the same entry; the user can also remove it manually via its
-    // queue-cancel button.
-    const entry = messageQueue[0];
+    entry.status = "sending";
+    renderQueue();
     announce("Sending next queued message.");
-    let ok = false;
+    let res = { ok: false, mode: "failed" };
     try {
-      ok = await sendInExistingRun(entry);
+      res = await sendInExistingRun(entry);
     } catch (err) {
       handleStreamError(err);
-      ok = false;
+      res = { ok: false, mode: "failed" };
     } finally {
       queueDraining = false;
     }
-    if (ok && messageQueue[0] === entry) {
-      messageQueue.shift();
+    if (res.mode === "fresh") {
+      // Fell back to a brand-new run: the message is that run's initial
+      // prompt, not a recallable queue item, so drop the chip now.
+      removeQueueEntry(entry);
+    } else if (res.mode === "injected") {
+      // In the server queue now; keep the "sending" chip (its × recalls it)
+      // until the user_prompt / queued_input_cancelled event resolves it.
+      renderQueue();
+    } else if (messageQueue.indexOf(entry) !== -1) {
+      // Failed (network/auth) — return it to plain queued so a later drain or
+      // the user can retry, and so its × drops it locally again.
+      entry.status = undefined;
       renderQueue();
     }
   }
@@ -1665,6 +1739,7 @@
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
+      if (entry.queue_id) fd.append("queue_id", entry.queue_id);
       if (sessionId) fd.append("session_id", sessionId);
       const project = currentProject();
       if (project) fd.append("project", project);
@@ -2071,6 +2146,15 @@
       const body = appendMessage("user", obj.text || "");
       if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
       if (obj.file_count) appendFilePlaceholder(body, obj.file_count);
+      // The server confirmed this queued message reached the CLI — clear its
+      // chip; it's no longer recallable.
+      if (obj.queue_id) clearQueueEntryById(obj.queue_id);
+    } else if (obj.type === "queued_input_cancelled") {
+      // A recall (this tab or another) dropped a queued message before the
+      // CLI saw it. Idempotent: no-op if we already cleared it locally.
+      if (obj.queue_id && clearQueueEntryById(obj.queue_id)) {
+        announce("Queued message cancelled.");
+      }
     } else if (obj.type === "stopped") {
       discardPartial(ctx);
       setActiveTodoLabel(null);
@@ -2087,6 +2171,11 @@
       // users but burned CPU and network.
       stopGerunds();
       setStreaming(false);
+      // A queued message stranded by an abnormal end (server restart mid-turn,
+      // run killed) never saw a `result`. Flush it now — currentRunId still
+      // points at the finished run, so sendInExistingRun's 404 path falls back
+      // to a fresh run.
+      drainQueueIfPossible();
       return;
     } else if (obj.type === "restarted_during_run") {
       // The server was restarted while a previous turn was running. The
@@ -2097,6 +2186,7 @@
       // server change emits restarted_during_run without a trailing _done.
       stopGerunds();
       setStreaming(false);
+      drainQueueIfPossible();
       ctx.currentAssistantBody = null;
       const article = document.createElement("article");
       article.className = "msg info";

@@ -594,6 +594,88 @@ def test_delivery_already_reported_sentinel_suppresses_bg_emit() -> None:
     )
 
 
+def test_finish_skips_lost_input_for_canceled_queue_id() -> None:
+    """A queued message recalled via /api/chat/cancel-queued must not produce
+    a lost_input error when finish() drains the queue — the user asked for it
+    to go away, so flagging it "lost" would be a confusing false alarm. The
+    ack still resolves with the _DeliveryAlreadyReported sentinel so the
+    background confirm task stays silent."""
+    import asyncio
+
+    async def go():
+        run = app_module.ActiveRun("finish-cancel-test")
+        q = run.subscribe(start_index=0)
+        loop = asyncio.get_running_loop()
+        delivered: asyncio.Future = loop.create_future()
+        await run.user_input_queue.put({
+            "text": "recall me",
+            "image_blocks": [],
+            "delivered": delivered,
+            "queue_id": "qid-1",
+        })
+        run.canceled_input_ids.add("qid-1")
+        run.finish()
+        drained: list[dict] = []
+        while not q.empty():
+            drained.append(q.get_nowait())
+        assert delivered.done()
+        assert isinstance(delivered.exception(), app_module._DeliveryAlreadyReported)
+        return drained
+
+    drained = asyncio.run(go())
+    types = [e.get("type") for e in drained]
+    assert "error" not in types, (
+        f"a canceled queued input must not emit lost_input; got {types}"
+    )
+    assert "_done" in types
+
+
+def test_cancel_queued_recalls_pending_message() -> None:
+    """Recalling a queue_id the driver hasn't committed to delivery yet marks
+    it canceled (the driver drops it on pickup) and reports cancelled=True."""
+    import asyncio
+
+    async def go():
+        run = app_module.ActiveRun("recall-pending-test")
+        app_module.ACTIVE_RUNS[run.run_id] = run
+        try:
+            resp = await app_module.api_chat_cancel_queued(
+                run_id=run.run_id, queue_id="qid-2", user={"sub": "tester"},
+            )
+        finally:
+            app_module.ACTIVE_RUNS.pop(run.run_id, None)
+        return resp, "qid-2" in run.canceled_input_ids
+
+    resp, marked = asyncio.run(go())
+    assert resp.get("cancelled") is True, resp
+    assert marked, "recall must add the id to canceled_input_ids"
+
+
+def test_cancel_queued_reports_already_delivered_after_commit() -> None:
+    """Once the driver has committed a queue_id to delivery (added it to
+    committed_input_ids immediately before the CLI write), a recall can't pull
+    it back — the endpoint reports already_delivered so the browser falls back
+    to interrupting the turn instead of silently no-op'ing."""
+    import asyncio
+
+    async def go():
+        run = app_module.ActiveRun("recall-committed-test")
+        run.committed_input_ids.add("qid-3")
+        app_module.ACTIVE_RUNS[run.run_id] = run
+        try:
+            resp = await app_module.api_chat_cancel_queued(
+                run_id=run.run_id, queue_id="qid-3", user={"sub": "tester"},
+            )
+        finally:
+            app_module.ACTIVE_RUNS.pop(run.run_id, None)
+        return resp, "qid-3" in run.canceled_input_ids
+
+    resp, marked = asyncio.run(go())
+    assert resp.get("cancelled") is False, resp
+    assert resp.get("reason") == "already_delivered", resp
+    assert not marked, "a committed id must not be added to canceled_input_ids"
+
+
 def test_active_run_subscribe_replays_from_sqlite_when_trimmed(tmp_path, monkeypatch) -> None:
     """When in-memory events have been trimmed, subscribe(start_index=0)
     must fetch the dropped range from sqlite. Without that fallback, a

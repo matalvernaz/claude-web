@@ -5027,6 +5027,16 @@ class ActiveRun:
         # the queue so it stays ahead of anything queued afterward. Drained by
         # finish() like the queue itself.
         self._deferred_user_item: Optional[dict] = None
+        # Client-correlated recall for queued user input. Each queued message
+        # carries a queue_id; POST /api/chat/cancel-queued adds it to
+        # canceled_input_ids, and the driver drops it on pickup (the check is
+        # synchronous with no await before the CLI write, so it can't race a
+        # concurrent recall). committed_input_ids records ids the driver has
+        # passed that check, so a recall arriving after delivery is told
+        # already_delivered instead of silently no-op'ing. Both live and die
+        # with the run.
+        self.canceled_input_ids: set[str] = set()
+        self.committed_input_ids: set[str] = set()
         self.pending_notifications: list[dict] = []
         self.notification_grace_started_at: Optional[float] = None
         # Tool notifications that arrive between turns auto-fire a synth user
@@ -5291,11 +5301,17 @@ class ActiveRun:
             except asyncio.QueueEmpty:
                 break
         for stray in strays:
-            _emit_lost_input(
-                self,
-                stray.get("text") or "",
-                "the run ended before Claude received it",
-            )
+            stray_qid = stray.get("queue_id")
+            if stray_qid and stray_qid in self.canceled_input_ids:
+                # Intentionally recalled before pickup — not lost, so don't
+                # emit a lost_input the user would read as a failure.
+                self.canceled_input_ids.discard(stray_qid)
+            else:
+                _emit_lost_input(
+                    self,
+                    stray.get("text") or "",
+                    "the run ended before Claude received it",
+                )
             ack: Optional[asyncio.Future] = stray.get("delivered")
             if ack is not None and not ack.done():
                 ack.set_exception(_DeliveryAlreadyReported(
@@ -5734,6 +5750,7 @@ async def _confirm_and_emit_user_prompt(
     image_count: int,
     file_count: int,
     delivered: asyncio.Future,
+    queue_id: Optional[str] = None,
 ) -> None:
     """Wait for the driver to acknowledge delivery of an injected user
     message, then emit the user_prompt event. On timeout, emit an error
@@ -5781,6 +5798,7 @@ async def _confirm_and_emit_user_prompt(
         "text": text,
         "image_count": image_count,
         "file_count": file_count,
+        "queue_id": queue_id,
     })
 
 
@@ -5790,6 +5808,7 @@ async def _inject_user_input(
     blocks: list[dict],
     image_count: int,
     file_count: int,
+    queue_id: Optional[str] = None,
 ) -> bool:
     """Queue user input for the driver to deliver to the CLI.
 
@@ -5814,10 +5833,12 @@ async def _inject_user_input(
         "text": text,
         "image_blocks": blocks,
         "delivered": delivered,
+        "queue_id": queue_id,
     })
     task = asyncio.create_task(
         _confirm_and_emit_user_prompt(
             run, text, image_count, file_count, delivered,
+            queue_id=queue_id,
         )
     )
     # Log unexpected exceptions instead of letting them surface as the
@@ -6903,6 +6924,7 @@ async def api_chat(
     fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
     account_slot: str = Form(default=""),
+    queue_id: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -7093,6 +7115,7 @@ async def api_chat(
                 existing, effective, image_blocks,
                 image_count=len(image_blocks),
                 file_count=len(file_metas),
+                queue_id=queue_id or None,
             ):
                 # Race: the driver finished between our _existing_run_for_session
                 # lookup and the inject. The session JSONL on disk is intact,
@@ -7931,6 +7954,34 @@ async def api_chat(
 
                         if popped_user_item is not None:
                             item = popped_user_item
+                            qid: Optional[str] = item.get("queue_id")
+                            if qid and qid in run.canceled_input_ids:
+                                # Recalled (POST /api/chat/cancel-queued) before
+                                # we committed to delivery: drop it without
+                                # writing to the CLI. Mirrors the ack-cancelled
+                                # drop below — no turn starts, no user_prompt,
+                                # and no lost_input (the user asked for this).
+                                # Race-free: the recall handler only adds to
+                                # canceled_input_ids, and there's no await
+                                # between this check and the send, so on the one
+                                # event loop the decision is atomic.
+                                run.canceled_input_ids.discard(qid)
+                                cancel_ack: Optional[asyncio.Future] = item.get("delivered")
+                                if cancel_ack is not None and not cancel_ack.done():
+                                    cancel_ack.set_exception(_DeliveryAlreadyReported(
+                                        "queued input cancelled"
+                                    ))
+                                run.emit({
+                                    "type": "queued_input_cancelled",
+                                    "queue_id": qid,
+                                    "text_preview": (item.get("text") or "")[:120],
+                                })
+                                popped_user_item = None
+                                continue
+                            if qid:
+                                # Past the recall window. A recall arriving now
+                                # finds the id here and reports already_delivered.
+                                run.committed_input_ids.add(qid)
                             run.consecutive_auto_fires = 0
                             # A new turn is starting; drop any stale interrupt
                             # flag left by a stop click that found nothing to
@@ -8105,6 +8156,7 @@ async def api_chat_send(
     message: str = Form(...),
     personality_id: Optional[int] = Form(default=None),
     account_slot: str = Form(default=""),
+    queue_id: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
     """Inject a user message into an already-running long-lived run.
@@ -8189,6 +8241,7 @@ async def api_chat_send(
         run, effective, image_blocks,
         image_count=len(image_blocks),
         file_count=len(file_metas),
+        queue_id=queue_id or None,
     ):
         # Race: driver finished between the ACTIVE_RUNS lookup and inject.
         return JSONResponse(
@@ -8345,6 +8398,39 @@ async def api_chat_stop(run_id: str, user: dict = Depends(auth.require_user)):
             run.task.cancel()
         return {"ok": True, "interrupt_failed": True}
     return {"ok": True, "interrupted": True}
+
+
+@app.post("/api/chat/cancel-queued/{run_id}")
+async def api_chat_cancel_queued(
+    run_id: str,
+    queue_id: str = Form(...),
+    user: dict = Depends(auth.require_user),
+):
+    """Recall a queued user message that hasn't reached the CLI yet.
+
+    The browser queues messages typed mid-turn and drains them into the live
+    run as each turn ends (POST /api/chat/send). Once enqueued, a message used
+    to be impossible to take back — it sat in user_input_queue until the
+    driver delivered it, so a ``×`` on the chip or a Stop-then-resend left the
+    original to run anyway. This pulls it back.
+
+    Race-free with delivery: the driver adds the id to committed_input_ids
+    synchronously immediately before writing to the CLI, with no await in
+    between. So exactly one of two things is true when we look:
+      - id not yet committed -> mark canceled; the driver drops it on pickup.
+      - id already committed  -> report already_delivered; the browser falls
+        back to interrupt (Stop) since the turn is already running on it.
+    Idempotent for finished runs (404).
+    """
+    _safe_id(run_id)
+    run = ACTIVE_RUNS.get(run_id)
+    if run is None or run.done:
+        raise HTTPException(404, "no such run")
+    _require_owner(run, user)
+    if queue_id in run.committed_input_ids:
+        return {"ok": True, "cancelled": False, "reason": "already_delivered"}
+    run.canceled_input_ids.add(queue_id)
+    return {"ok": True, "cancelled": True}
 
 
 # ─── Live control-verb routes (SDK control protocol) ─────────────────────────
