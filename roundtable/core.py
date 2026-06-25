@@ -1531,11 +1531,16 @@ def _call_anthropic_cli(
             timeout=PROVIDER_TIMEOUT_SEC,
         )
         if proc.returncode != 0:
-            # Surface stderr — claude-ha prints account-switching diagnostics
-            # there, and any auth/quota failure will be readable.
-            tail = (proc.stderr or "")[-2000:]
+            # Surface BOTH streams. claude-ha writes account-switching
+            # diagnostics to stderr, but the inner `claude -p` can exit
+            # nonzero with an EMPTY stderr and the real error on stdout —
+            # which is exactly the silent `exit=1; stderr ''` that a
+            # concurrent roundtable hits. Without stdout the failure is
+            # undiagnosable.
+            err = (proc.stderr or "")[-2000:]
+            out = (proc.stdout or "")[-2000:]
             raise RuntimeError(
-                f"claude CLI exit={proc.returncode}; stderr tail: {tail!r}"
+                f"claude CLI exit={proc.returncode}; stderr: {err!r}; stdout: {out!r}"
             )
         return proc.stdout
 

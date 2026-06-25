@@ -260,3 +260,20 @@ def test_repo_pack_requires_a_binding():
     tid = core.roundtable_create("pack nobind")["thread_id"]
     with pytest.raises(RuntimeError):
         core.roundtable_repo_pack(tid)
+
+
+# ─── CLI failure diagnostics ─────────────────────────────────────────────
+
+def test_cli_failure_surfaces_stdout_when_stderr_empty(monkeypatch):
+    """The silent exit=1 a concurrent roundtable hit had an empty stderr;
+    the real error must still surface from stdout."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(core, "_CLAUDE_CLI", "/bin/false")
+
+    def fake_run(*a, **k):
+        return SimpleNamespace(returncode=1, stdout="CONCURRENT_SESSION_CONFLICT", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError) as ei:
+        core._call_anthropic_cli("claude-x", "sys", "transcript", "", None, False)
+    assert "CONCURRENT_SESSION_CONFLICT" in str(ei.value)
