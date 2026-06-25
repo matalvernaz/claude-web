@@ -44,6 +44,10 @@ os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(_TEST_TMP, "project")
 os.environ["CLAUDE_WEB_ENABLE_SETUP"] = "true"
 # Loosen CSRF so tests using the bare TestClient don't all need to set Origin.
 os.environ["CLAUDE_WEB_CSRF_STRICT"] = "false"
+# roundtable.core derives DB_PATH from this at import; point it at a temp dir
+# so the roundtable tests (and test_panel_tools' core import) never touch the
+# host's real ~/.claude-roundtable/state.db.
+os.environ["CLAUDE_ROUNDTABLE_STATE_DIR"] = os.path.join(_TEST_TMP, "roundtable-state")
 for d in (
     os.environ["CLAUDE_HOME"],
     os.environ["CLAUDE_WEB_STATE_DIR"],

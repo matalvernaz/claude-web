@@ -62,18 +62,20 @@ the processes are restarted (claude-web.service + the MCP server children).
   never auto-allowed).
 - `ROUNDTABLE_REPO_ROOTS` allowlist (enforced if set; warns if unset).
 - MCP `ask`/`ask_parallel` wrappers resolve and pass the context.
-- **Only Anthropic participants consume the binding today** (the existing
-  SDK-with-tools path). Gemini/OpenAI is Goal 1.
+- Anthropic consumes the binding via the SDK-with-tools path; Gemini/OpenAI
+  via their function-calling loops, gated by `CLAUDE_ROUNDTABLE_PANEL_TOOLS`
+  (Goal 1 below — implemented; flag enabled 2026-06-24).
 
 ## Remaining
 
-- **Goal 1 / Phase 3 (NEXT, largest piece):** repo/tool access for Gemini +
-  OpenAI. Build one `LocalRepoToolExecutor` (Read/Grep/Glob; path canonicalize +
-  symlink-escape reject under cwd; result-size caps + truncation markers), wire
-  into `_call_openai` (Responses `function_call`→execute→`function_call_output`,
-  **replay reasoning items** across turns) and `_call_gemini` (manual
-  `functionCall`/`functionResponse` loop, `mode=AUTO`, NOT auto-execution).
-  Read-only first; no Edit/Write to Gemini/OpenAI in v1.
+- **Goal 1 / Phase 3 — DONE (impl. ~2026-06-12; flag enabled 2026-06-24):**
+  repo/tool access for Gemini + OpenAI. `_RepoTools` (Read/Grep/Glob; path
+  canonicalize + symlink-escape reject under cwd — incl. the rglob/grep hole;
+  result-size caps + truncation markers); `_call_openai_with_tools` (Responses
+  `function_call`→execute→`function_call_output`, replays reasoning items) and
+  `_call_gemini_with_tools` (manual loop, `automatic_function_calling.disable=True`).
+  Read-only only; no Edit/Write for Gemini/OpenAI. Gated by
+  `CLAUDE_ROUNDTABLE_PANEL_TOOLS`; covered by `tests/test_panel_tools.py`.
 - **Goal 3 / Phase 4:** schema-structured findings. `SchemaSpec`,
   `roundtable_ask_structured` / `ask_parallel_structured`; adapters (OpenAI
   `text.format` json_schema; Gemini response schema + **2-call fallback** where

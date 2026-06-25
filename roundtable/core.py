@@ -2086,8 +2086,9 @@ def roundtable_bind_repo(
     ``allowed_tools`` optionally clamps the toolset further; ``None`` uses
     the policy default (the read-only trio for ``readonly``).
 
-    Only Anthropic participants consume the binding today; Gemini/OpenAI
-    repo access is Goal 1 (Layer 2), still to come.
+    Anthropic participants always consume the binding (the agent-SDK tool
+    path); Gemini/OpenAI consume it via their own permission-gated
+    function-calling loops when ``CLAUDE_ROUNDTABLE_PANEL_TOOLS`` is set.
 
     Returns the stored binding dict.
     """
@@ -2557,9 +2558,11 @@ def _run_turn(
     several responses atomically (and against the same transcript
     snapshot) without one bleed-through into another's view.
 
-    ``tool_use_context`` (Anthropic-only for now) opts the participant
-    into real filesystem tool use, with every tool call routed through
-    the supplied permission_callback. Non-Anthropic providers ignore it.
+    ``tool_use_context`` opts the participant into real filesystem tool
+    use, every call routed through the supplied permission_callback.
+    Anthropic uses the agent-SDK tool path; Gemini and OpenAI use their
+    function-calling loops when ``PANEL_TOOLS_ENABLED`` is set (otherwise
+    they ignore the context and debate from the transcript alone).
     """
     trimmed = _trim_messages_to_cap(
         messages, PROMPT_CHAR_CAP, for_participant_label=info["label"],

@@ -13,11 +13,13 @@ a ``tool_use_context`` parameter whose ``permission_callback`` field is
 a ``Callable`` — pydantic can't generate a JSON schema for callables,
 so registering the core function directly blows up at schema-discovery
 time. We instead register explicit wrappers that match the
-MCP-callable surface (no ``tool_use_context``) and call core with
-``tool_use_context=None`` — preserving the prior MCP-stdio behaviour
-where Anthropic participants have no filesystem access. Tool-use is
-a webapp-only capability for Layer 1, since stdio MCP has no UI to
-surface permission prompts to.
+MCP-callable surface (no ``tool_use_context``) and resolve the thread's
+stored repo binding server-side via ``core._effective_tool_context``. A
+``readonly`` binding needs no interactive callback, so repo reads work
+over stdio MCP (Anthropic via the agent SDK; Gemini/OpenAI via their
+function-calling loops when ``CLAUDE_ROUNDTABLE_PANEL_TOOLS`` is set).
+Only the ``ask`` policy stays web-only — it needs a UI prompt, so over
+stdio it falls back to no-tools rather than auto-allowing.
 
 Run this module to start the stdio server:
 
