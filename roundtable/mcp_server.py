@@ -78,6 +78,7 @@ roundtable_ask_parallel.__doc__ = core.roundtable_ask_parallel.__doc__
 for _fn in (
     core.roundtable_create,
     core.roundtable_bind_repo,
+    core.roundtable_bind_github,
     core.roundtable_repo_context,
     core.roundtable_post,
     roundtable_ask,

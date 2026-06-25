@@ -10,6 +10,8 @@ in conftest.py, so these never touch the host's real roundtable DB.
 from __future__ import annotations
 
 import concurrent.futures
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -199,3 +201,40 @@ def test_concurrent_posts_get_contiguous_indices():
 
     idxs = sorted(m["idx"] for m in core._thread_messages(tid))
     assert idxs == list(range(workers * per))  # no dupes, no gaps
+
+
+# ─── roundtable_bind_github (offline, via file:// clone) ─────────────────
+
+def _local_git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "hello.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    def g(*a):
+        subprocess.run(["git", *a], cwd=path, check=True, capture_output=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@example.com")
+    g("config", "user.name", "Test")
+    g("add", "-A")
+    g("-c", "commit.gpgsign=false", "commit", "-qm", "init")
+    return path
+
+
+def test_bind_github_clones_strips_git_and_binds_readonly(tmp_path):
+    src = _local_git_repo(tmp_path / "src")
+    tid = core.roundtable_create("gh ok")["thread_id"]
+    res = core.roundtable_bind_github(tid, f"file://{src}")
+    assert len(res["commit_sha"]) == 40
+    assert res["file_count"] == 1
+    ctx = core._effective_tool_context(tid)
+    assert ctx is not None and ctx.allowed_tools == core._READONLY_TOOLS
+    root = Path(res["working_directory"])
+    assert (root / "hello.py").is_file()
+    assert not (root / ".git").exists()  # VCS metadata stripped
+
+
+def test_bind_github_bad_repo_raises_and_leaves_no_binding(tmp_path):
+    tid = core.roundtable_create("gh fail")["thread_id"]
+    with pytest.raises(Exception):
+        core.roundtable_bind_github(tid, f"file://{tmp_path}/nope")
+    assert core.roundtable_repo_context(tid) is None

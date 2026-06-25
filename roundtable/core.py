@@ -2160,6 +2160,117 @@ def roundtable_repo_context(thread_id: int) -> Optional[dict]:
     }
 
 
+# ─── GitHub repo binding ─────────────────────────────────────────────────
+
+_GITHUB_CLONE_ROOT = STATE_DIR / "github"
+# Refuse to bind a working tree larger than this. A depth-1 clone of a sane
+# repo is small; this stops an accidental monorepo from blowing up reads.
+_BIND_GITHUB_MAX_BYTES = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_BIND_GITHUB_MAX_BYTES", str(200 * 1024 * 1024))
+)
+_GIT_CLONE_TIMEOUT_SEC = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_GIT_CLONE_TIMEOUT_SEC", "180")
+)
+_GITHUB_SHORTHAND_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _git(args: list[str]) -> str:
+    """Run a git/gh command; return stdout, raise with stderr on failure.
+
+    Output is captured (never written to stdout — that's the MCP JSON-RPC
+    channel) and network ops are bounded by ``_GIT_CLONE_TIMEOUT_SEC``.
+    """
+    proc = subprocess.run(
+        args, capture_output=True, text=True, timeout=_GIT_CLONE_TIMEOUT_SEC,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`{' '.join(args[:3])} …` failed (exit {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip()[:500]}"
+        )
+    return proc.stdout
+
+
+def _github_clone_url(repo: str) -> str:
+    """Resolve an ``owner/name`` shorthand to a GitHub HTTPS URL, or pass a
+    full git URL (https://, git@, file://) through unchanged."""
+    repo = repo.strip()
+    if "://" in repo or repo.startswith("git@"):
+        return repo
+    if _GITHUB_SHORTHAND_RE.match(repo):
+        owner, name = repo.split("/", 1)
+        name = name[:-4] if name.endswith(".git") else name
+        return f"https://github.com/{owner}/{name}.git"
+    raise ValueError(
+        f"repo must be 'owner/name' or a git URL (https://, git@, file://); "
+        f"got {repo!r}"
+    )
+
+
+def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict:
+    """Shallow-clone a GitHub repo (or any git URL) and bind it read-only.
+
+    Turns "panel, review owner/name" into one call: every participant then
+    reads the same ground truth instead of a pasted excerpt. ``repo`` is
+    ``"owner/name"`` (cloned via ``gh`` when it's installed, so private repos
+    work; otherwise the public HTTPS URL) or any git-cloneable URL, including
+    ``file://`` for local repos and tests. ``ref`` is a branch, tag, or
+    commit SHA; ``"HEAD"`` (default) takes the remote's default branch.
+
+    Clones depth-1 under the state dir, strips ``.git`` (so the panel can't
+    read remote URLs or stored credentials), enforces a working-tree size
+    cap, then registers a ``readonly`` binding via ``roundtable_bind_repo``.
+    A failed clone raises rather than leaving the panel silently ungrounded.
+
+    Returns ``{"thread_id", "repo", "ref", "commit_sha",
+    "working_directory", "file_count"}``.
+    """
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — cannot bind a repo.")
+
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", repo.strip())[:80]
+    dest = _GITHUB_CLONE_ROOT / f"t{thread_id}-{slug}"
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    use_gh = bool(_GITHUB_SHORTHAND_RE.match(repo.strip())) and shutil.which("gh")
+    try:
+        if use_gh:
+            _git(["gh", "repo", "clone", repo.strip(), str(dest), "--", "--depth", "1"])
+        else:
+            _git(["git", "clone", "--depth", "1", _github_clone_url(repo), str(dest)])
+        if ref and ref != "HEAD":
+            # fetch+checkout handles a branch, tag, OR commit SHA uniformly.
+            _git(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", ref])
+            _git(["git", "-C", str(dest), "checkout", "FETCH_HEAD"])
+        commit_sha = _git(["git", "-C", str(dest), "rev-parse", "HEAD"]).strip()
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+    size = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file())
+    if size > _BIND_GITHUB_MAX_BYTES:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise ValueError(
+            f"cloned working tree is {size} bytes, over the "
+            f"{_BIND_GITHUB_MAX_BYTES}-byte cap (raise "
+            f"CLAUDE_ROUNDTABLE_BIND_GITHUB_MAX_BYTES if intended)."
+        )
+    shutil.rmtree(dest / ".git", ignore_errors=True)
+    file_count = sum(1 for p in dest.rglob("*") if p.is_file())
+
+    roundtable_bind_repo(thread_id, str(dest), permission_policy="readonly")
+    return {
+        "thread_id": thread_id, "repo": repo, "ref": ref,
+        "commit_sha": commit_sha, "working_directory": str(dest),
+        "file_count": file_count,
+    }
+
+
 def roundtable_post(thread_id: int, content: str, speaker: str = "orchestrator") -> dict:
     """Append a message to the thread without invoking a participant.
 
