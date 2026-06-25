@@ -238,3 +238,25 @@ def test_bind_github_bad_repo_raises_and_leaves_no_binding(tmp_path):
     with pytest.raises(Exception):
         core.roundtable_bind_github(tid, f"file://{tmp_path}/nope")
     assert core.roundtable_repo_context(tid) is None
+
+
+# ─── roundtable_repo_pack ────────────────────────────────────────────────
+
+def test_repo_pack_injects_tree_and_file_contents(tmp_path):
+    src = tmp_path / "repo"
+    (src / "pkg").mkdir(parents=True)
+    (src / "README.md").write_text("hello readme\n", encoding="utf-8")
+    (src / "pkg" / "mod.py").write_text("def f():\n    return 'NEEDLE'\n", encoding="utf-8")
+    tid = core.roundtable_create("pack test")["thread_id"]
+    core.roundtable_bind_repo(tid, str(src), permission_policy="readonly")
+    res = core.roundtable_repo_pack(tid, query="NEEDLE")
+    assert res["files_included"] == 2
+    hist = core.roundtable_history(tid)
+    assert "README.md" in hist and "pkg/mod.py" in hist
+    assert "NEEDLE" in hist  # file contents are inlined, not just the tree
+
+
+def test_repo_pack_requires_a_binding():
+    tid = core.roundtable_create("pack nobind")["thread_id"]
+    with pytest.raises(RuntimeError):
+        core.roundtable_repo_pack(tid)

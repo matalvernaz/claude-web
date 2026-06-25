@@ -2271,6 +2271,102 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
     }
 
 
+def roundtable_repo_pack(
+    thread_id: int, query: str = "", max_files: int = 40, max_bytes: int = 160_000,
+) -> dict:
+    """Inject a read-only snapshot of the thread's bound repo into the transcript.
+
+    Cheap grounding that reaches EVERY participant — including providers whose
+    tool loop is off, or to skip many tool round-trips: builds a file tree plus
+    the contents of up to ``max_files`` files (``max_bytes`` total) and posts it
+    as an orchestrator turn, so the next ask sees the repo inline. With
+    ``query`` set, files whose path or contents contain it (case-insensitive)
+    are included first. Requires a prior ``bind_repo`` / ``bind_github``.
+
+    Returns ``{"thread_id", "files_included", "bytes_included", "truncated"}``.
+    """
+    binding = roundtable_repo_context(thread_id)
+    if binding is None:
+        raise RuntimeError(
+            f"thread {thread_id} has no bound repo — call roundtable_bind_repo "
+            f"or roundtable_bind_github first."
+        )
+    root = Path(binding["working_directory"]).resolve()
+
+    files: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        try:  # jail: skip symlinks whose target escapes the repo root
+            if not p.resolve().is_relative_to(root):
+                continue
+        except OSError:
+            continue
+        files.append(p)
+    rels = [p.relative_to(root).as_posix() for p in files]
+
+    q = query.strip().lower()
+
+    def _priority(p: Path, rel: str) -> int:
+        if q:
+            if q in rel.lower():
+                return 0
+            try:
+                if q in p.read_text("utf-8", errors="ignore").lower():
+                    return 1
+            except OSError:
+                pass
+        if rel.rsplit("/", 1)[-1].lower().startswith("readme"):
+            return 2
+        return 3
+
+    order = sorted(range(len(files)), key=lambda i: (_priority(files[i], rels[i]), rels[i]))
+    per_file_cap = max(max_bytes // max(max_files, 1), 2000)
+
+    chunks: list[str] = []
+    used = included = 0
+    truncated = False
+    for i in order:
+        if included >= max_files or used >= max_bytes:
+            truncated = True
+            break
+        try:
+            text = files[i].read_text("utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len(text) > per_file_cap:
+            text = text[:per_file_cap] + "\n[… file truncated …]"
+            truncated = True
+        block = f"### {rels[i]}\n```\n{text}\n```\n"
+        if used + len(block) > max_bytes and included > 0:
+            truncated = True
+            break
+        chunks.append(block)
+        used += len(block)
+        included += 1
+    if included < len(files):
+        truncated = True
+
+    _TREE_CAP = 500
+    tree = "\n".join(rels[:_TREE_CAP])
+    if len(rels) > _TREE_CAP:
+        tree += f"\n[… {len(rels) - _TREE_CAP} more files …]"
+    header = (
+        f"[repo pack: {root.name} — {included} of {len(files)} files inlined"
+        + (f", query={query!r}" if query else "")
+        + "]"
+    )
+    body = (
+        f"{header}\n\n## File tree ({len(rels)} files)\n{tree}\n\n"
+        f"## Files\n" + "\n".join(chunks)
+    )
+    roundtable_post(thread_id, body, speaker="orchestrator")
+    return {
+        "thread_id": thread_id, "files_included": included,
+        "bytes_included": used, "truncated": truncated,
+    }
+
+
 def roundtable_post(thread_id: int, content: str, speaker: str = "orchestrator") -> dict:
     """Append a message to the thread without invoking a participant.
 
