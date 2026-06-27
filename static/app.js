@@ -1689,24 +1689,29 @@
     }
   }
 
-  async function drainQueueIfPossible() {
-    if (!currentRunId || isStreaming) return;
+  async function drainQueueIfPossible(resultSummary) {
+    // A just-ended turn's summary must still reach a screen reader even when we
+    // also announce the drain in the same tick — announce() coalesces calls
+    // within its gap, so we fold the summary into one announcement instead of
+    // letting the drain clobber it. speakResult() covers the no-drain paths.
+    const speakResult = () => { if (resultSummary) announce(resultSummary); };
+    if (!currentRunId || isStreaming) { speakResult(); return; }
     // Re-entrancy guard: sendInExistingRun's fallback path awaits a full
     // sendOne (a fresh run that streams to completion). That run's `result`
     // event calls drainQueueIfPossible again while we're still parked here —
     // without this guard the same message gets sent twice (dangerous when
     // it's an instruction like "yes, delete it").
-    if (queueDraining) return;
+    if (queueDraining) { speakResult(); return; }
     // Drain the first entry we haven't POSTed yet. An already-"sending" entry
     // is in the server's queue (or running) and clears itself on its
     // user_prompt / queued_input_cancelled event — re-sending it here would
     // double it up.
     const entry = messageQueue.find((e) => e.status !== "sending");
-    if (!entry) return;
+    if (!entry) { speakResult(); return; }
     queueDraining = true;
     entry.status = "sending";
     renderQueue();
-    announce("Sending next queued message.");
+    announce(resultSummary ? `${resultSummary} Sending next queued message.` : "Sending next queued message.");
     let res = { ok: false, mode: "failed" };
     try {
       res = await sendInExistingRun(entry);
@@ -1815,8 +1820,14 @@
   }
 
   async function drainQueue() {
-    while (messageQueue.length) {
-      const next = messageQueue.shift();
+    // The event-driven drainQueueIfPossible owns any entry it is mid-delivering
+    // (status "sending") and runs under queueDraining; skip those and bail
+    // while it's active, or the same message gets sent twice.
+    while (true) {
+      if (queueDraining) return;
+      const idx = messageQueue.findIndex((e) => e.status !== "sending");
+      if (idx === -1) return;
+      const [next] = messageQueue.splice(idx, 1);
       renderQueue();
       announce("Sending next queued message.");
       await sendOne(next);
@@ -2080,7 +2091,8 @@
         currentRunId = null;
         safeRemove(sessionStorage, RUN_KEY);
         setStreaming(false);
-        promptEl.focus();
+        // Don't steal focus: a reconnect/resume isn't user-initiated, so a
+        // screen-reader user stays where they were reading.
       }
     }
     return true;
@@ -2152,7 +2164,8 @@
         currentRunId = null;
         safeRemove(sessionStorage, RUN_KEY);
         setStreaming(false);
-        promptEl.focus();
+        // Don't steal focus: this turn wasn't user-initiated (it's a restore/
+        // attach), so a screen-reader user stays where they were reading.
       }
     }
   }
@@ -2631,13 +2644,14 @@
       stopGerunds();
       const summary = obj.interrupted ? "Turn interrupted." : summariseResult(obj);
       setStatus(summary);
-      announce(summary);
       refreshSessions();
       refreshHeaderCost();
       setStreaming(false);
       // Drain any client-side queued messages — the user submitted them
-      // mid-turn and we promised we'd flush after the turn ends.
-      drainQueueIfPossible();
+      // mid-turn and we promised we'd flush after the turn ends. Pass the
+      // result summary so a screen reader still hears it even when the drain
+      // announcement fires in the same tick (announce() coalesces calls).
+      drainQueueIfPossible(summary);
       playCue(obj.is_error ? "error" : "done");
       if (obj.is_error) {
         const lines = [obj.result || obj.subtype || "Error"];
