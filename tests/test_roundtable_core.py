@@ -277,3 +277,14 @@ def test_cli_failure_surfaces_stdout_when_stderr_empty(monkeypatch):
     with pytest.raises(RuntimeError) as ei:
         core._call_anthropic_cli("claude-x", "sys", "transcript", "", None, False)
     assert "CONCURRENT_SESSION_CONFLICT" in str(ei.value)
+
+
+def test_github_clone_url_allows_https_and_file_rejects_others():
+    assert core._github_clone_url("owner/name") == "https://github.com/owner/name.git"
+    assert core._github_clone_url("https://github.com/o/n.git") == "https://github.com/o/n.git"
+    # file:// stays allowed — no broader than bind_repo to a local path.
+    assert core._github_clone_url("file:///tmp/x").startswith("file://")
+    # ssh/git@ (key/SSRF/hang), plain http (SSRF), ext:: (RCE) are refused.
+    for bad in ("ssh://h/x", "git@h:x", "http://169.254.169.254/x", "ext::sh -c id"):
+        with pytest.raises(ValueError):
+            core._github_clone_url(bad)

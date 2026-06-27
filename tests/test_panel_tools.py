@@ -217,3 +217,27 @@ def test_grep_symlink_escape_blocked(tmp_path):
         assert "GREP_LEAKED_SECRET" not in out
     finally:
         secret.unlink()
+
+
+def test_glob_symlink_escape_blocked(tmp_path):
+    # Glob must not enumerate files outside the jail via an in-root symlink —
+    # the same resolve()+re-jail that _read/_grep apply, now applied to _glob.
+    import os
+    outside = tmp_path.parent / "glob_outside_dir"
+    outside.mkdir(exist_ok=True)
+    (outside / "GLOB_LEAKED_SECRET").write_text("x", encoding="utf-8")
+    (tmp_path / "inside.txt").write_text("x", encoding="utf-8")
+    link = tmp_path / "esc"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        return  # no symlink perms — skip
+    try:
+        out = _mk(tmp_path).execute("Glob", {"pattern": "esc/*"})
+        assert "GLOB_LEAKED_SECRET" not in out  # escape blocked
+        # in-repo glob still works
+        assert "inside.txt" in _mk(tmp_path).execute("Glob", {"pattern": "*.txt"})
+    finally:
+        link.unlink()
+        (outside / "GLOB_LEAKED_SECRET").unlink()
+        outside.rmdir()

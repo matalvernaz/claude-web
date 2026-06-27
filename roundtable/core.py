@@ -2179,14 +2179,17 @@ _GIT_CLONE_TIMEOUT_SEC = int(
 _GITHUB_SHORTHAND_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def _git(args: list[str]) -> str:
+def _git(args: list[str], env: Optional[dict] = None) -> str:
     """Run a git/gh command; return stdout, raise with stderr on failure.
 
     Output is captured (never written to stdout — that's the MCP JSON-RPC
     channel) and network ops are bounded by ``_GIT_CLONE_TIMEOUT_SEC``.
+    ``env`` is merged over the inherited environment — used to pin
+    GIT_ALLOW_PROTOCOL / GIT_TERMINAL_PROMPT on clones.
     """
     proc = subprocess.run(
         args, capture_output=True, text=True, timeout=_GIT_CLONE_TIMEOUT_SEC,
+        env={**os.environ, **env} if env else None,
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -2197,18 +2200,25 @@ def _git(args: list[str]) -> str:
 
 
 def _github_clone_url(repo: str) -> str:
-    """Resolve an ``owner/name`` shorthand to a GitHub HTTPS URL, or pass a
-    full git URL (https://, git@, file://) through unchanged."""
+    """Resolve an ``owner/name`` shorthand to a GitHub HTTPS URL, or accept an
+    explicit ``https://`` or ``file://`` git URL. Other transports are refused:
+    ``ssh``/``git@`` (host-key hang + key/SSRF risk), plain ``http`` (SSRF), and
+    git's ``ext::``/``fd::`` helpers (command execution). ``file://`` is allowed
+    — it's no broader than ``roundtable_bind_repo`` to a local path."""
     repo = repo.strip()
     if "://" in repo or repo.startswith("git@"):
+        if not (repo.startswith("https://") or repo.startswith("file://")):
+            raise ValueError(
+                f"only https:// or file:// git URLs are allowed; got {repo!r} "
+                f"(ssh/git@, http, and ext::/fd:: transports are refused)"
+            )
         return repo
     if _GITHUB_SHORTHAND_RE.match(repo):
         owner, name = repo.split("/", 1)
         name = name[:-4] if name.endswith(".git") else name
         return f"https://github.com/{owner}/{name}.git"
     raise ValueError(
-        f"repo must be 'owner/name' or a git URL (https://, git@, file://); "
-        f"got {repo!r}"
+        f"repo must be 'owner/name' or an https:// / file:// git URL; got {repo!r}"
     )
 
 
@@ -2262,15 +2272,28 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     use_gh = bool(_GITHUB_SHORTHAND_RE.match(repo.strip())) and shutil.which("gh")
+    # Pin the transport allowlist (https/file only) and disable credential
+    # prompts so a clone can't reach a transport helper (ext::/fd::), probe
+    # internal hosts, or hang on an auth prompt. core.symlinks=false stops a
+    # hostile repo writing an outward symlink into the worktree.
+    clone_env = {"GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "https:file"}
+    if ref and ref.startswith("-"):
+        raise ValueError(f"invalid ref {ref!r}")
     try:
         if use_gh:
-            _git(["gh", "repo", "clone", repo.strip(), str(dest), "--", "--depth", "1"])
+            _git(["gh", "repo", "clone", repo.strip(), str(dest), "--", "--depth", "1"], env=clone_env)
         else:
-            _git(["git", "clone", "--depth", "1", _github_clone_url(repo), str(dest)])
+            _git(
+                ["git", "-c", "core.symlinks=false", "clone", "--depth", "1",
+                 "--", _github_clone_url(repo), str(dest)],
+                env=clone_env,
+            )
         if ref and ref != "HEAD":
             # fetch+checkout handles a branch, tag, OR commit SHA uniformly.
-            _git(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", ref])
-            _git(["git", "-C", str(dest), "checkout", "FETCH_HEAD"])
+            # ref can't start with '-' (guarded above) so it can't pose as an
+            # option in operand position.
+            _git(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", ref], env=clone_env)
+            _git(["git", "-C", str(dest), "checkout", "FETCH_HEAD"], env=clone_env)
         commit_sha = _git(["git", "-C", str(dest), "rev-parse", "HEAD"]).strip()
     except Exception:
         _rmtree_force(dest)
@@ -2631,13 +2654,22 @@ class _RepoTools:
         if not pattern:
             return "[glob: empty pattern]"
         try:
-            # as_posix() so repo-relative paths shown to the LLM use '/' on
-            # every host; str() would emit backslashes on Windows.
-            hits = sorted(
-                p.relative_to(self.root).as_posix()
-                for p in self.root.glob(pattern) if p.is_file()
-            )
-        except (ValueError, OSError) as exc:
+            # Re-jail by REAL path before yielding: self.root.glob follows a
+            # symlink under root whose target is outside, while relative_to
+            # passes lexically — so an outward link would leak external file
+            # names/existence. resolve() collapses the link; reject anything
+            # landing outside root. Mirrors _read/_grep. (as_posix() shows the
+            # un-resolved relative path with '/' on every host.)
+            hits = []
+            for p in self.root.glob(pattern):
+                try:
+                    if not p.is_file() or not p.resolve().is_relative_to(self.root):
+                        continue
+                except OSError:
+                    continue
+                hits.append(p.relative_to(self.root).as_posix())
+            hits.sort()
+        except (ValueError, OSError, NotImplementedError) as exc:
             return f"[glob error: {exc}]"
         if not hits:
             return "[no matches]"
