@@ -456,6 +456,7 @@ PLAN_TOOL = "ExitPlanMode"
 # Active subscribers should never approach this — events are bytes on the wire
 # the moment they're queued.
 MAX_SUBSCRIBER_QUEUE = int(os.getenv("CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE", "1000"))
+MAX_USER_INPUT_QUEUE = int(os.getenv("CLAUDE_WEB_MAX_USER_INPUT_QUEUE", "50"))
 
 # Soft cap on in-memory ActiveRun.events. Sized to comfortably hold the entire
 # event stream of a normal conversation (≈500 events) while putting a ceiling
@@ -4325,7 +4326,12 @@ def _persist_event(run_id: str, idx: int, event: dict) -> None:
     try:
         payload = json.dumps(event)
     except (TypeError, ValueError):
-        return
+        # Don't drop a non-serializable event — that leaves a hole in the
+        # persisted idx sequence, which on restore collides the restart-synth
+        # idxs and misaligns subscribe() replay. Persist a typed placeholder at
+        # this idx so the sequence stays dense (the real event was in-memory
+        # only and is lost on restart regardless).
+        payload = json.dumps({"type": "_unpersisted", "_idx": event.get("_idx", idx)})
     try:
         _state_db().execute(
             "INSERT OR REPLACE INTO events(run_id, idx, payload) VALUES(?, ?, ?)",
@@ -4547,6 +4553,11 @@ def _restore_persisted_runs() -> None:
                 unresolved_perms[eid] = len(run.events) - 1
             elif etype in ("permission_timeout", "permission_resolved") and eid:
                 unresolved_perms.pop(eid, None)
+        # Next free idx is (max existing _idx)+1, NOT len(run.events): a dropped
+        # /placeholder event could leave the restored sequence non-contiguous,
+        # and a len()-based idx would then collide a synth with a real event
+        # (INSERT OR REPLACE would overwrite it).
+        next_idx = max((evt.get("_idx", -1) for evt in run.events), default=-1) + 1
         # Append a synthetic timeout for each orphaned request so the
         # browser disables its card on resume instead of letting a click
         # 404 silently.
@@ -4557,10 +4568,11 @@ def _restore_persisted_runs() -> None:
                 "tool": None,
                 "timeout_seconds": 0,
                 "reason": "server_restart",
-                "_idx": len(run.events),
+                "_idx": next_idx,
             }
             run.events.append(synth)
-            _persist_event(run_id, len(run.events) - 1, synth)
+            _persist_event(run_id, next_idx, synth)
+            next_idx += 1
         was_killed = finished_at is None
         # Idempotent restart marker: if a previous restore already appended a
         # restarted_during_run event (and crashed before _persist_run_meta
@@ -4579,22 +4591,18 @@ def _restore_persisted_runs() -> None:
                     "will pick up from here."
                 ),
                 "ts": now,
-                "_idx": len(run.events),
+                "_idx": next_idx,
             }
             run.events.append(synth)
-            _persist_event(run_id, len(run.events) - 1, synth)
+            _persist_event(run_id, next_idx, synth)
+            next_idx += 1
             interrupted += 1
         run.done = True
         run.finished_at = finished_at or now
-        # Restored events were appended to run.events directly (bypassing
-        # emit()), so the per-run idx counter hasn't been bumped. Sync it
-        # to (max _idx + 1) so any future emit() — unlikely, since
-        # done=True, but possible if a later code path appends a synthetic
-        # event to a hydrated run — picks the next free slot rather than
-        # colliding with a restored idx.
-        run._next_idx = max(
-            (evt.get("_idx", 0) for evt in run.events), default=-1,
-        ) + 1
+        # next_idx is already (max restored _idx)+1 advanced past the synths,
+        # so any future emit() on this hydrated run picks the next free slot
+        # rather than colliding with a restored or synthetic idx.
+        run._next_idx = next_idx
         ACTIVE_RUNS[run_id] = run
         if was_killed:
             _persist_run_meta(run)
@@ -5504,9 +5512,26 @@ async def _restart_watcher_loop() -> None:
         return
 
 
+_GC_INTERVAL_SECONDS = int(os.getenv("CLAUDE_WEB_GC_INTERVAL", "60"))
+
+
+async def _periodic_gc_loop() -> None:
+    """Run _gc_runs on a timer. Without this, a conversation that only ever
+    uses /api/chat/send (never /api/chat, the sole on-demand GC trigger) lets
+    finished/zombie runs, expired uploads, and the persisted event store grow
+    unbounded for the process's lifetime."""
+    while True:
+        await asyncio.sleep(_GC_INTERVAL_SECONDS)
+        try:
+            _gc_runs()
+        except Exception:
+            log.exception("periodic _gc_runs failed")
+
+
 @app.on_event("startup")
 async def _install_restart_machinery() -> None:
     asyncio.create_task(_restart_watcher_loop())
+    asyncio.create_task(_periodic_gc_loop())
     if hasattr(signal, "SIGUSR1"):
         try:
             asyncio.get_running_loop().add_signal_handler(
@@ -5846,6 +5871,12 @@ async def _inject_user_input(
     between turns, serializing every write through one writer.
     """
     if run.done or not run.accepting_input:
+        return False
+    # Bound the per-run input backlog. The browser caps at MAX_QUEUE_LENGTH
+    # client-side, but a direct API caller could otherwise enqueue without
+    # limit — each item spawns a delivery task + Future. Reject past the cap so
+    # the caller surfaces a 409 and the user retries once the driver drains.
+    if run.user_input_queue.qsize() >= MAX_USER_INPUT_QUEUE:
         return False
     loop = asyncio.get_running_loop()
     delivered: asyncio.Future = loop.create_future()

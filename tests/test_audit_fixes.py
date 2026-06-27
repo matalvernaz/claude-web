@@ -331,3 +331,63 @@ def test_existing_run_scan_skips_finished_and_zombie() -> None:
     finally:
         app_module.ACTIVE_RUNS.pop("scan-done", None)
         app_module.ACTIVE_RUNS.pop("scan-zombie", None)
+
+
+async def test_inject_user_input_rejects_when_queue_full() -> None:
+    """Server-side backlog is bounded — a direct API caller can't grow
+    user_input_queue (and its per-item delivery task + Future) without limit."""
+    run = app_module.ActiveRun("cap-run")
+    run.accepting_input = True
+    run.done = False
+    for _ in range(app_module.MAX_USER_INPUT_QUEUE):
+        run.user_input_queue.put_nowait({"text": "x"})
+    ok = await app_module._inject_user_input(
+        run, "one too many", [], image_count=0, file_count=0)
+    assert ok is False
+
+
+def test_persist_event_keeps_unserializable_as_placeholder() -> None:
+    """A non-serializable event must not be dropped — that would leave a hole in
+    the persisted idx sequence. It's stored as a typed placeholder instead."""
+    db = app_module._state_db()
+    rid = "persist-placeholder"
+    try:
+        app_module._persist_event(rid, 7, {"type": "weird", "_idx": 7, "obj": object()})
+        row = db.execute(
+            "SELECT payload FROM events WHERE run_id=? AND idx=7", (rid,)
+        ).fetchone()
+        assert row is not None, "event was dropped, leaving an idx gap"
+        assert json.loads(row[0])["type"] == "_unpersisted"
+    finally:
+        db.execute("DELETE FROM events WHERE run_id=?", (rid,))
+
+
+def test_restore_handles_idx_gap_without_collision() -> None:
+    """A gap in the persisted idx sequence must not make a restart-synth event
+    collide with (and INSERT OR REPLACE overwrite) a real restored event."""
+    db = app_module._state_db()
+    rid = "restore-gap"
+    old = time.time() - 100
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO runs(run_id, owner_sub, session_id,"
+            " project_key, created_at, finished_at, last_activity)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (rid, None, None, "p", old, None, old),  # finished_at NULL = killed mid-turn
+        )
+        for i in (0, 1, 3):  # idx 2 missing — a gap
+            db.execute(
+                "INSERT OR REPLACE INTO events(run_id, idx, payload) VALUES(?,?,?)",
+                (rid, i, json.dumps({"type": "marker", "_idx": i})),
+            )
+        app_module._restore_persisted_runs()
+        run = app_module.ACTIVE_RUNS.get(rid)
+        assert run is not None
+        idxs = [e["_idx"] for e in run.events]
+        assert len(idxs) == len(set(idxs)), f"colliding idxs after restore: {idxs}"
+        assert run._next_idx > max(idxs)
+        assert idxs.count(3) == 1  # the restart synth landed past the gap, not on idx 3
+    finally:
+        app_module.ACTIVE_RUNS.pop(rid, None)
+        db.execute("DELETE FROM events WHERE run_id=?", (rid,))
+        db.execute("DELETE FROM runs WHERE run_id=?", (rid,))
