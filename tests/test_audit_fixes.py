@@ -391,3 +391,19 @@ def test_restore_handles_idx_gap_without_collision() -> None:
         app_module.ACTIVE_RUNS.pop(rid, None)
         db.execute("DELETE FROM events WHERE run_id=?", (rid,))
         db.execute("DELETE FROM runs WHERE run_id=?", (rid,))
+
+
+def test_setup_gate_honors_admin_emails_without_per_user(monkeypatch) -> None:
+    """Shared-slot setup must be admin-gated whenever ADMIN_EMAILS is set, even
+    outside PER_USER_SESSIONS — otherwise any signed-in user could rotate the
+    shared credential. Empty ADMIN_EMAILS keeps the single-operator default."""
+    import pytest
+    monkeypatch.setattr(app_module, "ENABLE_SETUP", "true")  # skip the auto-lock gate
+    monkeypatch.setattr(app_module, "PER_USER_SESSIONS", False)
+    monkeypatch.setattr(app_module, "ADMIN_EMAILS", {"admin@x"})
+    with pytest.raises(app_module.HTTPException) as ei:
+        app_module._require_setup_access({"email": "user@x", "sub": "u"})
+    assert ei.value.status_code == 403
+    app_module._require_setup_access({"email": "admin@x", "sub": "a"})  # admin: no raise
+    monkeypatch.setattr(app_module, "ADMIN_EMAILS", set())
+    app_module._require_setup_access({"email": "anyone@x", "sub": "b"})  # single-operator: no raise

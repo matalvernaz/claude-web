@@ -295,7 +295,13 @@ def _require_setup_access(user: dict) -> None:
             "setup is locked after first configuration. Set "
             "CLAUDE_WEB_ENABLE_SETUP=true and restart to re-auth.",
         )
-    if PER_USER_SESSIONS:
+    # Admin gate applies whenever an admin list is configured, not only in
+    # PER_USER_SESSIONS mode. Otherwise a single-tenant install with
+    # ENABLE_SETUP=true would let any allowlisted user rotate/wipe the shared
+    # credential the whole instance bills against. Empty ADMIN_EMAILS keeps the
+    # single-operator default (any signed-in user may configure); PER_USER with
+    # an empty list stays locked (no email is in the empty set).
+    if PER_USER_SESSIONS or ADMIN_EMAILS:
         email = (user.get("email") or "").lower()
         if email not in ADMIN_EMAILS:
             log.info(
@@ -8224,11 +8230,11 @@ async def api_chat(
                 "driver error: %s\nstderr:\n%s\ntraceback:\n%s", e, tail, tb,
             )
             payload = {"type": "error", "message": f"{type(e).__name__}: {e}"}
-            detail_parts: list[str] = []
+            # The CLI stderr tail helps the user; the Python traceback is
+            # internal disclosure (absolute paths, module layout) and is already
+            # in the server log above, so it doesn't go to the browser.
             if tail:
-                detail_parts.append("--- CLI stderr ---\n" + tail)
-            detail_parts.append("--- traceback ---\n" + tb)
-            payload["stderr"] = "\n\n".join(detail_parts)
+                payload["stderr"] = "--- CLI stderr ---\n" + tail
             run.emit(payload)
         finally:
             run.finish()
