@@ -2577,9 +2577,11 @@ class _RepoTools:
             return None
         try:
             p = (self.root / rel).resolve()
-            p.relative_to(self.root)
+            rp = p.relative_to(self.root)
         except (ValueError, OSError):
             return None
+        if ".git" in rp.parts:
+            return None  # never expose VCS metadata (remote URLs, embedded tokens)
         return p
 
     def execute(self, name: str, args: dict) -> str:
@@ -2638,6 +2640,8 @@ class _RepoTools:
                 real = f.resolve()
                 if not real.is_relative_to(self.root):
                     continue
+                if ".git" in f.relative_to(self.root).parts:
+                    continue  # never expose VCS metadata
                 rp = f.relative_to(self.root).as_posix()  # '/' on every host; see _glob
                 with f.open(encoding="utf-8", errors="replace") as fh:
                     for n, line in enumerate(fh, 1):
@@ -2667,7 +2671,10 @@ class _RepoTools:
                         continue
                 except OSError:
                     continue
-                hits.append(p.relative_to(self.root).as_posix())
+                rp = p.relative_to(self.root)
+                if ".git" in rp.parts:
+                    continue  # never expose VCS metadata
+                hits.append(rp.as_posix())
             hits.sort()
         except (ValueError, OSError, NotImplementedError) as exc:
             return f"[glob error: {exc}]"

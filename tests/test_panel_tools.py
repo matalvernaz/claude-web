@@ -219,6 +219,22 @@ def test_grep_symlink_escape_blocked(tmp_path):
         secret.unlink()
 
 
+def test_git_metadata_not_readable(tmp_path):
+    # The panel must never read VCS metadata (remote URLs / embedded tokens),
+    # even though .git lives inside the bound repo — covers every bound repo,
+    # not just clones that strip .git.
+    git = tmp_path / ".git"
+    git.mkdir()
+    (git / "config").write_text(
+        "url = https://x-access-token:GITSECRET@github.com/o/r", encoding="utf-8")
+    (tmp_path / "code.py").write_text("ok", encoding="utf-8")
+    t = _mk(tmp_path)
+    assert "GITSECRET" not in t.execute("Read", {"path": ".git/config"})
+    assert "GITSECRET" not in t.execute("Grep", {"pattern": "GITSECRET"})
+    assert ".git/config" not in t.execute("Glob", {"pattern": "**/*"})
+    assert t.execute("Read", {"path": "code.py"}) == "ok"  # normal files still work
+
+
 def test_glob_symlink_escape_blocked(tmp_path):
     # Glob must not enumerate files outside the jail via an in-root symlink —
     # the same resolve()+re-jail that _read/_grep apply, now applied to _glob.
