@@ -2212,6 +2212,25 @@ def _github_clone_url(repo: str) -> str:
     )
 
 
+def _rmtree_force(path: Path) -> None:
+    """Remove a tree, including read-only files. Git marks loose objects and
+    pack files read-only; a plain ``shutil.rmtree(..., ignore_errors=True)``
+    silently leaves them on Windows (read-only files can't be unlinked there),
+    so a stripped ``.git`` reappears in the working tree and clone dirs can't
+    be cleaned up. The handler clears the read-only bit and retries, swallowing
+    anything it still can't remove so exception-cleanup callers never raise."""
+    def _on_error(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass
+    try:
+        shutil.rmtree(path, onexc=_on_error)
+    except TypeError:  # Python < 3.12 spells it onerror, not onexc
+        shutil.rmtree(path, onerror=_on_error)
+
+
 def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict:
     """Shallow-clone a GitHub repo (or any git URL) and bind it read-only.
 
@@ -2239,7 +2258,7 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
     slug = re.sub(r"[^A-Za-z0-9._-]", "_", repo.strip())[:80]
     dest = _GITHUB_CLONE_ROOT / f"t{thread_id}-{slug}"
     if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
+        _rmtree_force(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     use_gh = bool(_GITHUB_SHORTHAND_RE.match(repo.strip())) and shutil.which("gh")
@@ -2254,18 +2273,18 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
             _git(["git", "-C", str(dest), "checkout", "FETCH_HEAD"])
         commit_sha = _git(["git", "-C", str(dest), "rev-parse", "HEAD"]).strip()
     except Exception:
-        shutil.rmtree(dest, ignore_errors=True)
+        _rmtree_force(dest)
         raise
 
     size = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file())
     if size > _BIND_GITHUB_MAX_BYTES:
-        shutil.rmtree(dest, ignore_errors=True)
+        _rmtree_force(dest)
         raise ValueError(
             f"cloned working tree is {size} bytes, over the "
             f"{_BIND_GITHUB_MAX_BYTES}-byte cap (raise "
             f"CLAUDE_ROUNDTABLE_BIND_GITHUB_MAX_BYTES if intended)."
         )
-    shutil.rmtree(dest / ".git", ignore_errors=True)
+    _rmtree_force(dest / ".git")
     file_count = sum(1 for p in dest.rglob("*") if p.is_file())
 
     roundtable_bind_repo(thread_id, str(dest), permission_policy="readonly")
