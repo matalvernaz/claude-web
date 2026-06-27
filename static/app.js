@@ -3602,7 +3602,10 @@
       for (const fm of fieldMeta) {
         const qtext = fm.q.question || fm.q.header;
         if (!qtext) continue;
-        const checked = [...form.querySelectorAll(`input[name="${fm.groupName}"]:checked`)];
+        // Iterate rather than build a selector from a server-supplied id: a
+        // CSS-special char in req.id would break the selector and silently drop
+        // answers (matches the project's avoid-selectors-from-ids convention).
+        const checked = [...form.querySelectorAll("input:checked")].filter((i) => i.name === fm.groupName);
         const vals = [];
         for (const c of checked) {
           if (c.value === "__other__") {

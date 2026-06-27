@@ -126,7 +126,10 @@ def _load_cache_from_disk() -> None:
             if not isinstance(entry, dict):
                 continue
             try:
-                _cache[code.upper()] = (float(entry["fetched_at"]), float(entry["rate"]))
+                rate = float(entry["rate"])
+                if not (rate > 0 and rate < float("inf")):  # reject 0/neg/NaN/inf
+                    continue
+                _cache[code.upper()] = (float(entry["fetched_at"]), rate)
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -170,6 +173,8 @@ def usd_rate(currency: str) -> Optional[float]:
             resp.raise_for_status()
             data = resp.json()
         rate = float(data["rates"][code])
+        if not (rate > 0 and rate < float("inf")):  # reject 0/neg/NaN/inf
+            raise ValueError(f"implausible rate {rate!r}")
     except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
         log.warning("frankfurter rate fetch for %s failed: %s", code, exc)
         # Serve stale rather than blanking the cost UI.
