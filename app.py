@@ -5650,20 +5650,40 @@ def _gc_runs() -> None:
         _purge_old_persisted(now)
 
 
-def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
-    """Return the live ActiveRun owning this client session, if any."""
-    if not session_id:
-        return None
-    run = ACTIVE_RUNS_BY_SESSION.get(session_id)
+def _run_is_live(run: Optional[ActiveRun]) -> bool:
     # ``run.task is None`` on a non-done run is a zombie: api_chat raised
     # between registering the run (under the session lock) and spawning its
     # driver task, so no CLI is attached and never will be. A healthy run is
     # never observable in this state (registration → create_task is a single
     # await-free stretch). Treat it as not-live so the next POST spawns a
     # fresh run instead of queueing input into a driver-less queue forever.
-    if run is None or run.done or run.task is None or run.task.done():
+    return bool(
+        run is not None and not run.done
+        and run.task is not None and not run.task.done()
+    )
+
+
+def _existing_run_for_session(session_id: str) -> Optional[ActiveRun]:
+    """Return the live ActiveRun owning this client session, if any."""
+    if not session_id:
         return None
-    return run
+    run = ACTIVE_RUNS_BY_SESSION.get(session_id)
+    if _run_is_live(run):
+        return run
+    # Fast-path miss (no mapping, or a dead/zombie one). Defense-in-depth
+    # against ACTIVE_RUNS_BY_SESSION losing a still-valid mapping — e.g. the
+    # SDK reporting a different session_id at init, whose re-index hook pops
+    # the old key (see emit()). A live run still writing this session's jsonl
+    # must be reused, never shadowed by a second CLI resuming the same
+    # transcript. session_id is the jsonl basename, so run.session_id ==
+    # session_id is a path match. O(active runs) and only on the miss path;
+    # the map hit above stays O(1). Synchronous (no await), so the re-heal
+    # write is atomic w.r.t. other coroutines in this single-worker process.
+    for candidate in ACTIVE_RUNS.values():
+        if candidate.session_id == session_id and _run_is_live(candidate):
+            ACTIVE_RUNS_BY_SESSION[session_id] = candidate
+            return candidate
+    return None
 
 
 def _require_owner(run: ActiveRun, user: dict) -> None:
@@ -6030,10 +6050,25 @@ async def api_session(
     # path lives at <CLAUDE_HOME>/projects/<sanitized-cwd>/<sid>.jsonl, so the
     # parent dir's name *is* the project key — no need to walk PROJECTS.
     project_key = path.parent.name
+    # Surface a live run for this session so a fresh page (no sessionStorage
+    # RUN_KEY, so tryResume can't fire) can attach to an in-flight turn instead
+    # of mis-routing later sends. Owner-gated like /api/chat/active so a run_id
+    # never leaks across users. next_idx is the tail for a double-render-free
+    # attach: the client renders disk history, then subscribes from here.
+    live = _existing_run_for_session(sid)
+    live_run = None
+    if live is not None and (not live.owner_sub or live.owner_sub == user.get("sub")):
+        live_run = {
+            "run_id": live.run_id,
+            "active": not live.done,
+            "between_turns": live.between_turns,
+            "next_idx": live._next_idx,
+        }
     return {
         "id": sid,
         "project": project_key,
         "messages": session_transcript(sid, project_key),
+        "live_run": live_run,
     }
 
 
@@ -6617,15 +6652,23 @@ async def api_personalities_set_active(
     return _personalities_payload(user)
 
 
-def _stream_run_response(run: ActiveRun, start_index: int = 0) -> StreamingResponse:
+def _stream_run_response(
+    run: ActiveRun, start_index: int = 0, head_event: Optional[dict] = None,
+) -> StreamingResponse:
     """Subscribe to an ActiveRun and stream its events as SSE.
 
     `start_index` controls how much history the new subscriber replays —
     0 for full reconnect, len(events)-N for "only events I'm about to emit".
+    `head_event` is an optional non-persisted lead frame: the reuse path uses
+    it to re-announce run_started so a client attaching at the tail (past the
+    original run_started) still learns the run_id. It carries no _idx, so the
+    client's dedup (keyed on _idx) skips it.
     Closing the request just unsubscribes — the SDK task keeps running so
     a reload or new tab can rejoin via /api/chat/stream/{run_id}.
     """
     async def stream() -> AsyncIterator[bytes]:
+        if head_event is not None:
+            yield f"data: {json.dumps(head_event)}\n\n".encode()
         q = run.subscribe(start_index=start_index)
         try:
             while True:
@@ -7137,7 +7180,21 @@ async def api_chat(
                     },
                     status_code=409,
                 )
-            return _stream_run_response(existing, start_index=start_index)
+            # Re-announce run_started at the head of the reuse stream. The
+            # subscribe starts at the tail (start_index past the original
+            # run_started), so without this a client that lost its run_id —
+            # e.g. a fresh-page sidebar restore — never relearns it and keeps
+            # re-entering this reuse path instead of /api/chat/send/{run_id}.
+            return _stream_run_response(
+                existing, start_index=start_index,
+                head_event={
+                    "type": "run_started",
+                    "run_id": existing.run_id,
+                    "session_id": existing.session_id,
+                    "project": existing.project_key,
+                    "resumed": True,
+                },
+            )
 
         sid_in = session_id or None
         run_id = str(uuid_mod.uuid4())

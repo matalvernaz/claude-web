@@ -201,3 +201,133 @@ def test_gemini_non_streaming_unchanged(monkeypatch) -> None:
     monkeypatch.setattr(core, "_gemini", _FakeGemini())
     result = core._call_gemini("gemini-pro-latest", "sys", "t", "")
     assert result.text == "one shot"
+
+
+# ─── Fresh-page sidebar restore of an in-progress session ────────────────────
+# A live run is observable to _existing_run_for_session only with a non-done
+# task; in a unit test a stand-in object whose .done() is False satisfies the
+# liveness check without a running event loop.
+import types  # noqa: E402
+
+
+def _live_task():
+    return types.SimpleNamespace(done=lambda: False)
+
+
+def _make_session_file(sid: str) -> "object":
+    """Create a minimal session jsonl under the default project so
+    /api/sessions/{sid} resolves a path instead of 404ing. Returns the path."""
+    sessions_dir = (
+        app_module.CLAUDE_HOME / "projects"
+        / app_module._sanitize_project_key(app_module.DEFAULT_CWD)
+    )
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    path = sessions_dir / f"{sid}.jsonl"
+    path.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_api_session_includes_live_run(client) -> None:
+    """A fresh page must be able to discover the session's live run so it can
+    attach instead of mis-routing later sends."""
+    sid = "11111111-1111-1111-1111-111111111111"
+    path = _make_session_file(sid)
+    run = app_module.ActiveRun("live-run-1")
+    run.session_id = sid
+    run.done = False
+    run.between_turns = False
+    run.task = _live_task()
+    for i in range(3):
+        run.emit({"type": "marker", "n": i})
+    app_module.ACTIVE_RUNS["live-run-1"] = run
+    app_module.ACTIVE_RUNS_BY_SESSION[sid] = run
+    try:
+        data = client.get(f"/api/sessions/{sid}").json()
+        assert data["live_run"] is not None
+        assert data["live_run"]["run_id"] == "live-run-1"
+        assert data["live_run"]["active"] is True
+        assert data["live_run"]["between_turns"] is False
+        assert data["live_run"]["next_idx"] == run._next_idx
+    finally:
+        app_module.ACTIVE_RUNS.pop("live-run-1", None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop(sid, None)
+        path.unlink(missing_ok=True)
+
+
+def test_api_session_live_run_null_for_zombie(client) -> None:
+    """A driver-less run must not be surfaced — the client would attach to a
+    run that can never produce events."""
+    sid = "22222222-2222-2222-2222-222222222222"
+    path = _make_session_file(sid)
+    run = app_module.ActiveRun("zombie-live")
+    run.session_id = sid
+    run.task = None
+    app_module.ACTIVE_RUNS["zombie-live"] = run
+    app_module.ACTIVE_RUNS_BY_SESSION[sid] = run
+    try:
+        assert client.get(f"/api/sessions/{sid}").json()["live_run"] is None
+    finally:
+        app_module.ACTIVE_RUNS.pop("zombie-live", None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop(sid, None)
+        path.unlink(missing_ok=True)
+
+
+def test_api_session_live_run_owner_gated(client) -> None:
+    """run_id must never leak across users — owner-gated like /api/chat/active.
+    The AUTH_MODE=none test user has sub None, so a run owned by someone else
+    is hidden."""
+    sid = "33333333-3333-3333-3333-333333333333"
+    path = _make_session_file(sid)
+    run = app_module.ActiveRun("other-owner")
+    run.session_id = sid
+    run.done = False
+    run.task = _live_task()
+    run.owner_sub = "someone-else"
+    app_module.ACTIVE_RUNS["other-owner"] = run
+    app_module.ACTIVE_RUNS_BY_SESSION[sid] = run
+    try:
+        assert client.get(f"/api/sessions/{sid}").json()["live_run"] is None
+    finally:
+        app_module.ACTIVE_RUNS.pop("other-owner", None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop(sid, None)
+        path.unlink(missing_ok=True)
+
+
+def test_existing_run_recovered_when_index_lost() -> None:
+    """If ACTIVE_RUNS_BY_SESSION lost the mapping (e.g. an SDK session_id
+    re-index popped the key) but a live run still owns the session jsonl,
+    _existing_run_for_session recovers it by scanning ACTIVE_RUNS and self-heals
+    the index — so a second CLI is never spawned on one transcript."""
+    run = app_module.ActiveRun("recover-run")
+    run.session_id = "sess-recover"
+    run.done = False
+    run.task = _live_task()
+    app_module.ACTIVE_RUNS["recover-run"] = run  # NOT registered by session
+    try:
+        assert app_module._existing_run_for_session("sess-recover") is run
+        assert app_module.ACTIVE_RUNS_BY_SESSION.get("sess-recover") is run
+    finally:
+        app_module.ACTIVE_RUNS.pop("recover-run", None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop("sess-recover", None)
+
+
+def test_existing_run_scan_skips_finished_and_zombie() -> None:
+    """The recovery scan must not resurrect a done or driver-less run — those
+    fall through to a fresh resume-from-disk spawn."""
+    done = app_module.ActiveRun("scan-done")
+    done.session_id = "sess-scan"
+    done.done = True
+    done.task = types.SimpleNamespace(done=lambda: True)
+    zombie = app_module.ActiveRun("scan-zombie")
+    zombie.session_id = "sess-scan"
+    zombie.task = None
+    app_module.ACTIVE_RUNS["scan-done"] = done
+    app_module.ACTIVE_RUNS["scan-zombie"] = zombie
+    try:
+        assert app_module._existing_run_for_session("sess-scan") is None
+    finally:
+        app_module.ACTIVE_RUNS.pop("scan-done", None)
+        app_module.ACTIVE_RUNS.pop("scan-zombie", None)

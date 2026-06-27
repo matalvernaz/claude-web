@@ -884,6 +884,14 @@
     maybeAutoScroll(true);
     markActive(sessionId);
     updatePageTitle();
+    // If a live run owns this session, attach so currentRunId/RUN_KEY/
+    // isStreaming reflect reality and later sends route correctly. Guard on
+    // sessionId still matching what we loaded so a newer navigation wins
+    // (preserves "sidebar nav honored over resume"). Fire-and-forget: the
+    // attach holds the SSE open for the life of the turn.
+    if (data.live_run && data.live_run.run_id && sessionId === id) {
+      attachLiveRun(data.live_run);
+    }
   }
 
   function appendImagePlaceholder(bodyEl, count) {
@@ -2076,6 +2084,77 @@
       }
     }
     return true;
+  }
+
+  // Attach to a live run discovered via /api/sessions {live_run} on a fresh
+  // page load — no sessionStorage RUN_KEY exists, so tryResume can't fire.
+  // loadSession already rendered the disk transcript, so we TAIL-attach from
+  // the run's current _next_idx: subscribe() replays nothing already on disk,
+  // yet every durable whole-message event from here on (including the in-flight
+  // turn's final assistant message, _idx >= next_idx) still arrives. Only the
+  // pre-attach live-typing animation is missed — cosmetic, self-heals when the
+  // turn completes. The stream is held open even for an idle (between-turns)
+  // run because sendInExistingRun has no reader of its own.
+  async function attachLiveRun(info) {
+    const rid = info && info.run_id;
+    if (!rid) return;
+    const gen = ++streamGeneration;
+    const myAbort = new AbortController();
+    currentRunId = rid;
+    currentAbort = myAbort;
+    safeSet(sessionStorage, RUN_KEY, rid);
+    // Seed dedup at the tail so any already-buffered durable events the tail
+    // re-emits (next_idx grew between the snapshot and the subscribe) are
+    // dropped, not re-rendered. With no run_started on a tail attach,
+    // handleSSEEvent keys dedup on currentRunId, which we've just set.
+    if (typeof info.next_idx === "number" && info.next_idx > 0) {
+      renderedIdxByRun.set(rid, info.next_idx - 1);
+    }
+    // isStreaming reflects reality: spinner only if a turn is actually mid-
+    // flight. An idle live run reads false so the next send routes straight
+    // through sendInExistingRun, not the queue.
+    const midTurn = !!(info.active && !info.between_turns);
+    setStreaming(midTurn);
+    if (midTurn) {
+      startGerunds();
+      announce("Reconnecting to the response in progress.");
+    }
+    try {
+      const start = typeof info.next_idx === "number" ? info.next_idx : 0;
+      const streamUrl = `/api/chat/stream/${encodeURIComponent(rid)}?start_index=${start}`;
+      const r = await fetch(streamUrl, { signal: myAbort.signal });
+      if (!r.ok) {
+        // Benign race: the run finished/GC'd between the /api/sessions snapshot
+        // and here. Keep the disk transcript already rendered, drop the dead
+        // handle so the next send is a clean fresh /api/chat. No error toast —
+        // nothing actually went wrong for the user.
+        if (gen === streamGeneration && currentAbort === myAbort) {
+          currentAbort = null;
+          currentRunId = null;
+          safeRemove(sessionStorage, RUN_KEY);
+          setStreaming(false);
+        }
+        return;
+      }
+      await drainStream(r, gen);
+    } catch (err) {
+      if (err.name === "AbortError") {
+        if (gen === streamGeneration) stopGerunds();
+      } else if (gen === streamGeneration) {
+        if (!maybeRecoverFromDrop(err)) handleStreamError(err);
+      }
+    } finally {
+      // Same generation/abort guard as tryResume — a newer send/load that
+      // started during the attach must not be clobbered by our cleanup, and an
+      // A→B→A sidebar nav must not leave RUN_KEY pointing at the wrong run.
+      if (gen === streamGeneration && currentAbort === myAbort) {
+        currentAbort = null;
+        currentRunId = null;
+        safeRemove(sessionStorage, RUN_KEY);
+        setStreaming(false);
+        promptEl.focus();
+      }
+    }
   }
 
   function handleSSEEvent(evt, ctx) {
