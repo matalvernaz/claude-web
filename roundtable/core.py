@@ -355,6 +355,21 @@ def _conn() -> sqlite3.Connection:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_thread ON usage(thread_id)"
         )
+        # A thread may carry a standing "context pack" — the constraints,
+        # conventions, and prior decisions only the orchestrator holds —
+        # injected into every participant's system prompt so the panel isn't
+        # blind to context Gemini/OpenAI can't otherwise see. One pack per
+        # thread (PK thread_id); set_context REPLACEs. Kept out of the
+        # transcript on purpose: it rides the cached system-prompt prefix
+        # (stable across turns) rather than the volatile, trimmed message log.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS thread_context (
+                thread_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL,
+                source TEXT,
+                created_at REAL NOT NULL
+            )"""
+        )
         cols = {row[1] for row in c.execute("PRAGMA table_info(threads)").fetchall()}
         if "participants_json" not in cols:
             c.execute(
@@ -390,6 +405,17 @@ def _thread_row(thread_id: int) -> Optional[dict]:
             "FROM threads WHERE id = ?",
             (thread_id,),
         ).fetchone()
+        # Load the context pack in the same lock acquisition (the pack lives in
+        # a separate 1:1 table). Both consumers — _build_system_prompt and the
+        # _run_turn trim budget — read it off this dict, so it's fetched once
+        # per ask here, not per participant in the parallel fan-out.
+        ctx_row = (
+            _conn().execute(
+                "SELECT content FROM thread_context WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is not None else None
+        )
     if row is None:
         return None
     return {
@@ -399,6 +425,7 @@ def _thread_row(thread_id: int) -> Optional[dict]:
         "created_at": row[3],
         "closed_at": row[4],
         "house_rules": row[5] or "",
+        "context_pack": (ctx_row[0] if ctx_row else "") or "",
     }
 
 
@@ -464,6 +491,19 @@ def _thread_is_closed(thread_id: int) -> bool:
 # truncation warning the participant can see and react to ("you've lost
 # the older context, summarise if you need it") over an opaque API error.
 PROMPT_CHAR_CAP = int(os.environ.get("CLAUDE_ROUNDTABLE_PROMPT_CHAR_CAP", "400000"))
+
+# Cap the standing context pack (roundtable_set_context). It rides in the
+# system prompt — which on the default Anthropic CLI transport is passed as an
+# argv arg (--system-prompt), and this host's ARG_MAX is ~130KB. Keep the pack
+# well under that so base framing + house_rules fit alongside on argv.
+CONTEXT_PACK_CHAR_CAP = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_CONTEXT_PACK_CHAR_CAP", "60000")
+)
+# Floor for the transcript budget once the context pack is subtracted from
+# PROMPT_CHAR_CAP, so a large pack can't starve the conversation to nothing.
+MIN_TRANSCRIPT_CAP = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_MIN_TRANSCRIPT_CAP", "50000")
+)
 
 
 def _format_transcript(
@@ -684,6 +724,16 @@ def _build_system_prompt(
         base += (
             "\n\n=== House rules for this thread (apply to every reply) ===\n"
             + house_rules
+        )
+    # Standing context pack: stable per thread, so it stays in the cached
+    # system-prompt prefix and doesn't re-bill per turn (see roundtable_set_
+    # context). Read off the thread dict, same as house_rules.
+    context_pack = (thread.get("context_pack") or "").strip()
+    if context_pack:
+        base += (
+            "\n\n=== Standing context for this thread (constraints, "
+            "conventions, prior decisions — treat as ground truth) ===\n"
+            + context_pack
         )
     return base
 
@@ -2017,6 +2067,7 @@ def _call_anthropic_router(
 
 def roundtable_create(
     topic: str, participants: list[str] = [], house_rules: str = "",
+    context: str = "",
 ) -> dict:
     """Create a new roundtable thread.
 
@@ -2034,7 +2085,13 @@ def roundtable_create(
     the code, don't quote it back." Saves restating the format every
     ask. Leave empty for a free-form discussion.
 
-    Returns ``{"thread_id", "topic", "participants", "house_rules"}``.
+    ``context`` is an optional standing context pack (constraints,
+    conventions, prior decisions) injected into every participant's system
+    prompt — see ``roundtable_set_context``. Convenience for setting it at
+    create time; it can also be set or replaced later.
+
+    Returns ``{"thread_id", "topic", "participants", "house_rules"}`` plus
+    ``context_bytes``/``context_truncated`` when a context pack was set.
     """
     unknown = [p for p in participants if p not in PARTICIPANTS]
     if unknown:
@@ -2057,12 +2114,17 @@ def roundtable_create(
             (topic, json.dumps(participants), time.time(), house_rules or None),
         )
         thread_id = int(cur.lastrowid)
-    return {
+    created = {
         "thread_id": thread_id,
         "topic": topic,
         "participants": participants,
         "house_rules": house_rules,
     }
+    if context.strip():
+        ctx = _store_context(thread_id, context, "inline")
+        created["context_bytes"] = ctx["bytes"]
+        created["context_truncated"] = ctx["truncated"]
+    return created
 
 
 def roundtable_bind_repo(
@@ -2162,6 +2224,128 @@ def roundtable_repo_context(thread_id: int) -> Optional[dict]:
         "working_directory": row[0],
         "allowed_tools": json.loads(row[1]) if row[1] else None,
         "permission_policy": row[2],
+    }
+
+
+# ─── Standing context pack ───────────────────────────────────────────────
+
+
+def _store_context(thread_id: int, content: str, source: str) -> dict:
+    """Store (replacing any existing) the standing context pack for a thread.
+
+    The pack is injected verbatim into every participant's system prompt by
+    ``_build_system_prompt``, so it must stay within ``CONTEXT_PACK_CHAR_CAP``
+    — an oversized pack is middle-truncated (with a marker) rather than
+    rejected or sent past the argv/context ceiling. Returns
+    ``{"thread_id", "bytes", "truncated", "source"}``.
+    """
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — cannot set context.")
+    stored = _truncate_message_body(
+        {"content": content}, CONTEXT_PACK_CHAR_CAP,
+    )["content"]
+    with _db_lock:
+        _conn().execute(
+            "INSERT OR REPLACE INTO thread_context(thread_id, content, source, "
+            "created_at) VALUES(?, ?, ?, ?)",
+            (thread_id, stored, source, time.time()),
+        )
+    return {
+        "thread_id": thread_id,
+        "bytes": len(stored),
+        "truncated": stored != content,
+        "source": source,
+    }
+
+
+def roundtable_set_context(thread_id: int, content: str) -> dict:
+    """Store a standing context pack for a thread — the constraints,
+    conventions, and prior decisions only the orchestrator holds — injected
+    into EVERY participant's system prompt so the panel isn't blind to them.
+
+    Use it so Gemini / GPT propose designs and findings that respect the
+    project's real rules (e.g. "auth is Keycloak SSO via oauth2-proxy",
+    "never add indexers outside Prowlarr") instead of generic best practice
+    that contradicts them. Set it once per thread: the pack is stable across
+    turns and rides the cached prompt prefix, so it doesn't re-bill every
+    ask. Calling again replaces it.
+
+    Keep it curated — relevant constraints, not a memory dump. An oversized
+    pack is middle-truncated to the context char cap. Returns
+    ``{"thread_id", "bytes", "truncated", "source"}``.
+    """
+    return _store_context(thread_id, content, "inline")
+
+
+def roundtable_bind_context(thread_id: int, paths: list[str]) -> dict:
+    """Assemble a context pack by reading the named doc files and store it
+    like ``roundtable_set_context``.
+
+    For pointing the panel at standing docs without pasting them — a
+    conventions file, a design doc. Each path must resolve under
+    ``ROUNDTABLE_REPO_ROOTS`` (same allowlist as ``roundtable_bind_repo``).
+    Files are concatenated with ``=== <path> ===`` headers and the result is
+    capped / truncated like set_context. Returns
+    ``{"thread_id", "files", "bytes", "truncated"}``.
+    """
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — cannot bind context.")
+    if not paths:
+        raise ValueError("paths is empty — nothing to bind.")
+    sections: list[str] = []
+    read_paths: list[str] = []
+    for p in paths:
+        resolved = Path(p).expanduser().resolve()
+        if not _path_under_allowlist(str(resolved)):
+            raise ValueError(
+                f"context file {resolved} is outside ROUNDTABLE_REPO_ROOTS "
+                f"({_REPO_ROOT_ALLOWLIST}). Add it to the allowlist to read it."
+            )
+        if not resolved.is_file():
+            raise ValueError(
+                f"context file {p!r} is not an existing file "
+                f"(resolved to {resolved})."
+            )
+        # Bound the per-file read: the pack is clamped to CONTEXT_PACK_CHAR_CAP
+        # regardless, so pulling more than that from any one file is wasted
+        # work — and a guard against a stray oversized file.
+        with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read(CONTEXT_PACK_CHAR_CAP + 1)
+        sections.append(f"=== {resolved} ===\n{text}")
+        read_paths.append(str(resolved))
+    result = _store_context(thread_id, "\n\n".join(sections), "files")
+    return {
+        "thread_id": thread_id,
+        "files": read_paths,
+        "bytes": result["bytes"],
+        "truncated": result["truncated"],
+    }
+
+
+def roundtable_context(thread_id: int) -> Optional[dict]:
+    """Return the thread's stored context pack, or None if unset.
+
+    Returns ``{"thread_id", "content", "source", "bytes"}``. Mirrors
+    ``roundtable_repo_context``.
+    """
+    with _db_lock:
+        row = _conn().execute(
+            "SELECT content, source FROM thread_context WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "thread_id": thread_id,
+        "content": row[0],
+        "source": row[1],
+        "bytes": len(row[0] or ""),
     }
 
 
@@ -2834,8 +3018,15 @@ def _run_turn(
     function-calling loops when ``PANEL_TOOLS_ENABLED`` is set (otherwise
     they ignore the context and debate from the transcript alone).
     """
+    # Reserve room for the context pack: it's part of the system prompt (built
+    # below at _build_system_prompt), so the transcript must fit in what's left
+    # of the cap once the pack is accounted for — floored so a huge pack can't
+    # zero out the conversation.
+    context_pack = thread.get("context_pack") or ""
     trimmed = _trim_messages_to_cap(
-        messages, PROMPT_CHAR_CAP, for_participant_label=info["label"],
+        messages,
+        max(PROMPT_CHAR_CAP - len(context_pack), MIN_TRANSCRIPT_CAP),
+        for_participant_label=info["label"],
     )
     transcript = _format_transcript(trimmed, for_participant_label=info["label"])
     provider = info["provider"]
@@ -3156,6 +3347,165 @@ def _render_artifact_diff(old: str, new: str, name: str, old_v: int, new_v: int)
         n=3,
     )
     return "".join(diff)
+
+
+# ─── Grounded confirm/refute over review findings ────────────────────────
+
+_CONVERGE_WINDOW_LINES = 40
+_VALID_VERDICTS = ("confirmed", "refuted", "unresolved")
+_VALID_CONVERGE_TRANSPORTS = {"cli", "api", "auto"}
+
+_CONVERGE_SYSTEM_PROMPT = (
+    "You are a code-review verifier. You are given a CLAIM about code, the "
+    "reviewer's stated PROOF, and the ACTUAL code at the cited location (with "
+    "line numbers). Decide whether the claim holds against the real code. "
+    "Judge ONLY from the code shown — do not speculate about code you can't "
+    "see; if the cited location lacks enough to decide, say so.\n\n"
+    "Reply with exactly two lines:\n"
+    "VERDICT: confirmed | refuted | unresolved\n"
+    "EVIDENCE: <one line, cite the line number(s) you relied on>"
+)
+
+
+def _excerpt_around(text: str, line: int) -> str:
+    """Return a line-numbered window of ``text`` centred on ``line`` (1-based).
+
+    A non-positive ``line`` means "not line-specific" — return the head of the
+    content (already byte-capped by the reader) instead of a centred window.
+    """
+    lines = text.splitlines()
+    if line and line > 0:
+        lo = max(0, line - 1 - _CONVERGE_WINDOW_LINES)
+        hi = min(len(lines), line - 1 + _CONVERGE_WINDOW_LINES + 1)
+    else:
+        lo, hi = 0, min(len(lines), 2 * _CONVERGE_WINDOW_LINES + 1)
+    return "\n".join(f"{lo + i + 1}: {s}" for i, s in enumerate(lines[lo:hi]))
+
+
+def _parse_verdict(text: str) -> str:
+    """Map a verifier reply to one of _VALID_VERDICTS; default unresolved.
+
+    An explicit ``VERDICT: x`` line wins. Otherwise a single unambiguous
+    verdict keyword is taken; anything ambiguous or absent is unresolved.
+    """
+    t = (text or "").lower()
+    m = re.search(r"verdict\s*[:\-]\s*(confirmed|refuted|unresolved)", t)
+    if m:
+        return m.group(1)
+    present = {v for v in _VALID_VERDICTS if re.search(rf"\b{v}\b", t)}
+    return present.pop() if len(present) == 1 else "unresolved"
+
+
+def _judge_finding(info: dict, transport: str, user_msg: str) -> str:
+    """One verifier turn — pure text judgment, no tools. Returns reply text.
+
+    The evidence-bearing ``user_msg`` is passed as the transcript (stdin on
+    the CLI transport), keeping the large code excerpt off argv; only the
+    small fixed system prompt rides argv.
+    """
+    model = info["model"]
+    provider = info["provider"]
+    if provider == "anthropic":
+        if transport == "cli":
+            res = _call_anthropic_cli(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+        elif transport == "api":
+            if _anthropic is None:
+                raise RuntimeError("transport='api' but ANTHROPIC_API_KEY is not set.")
+            res = _call_anthropic(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+        else:  # auto — let the router pick CLI (subscription) or SDK
+            res = _call_anthropic_router(
+                model, _CONVERGE_SYSTEM_PROMPT, user_msg, "",
+                tool_use_context=None, participant_label=info["label"],
+            )
+    elif provider == "gemini":
+        res = _call_gemini(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+    elif provider == "openai":
+        res = _call_openai(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+    else:
+        raise RuntimeError(f"converge: unsupported provider {provider!r}")
+    return (res.text or "").strip()
+
+
+def roundtable_converge(
+    thread_id: int, findings: list[dict],
+    verifier: str = "claude-opus", transport: str = "cli",
+) -> dict:
+    """Grounded confirm/refute pass over structured review findings.
+
+    For each finding ``{claim, file, line, proof, severity}`` this fetches the
+    real code at the cited ``file:line`` from the thread's bound repo — read
+    via the same jailed, read-only tools the panel uses — and asks ``verifier``
+    to rule it ``confirmed`` / ``refuted`` / ``unresolved`` against the actual
+    code. It never re-debates, only checks. Retrieval is deterministic and
+    free; only the judgment calls a model, routed by default to the free
+    Anthropic CLI (subscription) transport.
+
+    Needs a repo binding (``roundtable_bind_repo``) — verification has no
+    ground truth without one. A finding whose ``file:line`` can't be read is
+    pre-marked ``unresolved`` and never reaches the model.
+
+    ``transport`` is ``"cli"`` (default, free) | ``"api"`` | ``"auto"`` and
+    only affects Anthropic verifiers.
+
+    Returns ``{"thread_id", "ledger", "summary"}`` where each ledger row is
+    the finding plus ``{"verdict", "evidence", "verifier"}`` and ``summary``
+    counts each verdict.
+    """
+    if transport not in _VALID_CONVERGE_TRANSPORTS:
+        raise ValueError(
+            f"transport must be one of {sorted(_VALID_CONVERGE_TRANSPORTS)}; "
+            f"got {transport!r}"
+        )
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    info = _resolve_participant(verifier)
+    ctx = _effective_tool_context(thread_id)
+    if ctx is None or ctx.working_directory is None:
+        raise RuntimeError(
+            "roundtable_converge needs a repo binding (roundtable_bind_repo) "
+            "to fetch ground truth for verification."
+        )
+    repo_tools = _RepoTools(
+        Path(ctx.working_directory), ctx.permission_callback, info["label"],
+    )
+
+    ledger: list[dict] = []
+    for f in findings:
+        path = (f.get("file") or "").strip()
+        try:
+            line = int(f.get("line") or 0)
+        except (TypeError, ValueError):
+            line = 0
+        row = {
+            "claim": (f.get("claim") or "").strip(),
+            "file": path,
+            "line": line,
+            "proof": (f.get("proof") or "").strip(),
+            "severity": (f.get("severity") or "").strip(),
+            "verifier": info["label"],
+        }
+        raw = repo_tools.execute("Read", {"path": path}) if path else "[no file cited]"
+        if any(raw.startswith(p) for p in (
+            "[no such file", "[permission denied", "[Read error", "[no file cited",
+        )):
+            # Cited location can't be read — can't confirm or refute it.
+            ledger.append({**row, "verdict": "unresolved", "evidence": raw})
+            continue
+        user_msg = (
+            f"CLAIM: {row['claim']}\n"
+            f"LOCATION: {path}:{line}\n"
+            f"SEVERITY: {row['severity'] or 'unspecified'}\n"
+            f"REVIEWER'S PROOF: {row['proof'] or '(none given)'}\n\n"
+            f"ACTUAL CODE at {path} (line-numbered):\n{_excerpt_around(raw, line)}"
+        )
+        reply = _judge_finding(info, transport, user_msg)
+        ledger.append({**row, "verdict": _parse_verdict(reply), "evidence": reply})
+
+    summary = {
+        v: sum(1 for r in ledger if r["verdict"] == v) for v in _VALID_VERDICTS
+    }
+    return {"thread_id": thread_id, "ledger": ledger, "summary": summary}
 
 
 def roundtable_set_artifact(

@@ -1,6 +1,6 @@
 # roundtable-mcp — improvement work: progress & plan
 
-_Last updated: 2026-06-02._
+_Last updated: 2026-06-30._
 
 Self-audit of roundtable-mcp + the gemini-mcp/openai-mcp servers, driven through
 the roundtable itself (threads 60 = audit, 61 = design pass), then implemented in
@@ -66,6 +66,26 @@ the processes are restarted (claude-web.service + the MCP server children).
   via their function-calling loops, gated by `CLAUDE_ROUNDTABLE_PANEL_TOOLS`
   (Goal 1 below — implemented; flag enabled 2026-06-24).
 
+### Phase 7 — context layer (2026-06-30)
+- **Context seeding (Goal 6):** `thread_context` table (one pack per thread;
+  set_context REPLACEs). `roundtable_set_context` / `roundtable_bind_context`
+  (allowlisted file read) / `roundtable_context`, plus a `context=` arg on
+  `roundtable_create`. The pack is injected into the cached system-prompt prefix
+  by `_build_system_prompt` (adjacent to house_rules — stable across turns, so no
+  cache bust), capped at `CONTEXT_PACK_CHAR_CAP` (60k; conservative against the
+  CLI `--system-prompt` argv / ~130k ARG_MAX), and the `_run_turn` transcript
+  budget reserves room for it (floored at `MIN_TRANSCRIPT_CAP`). Loaded once per
+  ask in `_thread_row`. Lets the panel respect the user's standing constraints —
+  serves planning and review alike. **20 MCP tools total now.**
+- **Grounded converge (Goal 2, v1):** `roundtable_converge` — deterministic
+  retrieval of the cited `file:line` via `_RepoTools` (free, jailed, read-only),
+  then a per-finding confirm/refute judgment routed to the free Anthropic CLI by
+  default; an unreadable cite is pre-marked `unresolved` with no model call.
+  Returns a `{claim,file,line,proof,severity,verdict,evidence}` ledger + tallies.
+  Verdict parsed from text (explicit `VERDICT:` line, else a single keyword) —
+  swap for native structured output when Goal 3 lands.
+- Covered by `tests/test_context_layer.py` (18 tests).
+
 ## Remaining
 
 - **Goal 1 / Phase 3 — DONE (impl. ~2026-06-12; flag enabled 2026-06-24):**
@@ -82,9 +102,11 @@ the processes are restarted (claude-web.service + the MCP server children).
   tools+schema unsupported on non-Gemini-3; Anthropic forced submit-tool);
   `structured_outputs` table; `roundtable_corroborate_findings` (deterministic,
   support = distinct participants, no self-corroboration).
-- **Goal 2 / Phase 5:** `roundtable_converge` over `ask_parallel_structured` +
-  corroborate + optional synthesis round. Separate `independent_agreement`
-  (round 1) from `post_deliberation_consensus`; synthesizer never the sole truth.
+- **Goal 2 / Phase 5 — v1 DONE (2026-06-30, see Phase 7):** `roundtable_converge`
+  ships as a grounded confirm/refute pass. Still pending: build it over
+  `ask_parallel_structured` + `corroborate` + an optional synthesis round, and
+  separate `independent_agreement` (round 1) from `post_deliberation_consensus`
+  (synthesizer never the sole truth).
 - **Goal 5 / Phase 6:** streaming. `runs` + `run_events` tables, `ProgressEvent`,
   `on_event` callback + poll API (Callables can't cross MCP). Partial text stays
   in `run_events`, never `messages` (preserves ask_parallel independence).
