@@ -1161,6 +1161,114 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
+async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any]):
+    """Allow or deny a non-special tool call via the per-session allowlist,
+    falling back to a browser permission prompt.
+
+    Concurrent calls sharing one (tool, signature) are serialized on
+    run.sig_locks so a turn that batches several same-host calls prompts
+    once: the first prompts and records the grant, the rest then see the
+    fresh allowlist entry and auto-allow instead of each re-prompting. The
+    lock is taken only when the decision is allowlist-eligible; coarse
+    signatures (NO_SESSION_ALLOWLIST_TOOLS) use a nullcontext, since locking
+    them would force strictly serial re-prompts the allowlist can never
+    satisfy.
+    """
+    owner = run.owner_sub or "?"
+    sig = _tool_signature(tool_name, tool_input)
+    # Tools in NO_SESSION_ALLOWLIST_TOOLS bypass the per-session allowlist
+    # entirely — their signature is too coarse to be safe (e.g. Bash maps
+    # every command to its first word, so allowlisting `echo` would
+    # bless `echo "ok" && rm -rf ~`).
+    allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
+    gate = (
+        run.sig_locks.setdefault((tool_name, sig), asyncio.Lock())
+        if allow_session_supported
+        else contextlib.nullcontext()
+    )
+    async with gate:
+        # A stop sets run.interrupting and resolves only the futures already
+        # in PENDING (see _resolve_pending_permissions). A follower parked on
+        # the lock has no PENDING entry yet, so re-check here and deny rather
+        # than emit a fresh prompt into a turn that's already tearing down.
+        if run.interrupting:
+            return PermissionResultDeny(
+                message="Run interrupted before the tool was approved.",
+            )
+        if allow_session_supported and (tool_name, sig) in run.session_allowlist:
+            log.info(
+                "perm session-allowlist tool=%s sig=%r run=%s owner=%s",
+                tool_name, sig, run.run_id, owner,
+            )
+            return PermissionResultAllow()
+
+        request_id = str(uuid_mod.uuid4())
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
+        try:
+            run.emit({
+                "type": "permission_request",
+                "id": request_id,
+                "tool": tool_name,
+                "input": tool_input,
+                "signature": sig,
+                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                "allow_session_supported": allow_session_supported,
+            })
+            try:
+                decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                log.info(
+                    "perm timeout tool=%s sig=%r run=%s owner=%s after=%ss",
+                    tool_name, sig, run.run_id, owner, PERMISSION_TIMEOUT_SECONDS,
+                )
+                run.emit({
+                    "type": "permission_timeout",
+                    "id": request_id,
+                    "tool": tool_name,
+                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                })
+                return PermissionResultDeny(
+                    message=(
+                        f"Permission request timed out after "
+                        f"{PERMISSION_TIMEOUT_SECONDS}s with no user response."
+                    ),
+                )
+        finally:
+            PENDING.pop(request_id, None)
+
+        d = decision.get("decision")
+        log.info(
+            "perm decision=%s tool=%s sig=%r run=%s owner=%s",
+            d, tool_name, sig, run.run_id, owner,
+        )
+        # Persist the resolution so replays render this card as decided.
+        # Without it a reconnect re-renders the request as pending and a
+        # click 404s (PENDING is in-process and long gone).
+        run.emit({
+            "type": "permission_resolved",
+            "id": request_id,
+            "tool": tool_name,
+            "decision": d,
+        })
+        if d == "allow":
+            return PermissionResultAllow()
+        if d == "allow_session":
+            # Defense-in-depth: refuse to extend the allowlist for tools that
+            # opt out, even if a tampered client posted allow_session anyway.
+            # Treat it as allow-once.
+            if allow_session_supported:
+                run.session_allowlist.add((tool_name, sig))
+            else:
+                log.info(
+                    "perm allow_session-downgraded tool=%s sig=%r run=%s "
+                    "(signature unsafe to allowlist)",
+                    tool_name, sig, run.run_id,
+                )
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="User denied permission via web UI.")
+
+
 # ─── State persistence (sqlite-backed run + event store) ─────────────────────
 #
 # Goal: a `systemctl restart claude-web` doesn't lose the user's transcript.
@@ -5024,6 +5132,13 @@ class ActiveRun:
         self.created_at: float = now
         self.finished_at: Optional[float] = None
         self.session_allowlist: set[tuple[str, str]] = set()
+        # Serializes the check-then-add on session_allowlist per (tool, sig).
+        # The SDK runs can_use_tool concurrently for tools the model batches
+        # in one turn (e.g. several WebFetch to the same host); without this
+        # they all clear the allowlist check before any records the
+        # allow_session grant, so the user is prompted once per call. Same
+        # lifetime as session_allowlist — per-run and ephemeral.
+        self.sig_locks: dict[tuple[str, str], asyncio.Lock] = {}
         # Task ledger for the new TaskCreate/TaskUpdate tool family (replaces
         # TodoWrite from CLI 2.1.126+). The CLI assigns task ids in its tool
         # *result* ("Task #N created successfully: ..."), not in the tool_use
@@ -7417,84 +7532,7 @@ async def api_chat(
                 ),
             )
 
-        sig = _tool_signature(tool_name, tool_input)
-        # Tools in NO_SESSION_ALLOWLIST_TOOLS bypass the per-session allowlist
-        # entirely — their signature is too coarse to be safe (e.g. Bash maps
-        # every command to its first word, so allowlisting `echo` would
-        # bless `echo "ok" && rm -rf ~`).
-        allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
-        if allow_session_supported and (tool_name, sig) in run.session_allowlist:
-            log.info(
-                "perm session-allowlist tool=%s sig=%r run=%s owner=%s",
-                tool_name, sig, run.run_id, owner,
-            )
-            return PermissionResultAllow()
-
-        request_id = str(uuid_mod.uuid4())
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
-        try:
-            run.emit({
-                "type": "permission_request",
-                "id": request_id,
-                "tool": tool_name,
-                "input": tool_input,
-                "signature": sig,
-                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
-                "allow_session_supported": allow_session_supported,
-            })
-            try:
-                decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                log.info(
-                    "perm timeout tool=%s sig=%r run=%s owner=%s after=%ss",
-                    tool_name, sig, run.run_id, owner, PERMISSION_TIMEOUT_SECONDS,
-                )
-                run.emit({
-                    "type": "permission_timeout",
-                    "id": request_id,
-                    "tool": tool_name,
-                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
-                })
-                return PermissionResultDeny(
-                    message=(
-                        f"Permission request timed out after "
-                        f"{PERMISSION_TIMEOUT_SECONDS}s with no user response."
-                    ),
-                )
-        finally:
-            PENDING.pop(request_id, None)
-
-        d = decision.get("decision")
-        log.info(
-            "perm decision=%s tool=%s sig=%r run=%s owner=%s",
-            d, tool_name, sig, run.run_id, owner,
-        )
-        # Persist the resolution so replays render this card as decided.
-        # Without it a reconnect re-renders the request as pending and a
-        # click 404s (PENDING is in-process and long gone).
-        run.emit({
-            "type": "permission_resolved",
-            "id": request_id,
-            "tool": tool_name,
-            "decision": d,
-        })
-        if d == "allow":
-            return PermissionResultAllow()
-        if d == "allow_session":
-            # Defense-in-depth: refuse to extend the allowlist for tools that
-            # opt out, even if a tampered client posted allow_session anyway.
-            # Treat it as allow-once.
-            if allow_session_supported:
-                run.session_allowlist.add((tool_name, sig))
-            else:
-                log.info(
-                    "perm allow_session-downgraded tool=%s sig=%r run=%s "
-                    "(signature unsafe to allowlist)",
-                    tool_name, sig, run.run_id,
-                )
-            return PermissionResultAllow()
-        return PermissionResultDeny(message="User denied permission via web UI.")
+        return await _gate_tool_permission(run, tool_name, tool_input)
 
     # Buffer the CLI subprocess's stderr so we can include it in any error
     # event we emit. Without this the SDK just surfaces "Error in input
@@ -10541,69 +10579,82 @@ def _make_roundtable_permission_callback(
     problem where a user OKs a Read once and the agent silently reads
     fifty more files in a future turn.
     """
+    # Mirror of ActiveRun.sig_locks: serialize the check-then-add on
+    # session_allowlist per (tool, sig) so concurrent same-host fetches from
+    # different participants prompt once, not once per participant. All
+    # _ask_on_main coroutines run on main_loop, so one lock instance per key
+    # is shared across them.
+    sig_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
     async def _ask_on_main(participant_label: str, tool_name: str, tool_input: dict) -> str:
         if tool_name in SAFE_TOOLS:
             return "allow"
         sig = _tool_signature(tool_name, tool_input)
         allow_session_supported = tool_name not in NO_SESSION_ALLOWLIST_TOOLS
-        if allow_session_supported and (tool_name, sig) in session_allowlist:
-            return "allow"
+        gate = (
+            sig_locks.setdefault((tool_name, sig), asyncio.Lock())
+            if allow_session_supported
+            else contextlib.nullcontext()
+        )
+        async with gate:
+            if allow_session_supported and (tool_name, sig) in session_allowlist:
+                return "allow"
 
-        request_id = str(uuid_mod.uuid4())
-        fut: asyncio.Future = main_loop.create_future()
-        PENDING[request_id] = {"future": fut, "owner_sub": user_sub}
-        try:
-            await event_queue.put(("permission_request", {
-                "id": request_id,
-                "tool": tool_name,
-                "input": tool_input,
-                "signature": sig,
-                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
-                "allow_session_supported": allow_session_supported,
-                "participant_label": participant_label,
-                "source": "roundtable",
-            }))
+            request_id = str(uuid_mod.uuid4())
+            fut: asyncio.Future = main_loop.create_future()
+            PENDING[request_id] = {"future": fut, "owner_sub": user_sub}
             try:
-                decision = await asyncio.wait_for(
-                    fut, timeout=PERMISSION_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                log.info(
-                    "perm timeout (roundtable) tool=%s sig=%r participant=%s "
-                    "owner=%s after=%ss",
-                    tool_name, sig, participant_label, user_sub,
-                    PERMISSION_TIMEOUT_SECONDS,
-                )
-                await event_queue.put(("permission_timeout", {
+                await event_queue.put(("permission_request", {
                     "id": request_id,
                     "tool": tool_name,
+                    "input": tool_input,
+                    "signature": sig,
+                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+                    "allow_session_supported": allow_session_supported,
                     "participant_label": participant_label,
+                    "source": "roundtable",
                 }))
-                return "deny"
-        finally:
-            PENDING.pop(request_id, None)
+                try:
+                    decision = await asyncio.wait_for(
+                        fut, timeout=PERMISSION_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    log.info(
+                        "perm timeout (roundtable) tool=%s sig=%r participant=%s "
+                        "owner=%s after=%ss",
+                        tool_name, sig, participant_label, user_sub,
+                        PERMISSION_TIMEOUT_SECONDS,
+                    )
+                    await event_queue.put(("permission_timeout", {
+                        "id": request_id,
+                        "tool": tool_name,
+                        "participant_label": participant_label,
+                    }))
+                    return "deny"
+            finally:
+                PENDING.pop(request_id, None)
 
-        d = decision.get("decision", "deny")
-        log.info(
-            "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
-            d, tool_name, sig, participant_label, user_sub,
-        )
-        # Persist the resolution so a stream rejoin collapses the card
-        # instead of replaying it as pending (clicks would 404).
-        await event_queue.put(("permission_resolved", {
-            "id": request_id,
-            "tool": tool_name,
-            "decision": d,
-            "participant_label": participant_label,
-        }))
-        if d == "allow_session" and allow_session_supported:
-            session_allowlist.add((tool_name, sig))
-            return "allow"
-        if d == "allow_session":
-            # Same defense-in-depth as the main can_use_tool: refuse to
-            # remember an unsupported pair; downgrade to one-shot allow.
-            return "allow"
-        return d  # "allow" or "deny"
+            d = decision.get("decision", "deny")
+            log.info(
+                "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
+                d, tool_name, sig, participant_label, user_sub,
+            )
+            # Persist the resolution so a stream rejoin collapses the card
+            # instead of replaying it as pending (clicks would 404).
+            await event_queue.put(("permission_resolved", {
+                "id": request_id,
+                "tool": tool_name,
+                "decision": d,
+                "participant_label": participant_label,
+            }))
+            if d == "allow_session" and allow_session_supported:
+                session_allowlist.add((tool_name, sig))
+                return "allow"
+            if d == "allow_session":
+                # Same defense-in-depth as the main can_use_tool: refuse to
+                # remember an unsupported pair; downgrade to one-shot allow.
+                return "allow"
+            return d  # "allow" or "deny"
 
     def callback_sync(participant_label: str, tool_name: str, tool_input: dict) -> str:
         try:

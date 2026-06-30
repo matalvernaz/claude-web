@@ -1,6 +1,7 @@
 """app.py helpers: tool signatures, _safe_id, upload validators, _safe_filename."""
 from __future__ import annotations
 
+import asyncio
 import io
 from types import SimpleNamespace
 
@@ -649,6 +650,146 @@ def test_cancel_queued_recalls_pending_message() -> None:
     resp, marked = asyncio.run(go())
     assert resp.get("cancelled") is True, resp
     assert marked, "recall must add the id to canceled_input_ids"
+
+
+# ─── Concurrent same-signature permission prompts collapse to one ───────────
+#
+# Regression for the bug where a turn that fires several WebFetch to the same
+# host prompts once per call. The SDK runs can_use_tool concurrently per
+# tool_use, and the allowlist check-then-add straddled the browser await, so
+# every concurrent call cleared the empty allowlist before any recorded the
+# allow_session grant. _gate_tool_permission now serializes same-(tool, sig)
+# calls on run.sig_locks so one approval covers the batch.
+
+
+def _capture_prompts(run):
+    """Replace run.emit with a recorder. Returns (events, prompt_event):
+    events accumulates every emitted dict; prompt_event is set whenever a
+    permission_request is emitted, so a test can await the leader's prompt
+    before resolving it. The gate populates PENDING before it emits, so the
+    recorder need not call through to the real emit."""
+    events: list[dict] = []
+    prompt_event = asyncio.Event()
+
+    def _emit(evt: dict) -> None:
+        events.append(evt)
+        if evt.get("type") == "permission_request":
+            prompt_event.set()
+
+    run.emit = _emit  # type: ignore[method-assign]
+    return events, prompt_event
+
+
+def _prompt_ids(events) -> list:
+    return [e["id"] for e in events if e.get("type") == "permission_request"]
+
+
+def _resolve(request_id: str, decision: str) -> None:
+    """Resolve a pending gate future the way POST /api/permission does."""
+    app_module.PENDING[request_id]["future"].set_result(
+        {"decision": decision, "payload": None}
+    )
+
+
+async def test_gate_allow_session_collapses_concurrent_same_host() -> None:
+    """Two concurrent WebFetch to one host: approving the first for the
+    session must auto-allow the second with no second prompt."""
+    run = app_module.ActiveRun("gate-collapse")
+    events, prompt_event = _capture_prompts(run)
+
+    async def attempt(path: str):
+        return await app_module._gate_tool_permission(
+            run, "WebFetch", {"url": f"https://x.com/{path}"}
+        )
+
+    t1 = asyncio.ensure_future(attempt("a"))
+    t2 = asyncio.ensure_future(attempt("b"))
+    # Wait for the leader's prompt, then allow the host for the session. Only
+    # the leader can have prompted — the follower is parked on the lock.
+    await asyncio.wait_for(prompt_event.wait(), timeout=2)
+    _resolve(_prompt_ids(events)[0], "allow_session")
+
+    r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2)
+    assert len(_prompt_ids(events)) == 1, "follower must not re-prompt"
+    assert isinstance(r1, app_module.PermissionResultAllow)
+    assert isinstance(r2, app_module.PermissionResultAllow)
+    assert ("WebFetch", "x.com") in run.session_allowlist
+
+
+async def test_gate_allow_once_does_not_collapse_batch() -> None:
+    """"Allow once" is not remembered, so each concurrent call still prompts —
+    confirms the collapse is specific to the allow_session grant (E4)."""
+    run = app_module.ActiveRun("gate-once")
+    events, prompt_event = _capture_prompts(run)
+
+    async def attempt(path: str):
+        return await app_module._gate_tool_permission(
+            run, "WebFetch", {"url": f"https://y.com/{path}"}
+        )
+
+    t1 = asyncio.ensure_future(attempt("a"))
+    t2 = asyncio.ensure_future(attempt("b"))
+    # Leader prompts; allow-once. The follower then acquires the lock, finds
+    # the allowlist still empty, and emits its own prompt.
+    await asyncio.wait_for(prompt_event.wait(), timeout=2)
+    prompt_event.clear()
+    first = _prompt_ids(events)[0]
+    _resolve(first, "allow")
+    await asyncio.wait_for(prompt_event.wait(), timeout=2)
+    second = [i for i in _prompt_ids(events) if i != first][0]
+    _resolve(second, "allow")
+
+    r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2)
+    assert len(_prompt_ids(events)) == 2
+    assert isinstance(r1, app_module.PermissionResultAllow)
+    assert isinstance(r2, app_module.PermissionResultAllow)
+    assert ("WebFetch", "y.com") not in run.session_allowlist
+
+
+async def test_gate_coarse_signature_tools_not_serialized() -> None:
+    """NO_SESSION_ALLOWLIST_TOOLS (Bash) use a nullcontext, never a lock — a
+    lock would force strictly serial re-prompts the allowlist can never
+    satisfy. Two same-first-word Bash calls must prompt concurrently."""
+    run = app_module.ActiveRun("gate-bash")
+    events, _ = _capture_prompts(run)
+
+    async def attempt():
+        return await app_module._gate_tool_permission(
+            run, "Bash", {"command": "git status"}
+        )
+
+    t1 = asyncio.ensure_future(attempt())
+    t2 = asyncio.ensure_future(attempt())
+
+    async def _both_prompted():
+        while len(_prompt_ids(events)) < 2:
+            await asyncio.sleep(0)
+
+    # Both must reach the prompt without either being resolved first; if a lock
+    # serialized them this times out (only one prompt until the first resolves).
+    await asyncio.wait_for(_both_prompted(), timeout=2)
+    for rid in _prompt_ids(events):
+        _resolve(rid, "deny")
+    r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2)
+    assert len(_prompt_ids(events)) == 2
+    assert isinstance(r1, app_module.PermissionResultDeny)
+    assert isinstance(r2, app_module.PermissionResultDeny)
+
+
+async def test_gate_denies_without_prompt_while_interrupting() -> None:
+    """A stop sets run.interrupting and resolves only PENDING futures; a call
+    that acquires the lock afterward must deny without emitting a fresh prompt
+    into the tearing-down turn (E2)."""
+    run = app_module.ActiveRun("gate-interrupt")
+    run.interrupting = True
+    events, _ = _capture_prompts(run)
+
+    r = await asyncio.wait_for(
+        app_module._gate_tool_permission(run, "WebFetch", {"url": "https://z.com/"}),
+        timeout=2,
+    )
+    assert isinstance(r, app_module.PermissionResultDeny)
+    assert _prompt_ids(events) == []
 
 
 def test_cancel_queued_reports_already_delivered_after_commit() -> None:
