@@ -6,15 +6,14 @@ Self-audit of roundtable-mcp + the gemini-mcp/openai-mcp servers, driven through
 the roundtable itself (threads 60 = audit, 61 = design pass), then implemented in
 phases. This doc lets a future session resume cleanly.
 
-## ⚠️ Canonical location — edit `claude-web/roundtable/`, NOT `roundtable-mcp/`
+## Canonical location — `claude-web/roundtable/` (sole copy)
 
 The live roundtable MCP server is launched with `PYTHONPATH=/home/matt/claude-web`
-and `-m roundtable.mcp_server`, so it imports **`/home/matt/claude-web/roundtable/`**
-— which is git-tracked inside the `claude-web` repo. `/home/matt/roundtable-mcp/`
-is a **stale dev duplicate** that nothing live imports; this whole effort was
-first written there by mistake, then ported into `claude-web/roundtable/`. The two
-are in sync as of this commit. Treat `claude-web/roundtable/` as canonical and
-consider deleting `roundtable-mcp/` to avoid re-confusing a future session.
+and `-m roundtable.mcp_server`, so it imports **`/home/matt/claude-web/roundtable/`**,
+git-tracked inside the `claude-web` repo — the one and only copy. The old
+`/home/matt/roundtable-mcp/` dev duplicate (where this effort was first written by
+mistake, then ported here) was **deleted 2026-06-30**; there's no second copy to
+keep in sync anymore.
 
 The standalone `gemini-mcp` / `openai-mcp` servers run from their own dirs
 (not git repos); their edits are live in place. None of this takes effect until
