@@ -430,3 +430,30 @@ def test_setup_gate_honors_admin_emails_without_per_user(monkeypatch) -> None:
     app_module._require_setup_access({"email": "admin@x", "sub": "a"})  # admin: no raise
     monkeypatch.setattr(app_module, "ADMIN_EMAILS", set())
     app_module._require_setup_access({"email": "anyone@x", "sub": "b"})  # single-operator: no raise
+
+
+def test_usage_history_payload_groups_by_day(tmp_path, monkeypatch) -> None:
+    """Per-day aggregation for /api/usage/history: cost counts only api_key
+    (billed) rows; oauth turns count toward turns/tokens but not cost (F3)."""
+    log = tmp_path / "usage.jsonl"
+    now = int(time.time())
+    day = 86400
+    rows = [
+        {"ts": now, "input_tokens": 10, "output_tokens": 5,
+         "total_cost_usd": 0.02, "credential_mode": "api_key"},
+        {"ts": now, "input_tokens": 3, "output_tokens": 1,
+         "total_cost_usd": 0.99, "credential_mode": "oauth"},  # unbilled
+        {"ts": now - day, "input_tokens": 7, "output_tokens": 2,
+         "total_cost_usd": 0.05, "credential_mode": "api_key"},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "USAGE_LOG", log)
+    out = app_module._usage_history_payload(None, "", days=7)
+    assert len(out["days"]) == 2  # two distinct days
+    today = out["days"][-1]  # sorted ascending, so newest last
+    assert today["turns"] == 2 and today["billed_turns"] == 1
+    assert today["input_tokens"] == 13  # both rows count toward tokens
+    assert abs(today["cost_usd"] - 0.02) < 1e-9  # only the api_key row's cost
+    assert out["totals"]["turns"] == 3
+    assert out["totals"]["has_billed_usage"] is True
+    assert abs(out["totals"]["cost_usd"] - 0.07) < 1e-9

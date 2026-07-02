@@ -9529,6 +9529,97 @@ async def api_usage(request: Request, user: dict = Depends(auth.require_user)):
     )
 
 
+def _usage_history_payload(
+    user_sub: Optional[str], accept_language: str = "", days: int = 30,
+) -> dict:
+    """Aggregate usage.jsonl into a per-local-day spend/token series.
+
+    Complements _compute_usage_payload (today-only) with a trailing-window
+    trend. Same ownership filter and billed-cost gating: OAuth/subscription
+    turns count toward token totals but not cost (their SDK cost is synthetic).
+    Runs on a worker thread — usage.jsonl grows monotonically.
+    """
+    days = max(1, min(days, 365))
+    midnight = datetime.datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    cutoff = int((midnight - datetime.timedelta(days=days - 1)).timestamp())
+
+    by_day: dict[str, dict] = {}
+    for row in _iter_jsonl(USAGE_LOG):
+        ts = row.get("ts")
+        if ts is None or ts < cutoff:
+            continue
+        if PER_USER_SESSIONS and user_sub is not None:
+            owner = row.get("owner_sub")
+            if owner is not None and owner != user_sub:
+                continue
+        day = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        agg = by_day.setdefault(day, {
+            "turns": 0, "billed_turns": 0, "cost_usd": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+        })
+        agg["turns"] += 1
+        agg["input_tokens"] += int(row.get("input_tokens") or 0)
+        agg["output_tokens"] += int(row.get("output_tokens") or 0)
+        if _is_billed_row(row):
+            agg["billed_turns"] += 1
+            agg["cost_usd"] += float(row.get("total_cost_usd") or 0.0)
+
+    day_list = [
+        {
+            "date": d,
+            "turns": a["turns"],
+            "billed_turns": a["billed_turns"],
+            "cost_usd": round(a["cost_usd"], 4),
+            "input_tokens": a["input_tokens"],
+            "output_tokens": a["output_tokens"],
+        }
+        for d, a in sorted(by_day.items())
+    ]
+    totals = {
+        "turns": sum(a["turns"] for a in by_day.values()),
+        "billed_turns": sum(a["billed_turns"] for a in by_day.values()),
+        "cost_usd": round(sum(a["cost_usd"] for a in by_day.values()), 4),
+        "input_tokens": sum(a["input_tokens"] for a in by_day.values()),
+        "output_tokens": sum(a["output_tokens"] for a in by_day.values()),
+        "has_billed_usage": any(a["billed_turns"] for a in by_day.values()),
+    }
+    currency_code = currency.resolve_currency(
+        accept_language, override=os.getenv("CLAUDE_WEB_CURRENCY"),
+    )
+    rate = currency.usd_rate(currency_code)
+    if rate is None:
+        currency_code = "USD"
+        rate = 1.0
+    return {
+        "days": day_list,
+        "totals": totals,
+        "window_days": days,
+        "currency": currency_code,
+        "usd_rate": rate,
+    }
+
+
+@app.get("/api/usage/history")
+async def api_usage_history(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    """Per-day spend/token history over a trailing window (default 30 days).
+
+    Complements /api/usage's today-only view. Scanned on a worker thread like
+    /api/usage since usage.jsonl grows monotonically.
+    """
+    try:
+        days = int(request.query_params.get("days") or 30)
+    except (TypeError, ValueError):
+        days = 30
+    accept_language = request.headers.get("accept-language", "")
+    return await asyncio.to_thread(
+        _usage_history_payload, user.get("sub"), accept_language, days,
+    )
+
+
 @app.get("/account")
 async def account_page(request: Request, user: dict = Depends(auth.require_user)):
     """Per-user credential management — add/remove/rename Claude accounts.
