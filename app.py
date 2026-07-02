@@ -10759,6 +10759,7 @@ def _make_roundtable_permission_callback(
             request_id = str(uuid_mod.uuid4())
             fut: asyncio.Future = main_loop.create_future()
             PENDING[request_id] = {"future": fut, "owner_sub": user_sub}
+            emitted_resolution = False
             try:
                 await event_queue.put(("permission_request", {
                     "id": request_id,
@@ -10786,31 +10787,47 @@ def _make_roundtable_permission_callback(
                         "tool": tool_name,
                         "participant_label": participant_label,
                     }))
+                    emitted_resolution = True
                     return "deny"
+
+                d = decision.get("decision", "deny")
+                log.info(
+                    "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
+                    d, tool_name, sig, participant_label, user_sub,
+                )
+                # Persist the resolution so a stream rejoin collapses the card
+                # instead of replaying it as pending (clicks would 404).
+                await event_queue.put(("permission_resolved", {
+                    "id": request_id,
+                    "tool": tool_name,
+                    "decision": d,
+                    "participant_label": participant_label,
+                }))
+                emitted_resolution = True
+                if d == "allow_session" and allow_session_supported:
+                    session_allowlist.add((tool_name, sig))
+                    return "allow"
+                if d == "allow_session":
+                    # Same defense-in-depth as the main can_use_tool: refuse to
+                    # remember an unsupported pair; downgrade to one-shot allow.
+                    return "allow"
+                return d  # "allow" or "deny"
             finally:
                 PENDING.pop(request_id, None)
-
-            d = decision.get("decision", "deny")
-            log.info(
-                "perm decision (roundtable) %s tool=%s sig=%r participant=%s owner=%s",
-                d, tool_name, sig, participant_label, user_sub,
-            )
-            # Persist the resolution so a stream rejoin collapses the card
-            # instead of replaying it as pending (clicks would 404).
-            await event_queue.put(("permission_resolved", {
-                "id": request_id,
-                "tool": tool_name,
-                "decision": d,
-                "participant_label": participant_label,
-            }))
-            if d == "allow_session" and allow_session_supported:
-                session_allowlist.add((tool_name, sig))
-                return "allow"
-            if d == "allow_session":
-                # Same defense-in-depth as the main can_use_tool: refuse to
-                # remember an unsupported pair; downgrade to one-shot allow.
-                return "allow"
-            return d  # "allow" or "deny"
+                if not emitted_resolution:
+                    # We were cancelled before emitting a resolution — commonly
+                    # the outer bridge deadline (callback_sync) firing while this
+                    # follower was still parked on the lock. Best-effort tell the
+                    # UI the prompt is done so a stream rejoin doesn't replay it
+                    # as a pending card whose click would 404 forever.
+                    try:
+                        event_queue.put_nowait(("permission_timeout", {
+                            "id": request_id,
+                            "tool": tool_name,
+                            "participant_label": participant_label,
+                        }))
+                    except Exception:  # noqa: BLE001 — best-effort on a full/closed queue
+                        pass
 
     def callback_sync(participant_label: str, tool_name: str, tool_input: dict) -> str:
         try:
@@ -10823,7 +10840,13 @@ def _make_roundtable_permission_callback(
             # is the only safe answer — we no longer have a UI to ask.
             return "deny"
         try:
-            return cf.result(timeout=PERMISSION_TIMEOUT_SECONDS + 30)
+            # A follower serialized on the sig lock waits for the leader's
+            # prompt (up to PERMISSION_TIMEOUT) before its own even starts, so
+            # this backstop allows a leader + this follower + margin. Without
+            # the headroom the outer deadline could fire mid-answer and cancel
+            # the follower's own prompt. _ask_on_main still emits a resolution
+            # from its finally even if this cancel wins, so no card is stranded.
+            return cf.result(timeout=PERMISSION_TIMEOUT_SECONDS * 2 + 30)
         except cf_futures.TimeoutError:
             cf.cancel()
             return "deny"
