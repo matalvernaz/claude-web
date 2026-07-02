@@ -2673,6 +2673,11 @@
       }
     } else if (obj.type === "error") {
       discardPartial(ctx);
+      // A lost_input error carries the queue_id of the message that never
+      // reached Claude — clear its "(sending…)" chip so it doesn't hang
+      // forever (user_prompt / queued_input_cancelled, its usual clearers,
+      // never fire for a message that was lost).
+      if (obj.queue_id) clearQueueEntryById(obj.queue_id);
       // Driver crashed mid-turn. The server will emit `_done` and close
       // the SSE shortly, but flip the local state now so the input isn't
       // trapped in "Queue" mode while we wait for the close to land.

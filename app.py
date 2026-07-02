@@ -5457,6 +5457,7 @@ class ActiveRun:
                     self,
                     stray.get("text") or "",
                     "the run ended before Claude received it",
+                    queue_id=stray_qid,
                 )
             ack: Optional[asyncio.Future] = stray.get("delivered")
             if ack is not None and not ack.done():
@@ -5592,7 +5593,8 @@ def _busy_runs() -> list[str]:
             # Finished, or a restored row from state.db with no live CLI —
             # nothing a drain needs to wait for.
             continue
-        if not run.between_turns or not run.user_input_queue.empty():
+        if (not run.between_turns or not run.user_input_queue.empty()
+                or run._deferred_user_item is not None):
             busy.append(run.run_id)
     live_panels = sum(1 for s in ASSISTANT_STREAMS.values() if not s.done)
     if live_panels:
@@ -5915,16 +5917,24 @@ class _DeliveryAlreadyReported(RuntimeError):
     """
 
 
-def _emit_lost_input(run: "ActiveRun", text: str, reason: str) -> None:
+def _emit_lost_input(
+    run: "ActiveRun", text: str, reason: str, queue_id: Optional[str] = None,
+) -> None:
     """Emit a structured lost_input error event for an undelivered user
     message. Single source of formatting + truncation so the error looks
-    the same regardless of which failure path fired it."""
+    the same regardless of which failure path fired it. ``queue_id`` lets the
+    client match the event to its "(sending…)" chip and clear it — without it
+    the chip stays stuck forever (its only other clearers are user_prompt /
+    queued_input_cancelled, neither of which fires for a lost message)."""
     preview = text[:200] + ("…" if len(text) > 200 else "")
-    run.emit({
+    evt = {
         "type": "error",
         "message": f"Your message wasn't delivered: {reason}",
         "lost_input": preview,
-    })
+    }
+    if queue_id:
+        evt["queue_id"] = queue_id
+    run.emit(evt)
 
 
 def _resolve_plan_text(run: Optional["ActiveRun"], inline: str) -> str:
@@ -5996,6 +6006,7 @@ async def _confirm_and_emit_user_prompt(
         _emit_lost_input(
             run, text,
             "the run ended or stalled before Claude received it",
+            queue_id=queue_id,
         )
         log.warning(
             "user input delivery timed out for run %s (preview=%r)",
@@ -6007,7 +6018,7 @@ async def _confirm_and_emit_user_prompt(
         # of _done; nothing to do here.
         return
     except Exception as exc:
-        _emit_lost_input(run, text, f"{type(exc).__name__}: {exc}")
+        _emit_lost_input(run, text, f"{type(exc).__name__}: {exc}", queue_id=queue_id)
         log.warning(
             "user input delivery failed for run %s: %s (preview=%r)",
             run.run_id, exc, preview,
@@ -7846,7 +7857,13 @@ async def api_chat(
                         #      slow process is silent by design. The cap is
                         #      a safety net for a wedged subprocess only.
                         #   4. Between turns, nothing pending → session idle.
-                        if (run.between_turns and run.pending_notifications
+                        if run.between_turns and run._deferred_user_item is not None:
+                            # A message parked on a prior round (the CLI was
+                            # mid-turn) is waiting and the CLI is now between
+                            # turns — pick it up immediately instead of idling up
+                            # to SESSION_IDLE_TIMEOUT (10 min) before delivering.
+                            timeout = 0.0
+                        elif (run.between_turns and run.pending_notifications
                                 and run.notification_grace_started_at is not None
                                 and not cap_reached):
                             elapsed = time.monotonic() - run.notification_grace_started_at
@@ -7987,6 +8004,7 @@ async def api_chat(
                                         run,
                                         popped_user_item.get("text") or "",
                                         f"CLI exited mid-wait ({terminal_kind})",
+                                        queue_id=popped_user_item.get("queue_id"),
                                     )
                                     ack = popped_user_item.get("delivered")
                                     if ack is not None and not ack.done():
@@ -8136,6 +8154,10 @@ async def api_chat(
                             # arriving between turns must keep run.between_turns
                             # = True so the grace timer can arm.
 
+                        # Set once a queued/deferred message actually reaches the
+                        # CLI this round, so the continue below fires and we don't
+                        # misclassify the new turn as a wedge.
+                        delivered_user_input = False
                         if popped_user_item is not None and not run.between_turns:
                             # Race fix (2026-05-29): if msg_get just delivered
                             # a new UserMessage/AssistantMessage (commonly a
@@ -8231,6 +8253,7 @@ async def api_chat(
                                     _emit_lost_input(
                                         run, item.get("text") or "",
                                         f"{type(exc).__name__}: {exc}",
+                                        queue_id=item.get("queue_id"),
                                     )
                                 if ack is not None and not ack.done():
                                     ack.set_exception(
@@ -8253,8 +8276,14 @@ async def api_chat(
                             if run.between_turns:
                                 run.turn_started_at = time.monotonic()
                             run.between_turns = False
+                            delivered_user_input = True
 
-                        if msg_done or user_done:
+                        if msg_done or user_done or delivered_user_input:
+                            # Delivering a queued/deferred message starts a new
+                            # turn. Loop again rather than fall through to the
+                            # timeout classifier below, which would see
+                            # between_turns=False and misreport the just-started
+                            # turn as a wedged subprocess and tear the run down.
                             continue
 
                         # Timeout fired — four sub-cases:

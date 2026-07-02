@@ -101,15 +101,19 @@ def test_session_search_cap_keeps_newest(tmp_path) -> None:
 
 def test_finish_drains_deferred_user_item() -> None:
     """A message held in the one-slot deferred field surfaces a lost_input on
-    run finish, just like a queued one."""
+    run finish, just like a queued one — and it carries the queue_id so the
+    client can clear the stuck '(sending…)' chip."""
     run = app_module.ActiveRun("finish-deferred")
-    run._deferred_user_item = {"text": "held message", "delivered": None}
+    run._deferred_user_item = {
+        "text": "held message", "delivered": None, "queue_id": "q-held-1",
+    }
     run.finish()
     assert run._deferred_user_item is None
-    assert any(
-        e.get("type") == "error" and "held message" in (e.get("lost_input") or "")
-        for e in run.events
-    )
+    lost = [
+        e for e in run.events
+        if e.get("type") == "error" and "held message" in (e.get("lost_input") or "")
+    ]
+    assert lost and lost[0].get("queue_id") == "q-held-1"
 
 
 def test_next_backup_path_never_overwrites(tmp_path) -> None:
