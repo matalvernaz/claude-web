@@ -116,6 +116,25 @@ def test_finish_drains_deferred_user_item() -> None:
     assert lost and lost[0].get("queue_id") == "q-held-1"
 
 
+def test_pending_prompts_for_run_filters_to_unresolved() -> None:
+    """A fresh-page attach must be handed the prompt events still awaiting a
+    decision (in PENDING), and only those — resolved or unrelated events are
+    excluded so the client re-renders exactly the open cards (H5)."""
+    run = app_module.ActiveRun("pending-prompts")
+    run.emit({"type": "permission_request", "id": "p-open", "tool": "WebFetch"})
+    run.emit({"type": "permission_request", "id": "p-closed", "tool": "Bash"})
+    run.emit({"type": "assistant", "id": "not-a-prompt"})
+    app_module.PENDING["p-open"] = {"future": None, "run_id": run.run_id}
+    app_module.PENDING["other-run"] = {"future": None, "run_id": "someone-else"}
+    try:
+        out = app_module._pending_prompts_for_run(run)
+        ids = [e.get("id") for e in out]
+        assert ids == ["p-open"]  # only the one still in PENDING for this run
+    finally:
+        app_module.PENDING.pop("p-open", None)
+        app_module.PENDING.pop("other-run", None)
+
+
 def test_next_backup_path_never_overwrites(tmp_path) -> None:
     """Numbered backups: a second apply on the same file must not clobber the
     first backup (which holds the true original)."""

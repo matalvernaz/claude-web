@@ -2107,6 +2107,24 @@
   // pre-attach live-typing animation is missed — cosmetic, self-heals when the
   // turn completes. The stream is held open even for an idle (between-turns)
   // run because sendInExistingRun has no reader of its own.
+  // Render a prompt that was already open when this page attached to a live
+  // run. It sits below next_idx so the tail stream won't replay it. Idempotent:
+  // a re-attach (stream recovery) can't double-render — the card and the queue
+  // entry both dedup on request id.
+  function renderPendingPrompt(p) {
+    if (!p || !p.id || findRequestCard(p.id)) return;
+    if (p.type === "permission_request") {
+      renderPermissionCard(p);
+      enqueuePermRequest("permission", p);
+    } else if (p.type === "question_request") {
+      renderQuestionCard(p);
+      enqueuePermRequest("question", p);
+    } else if (p.type === "plan_review") {
+      renderPlanCard(p);
+      enqueuePermRequest("plan", p);
+    }
+  }
+
   async function attachLiveRun(info) {
     const rid = info && info.run_id;
     if (!rid) return;
@@ -2130,6 +2148,13 @@
     if (midTurn) {
       startGerunds();
       announce("Reconnecting to the response in progress.");
+    }
+    // Surface any prompt that was already open when we attached — otherwise a
+    // fresh page sits on a spinner while the tool call silently times out.
+    if (Array.isArray(info.pending_prompts) && info.pending_prompts.length) {
+      info.pending_prompts.forEach(renderPendingPrompt);
+      const n = info.pending_prompts.length;
+      announce(`${n} approval${n === 1 ? "" : "s"} waiting for you.`);
     }
     try {
       const start = typeof info.next_idx === "number" ? info.next_idx : 0;

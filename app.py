@@ -6285,6 +6285,10 @@ async def api_session(
             "active": not live.done,
             "between_turns": live.between_turns,
             "next_idx": live._next_idx,
+            # A prompt open when the page loads was emitted below next_idx, so
+            # the tail-attach never replays it — without this the fresh page sits
+            # on a spinner while the tool call silently times out.
+            "pending_prompts": _pending_prompts_for_run(live),
         }
     return {
         "id": sid,
@@ -6797,6 +6801,22 @@ def _resolve_pending_permissions(run: ActiveRun, reason: str) -> int:
             fut.set_result({"decision": "deny", "interrupted": True, "reason": reason})
             resolved += 1
     return resolved
+
+
+def _pending_prompts_for_run(run: "ActiveRun") -> list[dict]:
+    """Prompt-request events (permission/question/plan) for ``run`` still
+    awaiting a decision — the original event dicts, so a fresh page attaching to
+    a live run can render the actionable card. Their futures are still in
+    PENDING, so answering resolves normally."""
+    pending_ids = {
+        rid for rid, entry in PENDING.items() if entry.get("run_id") == run.run_id
+    }
+    if not pending_ids:
+        return []
+    return [
+        ev for ev in run.events
+        if ev.get("type") in PROMPT_REQUEST_EVENT_TYPES and ev.get("id") in pending_ids
+    ]
 
 
 @app.get("/api/mcp")
