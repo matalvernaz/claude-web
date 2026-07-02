@@ -713,7 +713,7 @@ async def test_gate_allow_session_collapses_concurrent_same_host() -> None:
     assert len(_prompt_ids(events)) == 1, "follower must not re-prompt"
     assert isinstance(r1, app_module.PermissionResultAllow)
     assert isinstance(r2, app_module.PermissionResultAllow)
-    assert ("WebFetch", "x.com") in run.session_allowlist
+    assert ("WebFetch", "x.com", run.permission_mode) in run.session_allowlist
 
 
 async def test_gate_allow_once_does_not_collapse_batch() -> None:
@@ -743,7 +743,7 @@ async def test_gate_allow_once_does_not_collapse_batch() -> None:
     assert len(_prompt_ids(events)) == 2
     assert isinstance(r1, app_module.PermissionResultAllow)
     assert isinstance(r2, app_module.PermissionResultAllow)
-    assert ("WebFetch", "y.com") not in run.session_allowlist
+    assert ("WebFetch", "y.com", run.permission_mode) not in run.session_allowlist
 
 
 async def test_gate_coarse_signature_tools_not_serialized() -> None:
@@ -790,6 +790,37 @@ async def test_gate_denies_without_prompt_while_interrupting() -> None:
     )
     assert isinstance(r, app_module.PermissionResultDeny)
     assert _prompt_ids(events) == []
+
+
+async def test_gate_grant_does_not_survive_mode_change() -> None:
+    """An allow_session grant recorded under one permission mode must not
+    auto-allow after the mode is tightened — the mode is part of the allowlist
+    key, so the next same-host call re-prompts instead of riding the old grant
+    (H2)."""
+    run = app_module.ActiveRun("gate-mode")
+    events, prompt_event = _capture_prompts(run)
+
+    t1 = asyncio.ensure_future(
+        app_module._gate_tool_permission(run, "WebFetch", {"url": "https://m.com/a"})
+    )
+    await asyncio.wait_for(prompt_event.wait(), timeout=2)
+    _resolve(_prompt_ids(events)[0], "allow_session")
+    await asyncio.wait_for(t1, timeout=2)
+    assert ("WebFetch", "m.com", "default") in run.session_allowlist
+
+    # Tighten the mode; the prior grant is keyed to "default" and must not apply.
+    run.permission_mode = "plan"
+    prompt_event.clear()
+    t2 = asyncio.ensure_future(
+        app_module._gate_tool_permission(run, "WebFetch", {"url": "https://m.com/b"})
+    )
+    # If the stale grant still applied, this would auto-allow with no prompt and
+    # the wait would time out.
+    await asyncio.wait_for(prompt_event.wait(), timeout=2)
+    _resolve(_prompt_ids(events)[-1], "deny")
+    r2 = await asyncio.wait_for(t2, timeout=2)
+    assert isinstance(r2, app_module.PermissionResultDeny)
+    assert len(_prompt_ids(events)) == 2
 
 
 def test_cancel_queued_reports_already_delivered_after_commit() -> None:

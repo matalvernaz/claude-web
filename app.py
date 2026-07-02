@@ -1201,10 +1201,11 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
             return PermissionResultDeny(
                 message="Run interrupted before the tool was approved.",
             )
-        if allow_session_supported and (tool_name, sig) in run.session_allowlist:
+        if (allow_session_supported
+                and (tool_name, sig, run.permission_mode) in run.session_allowlist):
             log.info(
-                "perm session-allowlist tool=%s sig=%r run=%s owner=%s",
-                tool_name, sig, run.run_id, owner,
+                "perm session-allowlist tool=%s sig=%r mode=%s run=%s owner=%s",
+                tool_name, sig, run.permission_mode, run.run_id, owner,
             )
             return PermissionResultAllow()
 
@@ -1264,7 +1265,7 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
             # opt out, even if a tampered client posted allow_session anyway.
             # Treat it as allow-once.
             if allow_session_supported:
-                run.session_allowlist.add((tool_name, sig))
+                run.session_allowlist.add((tool_name, sig, run.permission_mode))
             else:
                 log.info(
                     "perm allow_session-downgraded tool=%s sig=%r run=%s "
@@ -5137,7 +5138,12 @@ class ActiveRun:
         now = time.time()
         self.created_at: float = now
         self.finished_at: Optional[float] = None
-        self.session_allowlist: set[tuple[str, str]] = set()
+        # (tool_name, signature, permission_mode) — the mode is part of the key
+        # so an allow-session grant made under one mode does NOT auto-allow after
+        # the mode is tightened (user picker or model EnterPlanMode/ExitPlanMode).
+        # Before this, a grant recorded under "default" kept auto-allowing for
+        # the rest of the run even after a switch to "plan"/"dontAsk".
+        self.session_allowlist: set[tuple[str, str, str]] = set()
         # Serializes the check-then-add on session_allowlist per (tool, sig).
         # The SDK runs can_use_tool concurrently for tools the model batches
         # in one turn (e.g. several WebFetch to the same host); without this
@@ -7509,6 +7515,13 @@ async def api_chat(
                 "tool": tool_name,
                 "decision": decision.get("decision"),
             })
+            if decision.get("interrupted"):
+                # A stop resolved this question future (deny+interrupted). The
+                # turn is tearing down — deny rather than letting the question
+                # tool run into a dying CLI.
+                return PermissionResultDeny(
+                    message="Run interrupted before the question was answered.",
+                )
             payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
             updated = dict(tool_input)
             answers = (payload or {}).get("answers")
