@@ -131,6 +131,10 @@
   // (including the "" default entry). Empty/missing = model has no effort
   // knob and the effort picker hides itself.
   const MODEL_EFFORTS = {};
+  // Request betas each model needs (e.g. the 1M-context variant). set_model
+  // can't change betas on a live CLI, so a switch across differing betas has to
+  // go through a fresh spawn — see the model picker's change handler.
+  const MODEL_BETAS = {};
   (() => {
     let data = [];
     const dataEl = document.getElementById("models-data");
@@ -140,8 +144,13 @@
     for (const m of data) {
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
+      MODEL_BETAS[m.key || ""] = m.betas || [];
     }
   })();
+  // Stable comparison key for a model's beta set (order-insensitive).
+  function betasKey(modelKey) {
+    return (MODEL_BETAS[modelKey || ""] || []).slice().sort().join(",");
+  }
   let lastSeenModel = null;
   let lastInputTokens = null;
   // Highest context-fill threshold already announced this session, so a
@@ -437,14 +446,29 @@
       modelSelect.value = savedModel;
     }
     modelSelect.addEventListener("change", () => {
-      safeSet(localStorage, MODEL_KEY, modelSelect.value);
-      lastSeenModel = modelSelect.value || lastSeenModel;
+      const newModel = modelSelect.value;
+      // set_model can't change request betas on a live CLI. A switch across
+      // differing betas (e.g. to the 1M-context variant) would relabel the
+      // model while it kept running at the old capacity, and the meter would
+      // over-report — a blind user misled about how much context is left. Only
+      // the spawn path applies betas, so require a new chat for that switch.
+      if (sessionId && betasKey(newModel) !== betasKey(lastSeenModel)) {
+        const label = [...modelSelect.options].find((o) => o.value === newModel);
+        announce(
+          `${label ? label.textContent : newModel} can't be switched to mid-chat `
+          + "— its context setting only applies to a new chat. Start a new chat to use it.",
+        );
+        modelSelect.value = lastSeenModel || "";
+        return;
+      }
+      safeSet(localStorage, MODEL_KEY, newModel);
+      lastSeenModel = newModel || lastSeenModel;
       renderContextMeter();
       syncEffortVisibility();
       // With a live conversation, switch the running CLI's model in place via
       // set_model so it takes effect from the next turn. Without one, the pick
       // rides the next /api/chat spawn (which reads the model field).
-      pushModelChange(modelSelect.value);
+      pushModelChange(newModel);
     });
   }
 

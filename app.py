@@ -6138,7 +6138,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             # Drop SDK-internal fields and expose only what the JS needs.
             "models_json": json.dumps([
                 {"key": m["key"], "label": m["label"], "context": m.get("context"),
-                 "efforts": m.get("efforts") or []}
+                 "efforts": m.get("efforts") or [], "betas": m.get("betas") or []}
                 for m in KNOWN_MODELS
             ]),
             "effort_levels": EFFORT_LEVELS,
@@ -8779,9 +8779,11 @@ async def api_chat_set_model(
     (see KNOWN_MODELS); empty selects the CLI default.
 
     Caveat: ``set_model`` changes only the model string, not the request
-    betas. Switching between two keys whose ``betas`` differ (e.g. the
-    1M-context variant) still needs a respawn through ``/api/chat`` to apply
-    the beta — the browser picks the path based on whether betas change.
+    betas, so it can't move between two keys whose ``betas`` differ (e.g. the
+    1M-context variant) — only a fresh spawn applies betas. The browser
+    enforces this: its model picker refuses a mid-chat switch across differing
+    betas and tells the user to start a new chat, so this route only ever sees
+    beta-compatible switches.
     """
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, f"unknown model {model!r}")
