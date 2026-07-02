@@ -6272,6 +6272,11 @@ async def api_session(
     # path lives at <CLAUDE_HOME>/projects/<sanitized-cwd>/<sid>.jsonl, so the
     # parent dir's name *is* the project key — no need to walk PROJECTS.
     project_key = path.parent.name
+    # Read the disk transcript BEFORE snapshotting next_idx below: if a message
+    # completed between the two, snapshotting first would leave it in the
+    # transcript AND above the watermark, so the tail attach replays it —
+    # a double render. Reading first keeps next_idx >= everything rendered.
+    messages = session_transcript(sid, project_key)
     # Surface a live run for this session so a fresh page (no sessionStorage
     # RUN_KEY, so tryResume can't fire) can attach to an in-flight turn instead
     # of mis-routing later sends. Owner-gated like /api/chat/active so a run_id
@@ -6293,7 +6298,7 @@ async def api_session(
     return {
         "id": sid,
         "project": project_key,
-        "messages": session_transcript(sid, project_key),
+        "messages": messages,
         "live_run": live_run,
     }
 
@@ -8686,6 +8691,12 @@ async def api_chat_cancel_queued(
     _require_owner(run, user)
     if queue_id in run.committed_input_ids:
         return {"ok": True, "cancelled": False, "reason": "already_delivered"}
+    # Bound this client-driven set: a legitimate pending cancel targets a
+    # currently-queued message, which the injection cap already limits. Refusing
+    # past a generous multiple stops a buggy/hostile client from growing it with
+    # distinct ids for the run's whole life.
+    if len(run.canceled_input_ids) >= MAX_USER_INPUT_QUEUE * 4:
+        raise HTTPException(429, "too many pending cancellations")
     run.canceled_input_ids.add(queue_id)
     return {"ok": True, "cancelled": True}
 
