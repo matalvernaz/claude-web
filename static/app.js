@@ -1440,19 +1440,30 @@
     }
   }
 
+  // A queued entry belongs to the run it was typed into. Draining it into a
+  // different conversation after a sidebar switch would deliver it to the wrong
+  // place (a "yes, delete it" could land in another project). The origin run id
+  // is stable across a session's turns and changes when you switch sessions, so
+  // gate both draining and rendering on it.
+  function entryForCurrentRun(e) {
+    return (e.originRunId || null) === (currentRunId || null);
+  }
+
   function renderQueue() {
     if (!queueArea) return;
     queueArea.innerHTML = "";
-    if (!messageQueue.length) {
+    // Only show chips for the current conversation's queue.
+    const mine = messageQueue.filter(entryForCurrentRun);
+    if (!mine.length) {
       queueArea.hidden = true;
       return;
     }
     queueArea.hidden = false;
     const heading = document.createElement("span");
     heading.className = "queue-heading";
-    heading.textContent = `${messageQueue.length} queued`;
+    heading.textContent = `${mine.length} queued`;
     queueArea.appendChild(heading);
-    messageQueue.forEach((entry) => {
+    mine.forEach((entry) => {
       const chip = document.createElement("span");
       chip.className = "queue-chip";
       const label = document.createElement("span");
@@ -1524,7 +1535,7 @@
         return;
       }
     }
-    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId() };
+    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId(), originRunId: currentRunId };
     promptEl.value = "";
     clearAttachments();
     if (forkNextSend) {
@@ -1706,7 +1717,7 @@
     // is in the server's queue (or running) and clears itself on its
     // user_prompt / queued_input_cancelled event — re-sending it here would
     // double it up.
-    const entry = messageQueue.find((e) => e.status !== "sending");
+    const entry = messageQueue.find((e) => e.status !== "sending" && entryForCurrentRun(e));
     if (!entry) { speakResult(); return; }
     queueDraining = true;
     entry.status = "sending";
@@ -1825,7 +1836,7 @@
     // while it's active, or the same message gets sent twice.
     while (true) {
       if (queueDraining) return;
-      const idx = messageQueue.findIndex((e) => e.status !== "sending");
+      const idx = messageQueue.findIndex((e) => e.status !== "sending" && entryForCurrentRun(e));
       if (idx === -1) return;
       const [next] = messageQueue.splice(idx, 1);
       renderQueue();
