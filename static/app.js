@@ -162,21 +162,34 @@
   // visible "Thinking…" text in #status is also live, but this region is
   // sr-only and used for milestone announcements (response complete,
   // permission needed) rather than every chunk.
+  // Serialized so two calls in the same tick both get spoken. The old design
+  // cleared any pending announcement and kept only the latest, which silently
+  // dropped messages whenever two landed together (e.g. an error right after a
+  // queue-drain notice, or model + permission-mode changes) — for a
+  // screen-reader user that's a lost turn outcome, not a cosmetic glitch.
+  // Each message clears the region, waits the NVDA coalescing gap (120ms —
+  // 10ms wasn't enough), then holds long enough to be spoken before the next.
+  const announceQueue = [];
+  let announceTimer = null;
   function announce(text) {
-    if (!announcer) return;
-    // NVDA needs a real gap between clearing and re-filling, otherwise the
-    // mutation gets coalesced and nothing speaks. 10ms wasn't enough; 120ms
-    // is reliable in NVDA + Chrome/Firefox without feeling laggy.
-    // Cancel any pending announcement so multiple calls within the gap
-    // don't fire out of order — the most recent message is what matters.
-    if (announceTimer) clearTimeout(announceTimer);
+    if (!announcer || !text) return;
+    announceQueue.push(String(text));
+    if (announceQueue.length > 8) announceQueue.shift();  // backpressure guard
+    if (!announceTimer) pumpAnnounce();
+  }
+  function pumpAnnounce() {
+    if (!announceQueue.length) { announceTimer = null; return; }
+    const text = announceQueue.shift();
     announcer.textContent = "";
     announceTimer = setTimeout(() => {
       announcer.textContent = text;
-      announceTimer = null;
+      // Dwell before the next clear so this message is spoken first. Rough
+      // word-count budget (speech rate is unknowable) — capped so a burst
+      // can't stall the queue for long.
+      const dwell = Math.min(5000, 800 + text.split(/\s+/).length * 160);
+      announceTimer = setTimeout(pumpAnnounce, dwell);
     }, 120);
   }
-  let announceTimer = null;
 
   // --- Event sounds ----------------------------------------------------
   // Distinct earcons so the run state is audible without reading the
@@ -499,6 +512,19 @@
     const savedMode = safeGet(localStorage, PERM_MODE_KEY);
     if (savedMode !== null && [...permModeSelect.options].some((o) => o.value === savedMode)) {
       permModeSelect.value = savedMode;
+    }
+    // A non-default mode restored from a prior session is a standing state a
+    // screen-reader user can't see — bypassPermissions in particular disables
+    // the approval prompts entirely. Announce it on load so a persisted mode
+    // isn't a silent safety surprise. (The picker itself is the queryable
+    // status; this is the proactive heads-up.)
+    if (permModeSelect.value && permModeSelect.value !== "default") {
+      const opt = [...permModeSelect.options].find((o) => o.value === permModeSelect.value);
+      const label = opt ? opt.textContent : permModeSelect.value;
+      announce(
+        `Permission mode is ${label}.`
+        + (permModeSelect.value === "bypassPermissions" ? " Approval prompts are off." : ""),
+      );
     }
     permModeSelect.addEventListener("change", async () => {
       const mode = permModeSelect.value;
@@ -1698,8 +1724,12 @@
         if (r.status !== 404 && !benign409) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
-        await sendOne(entry);
-        return { ok: true, mode: "fresh" };
+        const sent = await sendOne(entry);
+        // Only report "fresh" (which drops the chip) when the fresh send
+        // actually succeeded. A failed fallback (e.g. server restarting)
+        // reports "failed" so the caller keeps the chip rather than silently
+        // discarding the user's text.
+        return { ok: sent, mode: sent ? "fresh" : "failed" };
       }
       // The existing SSE stream will deliver the new turn's events; nothing
       // else to do here. setStreaming(false) happens on the next result.
@@ -1765,9 +1795,12 @@
       // until the user_prompt / queued_input_cancelled event resolves it.
       renderQueue();
     } else if (messageQueue.indexOf(entry) !== -1) {
-      // Failed (network/auth) — return it to plain queued so a later drain or
-      // the user can retry, and so its × drops it locally again.
+      // Failed (network/auth, or server restarting) — return it to plain queued
+      // so the user can retry. Re-bind to the current context (the fresh
+      // fallback may have dropped the live run), or H6's per-run filter would
+      // hide the chip and the text would be silently unreachable.
       entry.status = undefined;
+      entry.originRunId = currentRunId;
       renderQueue();
     }
   }
@@ -1784,6 +1817,7 @@
     currentAbort = myAbort;
     startGerunds();
     announce("Sent. Claude is responding.");
+    let ok = false;
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
@@ -1826,6 +1860,7 @@
         throw new Error("HTTP " + r.status);
       }
       await drainStream(r, gen);
+      ok = true;
     } catch (err) {
       // Aborts from a Stop click or stall-recovery aren't user-facing
       // errors. Only the active turn shows "Stopped." — a stale abort from
@@ -1852,6 +1887,7 @@
         promptEl.focus();
       }
     }
+    return ok;
   }
 
   async function drainQueue() {
@@ -1865,7 +1901,17 @@
       const [next] = messageQueue.splice(idx, 1);
       renderQueue();
       announce("Sending next queued message.");
-      await sendOne(next);
+      const sent = await sendOne(next);
+      if (!sent) {
+        // Send failed (e.g. server restarting). Put it back where it was,
+        // re-bound to the current context, and stop draining rather than
+        // discarding the text.
+        next.status = undefined;
+        next.originRunId = currentRunId;
+        messageQueue.splice(idx, 0, next);
+        renderQueue();
+        return;
+      }
     }
   }
 
@@ -2607,6 +2653,11 @@
         } else {
           resolvePermCardDom(resolvedCard, obj.decision);
         }
+      } else if (!resolvedCard) {
+        // No pending card — this tab may have collapsed it provisionally after
+        // losing a decision race (404). Rewrite that summary with the real
+        // decision the server just broadcast.
+        correctProvisionalSummary(obj.id, obj.decision);
       }
       removeFromPermQueue(obj.id);
     } else if (obj.type === "todos_update") {
@@ -3466,20 +3517,47 @@
   // semantic summary line (the heading already says "Claude wants to use
   // {tool}", and the path is in .permission-input-path for Edit/Write)
   // over the first line of the diff body.
-  function resolvePermCardDom(card, decision) {
+  const PERM_LABELS = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
+
+  function resolvePermCardDom(card, decision, opts) {
+    opts = opts || {};
     card.dataset.state = "resolved";
     const summary = document.createElement("article");
     summary.className = "msg permission-resolved";
-    const labels = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
     const heading = card.querySelector(".role")?.textContent?.replace(/^Claude wants to use\s+/, "") || "tool";
     const path = card.querySelector(".permission-input-path")?.textContent?.trim();
     const firstInput = card.querySelector(".permission-input")?.textContent?.split("\n")[0]?.trim();
     const detail = path || firstInput || "";
-    summary.textContent = detail
-      ? `${labels[decision] || decision} — ${heading}: ${detail}`
-      : `${labels[decision] || decision} — ${heading}`;
+    const suffix = detail ? `${heading}: ${detail}` : heading;
+    // Carry the request id + suffix onto the collapsed node so an authoritative
+    // permission_resolved re-broadcast can re-find and rewrite it. This matters
+    // for the provisional case: when this tab loses a two-tab decision race it
+    // gets a 404 and doesn't know the real decision, so it must NOT stamp its
+    // own — it shows "Handled elsewhere" and lets the re-broadcast correct it.
+    if (card.dataset.requestId) summary.dataset.requestId = card.dataset.requestId;
+    summary.dataset.state = "resolved";
+    summary.dataset.summarySuffix = suffix;
+    const verb = opts.provisional ? "Handled elsewhere" : (PERM_LABELS[decision] || decision);
+    if (opts.provisional) summary.dataset.provisional = "1";
+    summary.textContent = `${verb} — ${suffix}`;
     card.replaceWith(summary);
     removeFromPermQueue(card.dataset.requestId);
+    return summary;
+  }
+
+  // Rewrite a provisional "Handled elsewhere" summary with the authoritative
+  // decision once the server's permission_resolved re-broadcast arrives, so the
+  // durable transcript label is the real decision, not this tab's lost click.
+  function correctProvisionalSummary(id, decision) {
+    if (!id) return false;
+    const el = document.querySelector(
+      `.permission-resolved[data-provisional][data-request-id="${CSS.escape(String(id))}"]`,
+    );
+    if (!el) return false;
+    el.textContent = `${PERM_LABELS[decision] || decision} — ${el.dataset.summarySuffix || ""}`
+      .replace(/ — $/, "");
+    delete el.dataset.provisional;
+    return true;
   }
 
   // Returns true when the decision was accepted by the server.
@@ -3503,11 +3581,14 @@
       if (r.status === 404) {
         // The server already resolved this request (decided on another tab, or
         // a stale prompt replayed after a reconnect). Its future is gone, so
-        // retrying would only 404 again — collapse the card instead of
-        // re-enabling the buttons and telling the user to try again.
-        resolvePermCardDom(card, decision);
+        // retrying would only 404 again — collapse the card. This tab does NOT
+        // know the real decision (another tab may have picked the opposite), so
+        // show a neutral "Handled elsewhere" and let the authoritative
+        // permission_resolved re-broadcast rewrite it with the true decision,
+        // rather than stamping this tab's click as the durable label.
+        resolvePermCardDom(card, decision, { provisional: true });
         removeFromPermQueue(requestId);
-        announce("Already handled.");
+        announce("Already handled elsewhere.");
         return false;
       }
       if (!r.ok) throw new Error("HTTP " + r.status);
