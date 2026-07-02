@@ -3929,9 +3929,18 @@
     if (typeof usageDialog.showModal === "function") usageDialog.showModal();
     else usageDialog.setAttribute("open", "open");
     try {
-      const r = await fetch("/api/usage");
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      renderUsage(await r.json());
+      // Today's breakdown and the 30-day history come from two endpoints;
+      // fetch them together. History is best-effort — a failure there still
+      // shows Today rather than erroring the whole dialog.
+      const [uR, hR] = await Promise.all([
+        fetch("/api/usage"),
+        fetch("/api/usage/history?days=30").catch(() => null),
+      ]);
+      if (!uR.ok) throw new Error("HTTP " + uR.status);
+      renderUsage(await uR.json());
+      if (hR && hR.ok) {
+        try { renderUsageHistory(await hR.json()); } catch (_) { /* leave Today */ }
+      }
     } catch (err) {
       usageBody.textContent = "Could not load usage: " + err.message;
     }
@@ -3998,6 +4007,32 @@
     }
     html += `<p class="usage-note">Anthropic doesn't expose plan-level capacity via API. "Today" is what this app has logged since it started.</p>`;
     usageBody.innerHTML = html;
+  }
+
+  // Append a per-day spend/token history table (from /api/usage/history) below
+  // the Today view. An accessible <table> so a screen reader can navigate it by
+  // row/column. Cost column shown only when the window has API-key (billed)
+  // turns — subscription turns have synthetic per-turn costs.
+  function renderUsageHistory(data) {
+    const days = (data && data.days) || [];
+    if (!days.length) return;
+    const fmt = new Intl.NumberFormat();
+    const totals = data.totals || {};
+    const showCost = !!totals.has_billed_usage;
+    let html = `<h3 class="usage-section">History — last ${data.window_days || 30} days</h3>`;
+    const costHeader = showCost ? "<th>Cost</th>" : "";
+    html += `<table><thead><tr><th>Date</th><th>Turns</th>${costHeader}<th>In</th><th>Out</th></tr></thead><tbody>`;
+    for (const d of days.slice().reverse()) {  // newest first
+      const costCell = showCost
+        ? `<td>${d.billed_turns > 0 ? formatCost(d.cost_usd) : "—"}</td>` : "";
+      html += `<tr><td>${htmlEscape(d.date)}</td><td>${d.turns}</td>${costCell}`
+        + `<td>${fmt.format(d.input_tokens || 0)}</td><td>${fmt.format(d.output_tokens || 0)}</td></tr>`;
+    }
+    html += `</tbody></table>`;
+    const totalCost = showCost ? ` · ${formatCost(totals.cost_usd || 0)} total` : "";
+    html += `<p class="usage-note">${totals.turns || 0} turns over `
+      + `${days.length} active day${days.length === 1 ? "" : "s"}${totalCost}.</p>`;
+    usageBody.insertAdjacentHTML("beforeend", html);
   }
 
   function humanIn(date) {
