@@ -191,6 +191,12 @@ def _sanitize_project_key(cwd: Path) -> str:
 
 
 CLAUDE_HOME = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).resolve()
+# ExitPlanMode on the current CLI (2.1.198+) writes the plan to a file under
+# here and passes only ``allowedPrompts`` in the tool input — the plan text is
+# no longer inline. The plan-review card recovers it from this dir; see
+# _resolve_plan_text.
+PLANS_DIR = CLAUDE_HOME / "plans"
+MAX_PLAN_CHARS = 200_000
 
 
 def _configured_projects() -> list[Path]:
@@ -5156,6 +5162,11 @@ class ActiveRun:
         # the queue so it stays ahead of anything queued afterward. Drained by
         # finish() like the queue itself.
         self._deferred_user_item: Optional[dict] = None
+        # Absolute path of the plan file the model last wrote in this run (a
+        # Write/Edit under PLANS_DIR, excluding sub-agent *-agent-* plans).
+        # ExitPlanMode no longer carries the plan text inline, so the review
+        # card reads it from here. See _resolve_plan_text.
+        self.plan_file: Optional[str] = None
         # Client-correlated recall for queued user input. Each queued message
         # carries a queue_id; POST /api/chat/cancel-queued adds it to
         # canceled_input_ids, and the driver drops it on pickup (the check is
@@ -5908,6 +5919,48 @@ def _emit_lost_input(run: "ActiveRun", text: str, reason: str) -> None:
         "message": f"Your message wasn't delivered: {reason}",
         "lost_input": preview,
     })
+
+
+def _resolve_plan_text(run: Optional["ActiveRun"], inline: str) -> str:
+    """Return the plan body for an ExitPlanMode review card.
+
+    CLI 2.1.198+ writes the plan to a file under ``PLANS_DIR`` and passes only
+    ``allowedPrompts`` in the tool input, so ``inline`` is empty on current
+    CLIs. Prefer a non-empty inline plan (older CLIs); else read the plan file
+    the model wrote in this run (``run.plan_file``); else fall back to the
+    newest non-sub-agent plan file. Returns "" if nothing is resolvable — the
+    caller renders a visible placeholder rather than a silently blank card,
+    which a screen-reader user would experience as the plan simply not existing.
+    """
+    if inline and inline.strip():
+        return inline
+    candidate: Optional[Path] = None
+    tracked = getattr(run, "plan_file", None) if run is not None else None
+    if tracked:
+        p = Path(tracked)
+        try:
+            if p.is_file() and p.resolve().parent == PLANS_DIR.resolve():
+                candidate = p
+        except OSError:
+            candidate = None
+    if candidate is None:
+        try:
+            plans = [
+                p for p in PLANS_DIR.glob("*.md")
+                if p.is_file() and "-agent-" not in p.name
+            ]
+            candidate = max(plans, key=lambda p: p.stat().st_mtime) if plans else None
+        except OSError:
+            candidate = None
+    if candidate is None:
+        return ""
+    try:
+        text = candidate.read_text("utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) > MAX_PLAN_CHARS:
+        text = text[:MAX_PLAN_CHARS] + "\n\n[… plan truncated for display …]"
+    return text
 
 
 async def _confirm_and_emit_user_prompt(
@@ -7478,10 +7531,20 @@ async def api_chat(
             fut = asyncio.get_running_loop().create_future()
             PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
             try:
+                plan_text = _resolve_plan_text(run, tool_input.get("plan", ""))
+                if not plan_text:
+                    # Never leave the card silently blank — a screen-reader user
+                    # would perceive that as "no plan". Say so and point at where
+                    # it lives so they can still act.
+                    plan_text = (
+                        "*The plan text could not be loaded for display "
+                        f"(looked under `{PLANS_DIR}`). Approve to proceed, or "
+                        "choose Keep planning.*"
+                    )
                 run.emit({
                     "type": "plan_review",
                     "id": request_id,
-                    "plan": tool_input.get("plan", ""),
+                    "plan": plan_text,
                     "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
                 })
                 try:
@@ -8930,6 +8993,19 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                     "name": blk.name,
                     "input": blk.input,
                 })
+                # Remember a plan-file write so the matching ExitPlanMode card
+                # can show the plan — the tool input no longer carries it inline
+                # (CLI 2.1.198+). Sub-agent plans (*-agent-*) are excluded so a
+                # spawned Plan/Explore agent's file can't shadow the main plan.
+                if blk.name in ("Write", "Edit", "MultiEdit") and run is not None:
+                    _fp = (blk.input or {}).get("file_path") or ""
+                    try:
+                        _pp = Path(_fp)
+                        if (_fp and "-agent-" not in _pp.name
+                                and _pp.parent.resolve() == PLANS_DIR.resolve()):
+                            run.plan_file = str(_pp)
+                    except OSError:
+                        pass
                 # Promote TodoWrite to a structured panel update.
                 if blk.name == "TodoWrite":
                     todos = (blk.input or {}).get("todos") or []

@@ -1069,3 +1069,54 @@ def test_normal_result_emits_no_error_event(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "_resolve_credential_mode", lambda *a, **k: "oauth")
     events = app_module._sdk_message_to_events(_result(False, "All done."))
     assert not [e for e in events if e.get("type") == "error"]
+
+
+# ─── ExitPlanMode plan-text resolution (CLI 2.1.198 moved plan to a file) ───
+
+def test_resolve_plan_text_prefers_inline() -> None:
+    """Older CLIs that still pass the plan inline keep working."""
+    assert app_module._resolve_plan_text(None, "# inline plan") == "# inline plan"
+
+
+def test_resolve_plan_text_reads_tracked_file(tmp_path, monkeypatch) -> None:
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    monkeypatch.setattr(app_module, "PLANS_DIR", plans)
+    f = plans / "my-plan.md"
+    f.write_text("tracked plan body", encoding="utf-8")
+    run = SimpleNamespace(plan_file=str(f))
+    assert app_module._resolve_plan_text(run, "") == "tracked plan body"
+
+
+def test_resolve_plan_text_newest_fallback_excludes_agent(tmp_path, monkeypatch) -> None:
+    """With no tracked path, the newest non-sub-agent plan wins — a newer
+    *-agent-* sub-plan must never shadow the main plan."""
+    import os
+    import time
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    monkeypatch.setattr(app_module, "PLANS_DIR", plans)
+    main = plans / "main.md"
+    main.write_text("main plan", encoding="utf-8")
+    sub = plans / "main-agent-abc.md"
+    sub.write_text("sub plan", encoding="utf-8")
+    os.utime(sub, (time.time() + 10, time.time() + 10))  # make the sub-plan newer
+    assert app_module._resolve_plan_text(SimpleNamespace(plan_file=None), "") == "main plan"
+
+
+def test_resolve_plan_text_empty_when_no_plans(tmp_path, monkeypatch) -> None:
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    monkeypatch.setattr(app_module, "PLANS_DIR", plans)
+    assert app_module._resolve_plan_text(SimpleNamespace(plan_file=None), "") == ""
+
+
+def test_resolve_plan_text_truncates(tmp_path, monkeypatch) -> None:
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    monkeypatch.setattr(app_module, "PLANS_DIR", plans)
+    f = plans / "big.md"
+    f.write_text("x" * (app_module.MAX_PLAN_CHARS + 500), encoding="utf-8")
+    out = app_module._resolve_plan_text(SimpleNamespace(plan_file=str(f)), "")
+    assert "plan truncated" in out
+    assert len(out) <= app_module.MAX_PLAN_CHARS + 60
