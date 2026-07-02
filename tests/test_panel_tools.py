@@ -257,3 +257,39 @@ def test_glob_symlink_escape_blocked(tmp_path):
         link.unlink()
         (outside / "GLOB_LEAKED_SECRET").unlink()
         outside.rmdir()
+
+
+# ─── secret-file exclusion (broader than .git) ──────────────────────────────
+
+def test_is_excluded_repo_path_matrix():
+    from pathlib import Path
+    excl = core._is_excluded_repo_path
+    assert excl(Path(".git/config"))
+    assert excl(Path("sub/.git/HEAD"))
+    assert excl(Path(".env"))
+    assert excl(Path(".env.local"))
+    assert excl(Path("deploy/id_ed25519"))
+    assert excl(Path("certs/server.pem"))
+    assert excl(Path("k.key"))
+    assert excl(Path("app/.credentials.json"))
+    # ordinary source stays readable
+    assert not excl(Path("src/app.py"))
+    assert not excl(Path("README.md"))
+    assert not excl(Path("environment.md"))  # not a dotenv
+
+
+def test_secret_files_not_readable(tmp_path):
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-LEAK", encoding="utf-8")
+    (tmp_path / "id_ed25519").write_text("PRIVATE_KEY_LEAK", encoding="utf-8")
+    t = _mk(tmp_path)
+    assert "sk-LEAK" not in t.execute("Read", {"path": ".env"})
+    assert "PRIVATE_KEY_LEAK" not in t.execute("Read", {"path": "id_ed25519"})
+
+
+def test_secret_files_not_grepped_or_globbed(tmp_path):
+    (tmp_path / ".env").write_text("TOKEN=GREPLEAK", encoding="utf-8")
+    (tmp_path / "ok.txt").write_text("TOKEN=fine", encoding="utf-8")
+    t = _mk(tmp_path)
+    grep = t.execute("Grep", {"pattern": "TOKEN="})
+    assert "GREPLEAK" not in grep and "ok.txt" in grep
+    assert ".env" not in t.execute("Glob", {"pattern": "**/*"})

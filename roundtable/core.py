@@ -2107,6 +2107,13 @@ def roundtable_create(
             f"Participants {unavailable} need an API key that wasn't set "
             f"in the server env."
         )
+    if house_rules and len(house_rules) > _HOUSE_RULES_CHAR_CAP:
+        raise ValueError(
+            f"house_rules is {len(house_rules)} chars, over the "
+            f"{_HOUSE_RULES_CHAR_CAP} cap. The system prompt rides argv under "
+            f"~130k ARG_MAX alongside the context pack — trim it, or move "
+            f"standing context into a context pack (roundtable_set_context)."
+        )
     with _db_lock:
         cur = _conn().execute(
             "INSERT INTO threads(topic, participants_json, created_at, house_rules) "
@@ -2312,6 +2319,11 @@ def roundtable_bind_context(thread_id: int, paths: list[str]) -> dict:
                 f"context file {p!r} is not an existing file "
                 f"(resolved to {resolved})."
             )
+        if _is_excluded_repo_path(resolved):
+            raise ValueError(
+                f"context file {resolved} looks like VCS metadata or a secret "
+                f"file; refusing to send it to external panelists."
+            )
         # Bound the per-file read: the pack is clamped to CONTEXT_PACK_CHAR_CAP
         # regardless, so pulling more than that from any one file is wasted
         # work — and a guard against a stray oversized file.
@@ -2465,7 +2477,8 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
         raise ValueError(f"invalid ref {ref!r}")
     try:
         if use_gh:
-            _git(["gh", "repo", "clone", repo.strip(), str(dest), "--", "--depth", "1"], env=clone_env)
+            _git(["gh", "repo", "clone", repo.strip(), str(dest), "--",
+                  "--depth", "1", "--config", "core.symlinks=false"], env=clone_env)
         else:
             _git(
                 ["git", "-c", "core.symlinks=false", "clone", "--depth", "1",
@@ -2524,6 +2537,10 @@ def roundtable_repo_pack(
         )
     root = Path(binding["working_directory"]).resolve()
 
+    # Clamp caller-supplied limits so one call can't balloon the transcript.
+    max_files = max(1, min(max_files, _REPO_PACK_MAX_FILES))
+    max_bytes = max(2000, min(max_bytes, _REPO_PACK_MAX_BYTES))
+
     files: list[Path] = []
     for p in sorted(root.rglob("*")):
         if not p.is_file():
@@ -2533,6 +2550,8 @@ def roundtable_repo_pack(
                 continue
         except OSError:
             continue
+        if _is_excluded_repo_path(p.relative_to(root)):
+            continue  # never inline VCS metadata / secret files to the panel
         files.append(p)
     rels = [p.relative_to(root).as_posix() for p in files]
 
@@ -2697,6 +2716,40 @@ _TOOL_GLOB_MAX_RESULTS = 200
 # provider stuck in a tool-call loop can't burn unbounded tokens/quota.
 _PANEL_TOOL_MAX_ROUNDS = 12
 
+# Upper clamps so a single caller-driven bulk op can't balloon a transcript
+# (and the next ask's cost) or exceed the CLI argv budget.
+_REPO_PACK_MAX_FILES = 200
+_REPO_PACK_MAX_BYTES = 1_000_000
+_CONVERGE_MAX_FINDINGS = 100
+# house_rules rides the system prompt on argv (~130k ARG_MAX on this host)
+# alongside the ≤60k context pack; cap it so the two together can't E2BIG.
+_HOUSE_RULES_CHAR_CAP = int(
+    os.getenv("CLAUDE_ROUNDTABLE_HOUSE_RULES_CHAR_CAP", "20000")
+)
+
+# ── Paths never surfaced to external panel models ───────────────────────────
+# VCS metadata (remote URLs, embedded tokens) and common secret files must
+# never reach Gemini/OpenAI — not via the panel tools (model-driven
+# Read/Grep/Glob), roundtable_repo_pack (bulk inline), or roundtable_bind_context
+# (explicit bind). Intentionally conservative: a false exclude just hides a file
+# from the panel; a false include can leak a credential off-box.
+_SECRET_NAME_RE = re.compile(
+    r"(^\.env($|\.)|^\.envrc$|^\.netrc$|^\.pgpass$|\.pem$|\.key$|\.p12$|\.pfx$|"
+    r"\.keystore$|\.jks$|^id_(rsa|dsa|ecdsa|ed25519)$|credentials\.json$|"
+    r"\.htpasswd$)",
+    re.IGNORECASE,
+)
+
+
+def _is_excluded_repo_path(rel: Path) -> bool:
+    """True if a path must never be surfaced to external panelists: any ``.git``
+    component (VCS metadata) or a filename matching a secret pattern. ``rel`` may
+    be repo-relative or absolute — only its parts and final name are inspected."""
+    if ".git" in rel.parts:
+        return True
+    return bool(_SECRET_NAME_RE.search(rel.name))
+
+
 # Provider-neutral declarations. Tool names match the Anthropic convention
 # ("Read"/"Grep"/"Glob") so _readonly_permission_callback and the webapp
 # permission UI treat panel tool calls exactly like Claude's.
@@ -2764,8 +2817,8 @@ class _RepoTools:
             rp = p.relative_to(self.root)
         except (ValueError, OSError):
             return None
-        if ".git" in rp.parts:
-            return None  # never expose VCS metadata (remote URLs, embedded tokens)
+        if _is_excluded_repo_path(rp):
+            return None  # never expose VCS metadata or secret files
         return p
 
     def execute(self, name: str, args: dict) -> str:
@@ -2824,8 +2877,8 @@ class _RepoTools:
                 real = f.resolve()
                 if not real.is_relative_to(self.root):
                     continue
-                if ".git" in f.relative_to(self.root).parts:
-                    continue  # never expose VCS metadata
+                if _is_excluded_repo_path(f.relative_to(self.root)):
+                    continue  # never expose VCS metadata or secret files
                 rp = f.relative_to(self.root).as_posix()  # '/' on every host; see _glob
                 with f.open(encoding="utf-8", errors="replace") as fh:
                     for n, line in enumerate(fh, 1):
@@ -2856,8 +2909,8 @@ class _RepoTools:
                 except OSError:
                     continue
                 rp = p.relative_to(self.root)
-                if ".git" in rp.parts:
-                    continue  # never expose VCS metadata
+                if _is_excluded_repo_path(rp):
+                    continue  # never expose VCS metadata or secret files
                 hits.append(rp.as_posix())
             hits.sort()
         except (ValueError, OSError, NotImplementedError) as exc:
@@ -3470,6 +3523,12 @@ def roundtable_converge(
         Path(ctx.working_directory), ctx.permission_callback, info["label"],
     )
 
+    if len(findings) > _CONVERGE_MAX_FINDINGS:
+        raise ValueError(
+            f"converge got {len(findings)} findings, over the "
+            f"{_CONVERGE_MAX_FINDINGS} cap — each runs a serial verifier call. "
+            f"Split into batches."
+        )
     ledger: list[dict] = []
     for f in findings:
         path = (f.get("file") or "").strip()
