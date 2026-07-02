@@ -7984,7 +7984,12 @@ async def api_chat(
                                 detail_parts: list[str] = []
                                 if tail:
                                     detail_parts.append("--- CLI stderr ---\n" + tail)
-                                detail_parts.append("--- pump traceback ---\n" + msg.traceback)
+                                # The Python traceback is logged server-side
+                                # above but NOT sent to the browser: it exposes
+                                # absolute paths + module layout to an
+                                # internet-facing client. Only the CLI's own
+                                # stderr tail (its intended diagnostic) goes out.
+                                # Mirrors the outer driver-error redaction.
                                 # Translate the two signal-death exit codes
                                 # into their almost-always cause, so the UI
                                 # shows "the server restarted" instead of
