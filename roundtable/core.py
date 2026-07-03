@@ -2714,7 +2714,20 @@ _TOOL_GREP_MAX_MATCHES = 200
 _TOOL_GLOB_MAX_RESULTS = 200
 # Hard cap on tool-call rounds, independent of ToolUseContext.max_turns, so a
 # provider stuck in a tool-call loop can't burn unbounded tokens/quota.
-_PANEL_TOOL_MAX_ROUNDS = 12
+# Env-tunable because a deep effort=high audit legitimately spends more
+# rounds than a quick question — gpt-5.x tends to issue ONE Read/Grep per
+# round, so 12 rounds is ~12 file reads, not 12 batches.
+_PANEL_TOOL_MAX_ROUNDS = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_PANEL_TOOL_MAX_ROUNDS", "12")
+)
+# Appended as a final user turn when the round cap is hit while the model is
+# still requesting tools: one last no-tools call forces a text answer from
+# the evidence gathered so far, instead of committing an empty turn.
+_TOOL_BUDGET_FINAL_INSTRUCTION = (
+    "[orchestrator]: Your tool-call budget for this turn is exhausted. Do "
+    "not request more tool calls. Answer in full now from the evidence you "
+    "have already gathered."
+)
 
 # Upper clamps so a single caller-driven bulk op can't balloon a transcript
 # (and the next ask's cost) or exceed the CLI argv budget.
@@ -2961,15 +2974,20 @@ def _call_gemini_with_tools(
 
     def _do_call() -> ProviderResult:
         last = None
+        exhausted = True
         for _round in range(_PANEL_TOOL_MAX_ROUNDS):
-            resp = _gemini.models.generate_content(
-                model=model, contents=contents, config=config,
+            resp = _provider_call(
+                f"gemini-tools/{model}",
+                lambda: _gemini.models.generate_content(
+                    model=model, contents=contents, config=config,
+                ),
             )
             last = resp
             cand = (resp.candidates or [None])[0]
             parts = getattr(getattr(cand, "content", None), "parts", None) or []
             calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
             if not calls:
+                exhausted = False
                 break
             # Echo the model's function-call turn, then answer each call.
             contents.append(genai_types.Content(role="model", parts=parts))
@@ -2982,8 +3000,40 @@ def _call_gemini_with_tools(
                     ),
                 ))
             contents.append(genai_types.Content(role="user", parts=resp_parts))
+        if exhausted:
+            # Same forced-final-answer shape as the OpenAI loop. Tools stay
+            # declared (history already contains function parts, which the
+            # API rejects without matching declarations) — mode NONE just
+            # forbids new calls this turn.
+            logger.warning(
+                "gemini-tools/%s: tool budget exhausted after %d rounds; "
+                "forcing final answer", model, _PANEL_TOOL_MAX_ROUNDS,
+            )
+            contents.append(genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=_TOOL_BUDGET_FINAL_INSTRUCTION)],
+            ))
+            final_config = dict(config)
+            final_config["tool_config"] = genai_types.ToolConfig(
+                function_calling_config=genai_types.FunctionCallingConfig(
+                    mode="NONE",
+                ),
+            )
+            last = _provider_call(
+                f"gemini-tools/{model}/final",
+                lambda: _gemini.models.generate_content(
+                    model=model, contents=contents, config=final_config,
+                ),
+            )
+        text = _gemini_response_text(last)
+        if exhausted and not (text or "").strip():
+            text = (
+                f"[tool budget exhausted after {_PANEL_TOOL_MAX_ROUNDS} "
+                f"rounds without a final answer — re-ask with narrower "
+                f"scope or raise CLAUDE_ROUNDTABLE_PANEL_TOOL_MAX_ROUNDS]"
+            )
         return ProviderResult(
-            text=_gemini_response_text(last),
+            text=text,
             usage=_extract_usage("gemini", last) if last else None, raw=last,
         )
 
@@ -3020,14 +3070,19 @@ def _call_openai_with_tools(
 
     def _do_call() -> ProviderResult:
         last = None
+        exhausted = True
         for _round in range(_PANEL_TOOL_MAX_ROUNDS):
-            resp = _openai.responses.create(input=input_items, **base_kwargs)
+            resp = _provider_call(
+                f"openai-tools/{model}",
+                lambda: _openai.responses.create(input=input_items, **base_kwargs),
+            )
             last = resp
             fn_calls = [
                 item for item in (getattr(resp, "output", None) or [])
                 if getattr(item, "type", None) == "function_call"
             ]
             if not fn_calls:
+                exhausted = False
                 break
             # Carry the model's reasoning/function-call items forward, then
             # append each function_call_output keyed by call_id. Mutate in
@@ -3044,7 +3099,31 @@ def _call_openai_with_tools(
                     "call_id": getattr(call, "call_id", None),
                     "output": result,
                 })
+        if exhausted:
+            # The model was still mid-investigation when the round cap hit;
+            # its last response is reasoning/tool-calls with no text. Force
+            # a text answer (tool_choice="none") rather than returning the
+            # empty string the caller would commit verbatim.
+            logger.warning(
+                "openai-tools/%s: tool budget exhausted after %d rounds; "
+                "forcing final answer", model, _PANEL_TOOL_MAX_ROUNDS,
+            )
+            input_items.append(
+                {"role": "user", "content": _TOOL_BUDGET_FINAL_INSTRUCTION}
+            )
+            last = _provider_call(
+                f"openai-tools/{model}/final",
+                lambda: _openai.responses.create(
+                    input=input_items, tool_choice="none", **base_kwargs,
+                ),
+            )
         text = (getattr(last, "output_text", None) or "") if last else ""
+        if exhausted and not text.strip():
+            text = (
+                f"[tool budget exhausted after {_PANEL_TOOL_MAX_ROUNDS} "
+                f"rounds without a final answer — re-ask with narrower "
+                f"scope or raise CLAUDE_ROUNDTABLE_PANEL_TOOL_MAX_ROUNDS]"
+            )
         return ProviderResult(
             text=text, usage=_extract_usage("openai", last) if last else None, raw=last,
         )

@@ -1,6 +1,37 @@
 # roundtable-mcp — improvement work: progress & plan
 
-_Last updated: 2026-06-30._
+_Last updated: 2026-07-03._
+
+## 2026-07-03 — panel tool-loop exhaustion fix (the "[empty response from provider]" bug)
+
+Root cause of GPT-5 "failing a lot" on repo-bound threads (94/98/100): at
+effort=high, gpt-5.5 investigates one Read/Grep per round, exhausts
+`_PANEL_TOOL_MAX_ROUNDS` (12) mid-investigation, and the loop returned the
+last response's `output_text` — empty, because that response is
+reasoning + function calls only. Committed verbatim as
+"[empty response from provider]". Reproduced by replaying thread 100's
+exact snapshot; confirmed 12 rounds of legitimate single-call turns.
+Gemini never hit it (answers after a couple of chunky reads) but shared the
+same cliff.
+
+Fix (both `_call_openai_with_tools` and `_call_gemini_with_tools`):
+- On exhaust, append `_TOOL_BUDGET_FINAL_INSTRUCTION` and make ONE final
+  no-tools call (OpenAI `tool_choice="none"`; Gemini `tool_config` mode
+  `NONE` — tools stay declared because history holds function parts).
+- If even that yields no text, surface an explicit
+  "[tool budget exhausted after N rounds …]" marker instead of the generic
+  empty marker.
+- `_PANEL_TOOL_MAX_ROUNDS` now env-tunable:
+  `CLAUDE_ROUNDTABLE_PANEL_TOOL_MAX_ROUNDS` (default 12).
+- Per-round provider calls now go through `_provider_call` (retry/backoff +
+  logging) — the tools path previously had NO retries, which is why raw
+  `APITimeoutError: Request timed out.` surfaced as participant errors.
+
+Verified: replayed thread 100 ask-1 through the patched loop — 12 rounds,
+forced final call, 8.7k-char audit text returned. Known-remaining (not
+fixed): usage rows for tool-loop turns record only the final round's
+tokens; claude-opus CLI-path error "returned an error result: success"
+(thread 100 msgs 4/7) is a separate bug.
 
 Self-audit of roundtable-mcp + the gemini-mcp/openai-mcp servers, driven through
 the roundtable itself (threads 60 = audit, 61 = design pass), then implemented in

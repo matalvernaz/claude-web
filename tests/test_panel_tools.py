@@ -152,15 +152,24 @@ def test_openai_tool_loop_executes_then_finishes(tmp_path, monkeypatch):
     assert "f.py:1" in result.text
 
 
-def test_openai_tool_loop_caps_rounds(tmp_path, monkeypatch):
-    """A model that never stops calling tools is bounded by _PANEL_TOOL_MAX_ROUNDS."""
+def test_openai_tool_loop_caps_rounds_then_forces_final_answer(tmp_path, monkeypatch):
+    """A model that never stops calling tools is bounded by
+    _PANEL_TOOL_MAX_ROUNDS, then gets one no-tools call that forces a text
+    answer instead of committing an empty turn."""
     import roundtable.core as core
     (tmp_path / "f.py").write_text("x\n", encoding="utf-8")
-    calls = {"n": 0}
+    monkeypatch.setattr(core, "_PANEL_TOOL_MAX_ROUNDS", 3)
+    calls = {"n": 0, "kwargs": []}
 
     class _FakeResponses:
         def create(self, **kw):
             calls["n"] += 1
+            calls["kwargs"].append(kw)
+            if kw.get("tool_choice") == "none":
+                return SimpleNamespace(
+                    output=[], output_text="synthesis from gathered evidence",
+                    usage=None,
+                )
             fc = SimpleNamespace(
                 type="function_call", name="Glob", call_id=f"c{calls['n']}",
                 arguments='{"pattern": "*.py"}',
@@ -169,8 +178,67 @@ def test_openai_tool_loop_caps_rounds(tmp_path, monkeypatch):
 
     monkeypatch.setattr(core, "_openai", SimpleNamespace(responses=_FakeResponses()))
     tools = core._RepoTools(tmp_path, _allow_all, "gpt-5")
-    core._call_openai_with_tools("gpt-5", "s", "t", "", None, False, tools)
-    assert calls["n"] == core._PANEL_TOOL_MAX_ROUNDS
+    result = core._call_openai_with_tools("gpt-5", "s", "t", "", None, False, tools)
+    assert calls["n"] == 4  # 3 capped rounds + 1 forced final
+    final_kw = calls["kwargs"][-1]
+    assert final_kw.get("tool_choice") == "none"
+    assert final_kw["input"][-1]["content"] == core._TOOL_BUDGET_FINAL_INSTRUCTION
+    assert result.text == "synthesis from gathered evidence"
+
+
+def test_openai_tool_loop_exhaust_marker_when_final_still_empty(tmp_path, monkeypatch):
+    """If even the forced no-tools call yields no text, the turn surfaces an
+    explicit exhaustion marker rather than the generic empty string."""
+    import roundtable.core as core
+    (tmp_path / "f.py").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(core, "_PANEL_TOOL_MAX_ROUNDS", 2)
+
+    class _FakeResponses:
+        def create(self, **kw):
+            if kw.get("tool_choice") == "none":
+                return SimpleNamespace(output=[], output_text="", usage=None)
+            fc = SimpleNamespace(
+                type="function_call", name="Glob", call_id="c1",
+                arguments='{"pattern": "*.py"}',
+            )
+            return SimpleNamespace(output=[fc], output_text="", usage=None)
+
+    monkeypatch.setattr(core, "_openai", SimpleNamespace(responses=_FakeResponses()))
+    tools = core._RepoTools(tmp_path, _allow_all, "gpt-5")
+    result = core._call_openai_with_tools("gpt-5", "s", "t", "", None, False, tools)
+    assert "tool budget exhausted after 2 rounds" in result.text
+
+
+def test_gemini_tool_loop_caps_rounds_then_forces_final_answer(tmp_path, monkeypatch):
+    """Gemini mirror of the OpenAI exhaust contract: capped rounds, then a
+    mode=NONE call that must produce text."""
+    import roundtable.core as core
+    (tmp_path / "f.py").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(core, "_PANEL_TOOL_MAX_ROUNDS", 3)
+    calls = {"n": 0, "kwargs": []}
+
+    class _FakeModels:
+        def generate_content(self, **kw):
+            calls["n"] += 1
+            calls["kwargs"].append(kw)
+            cfg = kw.get("config") or {}
+            if isinstance(cfg, dict) and cfg.get("tool_config") is not None:
+                part = SimpleNamespace(function_call=None, text="forced answer")
+                cand = SimpleNamespace(content=SimpleNamespace(parts=[part]))
+                return SimpleNamespace(candidates=[cand], text="forced answer",
+                                       usage_metadata=None)
+            fc = SimpleNamespace(name="Read", args={"path": "f.py"})
+            part = SimpleNamespace(function_call=fc, text=None)
+            cand = SimpleNamespace(content=SimpleNamespace(parts=[part]))
+            return SimpleNamespace(candidates=[cand], text=None, usage_metadata=None)
+
+    monkeypatch.setattr(core, "_gemini", SimpleNamespace(models=_FakeModels()))
+    tools = core._RepoTools(tmp_path, _allow_all, "gemini")
+    result = core._call_gemini_with_tools(
+        "gemini-pro-latest", "s", "t", "", None, False, tools,
+    )
+    assert calls["n"] == 4  # 3 capped rounds + 1 forced final
+    assert result.text == "forced answer"
 
 
 def test_gemini_tool_loop_executes_then_finishes(tmp_path, monkeypatch):
