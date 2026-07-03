@@ -186,6 +186,67 @@ def test_run_turn_skips_tools_when_flag_off(tmp_path, monkeypatch):
     assert out.text == "plain"
 
 
+# ─── anthropic SDK-with-tools child env (subscription vs api transport) ──
+
+class _FakeAgentSDK:
+    """Just enough of claude_agent_sdk for _call_anthropic_sdk_with_tools."""
+
+    def __init__(self):
+        self.captured_options = {}
+
+    class PermissionResultAllow:
+        pass
+
+    class PermissionResultDeny:
+        def __init__(self, message=""):
+            self.message = message
+
+    class AssistantMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class TextBlock:
+        def __init__(self, text):
+            self.text = text
+
+    def ClaudeAgentOptions(self, **kw):
+        self.captured_options = kw
+        from types import SimpleNamespace
+        return SimpleNamespace(**kw)
+
+    def query(self, prompt, options):
+        async def _gen():
+            async for _ in prompt:
+                pass
+            yield self.AssistantMessage([self.TextBlock("pong")])
+        return _gen()
+
+
+def _sdk_tools_turn(monkeypatch, tmp_path, transport):
+    fake = _FakeAgentSDK()
+    monkeypatch.setattr(core, "_import_agent_sdk", lambda: fake)
+    monkeypatch.setattr(core, "_ANTHROPIC_TRANSPORT", transport)
+    result = core._call_anthropic_sdk_with_tools(
+        "claude-opus-4-8", "sys", "transcript", "", None, False,
+        _ctx(tmp_path), "Claude Opus",
+    )
+    assert result.text == "pong"
+    return fake.captured_options
+
+
+def test_sdk_tools_strips_api_key_on_subscription_transports(tmp_path, monkeypatch):
+    """transport auto/cli = subscription intent: the SDK child must not
+    inherit ANTHROPIC_API_KEY, or it silently bills the API per-token."""
+    for transport in ("auto", "cli"):
+        opts = _sdk_tools_turn(monkeypatch, tmp_path, transport)
+        assert opts.get("env") == {"ANTHROPIC_API_KEY": ""}, transport
+
+
+def test_sdk_tools_keeps_api_key_on_forced_api_transport(tmp_path, monkeypatch):
+    opts = _sdk_tools_turn(monkeypatch, tmp_path, "api")
+    assert "env" not in opts
+
+
 # ─── DB-lock concurrency (reconstructs the deleted test_concurrency.py) ──
 
 def test_concurrent_posts_get_contiguous_indices():

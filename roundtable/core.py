@@ -1935,6 +1935,15 @@ def _call_anthropic_sdk_with_tools(
         options_kwargs["cwd"] = cwd_str
     if effort:
         options_kwargs["effort"] = effort
+    if _ANTHROPIC_TRANSPORT != "api":
+        # auto/cli mean subscription intent, but the SDK child prefers an
+        # inherited ANTHROPIC_API_KEY over OAuth — silently billing the API
+        # per-token (and failing every turn outright when the key's account
+        # has no credits: the CLI reports it as is_error=true subtype=success,
+        # which the SDK masks into "error result: success"). options.env can
+        # override but not remove, so blank the key; the CLI treats an empty
+        # value as unset and falls back to OAuth.
+        options_kwargs["env"] = {"ANTHROPIC_API_KEY": ""}
 
     options = sdk.ClaudeAgentOptions(
         **{k: v for k, v in options_kwargs.items() if v is not None},

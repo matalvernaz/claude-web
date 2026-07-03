@@ -30,8 +30,24 @@ Fix (both `_call_openai_with_tools` and `_call_gemini_with_tools`):
 Verified: replayed thread 100 ask-1 through the patched loop — 12 rounds,
 forced final call, 8.7k-char audit text returned. Known-remaining (not
 fixed): usage rows for tool-loop turns record only the final round's
-tokens; claude-opus CLI-path error "returned an error result: success"
-(thread 100 msgs 4/7) is a separate bug.
+tokens.
+
+### Same day — claude-opus "returned an error result: success" (SDK-tools path)
+
+Root cause: `_call_anthropic_sdk_with_tools` (every repo-bound Claude turn)
+let the SDK child inherit the MCP server's `ANTHROPIC_API_KEY` — which the
+CLI prefers over OAuth. That key's account has **zero credit balance**, so
+every turn died with `is_error=true, subtype=success,
+result="Credit balance is too low"`; the agent SDK's fallback reads
+`errors[]`-then-`subtype` (never `result`), masking it as
+"error result: success". Reproduced with a bare `claude -p` under that key.
+
+Fix: on transport `auto`/`cli` (subscription intent) the SDK child env gets
+`ANTHROPIC_API_KEY=""` (options.env can override but not remove; the CLI
+treats empty as unset → OAuth). Forced `transport=api` keeps the key.
+Verified live: same poisoned env, patched path answers via subscription.
+The registration key itself is only good for forced-api / smoke tests until
+the account is topped up.
 
 Self-audit of roundtable-mcp + the gemini-mcp/openai-mcp servers, driven through
 the roundtable itself (threads 60 = audit, 61 = design pass), then implemented in
