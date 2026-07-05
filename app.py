@@ -7728,6 +7728,13 @@ async def api_chat(
         include_partial_messages=True,
         enable_file_checkpointing=FILE_CHECKPOINTS_ENABLED,
         stderr=_capture_stderr,
+        # The SDK prefers its bundled CLI snapshot over PATH, silently
+        # pinning every run to the CLI version the SDK shipped with —
+        # spawn-time flags newer than that snapshot (e.g. --advisor) then
+        # die with "unknown option". Prefer the system CLI, which
+        # auto-updates; None falls back to the bundle for installs
+        # without one.
+        cli_path=shutil.which("claude"),
     )
     sdk_model = selected_model.get("model") or ""
     if selected_model.get("plan_model") and _init_permission_mode == "plan":

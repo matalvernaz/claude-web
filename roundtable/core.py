@@ -1904,6 +1904,11 @@ def _call_anthropic_sdk_with_tools(
         },
         "permission_mode": "default",
         "can_use_tool": _can_use_tool,
+        # The SDK prefers its bundled CLI snapshot over PATH, silently
+        # pinning runs to the CLI version the SDK shipped with. Prefer
+        # the auto-updated system CLI; None (filtered below) falls back
+        # to the bundle for installs without one.
+        "cli_path": shutil.which("claude"),
         # No allowed_tools cap — the user's settings.json + can_use_tool
         # gate are the source of truth. Capping it here would silently
         # hide tools the user has explicitly allowed in their settings.
