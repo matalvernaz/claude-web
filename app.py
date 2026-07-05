@@ -391,6 +391,19 @@ KNOWN_MODELS = [
     {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
      "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    # Advisor entries: "advisor_model" attaches the CLI's hidden server-side
+    # advisor tool at spawn (--advisor, verified on 2.1.198) — the main model
+    # consults it on demand and only those consults bill at advisor rates.
+    # Spawn-only: no control request can attach/detach it live, so the
+    # browser refuses mid-chat switches across differing advisors the same
+    # way it does for betas (see switchKey() in app.js).
+    {"key": "opus-fable-advisor", "model": "claude-opus-4-8",
+     "advisor_model": "claude-fable-5", "label": "Opus 4.8 + Fable 5 advisor",
+     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
+    {"key": "fableplan-advisor", "model": "claude-opus-4-8",
+     "plan_model": "claude-fable-5", "advisor_model": "claude-fable-5",
+     "label": "Fableplan + Fable 5 advisor", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
@@ -403,6 +416,20 @@ KNOWN_MODELS = [
      "efforts": []},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
+
+
+def _models_payload() -> list[dict]:
+    """Client-visible slice of KNOWN_MODELS (the index page's models-data tag).
+
+    ``advisor`` rides along so the browser can refuse mid-chat switches
+    across differing advisor attachments the same way it does for betas.
+    """
+    return [
+        {"key": m["key"], "label": m["label"], "context": m.get("context"),
+         "efforts": m.get("efforts") or [], "betas": m.get("betas") or [],
+         "advisor": m.get("advisor_model") or ""}
+        for m in KNOWN_MODELS
+    ]
 
 # Optional reliability/cost knobs forwarded to the SDK on every fresh spawn.
 # CLAUDE_WEB_FALLBACK_MODEL: model id the CLI retries with when the primary
@@ -6146,11 +6173,7 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
             "default_project": _sanitize_project_key(DEFAULT_CWD),
             "models": KNOWN_MODELS,
             # Drop SDK-internal fields and expose only what the JS needs.
-            "models_json": json.dumps([
-                {"key": m["key"], "label": m["label"], "context": m.get("context"),
-                 "efforts": m.get("efforts") or [], "betas": m.get("betas") or []}
-                for m in KNOWN_MODELS
-            ]),
+            "models_json": json.dumps(_models_payload()),
             "effort_levels": EFFORT_LEVELS,
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
@@ -7714,6 +7737,11 @@ async def api_chat(
     if sdk_model:
         options_kwargs["model"] = sdk_model
     run.live_sdk_model = sdk_model or None
+    advisor_model = selected_model.get("advisor_model") or ""
+    if advisor_model:
+        # Undocumented but verified CLI flag; reaches the CLI via extra_args
+        # because the SDK has no first-class option for it yet.
+        options_kwargs["extra_args"] = {"advisor": advisor_model}
     sdk_betas = list(selected_model.get("betas") or [])
     if sdk_betas:
         # The CLI surfaces an unsupported beta as "Error in input stream", so
@@ -8850,7 +8878,8 @@ async def api_chat_set_model(
     1M-context variant) — only a fresh spawn applies betas. The browser
     enforces this: its model picker refuses a mid-chat switch across differing
     betas and tells the user to start a new chat, so this route only ever sees
-    beta-compatible switches.
+    beta-compatible switches. The same guard covers ``advisor_model`` entries
+    — ``--advisor`` only attaches at spawn.
     """
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, f"unknown model {model!r}")

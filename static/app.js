@@ -135,6 +135,9 @@
   // can't change betas on a live CLI, so a switch across differing betas has to
   // go through a fresh spawn — see the model picker's change handler.
   const MODEL_BETAS = {};
+  // Advisor model attached at spawn (--advisor). Like betas, it can't change
+  // on a live CLI, so switches across differing advisors need a fresh chat.
+  const MODEL_ADVISOR = {};
   (() => {
     let data = [];
     const dataEl = document.getElementById("models-data");
@@ -145,11 +148,14 @@
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
       MODEL_BETAS[m.key || ""] = m.betas || [];
+      MODEL_ADVISOR[m.key || ""] = m.advisor || "";
     }
   })();
-  // Stable comparison key for a model's beta set (order-insensitive).
-  function betasKey(modelKey) {
-    return (MODEL_BETAS[modelKey || ""] || []).slice().sort().join(",");
+  // Stable comparison key for the spawn-only parts of a model entry (betas +
+  // advisor, order-insensitive). Differing keys = mid-chat switch refused.
+  function switchKey(modelKey) {
+    const betas = (MODEL_BETAS[modelKey || ""] || []).slice().sort().join(",");
+    return betas + "|" + (MODEL_ADVISOR[modelKey || ""] || "");
   }
   let lastSeenModel = null;
   let lastInputTokens = null;
@@ -460,16 +466,17 @@
     }
     modelSelect.addEventListener("change", () => {
       const newModel = modelSelect.value;
-      // set_model can't change request betas on a live CLI. A switch across
-      // differing betas (e.g. to the 1M-context variant) would relabel the
-      // model while it kept running at the old capacity, and the meter would
-      // over-report — a blind user misled about how much context is left. Only
-      // the spawn path applies betas, so require a new chat for that switch.
-      if (sessionId && betasKey(newModel) !== betasKey(lastSeenModel)) {
+      // set_model can't change request betas or the advisor on a live CLI. A
+      // switch across differing betas/advisors would relabel the model while
+      // the CLI kept running with the old attachment — the context meter
+      // would over-report, or an advisor would silently stay attached (or
+      // never attach) contrary to the label. Only the spawn path applies
+      // them, so require a new chat for those switches.
+      if (sessionId && switchKey(newModel) !== switchKey(lastSeenModel)) {
         const label = [...modelSelect.options].find((o) => o.value === newModel);
         announce(
           `${label ? label.textContent : newModel} can't be switched to mid-chat `
-          + "— its context setting only applies to a new chat. Start a new chat to use it.",
+          + "— its settings only apply to a new chat. Start a new chat to use it.",
         );
         modelSelect.value = lastSeenModel || "";
         return;
