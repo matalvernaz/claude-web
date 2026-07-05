@@ -385,6 +385,12 @@ KNOWN_MODELS = [
      "efforts": EFFORT_LEVELS},
     {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    # Split-model entry: "plan_model" runs while the run is in plan mode,
+    # "model" the rest of the time (the CLI's opusplan pattern, pointed at
+    # Fable). _sync_plan_model drives the swap on plan enter/approve.
+    {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
+     "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
@@ -5087,6 +5093,10 @@ class ActiveRun:
         # switches model live via ClaudeSDKClient.set_model() — no respawn,
         # the conversation continues on the new model from the next turn.
         self.model: Optional[str] = None
+        # SDK model id the CLI is actually running right now (spawn value or
+        # last successful set_model). Lets _sync_plan_model skip redundant
+        # control requests when plan state flaps without a model change.
+        self.live_sdk_model: Optional[str] = None
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -7626,6 +7636,7 @@ async def api_chat(
                 log.info("plan approved run=%s owner=%s", run.run_id, owner)
                 run.permission_mode = "acceptEdits"
                 run.emit({"type": "plan_mode", "active": False})
+                await _sync_plan_model(run)
                 return PermissionResultAllow()
             feedback = ""
             payload = decision.get("payload")
@@ -7696,8 +7707,13 @@ async def api_chat(
         stderr=_capture_stderr,
     )
     sdk_model = selected_model.get("model") or ""
+    if selected_model.get("plan_model") and _init_permission_mode == "plan":
+        # Split-model entry starting straight in plan mode: spawn on the plan
+        # model; _sync_plan_model restores the base model on plan approval.
+        sdk_model = selected_model["plan_model"]
     if sdk_model:
         options_kwargs["model"] = sdk_model
+    run.live_sdk_model = sdk_model or None
     sdk_betas = list(selected_model.get("betas") or [])
     if sdk_betas:
         # The CLI surfaces an unsupported beta as "Error in input stream", so
@@ -8094,6 +8110,12 @@ async def api_chat(
                                 evts = []
                             else:
                                 evts = _sdk_message_to_events(msg, run)
+                                if any(e.get("type") == "plan_mode" and e.get("active")
+                                       for e in evts):
+                                    # EnterPlanMode flipped run.permission_mode
+                                    # inside the (sync) translator; the async
+                                    # model swap has to happen out here.
+                                    await _sync_plan_model(run)
                             if run.interrupting and isinstance(msg, ResultMessage):
                                 # This ResultMessage is the in-flight turn
                                 # winding down in response to client.interrupt()
@@ -8739,6 +8761,45 @@ def _live_run_or_400(session_id: str, user: dict) -> tuple["ActiveRun", Any]:
     return run, client
 
 
+async def _sync_plan_model(run: "ActiveRun") -> None:
+    """Align a live run's model with its plan state for split-model entries.
+
+    A KNOWN_MODELS entry carrying ``plan_model`` runs that model while the
+    run is in plan mode and its base ``model`` otherwise. No-op for ordinary
+    entries, before the client exists, or when the target is already live.
+    Failures are logged, not raised — a missed swap must not kill the run.
+    """
+    entry = MODELS_BY_KEY.get(run.model or "")
+    if not entry or not entry.get("plan_model"):
+        return
+    client = run.client
+    if client is None:
+        return
+    planning = run.permission_mode == "plan"
+    target = entry["plan_model"] if planning else entry["model"]
+    if target == run.live_sdk_model:
+        return
+    try:
+        async with run.client_write_lock:
+            await client.set_model(target)
+    except Exception as exc:  # noqa: BLE001 — surface in logs, keep the run alive
+        log.warning("plan-model swap failed run=%s target=%s: %s",
+                    run.run_id, target, exc)
+        return
+    run.live_sdk_model = target
+    label = next(
+        (m["label"] for m in KNOWN_MODELS if m["key"] and m["model"] == target),
+        target,
+    )
+    run.emit({
+        "type": "plan_model",
+        "active": planning,
+        "label": f"Planning on {label}." if planning else f"Back on {label}.",
+    })
+    log.info("plan-model swap run=%s target=%s planning=%s",
+             run.run_id, target, planning)
+
+
 @app.post("/api/chat/permission-mode")
 async def api_chat_permission_mode(
     session_id: str = Form(...),
@@ -8768,6 +8829,7 @@ async def api_chat_permission_mode(
         raise HTTPException(500, f"set permission mode failed: {exc}") from exc
     run.permission_mode = mode
     run.emit({"type": "permission_mode_changed", "mode": mode, "source": "user"})
+    await _sync_plan_model(run)
     log.info("permission mode set run=%s mode=%s", run.run_id, mode)
     return {"ok": True, "mode": mode}
 
@@ -8793,13 +8855,19 @@ async def api_chat_set_model(
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, f"unknown model {model!r}")
     run, client = _live_run_or_400(session_id, user)
-    sdk_model = (MODELS_BY_KEY.get(model, {}).get("model") or None) if model else None
+    entry = MODELS_BY_KEY.get(model, {}) if model else {}
+    sdk_model = entry.get("model") or None
+    if entry.get("plan_model") and run.permission_mode == "plan":
+        # Switching onto a split-model entry while already planning lands on
+        # its plan model; _sync_plan_model restores the base on approval.
+        sdk_model = entry["plan_model"]
     try:
         async with run.client_write_lock:
             await client.set_model(sdk_model)
     except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
         raise HTTPException(500, f"set model failed: {exc}") from exc
     run.model = model
+    run.live_sdk_model = sdk_model
     label = MODELS_BY_KEY.get(model, {}).get("label") or "Default"
     run.emit({"type": "model_changed", "model": model, "label": label})
     log.info("model set run=%s model=%s", run.run_id, model or "(default)")

@@ -2557,6 +2557,12 @@
         announce("Plan approved. Claude is now implementing.");
       }
       markVisibleActivity();
+    } else if (obj.type === "plan_model") {
+      // A split-model entry (Fableplan) swapped between its plan and base
+      // models server-side. The picker key is unchanged; just say which
+      // model is spending tokens now.
+      if (obj.label) announce(obj.label);
+      markVisibleActivity();
     } else if (obj.type === "permission_mode_changed") {
       // Server confirmed a permission-mode change (user picker or model-driven).
       // Keep the picker in sync and announce for NVDA.
