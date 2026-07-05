@@ -1,11 +1,16 @@
 """Currency resolution + USD-rate caching for the cost UI.
 
+Anthropic bills in USD and the SDK reports per-turn cost in USD, so USD is
+the default and truthful display currency. An operator can opt into a local
+approximation by setting ``$CLAUDE_WEB_CURRENCY`` to an ISO-4217 code, but
+that figure is an ECB-rate estimate that won't match a card issuer's actual
+conversion, so it stays strictly opt-in.
+
 Two pieces:
 
-* ``resolve_currency(accept_language, override)`` — pick a 3-letter ISO code
-  from an HTTP ``Accept-Language`` header, or honor an explicit env override.
-  The mapping is region-code-to-currency for the common locales; anything
-  unrecognised falls back to USD.
+* ``resolve_currency(override)`` — honor an explicit ISO-4217 override, else
+  USD. No locale sniffing: the billing currency doesn't depend on the
+  caller's browser language.
 * ``usd_rate(currency)`` — return the conversion rate (USD * rate = local),
   fetched daily from frankfurter.app (no API key, ECB rates) and cached on
   disk so a flaky network doesn't blank out the cost UI.
@@ -28,59 +33,18 @@ import httpx
 
 log = logging.getLogger("claude-web.currency")
 
-# Region (ISO-3166 alpha-2) → currency (ISO-4217). Covers ~95% of likely
-# users; everything else falls back to USD. Eurozone members all map to
-# EUR. Keep the list tight — adding rarely-used codes only adds breakage
-# surface if frankfurter.app ever drops one.
-_REGION_TO_CURRENCY = {
-    "US": "USD",
-    "CA": "CAD",
-    "GB": "GBP", "UK": "GBP",
-    "AU": "AUD", "NZ": "NZD",
-    "JP": "JPY", "CN": "CNY", "HK": "HKD", "TW": "TWD",
-    "KR": "KRW", "SG": "SGD", "IN": "INR", "ID": "IDR",
-    "TH": "THB", "MY": "MYR", "PH": "PHP", "VN": "VND",
-    "MX": "MXN", "BR": "BRL", "AR": "ARS", "CL": "CLP",
-    "CO": "COP", "PE": "PEN",
-    "CH": "CHF", "SE": "SEK", "NO": "NOK", "DK": "DKK",
-    "IS": "ISK", "PL": "PLN", "CZ": "CZK", "HU": "HUF",
-    "RO": "RON", "BG": "BGN", "HR": "HRK", "RU": "RUB",
-    "UA": "UAH", "TR": "TRY", "IL": "ILS", "AE": "AED",
-    "SA": "SAR", "QA": "QAR", "KW": "KWD", "EG": "EGP",
-    "ZA": "ZAR", "NG": "NGN", "KE": "KES",
-    "DE": "EUR", "FR": "EUR", "IT": "EUR", "ES": "EUR",
-    "NL": "EUR", "BE": "EUR", "AT": "EUR", "PT": "EUR",
-    "IE": "EUR", "FI": "EUR", "GR": "EUR", "LU": "EUR",
-    "SI": "EUR", "SK": "EUR", "EE": "EUR", "LV": "EUR",
-    "LT": "EUR", "MT": "EUR", "CY": "EUR", "AD": "EUR",
-    "MC": "EUR", "SM": "EUR", "VA": "EUR",
-}
 
-
-def resolve_currency(accept_language: str, override: Optional[str] = None) -> str:
+def resolve_currency(override: Optional[str] = None) -> str:
     """Return the ISO-4217 code to display costs in.
 
-    ``override`` (typically ``$CLAUDE_WEB_CURRENCY``) wins unconditionally so
-    deployments can pin a currency regardless of caller locale.
+    Defaults to USD — the currency Anthropic actually bills in. ``override``
+    (typically ``$CLAUDE_WEB_CURRENCY``) pins a local currency for operators
+    who want an approximate local figure; otherwise costs stay in USD.
     """
     if override:
         code = override.strip().upper()[:3]
         if len(code) == 3 and code.isalpha():
             return code
-    for tag in (accept_language or "").split(","):
-        # "en-CA;q=0.9" → "en-CA"
-        tag = tag.strip().split(";", 1)[0].replace("_", "-")
-        if not tag:
-            continue
-        bits = tag.split("-")
-        # Walk back-to-front looking for a 2-letter region code; `en-CA`
-        # is the common shape, `zh-Hans-CN` puts the region last too.
-        for bit in reversed(bits):
-            if len(bit) == 2 and bit.isalpha():
-                cur = _REGION_TO_CURRENCY.get(bit.upper())
-                if cur:
-                    return cur
-                break
     return "USD"
 
 

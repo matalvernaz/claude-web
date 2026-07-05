@@ -448,7 +448,7 @@ def test_usage_history_payload_groups_by_day(tmp_path, monkeypatch) -> None:
     ]
     log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     monkeypatch.setattr(app_module, "USAGE_LOG", log)
-    out = app_module._usage_history_payload(None, "", days=7)
+    out = app_module._usage_history_payload(None, days=7)
     assert len(out["days"]) == 2  # two distinct days
     today = out["days"][-1]  # sorted ascending, so newest last
     assert today["turns"] == 2 and today["billed_turns"] == 1

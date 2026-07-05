@@ -745,7 +745,7 @@
         style: "currency",
         currency: costCurrency,
         minimumFractionDigits: 2,
-        maximumFractionDigits: 4,
+        maximumFractionDigits: 2,
       });
     } catch {
       // Unknown currency code on this browser: fall back to USD format.
@@ -753,7 +753,7 @@
         style: "currency",
         currency: "USD",
         minimumFractionDigits: 2,
-        maximumFractionDigits: 4,
+        maximumFractionDigits: 2,
       });
     }
   }
@@ -763,12 +763,21 @@
   function formatCost(usdAmount) {
     const usd = Number(usdAmount);
     if (!Number.isFinite(usd)) return "";
-    const local = usd * costUsdRate;
     if (!costFormatter) buildCostFormatter();
+    const local = usd * costUsdRate;
+    // Sub-cent charges can't be shown honestly as dollars-and-cents: $0.00
+    // reads as free, a rounded-up $0.01 overstates. Mark them "<$0.01".
+    if (local > 0 && local < 0.01) {
+      try {
+        return "<" + costFormatter.format(0.01);
+      } catch {
+        return "<$0.01";
+      }
+    }
     try {
       return costFormatter.format(local);
     } catch {
-      return "$" + usd.toFixed(4);
+      return "$" + usd.toFixed(2);
     }
   }
 

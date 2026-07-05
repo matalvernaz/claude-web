@@ -9461,7 +9461,7 @@ def _is_billed_row(row: dict) -> bool:
     return row.get("credential_mode") == "api_key"
 
 
-def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -> dict:
+def _compute_usage_payload(user_sub: Optional[str]) -> dict:
     """Synchronous body of /api/usage — invoked on a worker thread so a fat
     usage.jsonl doesn't block the event loop.
 
@@ -9585,9 +9585,7 @@ def _compute_usage_payload(user_sub: Optional[str], accept_language: str = "") -
     except Exception:
         rate_limit = None
 
-    currency_code = currency.resolve_currency(
-        accept_language, override=os.getenv("CLAUDE_WEB_CURRENCY"),
-    )
+    currency_code = currency.resolve_currency(os.getenv("CLAUDE_WEB_CURRENCY"))
     rate = currency.usd_rate(currency_code)
     if rate is None:
         currency_code = "USD"
@@ -9627,15 +9625,10 @@ async def api_usage(request: Request, user: dict = Depends(auth.require_user)):
     blocking work, which starves every other in-flight request and stalls
     SSE streams. asyncio.to_thread is the minimal-blast-radius fix.
     """
-    accept_language = request.headers.get("accept-language", "")
-    return await asyncio.to_thread(
-        _compute_usage_payload, user.get("sub"), accept_language,
-    )
+    return await asyncio.to_thread(_compute_usage_payload, user.get("sub"))
 
 
-def _usage_history_payload(
-    user_sub: Optional[str], accept_language: str = "", days: int = 30,
-) -> dict:
+def _usage_history_payload(user_sub: Optional[str], days: int = 30) -> dict:
     """Aggregate usage.jsonl into a per-local-day spend/token series.
 
     Complements _compute_usage_payload (today-only) with a trailing-window
@@ -9689,9 +9682,7 @@ def _usage_history_payload(
         "output_tokens": sum(a["output_tokens"] for a in by_day.values()),
         "has_billed_usage": any(a["billed_turns"] for a in by_day.values()),
     }
-    currency_code = currency.resolve_currency(
-        accept_language, override=os.getenv("CLAUDE_WEB_CURRENCY"),
-    )
+    currency_code = currency.resolve_currency(os.getenv("CLAUDE_WEB_CURRENCY"))
     rate = currency.usd_rate(currency_code)
     if rate is None:
         currency_code = "USD"
@@ -9718,9 +9709,8 @@ async def api_usage_history(
         days = int(request.query_params.get("days") or 30)
     except (TypeError, ValueError):
         days = 30
-    accept_language = request.headers.get("accept-language", "")
     return await asyncio.to_thread(
-        _usage_history_payload, user.get("sub"), accept_language, days,
+        _usage_history_payload, user.get("sub"), days,
     )
 
 
