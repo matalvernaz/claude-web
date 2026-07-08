@@ -344,7 +344,7 @@
       // ticking, not an alarm. Long/loud enough to actually register over
       // speech — a 50ms blip was inaudible — but a single note, so it stays
       // clearly subordinate to the multi-note turn cues.
-      tone(ctx, 1046, t, 0.12, "triangle", 0.24);
+      tone(ctx, 784, t, 0.12, "triangle", 0.24);
     }
   }
 
