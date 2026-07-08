@@ -5527,7 +5527,8 @@ ACTIVE_RUNS_BY_SESSION: dict[str, ActiveRun] = {}
 # the restart. Instead: flip RESTART_STATE (SIGUSR1 to the main process, or
 # POST /api/admin/restart), refuse new turns with 503 restart_pending, wait
 # until every run is between turns, then exit cleanly and let the supervisor
-# bring the process back. Requires a supervisor that restarts on clean exit
+# bring the process back. Cancel a pending restart with SIGUSR2 or
+# DELETE /api/admin/restart. Requires a supervisor that restarts on clean exit
 # (systemd Restart=always; Docker restart: unless-stopped). Module-global
 # state is fine here for the same reason as ACTIVE_RUNS: single worker.
 RESTART_STATE: dict[str, Any] = {"pending": False, "requested_at": None, "source": None}
@@ -5709,14 +5710,23 @@ async def _periodic_gc_loop() -> None:
 async def _install_restart_machinery() -> None:
     asyncio.create_task(_restart_watcher_loop())
     asyncio.create_task(_periodic_gc_loop())
-    if hasattr(signal, "SIGUSR1"):
+    # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
+    # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
+    # can drive both without an OIDC session cookie.
+    signal_handlers = (
+        ("SIGUSR1", lambda: request_restart("SIGUSR1")),
+        ("SIGUSR2", lambda: cancel_restart()),
+    )
+    loop = asyncio.get_running_loop()
+    for sig_name, handler in signal_handlers:
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
         try:
-            asyncio.get_running_loop().add_signal_handler(
-                signal.SIGUSR1, lambda: request_restart("SIGUSR1"),
-            )
+            loop.add_signal_handler(sig, handler)
         except (NotImplementedError, RuntimeError):
-            # Windows / non-main-thread event loop: the API endpoint still
-            # works, only the signal trigger is unavailable.
+            # Windows / non-main-thread event loop: the API endpoints still
+            # work, only the signal triggers are unavailable.
             pass
 
 
