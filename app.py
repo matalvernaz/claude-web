@@ -5535,6 +5535,16 @@ RESTART_STATE: dict[str, Any] = {"pending": False, "requested_at": None, "source
 RESTART_MAX_WAIT = int(os.getenv("CLAUDE_WEB_RESTART_MAX_WAIT", "1800"))
 _RESTART_POLL_SECONDS = 2.0
 
+# True once uvicorn's lifespan shutdown has fired (SIGTERM/SIGINT, drain
+# restart reaching its exit, systemctl restart). Lets a driver task's
+# CancelledError handler tell "the process is going down" apart from "the
+# user stopped / superseded this run": the former emits restarted_during_run
+# (accurate, tells the user to resend) where a bare "stopped" used to imply
+# a deliberate stop. Lifespan shutdown runs before asyncio.run's teardown
+# cancels free-standing tasks, so the flag is set by the time drivers see
+# CancelledError.
+SHUTTING_DOWN = False
+
 
 # Detached roundtable assistant runs. The producer (create → attach →
 # panel → synth) runs as a free-standing task writing into an
@@ -5728,6 +5738,12 @@ async def _install_restart_machinery() -> None:
             # Windows / non-main-thread event loop: the API endpoints still
             # work, only the signal triggers are unavailable.
             pass
+
+
+@app.on_event("shutdown")
+async def _mark_shutting_down() -> None:
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
 
 
 def _require_restart_admin(user: dict) -> None:
@@ -6092,14 +6108,20 @@ async def _inject_user_input(
     image_count: int,
     file_count: int,
     queue_id: Optional[str] = None,
-) -> bool:
+) -> Optional[str]:
     """Queue user input for the driver to deliver to the CLI.
 
-    Returns False fast if the run is already finished (caller should
-    fall back to opening a fresh run); True if the item was enqueued —
-    a background task will emit either ``user_prompt`` (on delivery
-    success) or an ``error`` event with a ``lost_input`` preview (on
-    timeout, cancellation, or driver-side failure).
+    Returns None when the item was enqueued — a background task will emit
+    either ``user_prompt`` (on delivery success) or an ``error`` event with
+    a ``lost_input`` preview (on timeout, cancellation, or driver-side
+    failure). Otherwise returns a reason code:
+
+    - ``"run_finished"`` — the run is done or superseded; the caller should
+      fall back to spawning a fresh run that resumes the session.
+    - ``"queue_full"`` — the run is alive but its input backlog is at the
+      cap; the caller should tell the client to retry, NOT tear down a
+      healthy run. Previously both conditions returned a bare False and the
+      browser's run_finished fallback aborted a live mid-turn stream.
 
     Originally this also wrote directly to ``client.query()`` from the
     HTTP handler when the driver was running, in pursuit of
@@ -6109,13 +6131,12 @@ async def _inject_user_input(
     between turns, serializing every write through one writer.
     """
     if run.done or not run.accepting_input:
-        return False
+        return "run_finished"
     # Bound the per-run input backlog. The browser caps at MAX_QUEUE_LENGTH
     # client-side, but a direct API caller could otherwise enqueue without
-    # limit — each item spawns a delivery task + Future. Reject past the cap so
-    # the caller surfaces a 409 and the user retries once the driver drains.
+    # limit — each item spawns a delivery task + Future.
     if run.user_input_queue.qsize() >= MAX_USER_INPUT_QUEUE:
-        return False
+        return "queue_full"
     loop = asyncio.get_running_loop()
     delivered: asyncio.Future = loop.create_future()
     await run.user_input_queue.put({
@@ -6136,7 +6157,7 @@ async def _inject_user_input(
     # mode already; this is a backstop for run.emit() itself blowing up
     # (sqlite hard failure, etc.).
     task.add_done_callback(_log_task_exception)
-    return True
+    return None
 
 
 def _log_task_exception(task: asyncio.Task) -> None:
@@ -7444,12 +7465,27 @@ async def api_chat(
             # from appearing in the transcript when the CLI exits between
             # our enqueue and the driver's pickup — instead, an error event
             # with a preview surfaces what was lost.
-            if not await _inject_user_input(
+            inject_failure = await _inject_user_input(
                 existing, effective, image_blocks,
                 image_count=len(image_blocks),
                 file_count=len(file_metas),
                 queue_id=queue_id or None,
-            ):
+            )
+            if inject_failure == "queue_full":
+                # The run is alive but its input backlog is at the cap.
+                # Don't return run_finished — the client would respawn a
+                # duplicate run over a healthy one. 429 = retry later.
+                return JSONResponse(
+                    {
+                        "error": "queue_full",
+                        "detail": (
+                            "This session's input queue is full. Wait for "
+                            "the current turn to progress and resend."
+                        ),
+                    },
+                    status_code=429,
+                )
+            if inject_failure is not None:
                 # Race: the driver finished between our _existing_run_for_session
                 # lookup and the inject. The session JSONL on disk is intact,
                 # so the client can hit /api/chat again with the same
@@ -8458,10 +8494,25 @@ async def api_chat(
                             )
 
         except asyncio.CancelledError:
-            # Explicit /api/chat/stop or process shutdown — surface as a
-            # tidy "stopped" rather than the raw transport error that the
-            # SDK would otherwise raise on broken pipes.
-            run.emit({"type": "stopped"})
+            # Two distinct causes land here and deserve different stories:
+            # process shutdown (SIGTERM / drain restart) versus an explicit
+            # /api/chat/stop or supersede. The finally below runs finish()
+            # either way, so the runs row gets finished_at and the boot
+            # restore won't synthesize its own restart marker — meaning this
+            # emit is the ONLY chance to tell the user a restart (not a
+            # deliberate stop) killed their turn.
+            if SHUTTING_DOWN:
+                run.emit({
+                    "type": "restarted_during_run",
+                    "message": (
+                        "The server restarted while this turn was running. "
+                        "The conversation is intact — send a new message "
+                        "and Claude will pick up from here."
+                    ),
+                    "ts": time.time(),
+                })
+            else:
+                run.emit({"type": "stopped"})
             raise
         except Exception as e:
             tb = traceback.format_exc()
@@ -8571,12 +8622,20 @@ async def api_chat_send(
     # _inject_user_input — it only fires after the driver confirms write
     # to the CLI. Pre-ack the message was sometimes echoed to the user
     # before the CLI exited and silently dropped it.
-    if not await _inject_user_input(
+    inject_failure = await _inject_user_input(
         run, effective, image_blocks,
         image_count=len(image_blocks),
         file_count=len(file_metas),
         queue_id=queue_id or None,
-    ):
+    )
+    if inject_failure == "queue_full":
+        # The run is alive — 429 tells the browser to hold the message
+        # locally and retry, instead of the run_finished fallback (which
+        # would abort a healthy mid-turn stream and spawn a duplicate run).
+        return JSONResponse(
+            {"ok": False, "error": "queue_full"}, status_code=429,
+        )
+    if inject_failure is not None:
         # Race: driver finished between the ACTIVE_RUNS lookup and inject.
         return JSONResponse(
             {"ok": False, "error": "run_finished"}, status_code=409,
@@ -8603,6 +8662,14 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         "session_id": run.session_id,
         "project": run.project_key,
         "buffered_events": len(run.events),
+        # Turn state + tail index, mirroring the live_run payload in
+        # /api/sessions/{sid}. tryResume seeds its streaming UI from
+        # between_turns instead of assuming an active run is mid-turn —
+        # without it, a reload onto an idle run showed a phantom spinner and
+        # a reload onto a mid-turn multi-turn run ended replay in the wrong
+        # state (the last replayed result read as "turn over").
+        "between_turns": run.between_turns,
+        "next_idx": run._next_idx,
     }
 
 

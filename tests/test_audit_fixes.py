@@ -358,15 +358,39 @@ def test_existing_run_scan_skips_finished_and_zombie() -> None:
 
 async def test_inject_user_input_rejects_when_queue_full() -> None:
     """Server-side backlog is bounded — a direct API caller can't grow
-    user_input_queue (and its per-item delivery task + Future) without limit."""
+    user_input_queue (and its per-item delivery task + Future) without limit.
+    The reason code must be queue_full, NOT run_finished: the browser's
+    run_finished fallback tears down a healthy run's stream."""
     run = app_module.ActiveRun("cap-run")
     run.accepting_input = True
     run.done = False
     for _ in range(app_module.MAX_USER_INPUT_QUEUE):
         run.user_input_queue.put_nowait({"text": "x"})
-    ok = await app_module._inject_user_input(
+    reason = await app_module._inject_user_input(
         run, "one too many", [], image_count=0, file_count=0)
-    assert ok is False
+    assert reason == "queue_full"
+
+
+async def test_inject_user_input_distinguishes_finished_run() -> None:
+    """A done/superseded run reports run_finished so the caller falls back to
+    a fresh run that resumes the session."""
+    run = app_module.ActiveRun("done-run")
+    run.done = True
+    reason = await app_module._inject_user_input(
+        run, "late", [], image_count=0, file_count=0)
+    assert reason == "run_finished"
+
+
+async def test_inject_user_input_accepts_returns_none() -> None:
+    """Success is None (enqueued); truthiness of the old bool contract is
+    inverted, so pin the exact value."""
+    run = app_module.ActiveRun("ok-run")
+    run.accepting_input = True
+    run.done = False
+    reason = await app_module._inject_user_input(
+        run, "fits", [], image_count=0, file_count=0)
+    assert reason is None
+    assert run.user_input_queue.qsize() == 1
 
 
 def test_persist_event_keeps_unserializable_as_placeholder() -> None:
@@ -457,3 +481,58 @@ def test_usage_history_payload_groups_by_day(tmp_path, monkeypatch) -> None:
     assert out["totals"]["turns"] == 3
     assert out["totals"]["has_billed_usage"] is True
     assert abs(out["totals"]["cost_usd"] - 0.07) < 1e-9
+
+
+# Matching Origin so these POSTs pass whether or not test_csrf's strict-CSRF
+# app import leaked into the module cache (same dance as test_restart).
+_ORIGIN = {"Origin": "http://testserver"}
+
+
+def test_chat_active_reports_turn_state(client) -> None:
+    """tryResume seeds its streaming UI from /api/chat/active — the payload
+    must carry between_turns + next_idx (parity with /api/sessions live_run),
+    or a reload onto an idle run shows a phantom spinner."""
+    run = app_module.ActiveRun("55555555-5555-5555-5555-555555555555")
+    run.done = False
+    run.between_turns = True
+    run.task = _live_task()
+    run.emit({"type": "marker"})
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    try:
+        data = client.get(f"/api/chat/active?run_id={run.run_id}").json()
+        assert data["active"] is True
+        assert data["between_turns"] is True
+        assert data["next_idx"] == run._next_idx
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)
+
+
+def test_chat_send_queue_full_is_429_not_run_finished(client) -> None:
+    """A full input backlog on a LIVE run must come back 429 queue_full.
+    The old bare-False contract mapped it to 409 run_finished, and the
+    browser's run_finished fallback tears down a healthy mid-turn stream
+    and spawns a duplicate run over the same session."""
+    run = app_module.ActiveRun("66666666-6666-6666-6666-666666666666")
+    run.done = False
+    run.accepting_input = True
+    run.task = _live_task()
+    # Mirror a run spawned under the caller's current personality/account so
+    # the supersede re-checks pass and the request reaches the inject.
+    user = {"sub": None}
+    run.personality_id = app_module._resolve_personality_for_run(user)["id"]
+    run.account_slot = app_module._resolve_account_for_run(user)["slot"]
+    for _ in range(app_module.MAX_USER_INPUT_QUEUE):
+        run.user_input_queue.put_nowait({"text": "x"})
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    try:
+        r = client.post(
+            f"/api/chat/send/{run.run_id}", data={"message": "hi"},
+            headers=_ORIGIN,
+        )
+        assert r.status_code == 429
+        assert r.json()["error"] == "queue_full"
+        # The run itself must be untouched — still live, still accepting.
+        assert run.accepting_input is True
+        assert run.user_input_queue.qsize() == app_module.MAX_USER_INPUT_QUEUE
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)

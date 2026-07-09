@@ -95,6 +95,14 @@
   // full sendOne (see drainQueueIfPossible).
   let queueDraining = false;
   const queueArea = document.getElementById("queue-area");
+  // Set to the dead run's id when the client replaces a run with a fresh one
+  // for the SAME session (fresh-run fallback, stalled-stream recovery). The
+  // next run_started re-binds every queued entry from that run onto the new
+  // run id — without this, entryForCurrentRun's per-run filter hides the
+  // remaining chips forever and their text is silently unreachable. Cleared
+  // on any explicit navigation (loadSession, /fork) because those change
+  // sessions and the old queue must NOT follow.
+  let queueRebindFromRunId = null;
 
   // Stream stall watchdog. Two clocks:
   //   lastNetworkActivityAt — every byte read from the SSE socket, including
@@ -710,24 +718,31 @@
   refreshSessions();
   refreshHeaderCost();
 
-  // Boot order: if there's an in-flight run to resume, that wins; otherwise
-  // load the session history from the URL. Doing both would race on
-  // transcript.innerHTML and produce flicker/duplicates.
+  // Boot order: a URL that names a session loads via loadSession, which
+  // renders the FULL disk transcript and tail-attaches to any live run
+  // (live_run + next_idx). tryResume must not win that race: it replays run
+  // events only, and a run spawned with resume=<sid> has no events for the
+  // pre-resume turns — booting through it truncated the visible transcript
+  // to the run's own slice. tryResume still owns the no-session case (a
+  // fresh chat reloaded before system:init named its session) and remains
+  // the rescue when the session file can't be loaded.
   (async () => {
-    let resumed = false;
-    // tryResume throws when the active-run probe can't reach the server;
-    // on boot we just loaded the page from it, so treat that rare race as
-    // "nothing to resume" and fall through to the URL's session history.
-    try { resumed = await tryResume(); } catch (_) { /* fall through */ }
-    if (resumed) return;
+    let loaded = false;
     if (sessionId) {
       try {
         await loadSession(sessionId, sessionProject);
+        loaded = true;
+        markActive(sessionId);
       } catch (err) {
         setStatus("Could not load session: " + err.message);
         announce("Could not load the session: " + err.message);
       }
-      markActive(sessionId);
+    }
+    if (!loaded) {
+      // tryResume throws when the active-run probe can't reach the server;
+      // on boot we just loaded the page from it, so treat that rare race as
+      // "nothing to resume" and leave the empty composer.
+      try { await tryResume(); } catch (_) { /* fall through */ }
     }
     renderContextMeter();
   })();
@@ -909,6 +924,9 @@
     currentRunId = null;
     safeRemove(sessionStorage, RUN_KEY);
     setStreaming(false);
+    // Explicit navigation: a pending same-session queue re-bind belongs to
+    // the conversation we're leaving, not the one we're loading.
+    queueRebindFromRunId = null;
     streamGeneration++;
     sessionId = id || "";
     // Use ?? not || so the loaded session's own (possibly empty) project
@@ -1351,6 +1369,7 @@
       messageQueue.length = 0;
       renderQueue();
     }
+    queueRebindFromRunId = null;
     setStreaming(false);
     updatePageTitle();
     promptEl.focus();
@@ -1419,6 +1438,10 @@
       // AbortError catch stays silent instead of overwriting the stall
       // guidance above with "Stopped." (announce() cancels the pending timer).
       streamGeneration++;
+      // The next send spawns a fresh run for this same session — queued
+      // entries typed into the stalled run must follow it, not vanish
+      // behind the per-run chip filter.
+      queueRebindFromRunId = currentRunId;
       if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
       currentAbort = null;
       currentRunId = null;
@@ -1609,6 +1632,9 @@
       // spawn (sibling run, new session id), never into the live run.
       forkNextSend = false;
       entry.fork = true;
+      // Forking is an explicit new-session branch — the old run's queued
+      // entries must NOT follow onto the fork's run.
+      queueRebindFromRunId = null;
       if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
       currentAbort = null;
       currentRunId = null;
@@ -1622,7 +1648,9 @@
       if (streamLooksStalled()) {
         // No SSE events in STREAM_STALL_MS — assume the stream is dead
         // client-side and recover by sending as a fresh run rather than
-        // queueing into a queue that will never drain.
+        // queueing into a queue that will never drain. Queued entries typed
+        // into the stalled run re-bind onto the fresh one (same session).
+        queueRebindFromRunId = currentRunId;
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
         currentRunId = null;
@@ -1652,7 +1680,15 @@
     if (currentRunId) {
       // SSE is still open from a previous turn (long-lived run) — send into
       // it instead of opening a second stream.
-      await sendInExistingRun(entry);
+      const res = await sendInExistingRun(entry);
+      // Server-side input queue full: this entry was never queued locally
+      // (direct-send path), so park it in the local queue for the drain to
+      // retry — otherwise the text is silently gone.
+      if (res && res.mode === "queue_full" && messageQueue.indexOf(entry) === -1) {
+        entry.originRunId = currentRunId;
+        messageQueue.push(entry);
+        renderQueue();
+      }
       return;
     }
     await sendOne(entry);
@@ -1668,6 +1704,10 @@
       await sendOne(entry);
       return { ok: true, mode: "fresh" };
     }
+    // Captured for the fallback paths below: by the time they run,
+    // currentRunId has been nulled, and the queue re-bind needs the id of
+    // the run the entries were typed into.
+    const rid = currentRunId;
     setStreaming(true);
     startGerunds();
     announce("Sent. Claude is responding.");
@@ -1715,6 +1755,14 @@
         setStreaming(false);
         return { ok: false, mode: "failed" };
       }
+      if (r.status === 429) {
+        // Server-side input queue is full — the run is alive and mid-turn,
+        // so keep the stream and the streaming state. The entry stays (or
+        // is put back) in the local queue and retries after the next result.
+        setStatus("Claude's input queue is full — message held locally; it will retry when the turn ends.");
+        announce("Input queue full. Your message is held and will retry.");
+        return { ok: false, mode: "queue_full" };
+      }
       if (!r.ok) {
         // Any other non-2xx — 404 (run gone), 409 (run superseded by a
         // personality/account swap mid-conversation), 5xx (driver
@@ -1735,6 +1783,10 @@
         currentAbort = null;
         currentRunId = null;
         safeRemove(sessionStorage, RUN_KEY);
+        // The fresh run below continues the SAME session — arm the re-bind
+        // so queued entries typed into the dying run follow it (consumed by
+        // the new run's run_started).
+        queueRebindFromRunId = rid;
         const benign409 = supersededReason === "personality_changed" ||
                           supersededReason === "account_changed";
         if (r.status !== 404 && !benign409) {
@@ -1762,6 +1814,11 @@
       currentAbort = null;
       currentRunId = null;
       safeRemove(sessionStorage, RUN_KEY);
+      // No fresh run is spawned here, but the user's next manual send will
+      // spawn one for this same session — arm the re-bind so the queued
+      // entries typed into the dead run resurface on it instead of being
+      // hidden by the per-run filter.
+      queueRebindFromRunId = rid;
       handleStreamError(err);
       setStreaming(false);
       return { ok: false, mode: "failed" };
@@ -1872,6 +1929,9 @@
         try { code = (await r.json()).error || ""; } catch (_) { /* non-JSON body */ }
         if (code === "restart_pending") {
           throw new Error("Server restart in progress — wait a few seconds and resend.");
+        }
+        if (code === "queue_full") {
+          throw new Error("Claude's input queue for this session is full — wait for the current turn and resend.");
         }
         throw new Error("HTTP " + r.status);
       }
@@ -2061,6 +2121,9 @@
     if (attempt >= STREAM_RECOVERY_DELAYS_MS.length) {
       stopGerunds();
       setStreaming(false);
+      // Give up on this run. A later send spawns a fresh run for the same
+      // session — queued entries typed into this one re-bind onto it.
+      queueRebindFromRunId = rid;
       const msg = "Couldn't reconnect to the running task. Reload the page to retry, or send a new message.";
       setStatus(msg);
       announce(msg);
@@ -2093,6 +2156,9 @@
         // streaming UI rather than leaving a spinner that never resolves.
         stopGerunds();
         setStreaming(false);
+        // The run is gone for good — carry its queued entries onto the
+        // fresh run the next send will spawn for this same session.
+        queueRebindFromRunId = rid;
         const msg = "The previous response ended while you were away. Reload the page to see it, or send a new message.";
         setStatus(msg);
         announce(msg);
@@ -2160,9 +2226,22 @@
     const myAbort = new AbortController();
     currentRunId = savedRunId;
     currentAbort = myAbort;
-    setStreaming(true);
-    startGerunds();
-    announce("Reconnecting to previous response.");
+    // Seed streaming state from the server's authoritative turn state (same
+    // contract attachLiveRun uses) instead of assuming mid-turn. An idle or
+    // finished run resumes without a phantom spinner; a mid-turn run shows
+    // one immediately, and the replayed events keep it truthful from there
+    // (user_prompt/auto_fire flip it on, result/error/_done flip it off).
+    // between_turns may be absent while an older server is still running —
+    // fall back to the old assumption (streaming) for an active run then.
+    const midTurn = !!(info.active
+      && (typeof info.between_turns === "boolean" ? !info.between_turns : true));
+    setStreaming(midTurn);
+    if (midTurn) {
+      startGerunds();
+      announce("Reconnecting to the response in progress.");
+    } else {
+      announce("Restoring the previous conversation.");
+    }
     try {
       const streamUrl = `/api/chat/stream/${encodeURIComponent(savedRunId)}`
         + (incremental ? `?start_index=${wm + 1}` : "");
@@ -2195,8 +2274,10 @@
     return true;
   }
 
-  // Attach to a live run discovered via /api/sessions {live_run} on a fresh
-  // page load — no sessionStorage RUN_KEY exists, so tryResume can't fire.
+  // Attach to a live run discovered via /api/sessions {live_run}. This is
+  // the primary restore path whenever the URL names a session (boot prefers
+  // loadSession over tryResume — the disk transcript is the only complete
+  // history for a resumed run, whose event log starts at the resume point).
   // loadSession already rendered the disk transcript, so we TAIL-attach from
   // the run's current _next_idx: subscribe() replays nothing already on disk,
   // yet every durable whole-message event from here on (including the in-flight
@@ -2350,6 +2431,22 @@
       if (obj.run_id) {
         currentRunId = obj.run_id;
         safeSet(sessionStorage, RUN_KEY, obj.run_id);
+        // Same-session run replacement: carry queued entries from the dead
+        // run onto this one so their chips stay visible and drainable.
+        if (queueRebindFromRunId) {
+          let moved = 0;
+          messageQueue.forEach((e) => {
+            if (e.originRunId === queueRebindFromRunId) {
+              e.originRunId = obj.run_id;
+              moved += 1;
+            }
+          });
+          queueRebindFromRunId = null;
+          if (moved) {
+            renderQueue();
+            announce(`${moved} queued message${moved === 1 ? "" : "s"} carried over to the new run.`);
+          }
+        }
       }
       if (obj.project) sessionProject = obj.project;
       if (obj.model) lastSeenModel = obj.model;
@@ -2363,6 +2460,15 @@
       // The server confirmed this queued message reached the CLI — clear its
       // chip; it's no longer recallable.
       if (obj.queue_id) clearQueueEntryById(obj.queue_id);
+      // A user message reaching the CLI starts a turn — mirror auto_fire so
+      // the streaming state tracks the event stream. This matters on replay:
+      // a full re-play of a multi-turn run used to end on the LAST result's
+      // setStreaming(false) even while a live turn was still mid-flight,
+      // which killed the spinner, the stall watchdog, and the premature-EOF
+      // reconnect gate in drainStream. With user_prompt flipping it back on,
+      // the replayed sequence lands in the run's true current state.
+      setStreaming(true);
+      startGerunds();
     } else if (obj.type === "queued_input_cancelled") {
       // A recall (this tab or another) dropped a queued message before the
       // CLI saw it. Idempotent: no-op if we already cleared it locally.
