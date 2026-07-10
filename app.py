@@ -5169,6 +5169,13 @@ class ActiveRun:
         # clean interruption rather than a crash. Cleared when that result is
         # consumed, and again at each turn start as a stale-flag guard.
         self.interrupting: bool = False
+        # Armed when the driver consumes an interrupted turn's ResultMessage.
+        # The CLI follows that result with a bare UserMessage echo of the
+        # interrupt marker ("[Request interrupted by user]"); the echo opens
+        # no turn, so _apply_turn_state must not read it as one. Consumed by
+        # the first Assistant/UserMessage after arming, and dropped at each
+        # real turn start as a stale-flag guard.
+        self.expect_interrupt_echo: bool = False
         self.session_id: Optional[str] = None
         self.project_key: Optional[str] = None
         self.task: Optional[asyncio.Task] = None
@@ -8209,6 +8216,10 @@ async def api_chat(
                                 # rendering a crash banner. Cost/usage logging
                                 # already happened inside _sdk_message_to_events.
                                 run.interrupting = False
+                                # The CLI will echo the interrupt marker as a
+                                # bare UserMessage after this result; see
+                                # _apply_turn_state.
+                                run.expect_interrupt_echo = True
                                 for evt in evts:
                                     if evt.get("type") == "result":
                                         evt["is_error"] = False
@@ -8268,24 +8279,7 @@ async def api_chat(
                                         tid, len(run.bg_tool_use_ids), run.run_id,
                                     )
 
-                            if isinstance(msg, ResultMessage):
-                                run.between_turns = True
-                                # Drop any sub-flush-threshold partial text left
-                                # over from an interrupted block, so it can't be
-                                # prepended to the next turn's first partial frame.
-                                run.partial_text_buf = ""
-                                _notify_turn_complete(run)
-                            elif isinstance(msg, (AssistantMessage, UserMessage)):
-                                # Active LLM turn / tool dance. We're not
-                                # between-turns again until the next Result.
-                                if run.between_turns:
-                                    run.turn_started_at = time.monotonic()
-                                run.between_turns = False
-                                _maybe_record_checkpoint(run, msg)
-                            # Task* and Init messages are out-of-band — they
-                            # don't change run.between_turns. A TaskNotification
-                            # arriving between turns must keep run.between_turns
-                            # = True so the grace timer can arm.
+                            _apply_turn_state(run, msg, evts)
 
                         # Set once a queued/deferred message actually reaches the
                         # CLI this round, so the continue below fires and we don't
@@ -8349,7 +8343,10 @@ async def api_chat(
                             # A new turn is starting; drop any stale interrupt
                             # flag left by a stop click that found nothing to
                             # interrupt, so this turn's result isn't misread.
+                            # Same for an echo expectation whose echo never
+                            # arrived.
                             run.interrupting = False
+                            run.expect_interrupt_echo = False
                             ack: Optional[asyncio.Future] = item.get("delivered")
                             if ack is not None and ack.cancelled():
                                 # The POST handler's _confirm_and_emit_user_prompt
@@ -8426,6 +8423,7 @@ async def api_chat(
                             # auto-fire a synth user message.
                             action = _drain_pending_for_auto_fire()
                             run.interrupting = False
+                            run.expect_interrupt_echo = False
                             async with run.client_write_lock:
                                 await client.query(action["synth"])
                             last_cli_activity = time.monotonic()
@@ -9166,6 +9164,47 @@ def _maybe_record_checkpoint(run: "ActiveRun", msg) -> None:
     # once the conversation has moved far past them.
     if len(run.checkpoints) > 200:
         del run.checkpoints[:100]
+
+
+def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
+    """Advance ``run.between_turns`` for one consumed SDK message.
+
+    Task*/Init messages are out-of-band and leave turn state alone — a
+    TaskNotification arriving between turns must keep ``between_turns`` True
+    so the auto-fire grace timer can arm. Factored out of the driver loop so
+    the interrupt-echo rule is unit-testable.
+    """
+    if isinstance(msg, ResultMessage):
+        run.between_turns = True
+        # Drop any sub-flush-threshold partial text left over from an
+        # interrupted block, so it can't be prepended to the next turn's
+        # first partial frame.
+        run.partial_text_buf = ""
+        _notify_turn_complete(run)
+    elif isinstance(msg, (AssistantMessage, UserMessage)):
+        # After client.interrupt(), the CLI echoes the interrupt marker
+        # ("[Request interrupted by user]") as a bare UserMessage AFTER the
+        # turn's ResultMessage. The echo opens no turn and translates to no
+        # events. Without this gate it flipped between_turns back to False
+        # with nothing running; the driver only polls user_input_queue
+        # between turns, so every queued message sat undelivered until the
+        # mid-turn silence cap tore the run down 30 minutes later. Real
+        # turns are entered by the driver's own delivery/auto-fire writers,
+        # never inferred from a bare echo.
+        is_interrupt_echo = (
+            run.expect_interrupt_echo
+            and run.between_turns
+            and isinstance(msg, UserMessage)
+            and not evts
+        )
+        run.expect_interrupt_echo = False
+        if not is_interrupt_echo:
+            # Active LLM turn / tool dance. We're not between-turns again
+            # until the next Result.
+            if run.between_turns:
+                run.turn_started_at = time.monotonic()
+            run.between_turns = False
+        _maybe_record_checkpoint(run, msg)
 
 
 # Coalesce partial text into ≥N-char SSE frames. Per-token frames would
