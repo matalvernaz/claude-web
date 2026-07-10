@@ -9830,6 +9830,171 @@ async def api_usage_history(
     )
 
 
+# ── Live plan usage (Anthropic OAuth API) ────────────────────────────────
+# The endpoints Claude Code's own /usage command talks to. They accept the
+# CLI's OAuth bearer token; API-key slots have no plan to query.
+ANTHROPIC_OAUTH_API = "https://api.anthropic.com/api/oauth"
+ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
+LIVE_USAGE_TIMEOUT_SECONDS = 10.0
+
+# Labels for the fixed rate-limit buckets in /api/oauth/usage `limits[]`;
+# model-scoped weekly buckets are labelled from their scope instead.
+_LIVE_LIMIT_LABELS = {
+    "session": "Session (5-hour window)",
+    "weekly_all": "Week — all models",
+}
+
+
+def _read_oauth_token(home: Optional[Path]) -> tuple[Optional[str], Optional[int]]:
+    """Access token + expiry (ms epoch) from a slot's .credentials.json.
+
+    The token stays server-side: callers use it for the outbound Anthropic
+    request and must never place it in a response, log line, or exception
+    message.
+    """
+    try:
+        data = json.loads(
+            setup_flow.credentials_path(home).read_text(encoding="utf-8"),
+        )
+    except (OSError, ValueError):
+        return None, None
+    oauth = data.get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
+        return None, None
+    expires = oauth.get("expiresAt")
+    return token, expires if isinstance(expires, (int, float)) else None
+
+
+async def _fetch_anthropic_live_usage(
+    token: str,
+) -> tuple[Optional[dict], Optional[dict], Optional[str]]:
+    """GET the OAuth profile and usage endpoints concurrently.
+
+    Returns ``(profile, usage, error)``. Best-effort per endpoint — a
+    profile failure still returns usage and vice versa; ``error`` reflects
+    whichever half failed (usage's error wins: it's what the dialog is
+    for). Error strings are short tokens, never Anthropic response bodies.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+    }
+
+    async def _get(client: httpx.AsyncClient, path: str):
+        try:
+            resp = await client.get(f"{ANTHROPIC_OAUTH_API}/{path}", headers=headers)
+        except httpx.HTTPError:
+            return None, "anthropic_unreachable"
+        if resp.status_code == 401:
+            return None, "token_rejected"
+        if resp.status_code != 200:
+            return None, f"anthropic_http_{resp.status_code}"
+        try:
+            return resp.json(), None
+        except ValueError:
+            return None, "anthropic_bad_json"
+
+    async with httpx.AsyncClient(timeout=LIVE_USAGE_TIMEOUT_SECONDS) as client:
+        (profile, profile_err), (usage, usage_err) = await asyncio.gather(
+            _get(client, "profile"), _get(client, "usage"),
+        )
+    return profile, usage, usage_err or profile_err
+
+
+def _shape_live_usage(profile: Optional[dict], usage: Optional[dict]) -> dict:
+    """Trim the Anthropic responses down to what the usage dialog renders.
+
+    Whitelist-shaped on purpose: new upstream fields reach the client only
+    when picked up here. Unknown limit kinds still pass through (labelled
+    by their raw kind) so new buckets appear without a code change.
+    """
+    out: dict[str, Any] = {
+        "account": None, "organization": None, "limits": [], "extra_usage": None,
+    }
+    if profile:
+        acct = profile.get("account") or {}
+        org = profile.get("organization") or {}
+        out["account"] = {
+            "email": acct.get("email"),
+            "display_name": acct.get("display_name"),
+        }
+        out["organization"] = {
+            "name": org.get("name"),
+            "organization_type": org.get("organization_type"),
+            "rate_limit_tier": org.get("rate_limit_tier"),
+            "seat_tier": org.get("seat_tier"),
+            "subscription_status": org.get("subscription_status"),
+        }
+    if usage:
+        for lim in usage.get("limits") or []:
+            if not isinstance(lim, dict):
+                continue
+            kind = lim.get("kind") or ""
+            label = _LIVE_LIMIT_LABELS.get(kind)
+            if label is None:
+                scope_model = (
+                    ((lim.get("scope") or {}).get("model")) or {}
+                ).get("display_name")
+                if kind == "weekly_scoped" and scope_model:
+                    label = f"Week — {scope_model}"
+                else:
+                    label = kind or "Limit"
+            out["limits"].append({
+                "kind": kind,
+                "label": label,
+                "percent": lim.get("percent"),
+                "resets_at": lim.get("resets_at"),
+                "is_active": bool(lim.get("is_active")),
+                "severity": lim.get("severity"),
+            })
+        extra = usage.get("extra_usage") or {}
+        out["extra_usage"] = {
+            "is_enabled": bool(extra.get("is_enabled")),
+            "disabled_reason": extra.get("disabled_reason"),
+            "utilization": extra.get("utilization"),
+        }
+    return out
+
+
+@app.get("/api/usage/live")
+async def api_usage_live(request: Request, user: dict = Depends(auth.require_user)):
+    """Live plan usage for one credential slot, fetched from Anthropic.
+
+    ``?slot=`` takes the account picker's value (``shared`` or ``cred:<id>``);
+    unowned/garbage slots 404 like the other account endpoints. The slot's
+    OAuth bearer is read server-side and used for the outbound call only —
+    it never appears in the response.
+
+    Deliberately no token refresh here: Anthropic rotates refresh tokens on
+    use, so refreshing from this handler could invalidate the copy the CLI
+    holds and sign the slot out. A stale token is reported as an error
+    instead; any run on the slot refreshes it as a side effect.
+    """
+    slot = request.query_params.get("slot") or "shared"
+    sub = user.get("sub")
+    if not _account_slot_visible(sub, slot):
+        raise HTTPException(status_code=404, detail="unknown account slot")
+    cred_id = _parse_cred_active(slot)
+    home = _credential_home_path(sub, cred_id) if cred_id is not None else None
+    info = await asyncio.to_thread(setup_flow.whoami, home)
+    base = {"slot": slot, "mode": info.get("mode"), "error": None}
+    if info.get("mode") != "oauth":
+        return base
+    token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    if not token:
+        return {**base, "error": "no_token"}
+    if expires_at is not None and expires_at / 1000 <= time.time():
+        return {**base, "error": "token_expired"}
+    profile, usage, err = await _fetch_anthropic_live_usage(token)
+    return {
+        **base,
+        **_shape_live_usage(profile, usage),
+        "error": err,
+        "fetched_at": int(time.time()),
+    }
+
+
 @app.get("/account")
 async def account_page(request: Request, user: dict = Depends(auth.require_user)):
     """Per-user credential management — add/remove/rename Claude accounts.

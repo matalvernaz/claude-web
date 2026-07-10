@@ -4052,10 +4052,23 @@
   const usageDialog = document.getElementById("usage-dialog");
   const usageBody = document.getElementById("usage-body");
 
+  // Guards a reopen race: closing and reopening the dialog (possibly on a
+  // different account) must not let the previous open's still-in-flight live
+  // fetch write into the fresh placeholder.
+  let usageOpenSeq = 0;
+
   usageBtn.addEventListener("click", async () => {
+    const seq = ++usageOpenSeq;
     usageBody.textContent = "Loading…";
     if (typeof usageDialog.showModal === "function") usageDialog.showModal();
     else usageDialog.setAttribute("open", "open");
+    const slot = accountSelect && accountSelect.value ? accountSelect.value : "shared";
+    const slotLabel = accountSelect && accountSelect.selectedIndex >= 0
+      ? accountSelect.options[accountSelect.selectedIndex].text
+      : "Shared";
+    // Live plan usage is an outbound call to Anthropic — start it now, fill
+    // its placeholder in whenever it lands so local data never waits on it.
+    const liveP = fetch("/api/usage/live?slot=" + encodeURIComponent(slot)).catch(() => null);
     try {
       // Today's breakdown and the 30-day history come from two endpoints;
       // fetch them together. History is best-effort — a failure there still
@@ -4065,16 +4078,24 @@
         fetch("/api/usage/history?days=30").catch(() => null),
       ]);
       if (!uR.ok) throw new Error("HTTP " + uR.status);
-      renderUsage(await uR.json());
+      renderUsage(await uR.json(), slotLabel);
       if (hR && hR.ok) {
         try { renderUsageHistory(await hR.json()); } catch (_) { /* leave Today */ }
       }
     } catch (err) {
       usageBody.textContent = "Could not load usage: " + err.message;
+      return;
     }
+    let live = null;
+    try {
+      const lR = await liveP;
+      if (lR && lR.ok) live = await lR.json();
+    } catch (_) { /* placeholder shows the failure text */ }
+    if (seq !== usageOpenSeq) return;
+    renderLiveUsage(live, slotLabel);
   });
 
-  function renderUsage(data) {
+  function renderUsage(data, slotLabel) {
     const t = data.today || {};
     const rl = data.rate_limit && data.rate_limit.info ? data.rate_limit.info : null;
     const showCost = !!t.has_billed_usage;
@@ -4082,6 +4103,11 @@
     const fmt = new Intl.NumberFormat();
 
     let html = "";
+
+    // Placeholder for the live Anthropic plan data; renderLiveUsage fills it
+    // when the /api/usage/live fetch resolves.
+    html += `<h3 class="usage-section">Plan — ${htmlEscape(slotLabel || "Shared")}</h3>
+      <div id="usage-live"><p class="usage-note">Checking Anthropic for live limits…</p></div>`;
 
     if (rl) {
       const reset = rl.resetsAt ? new Date(rl.resetsAt * 1000) : null;
@@ -4133,8 +4159,96 @@
     if (!showCost && (t.turns || 0) > 0) {
       html += `<p class="usage-note">Costs are hidden because today's turns ran on subscription credentials — Anthropic bills you the flat plan rate, not per-token. Switch to an API-key slot to see real per-turn costs.</p>`;
     }
-    html += `<p class="usage-note">Anthropic doesn't expose plan-level capacity via API. "Today" is what this app has logged since it started.</p>`;
+    html += `<p class="usage-note">"Today" and "History" are what this app has logged locally; the Plan section above is live from Anthropic.</p>`;
     usageBody.innerHTML = html;
+  }
+
+  // organization_type → human plan name; unknown types render raw.
+  const PLAN_TYPE_LABELS = {
+    claude_pro: "Pro plan",
+    claude_max: "Max plan",
+    claude_team: "Team plan",
+    claude_enterprise: "Enterprise plan",
+  };
+
+  // Fill the #usage-live placeholder with live plan data from Anthropic
+  // (/api/usage/live). Ends with a single announce() so a screen reader
+  // hears the numbers without hunting for the section that appeared above
+  // the reading position.
+  function renderLiveUsage(live, slotLabel) {
+    const target = document.getElementById("usage-live");
+    if (!target) return;
+    const fail = (text) => {
+      target.innerHTML = `<p class="usage-note">${htmlEscape(text)}</p>`;
+      announce("Live plan usage unavailable for " + (slotLabel || "this account"));
+    };
+    if (!live) return fail("Could not load live plan usage.");
+    if (live.mode === "api_key") {
+      target.innerHTML = `<p class="usage-note">This account uses an API key — per-token billing, plan limits don't apply.</p>`;
+      announce("API-key account: no plan limits");
+      return;
+    }
+    if (live.mode !== "oauth" || live.error === "no_token") {
+      return fail("No Claude subscription credentials on this account.");
+    }
+    if (live.error === "token_expired" || live.error === "token_rejected") {
+      return fail("Anthropic session token is expired or revoked. Send one message on this account to refresh it, then reopen Usage.");
+    }
+    if (live.error === "anthropic_unreachable") {
+      return fail("Could not reach Anthropic's API.");
+    }
+    if (live.error && !(live.limits && live.limits.length)) {
+      return fail("Anthropic returned an error (" + live.error + ").");
+    }
+
+    let html = "";
+    const acct = live.account || {};
+    const org = live.organization || {};
+    const bits = [];
+    if (acct.email) bits.push(htmlEscape(acct.email));
+    if (org.name) bits.push(htmlEscape(org.name));
+    if (org.organization_type) {
+      bits.push(htmlEscape(PLAN_TYPE_LABELS[org.organization_type] || org.organization_type));
+    }
+    if (org.rate_limit_tier) bits.push(`<span title="Anthropic rate-limit tier">${htmlEscape(org.rate_limit_tier)}</span>`);
+    if (bits.length) {
+      html += `<div class="summary">${bits.map((b) => `<span>${b}</span>`).join(" ")}</div>`;
+    }
+
+    const spoken = [];
+    if (live.limits && live.limits.length) {
+      html += `<table><thead><tr><th>Limit</th><th>Used</th><th>Resets</th></tr></thead><tbody>`;
+      for (const l of live.limits) {
+        const reset = l.resets_at ? new Date(l.resets_at) : null;
+        const resetText = reset && !isNaN(reset)
+          ? `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} (${humanIn(reset)})`
+          : "—";
+        const pct = l.percent == null ? "—" : `${l.percent}%`;
+        const used = l.is_active && l.percent != null ? `${pct} (active window)` : pct;
+        html += `<tr><td>${htmlEscape(l.label)}</td><td>${used}</td><td>${resetText}</td></tr>`;
+        if (l.percent != null) spoken.push(`${l.label} ${l.percent} percent`);
+      }
+      html += `</tbody></table>`;
+    } else {
+      html += `<p class="usage-note">Anthropic returned no limit data.</p>`;
+    }
+
+    if (live.extra_usage) {
+      const x = live.extra_usage;
+      let msg;
+      if (x.is_enabled) {
+        msg = "Extra usage is enabled" + (x.utilization != null ? ` — ${x.utilization}% of this month's cap used` : "") + ".";
+      } else if (x.disabled_reason === "out_of_credits") {
+        msg = "Extra usage: out of credits — hitting a cap hard-stops until the window resets.";
+      } else {
+        msg = "Extra usage is off — hitting a cap hard-stops until the window resets.";
+      }
+      html += `<p class="usage-note">${htmlEscape(msg)}</p>`;
+    }
+
+    target.innerHTML = html;
+    announce("Live plan usage for " + (slotLabel || "account") + ": "
+      + (spoken.length ? spoken.join(", ") : "no limit data"));
   }
 
   // Append a per-day spend/token history table (from /api/usage/history) below

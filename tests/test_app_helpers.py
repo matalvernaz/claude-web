@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -1151,3 +1152,125 @@ def test_resolve_plan_text_truncates(tmp_path, monkeypatch) -> None:
     out = app_module._resolve_plan_text(SimpleNamespace(plan_file=str(f)), "")
     assert "plan truncated" in out
     assert len(out) <= app_module.MAX_PLAN_CHARS + 60
+
+
+# ── /api/usage/live helpers ──────────────────────────────────────────────
+
+
+def test_shape_live_usage_maps_limits_and_scoped_model() -> None:
+    profile = {
+        "account": {"email": "a@b.c", "display_name": "A"},
+        "organization": {
+            "name": "COBD",
+            "organization_type": "claude_team",
+            "rate_limit_tier": "default_claude_max_5x",
+            "seat_tier": "team_tier_1",
+            "subscription_status": "active",
+        },
+    }
+    usage = {
+        "limits": [
+            {"kind": "session", "percent": 4, "resets_at": "R1",
+             "is_active": True, "severity": "normal", "scope": None},
+            {"kind": "weekly_all", "percent": 0, "resets_at": "R2",
+             "is_active": False, "severity": "normal", "scope": None},
+            {"kind": "weekly_scoped", "percent": 1, "resets_at": "R3",
+             "is_active": False, "severity": "normal",
+             "scope": {"model": {"id": None, "display_name": "Fable"},
+                       "surface": None}},
+            # Unknown bucket kinds must pass through, not vanish.
+            {"kind": "mystery_new", "percent": 7, "resets_at": None,
+             "is_active": False, "severity": "normal"},
+        ],
+        "extra_usage": {"is_enabled": False,
+                        "disabled_reason": "out_of_credits",
+                        "utilization": None},
+    }
+    out = app_module._shape_live_usage(profile, usage)
+    assert [lim["label"] for lim in out["limits"]] == [
+        "Session (5-hour window)", "Week — all models",
+        "Week — Fable", "mystery_new",
+    ]
+    assert out["limits"][0]["is_active"] is True
+    assert out["organization"]["rate_limit_tier"] == "default_claude_max_5x"
+    assert out["account"]["email"] == "a@b.c"
+    assert out["extra_usage"]["disabled_reason"] == "out_of_credits"
+
+
+def test_shape_live_usage_tolerates_missing_halves() -> None:
+    assert app_module._shape_live_usage(None, None) == {
+        "account": None, "organization": None,
+        "limits": [], "extra_usage": None,
+    }
+
+
+def test_read_oauth_token_valid_missing_and_malformed(tmp_path) -> None:
+    cred = tmp_path / ".credentials.json"
+    cred.write_text(json.dumps(
+        {"claudeAiOauth": {"accessToken": "tok-123", "expiresAt": 1234}},
+    ), encoding="utf-8")
+    assert app_module._read_oauth_token(tmp_path) == ("tok-123", 1234)
+
+    cred.write_text("not json", encoding="utf-8")
+    assert app_module._read_oauth_token(tmp_path) == (None, None)
+
+    cred.unlink()
+    assert app_module._read_oauth_token(tmp_path) == (None, None)
+
+
+async def test_api_usage_live_unknown_slot_is_404() -> None:
+    req = SimpleNamespace(query_params={"slot": "cred:424242"})
+    with pytest.raises(HTTPException) as exc:
+        await app_module.api_usage_live(req, {"sub": "user-live-404"})
+    assert exc.value.status_code == 404
+
+
+async def test_api_usage_live_api_key_slot_short_circuits(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "api_key"})
+
+    async def boom(token):
+        raise AssertionError("must not call Anthropic for api_key slots")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    req = SimpleNamespace(query_params={})
+    out = await app_module.api_usage_live(req, {"sub": "user-live-key"})
+    assert out == {"slot": "shared", "mode": "api_key", "error": None}
+
+
+async def test_api_usage_live_expired_token_skips_fetch(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "oauth"})
+    monkeypatch.setattr(app_module, "_read_oauth_token",
+                        lambda home: ("tok", 1000))  # expired long ago (ms)
+
+    async def boom(token):
+        raise AssertionError("must not call Anthropic with an expired token")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    req = SimpleNamespace(query_params={})
+    out = await app_module.api_usage_live(req, {"sub": "user-live-exp"})
+    assert out["error"] == "token_expired"
+    assert out["mode"] == "oauth"
+
+
+async def test_api_usage_live_happy_path_never_returns_token(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "oauth"})
+    monkeypatch.setattr(app_module, "_read_oauth_token",
+                        lambda home: ("sekrit-token", None))
+
+    async def fake_fetch(token):
+        assert token == "sekrit-token"
+        return (
+            {"account": {"email": "x@y.z"}, "organization": {"name": "Org"}},
+            {"limits": [{"kind": "session", "percent": 2, "resets_at": "R",
+                         "is_active": True, "severity": "normal"}],
+             "extra_usage": {"is_enabled": True}},
+            None,
+        )
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", fake_fetch)
+    req = SimpleNamespace(query_params={})
+    out = await app_module.api_usage_live(req, {"sub": "user-live-ok"})
+    assert out["slot"] == "shared" and out["error"] is None
+    assert out["account"]["email"] == "x@y.z"
+    assert out["limits"][0]["label"] == "Session (5-hour window)"
+    assert "sekrit-token" not in json.dumps(out)
