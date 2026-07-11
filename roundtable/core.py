@@ -147,8 +147,8 @@ _anthropic = anthropic.Anthropic(api_key=_anthropic_key, max_retries=0) if _anth
 # itself by role ("Gemini Pro"), not by version string. The KEYS are
 # likewise stable caller-facing handles, not model-version promises:
 # "gpt-5-mini" deliberately stays put across mini bumps (currently
-# gpt-5.4-mini), so don't rename a key on a model refresh — change only
-# the "model" value.
+# gpt-5.6-luna, the fast/affordable tier of the 5.6 series), so don't
+# rename a key on a model refresh — change only the "model" value.
 PARTICIPANTS: dict[str, dict] = {
     "gemini-flash": {
         "provider": "gemini",
@@ -162,12 +162,12 @@ PARTICIPANTS: dict[str, dict] = {
     },
     "gpt-5-mini": {
         "provider": "openai",
-        "model": "gpt-5.4-mini",
+        "model": "gpt-5.6-luna",
         "label": "GPT-5 Mini",
     },
     "gpt-5": {
         "provider": "openai",
-        "model": "gpt-5.5",
+        "model": "gpt-5.6-sol",
         "label": "GPT-5",
     },
     "claude-sonnet": {
@@ -3251,7 +3251,7 @@ def roundtable_ask(
 
     ``participant`` must be one of the keys in ``PARTICIPANTS``
     (currently: ``gemini-flash``, ``gemini-pro``, ``gpt-5-mini``,
-    ``gpt-5``, ``claude-sonnet``, ``claude-opus``).
+    ``gpt-5``, ``claude-sonnet``, ``claude-opus``, ``claude-fable``).
 
     ``effort`` selects the participant's reasoning/thinking spend:
     ``"low" | "medium" | "high"``, or empty (default) to let the
