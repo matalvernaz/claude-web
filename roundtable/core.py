@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 import anthropic
+import jsonschema
 from google import genai
 from google.genai import types as genai_types
 from openai import OpenAI
@@ -164,6 +165,11 @@ PARTICIPANTS: dict[str, dict] = {
         "provider": "openai",
         "model": "gpt-5.6-luna",
         "label": "GPT-5 Mini",
+    },
+    "gpt-5-terra": {
+        "provider": "openai",
+        "model": "gpt-5.6-terra",
+        "label": "GPT-5 Terra",
     },
     "gpt-5": {
         "provider": "openai",
@@ -370,6 +376,20 @@ def _conn() -> sqlite3.Connection:
                 created_at REAL NOT NULL
             )"""
         )
+        # A thread may carry one active compaction: messages with idx <=
+        # upto_idx are replaced, in what PARTICIPANTS see, by the stored
+        # summary. Non-destructive — the messages table keeps every original
+        # row (roundtable_history(raw=True) still shows them); only the
+        # rendered view changes. One row per thread; re-compacting REPLACEs
+        # with a larger upto_idx.
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS compactions (
+                thread_id INTEGER PRIMARY KEY,
+                upto_idx INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )"""
+        )
         cols = {row[1] for row in c.execute("PRAGMA table_info(threads)").fetchall()}
         if "participants_json" not in cols:
             c.execute(
@@ -468,6 +488,43 @@ def _append_message(thread_id: int, speaker: str, content: str) -> int:
         f"could not allocate a message idx for thread {thread_id} after "
         f"{_IDX_COLLISION_RETRIES} attempts (cross-process contention)"
     )
+
+
+def _compaction_row(thread_id: int) -> Optional[dict]:
+    """Return the thread's active compaction, or None if it has none."""
+    with _db_lock:
+        row = _conn().execute(
+            "SELECT upto_idx, summary, created_at FROM compactions "
+            "WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"upto_idx": row[0], "summary": row[1], "created_at": row[2]}
+
+
+def _effective_messages(thread_id: int) -> list[dict]:
+    """The message list PARTICIPANTS see: raw messages, unless the thread has
+    been compacted — then a single synthetic orchestrator message carrying the
+    stored summary stands in for everything at or before the compaction
+    cutoff, followed by the uncompacted tail verbatim.
+
+    The synthetic message reuses the cutoff idx so a later re-compaction can
+    tell what the summary already covers. Raw history is never modified —
+    ``_thread_messages`` / ``roundtable_history(raw=True)`` still return it.
+    """
+    messages = _thread_messages(thread_id)
+    comp = _compaction_row(thread_id)
+    if comp is None:
+        return messages
+    tail = [m for m in messages if m["idx"] > comp["upto_idx"]]
+    synthetic = {
+        "idx": comp["upto_idx"],
+        "speaker": "orchestrator",
+        "content": comp["summary"],
+        "ts": comp["created_at"],
+    }
+    return [synthetic] + tail
 
 
 def _thread_is_closed(thread_id: int) -> bool:
@@ -1708,6 +1765,25 @@ def _path_under_allowlist(path: str) -> bool:
     return False
 
 
+def _validate_bindable_dir(working_directory: str) -> Path:
+    """Resolve ``working_directory`` and enforce the bindability rules shared
+    by ``roundtable_bind_repo`` and ``roundtable_bind_diff``: it must exist,
+    be a directory, and sit under the ``ROUNDTABLE_REPO_ROOTS`` allowlist
+    (when one is configured). Returns the resolved path."""
+    resolved = Path(working_directory).expanduser().resolve()
+    if not resolved.is_dir():
+        raise ValueError(
+            f"working_directory {working_directory!r} is not an existing "
+            f"directory (resolved to {resolved})."
+        )
+    if not _path_under_allowlist(str(resolved)):
+        raise ValueError(
+            f"working_directory {resolved} is outside ROUNDTABLE_REPO_ROOTS "
+            f"({_REPO_ROOT_ALLOWLIST}). Add it to the allowlist to bind here."
+        )
+    return resolved
+
+
 def _readonly_permission_callback(
     participant_label: str, tool_name: str, tool_input: dict,
 ) -> PermissionDecision:
@@ -2190,17 +2266,7 @@ def roundtable_bind_repo(
             f"permission_policy must be one of {sorted(_VALID_TOOL_POLICIES)}; "
             f"got {permission_policy!r}"
         )
-    resolved = Path(working_directory).expanduser().resolve()
-    if not resolved.is_dir():
-        raise ValueError(
-            f"working_directory {working_directory!r} is not an existing "
-            f"directory (resolved to {resolved})."
-        )
-    if not _path_under_allowlist(str(resolved)):
-        raise ValueError(
-            f"working_directory {resolved} is outside ROUNDTABLE_REPO_ROOTS "
-            f"({_REPO_ROOT_ALLOWLIST}). Add it to the allowlist to bind here."
-        )
+    resolved = _validate_bindable_dir(working_directory)
     if not _REPO_ROOT_ALLOWLIST:
         logger.warning(
             "binding thread %s to %s with no ROUNDTABLE_REPO_ROOTS allowlist "
@@ -2526,6 +2592,143 @@ def roundtable_bind_github(thread_id: int, repo: str, ref: str = "HEAD") -> dict
         "thread_id": thread_id, "repo": repo, "ref": ref,
         "commit_sha": commit_sha, "working_directory": str(dest),
         "file_count": file_count,
+    }
+
+
+# ─── Working-diff binding ────────────────────────────────────────────────
+
+_DIFF_ARTIFACT_NAME = "working-diff"
+# Total cap on the captured diff text; middle-truncated beyond it. Sits
+# under PROMPT_CHAR_CAP so the artifact announcement can't starve the
+# rest of the transcript.
+_BIND_DIFF_MAX_CHARS = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_BIND_DIFF_MAX_CHARS", "200000")
+)
+# Untracked files are each rendered as a /dev/null pseudo-diff (one git
+# invocation apiece); cap how many so a node_modules-style spray can't
+# stall the call.
+_BIND_DIFF_MAX_UNTRACKED = 50
+
+
+def roundtable_bind_diff(
+    thread_id: int, working_directory: str, base: str = "HEAD",
+) -> dict:
+    """Capture the repo's working diff as a versioned artifact and bind the
+    repo read-only — one call to put "review my uncommitted change" in
+    front of the panel.
+
+    Runs ``git diff <base>`` in ``working_directory`` (``HEAD`` covers
+    staged + unstaged; any commit-ish works, e.g. ``main`` to review a
+    whole branch), appends each untracked file as a ``/dev/null``
+    pseudo-diff, and stores the result via ``roundtable_set_artifact`` as
+    ``'working-diff'`` — so re-capturing after edits announces what changed
+    since the last capture. Also registers a ``readonly`` repo binding
+    (replacing any existing one, like ``roundtable_bind_github``) so
+    participants can open the full files behind the hunks.
+
+    Files matching the secret/VCS exclusion patterns (``.env``, key
+    material, ``.git``) are dropped from both the tracked diff and the
+    untracked list — same rule as every other panel-facing read.
+
+    Raises ``ValueError`` when the tree is clean against ``base`` — a
+    silent empty artifact would read as "reviewed, no changes".
+
+    Returns ``{"thread_id", "base", "commit_sha", "files_changed",
+    "files_excluded", "untracked_included", "untracked_skipped",
+    "artifact_version", "chars", "truncated"}``.
+    """
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — cannot bind a diff.")
+    if base.startswith("-"):
+        raise ValueError(f"invalid base ref {base!r}")
+    resolved = _validate_bindable_dir(working_directory)
+
+    def _g(*args: str) -> str:
+        return _git(["git", "-C", str(resolved), *args])
+
+    try:
+        _g("rev-parse", "--is-inside-work-tree")
+        commit_sha = _g("rev-parse", "HEAD").strip()
+    except RuntimeError as exc:
+        raise ValueError(
+            f"{resolved} is not a git work tree with at least one commit: {exc}"
+        ) from exc
+
+    changed = [f for f in _g("diff", "--name-only", base, "--").splitlines() if f]
+    excluded = [f for f in changed if _is_excluded_repo_path(Path(f))]
+    if excluded:
+        # Pathspec-exclude the secret files rather than diffing then
+        # scrubbing text — the diff never contains their contents at all.
+        diff_text = _g(
+            "diff", base, "--", ".",
+            *[f":(exclude){f}" for f in excluded],
+        )
+    else:
+        diff_text = _g("diff", base)
+
+    untracked = [
+        f for f in _g("ls-files", "--others", "--exclude-standard").splitlines()
+        if f and not _is_excluded_repo_path(Path(f))
+    ]
+    untracked_shown = untracked[:_BIND_DIFF_MAX_UNTRACKED]
+    untracked_blocks: list[str] = []
+    for f in untracked_shown:
+        # --no-index exits 1 when the files differ (always true against
+        # /dev/null), so this can't go through _git's zero-exit check.
+        proc = subprocess.run(
+            ["git", "-C", str(resolved), "diff", "--no-index", "--",
+             "/dev/null", f],
+            capture_output=True, text=True, timeout=_GIT_CLONE_TIMEOUT_SEC,
+        )
+        if proc.returncode in (0, 1) and proc.stdout:
+            untracked_blocks.append(proc.stdout)
+
+    if not diff_text.strip() and not untracked_blocks:
+        raise ValueError(
+            f"working tree at {resolved} is clean against {base!r} — "
+            f"nothing to bind. Use roundtable_bind_repo for a plain binding."
+        )
+
+    parts = [
+        f"# Working diff of {resolved.name} vs {base} "
+        f"(HEAD = {commit_sha[:12]})",
+    ]
+    if excluded:
+        parts.append(
+            f"# {len(excluded)} changed file(s) excluded as secret/VCS "
+            f"paths: {', '.join(excluded)}"
+        )
+    if len(untracked) > len(untracked_shown):
+        parts.append(
+            f"# {len(untracked) - len(untracked_shown)} untracked file(s) "
+            f"beyond the {_BIND_DIFF_MAX_UNTRACKED}-file cap omitted"
+        )
+    if diff_text.strip():
+        parts.append(diff_text.rstrip())
+    if untracked_blocks:
+        parts.append("# Untracked files (shown as additions):")
+        parts.extend(b.rstrip() for b in untracked_blocks)
+    content = "\n\n".join(parts)
+    capped = _truncate_message_body(
+        {"content": content}, _BIND_DIFF_MAX_CHARS,
+    )["content"]
+
+    roundtable_bind_repo(thread_id, str(resolved), permission_policy="readonly")
+    art = roundtable_set_artifact(thread_id, _DIFF_ARTIFACT_NAME, capped)
+    return {
+        "thread_id": thread_id,
+        "base": base,
+        "commit_sha": commit_sha,
+        "files_changed": len(changed) - len(excluded),
+        "files_excluded": len(excluded),
+        "untracked_included": len(untracked_shown),
+        "untracked_skipped": len(untracked) - len(untracked_shown),
+        "artifact_version": art["version"],
+        "chars": len(capped),
+        "truncated": capped != content,
     }
 
 
@@ -3251,7 +3454,8 @@ def roundtable_ask(
 
     ``participant`` must be one of the keys in ``PARTICIPANTS``
     (currently: ``gemini-flash``, ``gemini-pro``, ``gpt-5-mini``,
-    ``gpt-5``, ``claude-sonnet``, ``claude-opus``, ``claude-fable``).
+    ``gpt-5-terra``, ``gpt-5``, ``claude-sonnet``, ``claude-opus``,
+    ``claude-fable``).
 
     ``effort`` selects the participant's reasoning/thinking spend:
     ``"low" | "medium" | "high"``, or empty (default) to let the
@@ -3290,7 +3494,7 @@ def roundtable_ask(
     # prompt is already in the snapshot.
     if prompt.strip():
         _append_message(thread_id, "orchestrator", prompt)
-    messages = _thread_messages(thread_id)
+    messages = _effective_messages(thread_id)
     try:
         result = _run_turn(
             thread, info, messages, "", effort, web_search,
@@ -3378,7 +3582,7 @@ def roundtable_ask_parallel(
     # returns — that's what guarantees independence.
     if prompt.strip():
         _append_message(thread_id, "orchestrator", prompt)
-    snapshot = _thread_messages(thread_id)
+    snapshot = _effective_messages(thread_id)
 
     # Empty instruction in _run_turn — the prompt is already in the
     # snapshot. Passing it again would duplicate it for each participant.
@@ -3437,6 +3641,469 @@ def roundtable_ask_parallel(
         responses[name] = clean
 
     return {"thread_id": thread_id, "responses": responses, "errors": errors}
+
+
+# ─── Structured asks ─────────────────────────────────────────────────────
+#
+# roundtable_ask_parallel returns freeform prose, which the orchestrator
+# then regex-parses into findings for roundtable_converge — lossy and
+# fragile. A structured ask forces each participant's reply through a
+# caller-supplied JSON Schema instead: native enforcement where the
+# provider supports it (OpenAI json_schema response format, Gemini
+# response_json_schema, Anthropic forced tool use), a prompt contract on
+# the CLI transport — and ALWAYS a local jsonschema validation with one
+# corrective retry, so the caller gets a validated object or an error,
+# never almost-JSON.
+
+# The schema rides system prompts / tool declarations; cap it so a
+# pathological schema can't blow the CLI argv budget (~130k ARG_MAX here,
+# shared with house_rules and the context pack).
+_STRUCTURED_SCHEMA_CHAR_CAP = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_SCHEMA_CHAR_CAP", "20000")
+)
+# One corrective re-ask after a failed validation. More buys little: a
+# model that ignores the validator's error message twice will keep
+# ignoring it, and each retry re-bills the whole transcript.
+_STRUCTURED_MAX_REPAIR_ATTEMPTS = 1
+# How much of an invalid reply to quote back in the repair instruction —
+# enough to locate the mistake without re-pasting a huge payload.
+_STRUCTURED_REPAIR_QUOTE_CAP = 4000
+
+_JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?|\n?\s*```\s*$")
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove a leading/trailing markdown code fence from ``text``.
+
+    Even schema-prompted models wrap JSON in ``` fences often enough that
+    rejecting on it would burn repair attempts on pure formatting.
+    """
+    return _JSON_FENCE_RE.sub("", text or "").strip()
+
+
+def _validate_structured(candidate: object, schema: dict) -> object:
+    """Parse (if text) and schema-validate a structured reply.
+
+    Returns the validated object. Raises ``ValueError`` whose message is
+    written to be fed straight back to the model as repair guidance.
+    """
+    if isinstance(candidate, str):
+        raw = _strip_json_fences(candidate)
+        try:
+            obj = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"reply is not valid JSON ({exc}). Reply with ONLY one JSON "
+                f"object — no prose, no markdown fences."
+            ) from exc
+    else:
+        obj = candidate
+    try:
+        jsonschema.validate(obj, schema)
+    except jsonschema.ValidationError as exc:
+        path = "$" + "".join(f"[{p!r}]" for p in exc.absolute_path)
+        raise ValueError(
+            f"reply violates the schema at {path}: {exc.message}"
+        ) from exc
+    return obj
+
+
+_STRUCTURED_PROMPT_CONTRACT = (
+    "\n\n=== Structured output contract (this turn) ===\n"
+    "Respond with ONLY a single JSON object — no prose before or after, no "
+    "markdown fences — that validates against this JSON Schema:\n"
+)
+
+
+def _call_openai_structured(
+    model: str, system_prompt: str, transcript: str, instruction: str,
+    effort: Optional[str], schema: dict,
+) -> ProviderResult:
+    """OpenAI structured turn via the Responses API ``json_schema`` format.
+
+    ``strict=True`` gives constrained decoding but rejects schemas that
+    don't meet OpenAI's strict-subset rules (every object needs
+    ``additionalProperties: false`` and all properties required); on that
+    400 we retry non-strict — the local validation in the caller is the
+    real contract either way.
+    """
+    user_msg = transcript
+    if instruction:
+        user_msg += f"\n\n[orchestrator]:\n{instruction}"
+    kwargs: dict = {
+        "model": model,
+        "instructions": system_prompt,
+        "input": user_msg,
+        "timeout": PROVIDER_TIMEOUT_SEC,
+    }
+    if effort:
+        kwargs["reasoning"] = {"effort": effort}
+
+    def _fmt(strict: bool) -> dict:
+        return {
+            "format": {
+                "type": "json_schema",
+                "name": "structured_reply",
+                "schema": schema,
+                "strict": strict,
+            }
+        }
+
+    import openai as _o
+    try:
+        resp = _provider_call(
+            f"openai-structured/{model}",
+            lambda: _openai.responses.create(text=_fmt(True), **kwargs),
+        )
+    except _o.BadRequestError as exc:
+        # Schema outside the strict subset — retry without constrained
+        # decoding rather than bouncing a legitimate schema to the caller.
+        logger.warning(
+            "openai-structured/%s: strict json_schema rejected (%s); "
+            "retrying non-strict", model, exc,
+        )
+        resp = _provider_call(
+            f"openai-structured/{model}/lax",
+            lambda: _openai.responses.create(text=_fmt(False), **kwargs),
+        )
+    return ProviderResult(
+        text=resp.output_text or "", usage=_extract_usage("openai", resp),
+        raw=resp,
+    )
+
+
+def _call_gemini_structured(
+    model: str, system_prompt: str, transcript: str, instruction: str,
+    effort: Optional[str], schema: dict,
+) -> ProviderResult:
+    """Gemini structured turn via ``response_json_schema`` + JSON mime type.
+
+    Falls back to mime-type-only plus the prompt contract when the
+    installed google-genai predates raw-JSON-Schema support (pydantic
+    rejects the config key) or the API rejects the schema — local
+    validation in the caller covers both paths.
+    """
+    user_msg = transcript
+    if instruction:
+        user_msg += f"\n\n[orchestrator]:\n{instruction}"
+    base_config: dict = {
+        "system_instruction": system_prompt,
+        "response_mime_type": "application/json",
+        "http_options": genai_types.HttpOptions(
+            timeout=int(PROVIDER_TIMEOUT_SEC * 1000),
+        ),
+    }
+    if effort:
+        if _gemini_uses_thinking_level(model):
+            base_config["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=effort,
+            )
+        elif effort in _GEMINI_BUDGETS:
+            base_config["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=_GEMINI_BUDGETS[effort],
+            )
+
+    from google.genai import errors as _g_errors
+    try:
+        resp = _provider_call(
+            f"gemini-structured/{model}",
+            lambda: _gemini.models.generate_content(
+                model=model, contents=user_msg,
+                config={**base_config, "response_json_schema": schema},
+            ),
+        )
+    except (TypeError, ValueError, _g_errors.APIError) as exc:
+        # TypeError/ValueError: SDK too old for response_json_schema
+        # (pydantic ValidationError is a ValueError). APIError: the API
+        # rejected this particular schema. Either way the mime type plus
+        # the prompt contract still gets JSON out; validation is local.
+        logger.warning(
+            "gemini-structured/%s: native json-schema path failed "
+            "(%s: %s); falling back to prompt contract",
+            model, type(exc).__name__, exc,
+        )
+        fallback_sys = (
+            system_prompt + _STRUCTURED_PROMPT_CONTRACT
+            + json.dumps(schema, indent=2)
+        )
+        resp = _provider_call(
+            f"gemini-structured/{model}/lax",
+            lambda: _gemini.models.generate_content(
+                model=model, contents=user_msg,
+                config={**base_config, "system_instruction": fallback_sys},
+            ),
+        )
+    return ProviderResult(
+        text=_gemini_response_text(resp),
+        usage=_extract_usage("gemini", resp), raw=resp,
+    )
+
+
+def _call_anthropic_structured_api(
+    model: str, system_prompt: str, transcript: str, instruction: str,
+    effort: Optional[str], schema: dict,
+) -> ProviderResult:
+    """Anthropic structured turn via forced tool use on the Messages API.
+
+    A single tool whose ``input_schema`` is the caller's schema, with
+    ``tool_choice`` pinned to it — the assistant's only legal move is to
+    emit conforming input. Extended thinking is NOT enabled here: the API
+    rejects a forced tool_choice combined with thinking, so a structured
+    turn trades thinking for schema enforcement (``effort`` still scales
+    ``max_tokens``).
+    """
+    user_msg = transcript
+    if instruction:
+        user_msg += f"\n\n[orchestrator]:\n{instruction}"
+    max_tokens = (
+        _ANTHROPIC_MAX_TOKENS_BY_EFFORT.get(effort, _ANTHROPIC_MAX_TOKENS)
+        if effort else _ANTHROPIC_MAX_TOKENS
+    )
+    kwargs: dict = {
+        "model": model,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_msg}],
+        "max_tokens": max_tokens,
+        "timeout": PROVIDER_TIMEOUT_SEC,
+        "tools": [{
+            "name": "structured_reply",
+            "description": "Emit your final answer as structured data "
+                           "conforming to this schema.",
+            "input_schema": schema,
+        }],
+        "tool_choice": {"type": "tool", "name": "structured_reply"},
+    }
+    resp = _provider_call(
+        f"anthropic-structured/{model}",
+        lambda: _anthropic.messages.create(**kwargs),
+    )
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use":
+            obj = block.input
+            return ProviderResult(
+                text=json.dumps(obj, indent=2), structured=obj,
+                usage=_extract_usage("anthropic", resp),
+                finish_reason=getattr(resp, "stop_reason", None), raw=resp,
+            )
+    # Forced tool_choice should make this unreachable; fall through to the
+    # text blocks so the caller's parse/validate sees whatever came back.
+    text = "".join(
+        b.text for b in resp.content if getattr(b, "type", None) == "text"
+    )
+    return ProviderResult(
+        text=text, usage=_extract_usage("anthropic", resp), raw=resp,
+    )
+
+
+def _structured_turn(
+    thread: dict, info: dict, messages: list[dict], instruction: str,
+    effort: Optional[str], schema: dict,
+) -> ProviderResult:
+    """One participant's schema-enforced turn, validated, with one repair.
+
+    Renders the transcript exactly like ``_run_turn`` (same trim budget,
+    same system prompt), dispatches to the provider's structured path —
+    or the prompt contract on the Anthropic CLI transport, which has no
+    enforcement hook — then locally validates. A failed validation gets
+    ONE corrective re-ask carrying the validator's error and the invalid
+    output; a second failure raises.
+    """
+    context_pack = thread.get("context_pack") or ""
+    trimmed = _trim_messages_to_cap(
+        messages,
+        max(PROMPT_CHAR_CAP - len(context_pack), MIN_TRANSCRIPT_CAP),
+        for_participant_label=info["label"],
+    )
+    transcript = _format_transcript(trimmed, for_participant_label=info["label"])
+    system_prompt = _build_system_prompt(
+        thread, info["label"], thread.get("participants") or [],
+    )
+    provider = info["provider"]
+    schema_text = json.dumps(schema, indent=2)
+
+    def _dispatch(instr: str) -> ProviderResult:
+        if provider == "openai":
+            return _call_openai_structured(
+                info["model"], system_prompt, transcript, instr, effort, schema,
+            )
+        if provider == "gemini":
+            return _call_gemini_structured(
+                info["model"], system_prompt, transcript, instr, effort, schema,
+            )
+        if provider == "anthropic":
+            # SDK Messages path gets forced tool use; the CLI transport has
+            # no enforcement hook, so it gets the schema as a prompt
+            # contract — the local validate+repair below is its net.
+            use_api = _ANTHROPIC_TRANSPORT == "api" or (
+                _ANTHROPIC_TRANSPORT == "auto" and _CLAUDE_CLI is None
+            )
+            if use_api:
+                if _anthropic is None:
+                    raise RuntimeError(
+                        "Anthropic structured ask needs ANTHROPIC_API_KEY "
+                        "on this transport."
+                    )
+                return _call_anthropic_structured_api(
+                    info["model"], system_prompt, transcript, instr,
+                    effort, schema,
+                )
+            contract_sys = (
+                system_prompt + _STRUCTURED_PROMPT_CONTRACT + schema_text
+            )
+            return _call_anthropic_cli(
+                info["model"], contract_sys, transcript, instr, effort,
+            )
+        raise RuntimeError(f"Unknown provider {provider!r}")
+
+    instr = instruction
+    last_err: Optional[ValueError] = None
+    for attempt in range(1 + _STRUCTURED_MAX_REPAIR_ATTEMPTS):
+        result = _dispatch(instr)
+        candidate = (
+            result.structured if result.structured is not None else result.text
+        )
+        try:
+            obj = _validate_structured(candidate, schema)
+        except ValueError as exc:
+            last_err = exc
+            bad = (result.text or "")[:_STRUCTURED_REPAIR_QUOTE_CAP]
+            instr = (
+                (instruction + "\n\n" if instruction else "")
+                + f"Your previous reply failed validation: {exc}\n"
+                + f"Previous reply (possibly truncated):\n{bad}\n\n"
+                + "Reply again with ONLY a single JSON object that "
+                + "validates against the schema."
+            )
+            logger.warning(
+                "structured turn for %s failed validation "
+                "(attempt %d/%d): %s",
+                info["label"], attempt + 1,
+                1 + _STRUCTURED_MAX_REPAIR_ATTEMPTS, exc,
+            )
+            continue
+        result.structured = obj
+        result.text = json.dumps(obj, indent=2)
+        return result
+    raise ValueError(
+        f"{info['label']} could not produce a schema-valid reply after "
+        f"{1 + _STRUCTURED_MAX_REPAIR_ATTEMPTS} attempts: {last_err}"
+    )
+
+
+def roundtable_ask_structured(
+    thread_id: int, participants: list[str], schema: dict,
+    prompt: str = "", effort: str = "",
+) -> dict:
+    """Ask participants for replies conforming to a JSON Schema — the
+    machine-readable sibling of ``roundtable_ask_parallel``.
+
+    Use this when the panel's output feeds a pipeline instead of a human:
+    verdict collection, findings lists for ``roundtable_converge``, scored
+    votes. Each participant is forced through ``schema`` — natively where
+    the provider supports it (OpenAI ``json_schema`` response format,
+    Gemini ``response_json_schema``, Anthropic forced tool use on the API
+    transport; the CLI transport gets the schema as a prompt contract) —
+    and every reply is locally validated against ``schema``, with one
+    corrective retry, so ``results`` contains parsed, validated objects,
+    never almost-JSON.
+
+    ``schema`` must be a JSON Schema whose root is ``{"type": "object"}``
+    (both OpenAI strict mode and Anthropic tool input require an object
+    root — wrap a bare list as ``{"items": [...]}``).
+
+    Semantics mirror ``roundtable_ask_parallel``: ``prompt`` is posted once
+    as an orchestrator turn, the transcript is snapshotted, participants
+    run concurrently against the same snapshot (no anchoring), and the
+    pretty-printed JSON replies are committed to the thread in call order
+    so later turns can reference them. ``web_search`` is intentionally not
+    offered — grounding plus constrained decoding is where providers
+    disagree most; run a searching ask first, then collect verdicts.
+
+    Returns ``{"thread_id", "results": {name: object}, "errors":
+    {name: "ExceptionType: message"}}`` — a participant appears in exactly
+    one of the two.
+    """
+    if not participants:
+        raise ValueError("roundtable_ask_structured requires at least one participant.")
+    if len(set(participants)) != len(participants):
+        raise ValueError(
+            f"Duplicate participants in {participants!r}; each name must "
+            f"appear once per structured ask."
+        )
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ValueError(
+            'schema must be a JSON Schema dict with root {"type": "object"} '
+            "— OpenAI strict mode and Anthropic tool input both require an "
+            "object root."
+        )
+    schema_len = len(json.dumps(schema))
+    if schema_len > _STRUCTURED_SCHEMA_CHAR_CAP:
+        raise ValueError(
+            f"schema serialises to {schema_len} chars, over the "
+            f"{_STRUCTURED_SCHEMA_CHAR_CAP} cap — it rides system prompts "
+            f"and tool declarations; trim it."
+        )
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValueError(f"schema is not a valid JSON Schema: {exc.message}") from exc
+
+    infos = {p: _resolve_participant(p) for p in participants}
+    effort = _normalise_effort(effort)
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(
+            f"Thread {thread_id} is closed — reopen by creating a new "
+            f"thread that references it, or accept that the debate is over."
+        )
+
+    if prompt.strip():
+        _append_message(thread_id, "orchestrator", prompt)
+    snapshot = _effective_messages(thread_id)
+
+    def _one(
+        name: str,
+    ) -> tuple[str, Optional[ProviderResult], Optional[Exception]]:
+        try:
+            resp = _structured_turn(
+                thread, infos[name], snapshot, "", effort, schema,
+            )
+            return name, resp, None
+        except Exception as exc:
+            return name, None, exc
+
+    collected: dict[str, tuple[Optional[ProviderResult], Optional[Exception]]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(participants)
+    ) as pool:
+        futures = [pool.submit(_one, p) for p in participants]
+        for fut in concurrent.futures.as_completed(futures):
+            name, resp, err = fut.result()
+            collected[name] = (resp, err)
+
+    closed_mid_flight = _thread_is_closed(thread_id)
+    results: dict[str, object] = {}
+    errors: dict[str, str] = {}
+    for name in participants:
+        resp, err = collected[name]
+        label = infos[name]["label"]
+        if err is not None:
+            msg = f"[provider error: {type(err).__name__}: {err}]"
+            _append_message(thread_id, label, msg)
+            errors[name] = f"{type(err).__name__}: {err}"
+            continue
+        _log_usage(label, resp, thread_id=thread_id)
+        committed = resp.text
+        if closed_mid_flight:
+            committed += (
+                "\n\n[note: thread was closed during this call; response "
+                "recorded post-closure]"
+            )
+        _append_message(thread_id, label, committed)
+        results[name] = resp.structured
+    return {"thread_id": thread_id, "results": results, "errors": errors}
 
 
 # ─── Artifacts ───────────────────────────────────────────────────────────
@@ -3542,34 +4209,44 @@ def _parse_verdict(text: str) -> str:
     return present.pop() if len(present) == 1 else "unresolved"
 
 
-def _judge_finding(info: dict, transport: str, user_msg: str) -> str:
-    """One verifier turn — pure text judgment, no tools. Returns reply text.
+def _oneshot_text(
+    info: dict, transport: str, system_prompt: str, user_msg: str,
+) -> str:
+    """One stateless text turn to a participant's provider — no tools, no
+    thread. Returns the stripped reply text.
 
-    The evidence-bearing ``user_msg`` is passed as the transcript (stdin on
-    the CLI transport), keeping the large code excerpt off argv; only the
-    small fixed system prompt rides argv.
+    The bulky ``user_msg`` is passed as the transcript (stdin on the CLI
+    transport), keeping large payloads off argv; only the small fixed
+    system prompt rides argv. ``transport`` (cli/api/auto) only affects
+    Anthropic participants. Shared by ``roundtable_converge`` judgments
+    and ``roundtable_compact`` summaries.
     """
     model = info["model"]
     provider = info["provider"]
     if provider == "anthropic":
         if transport == "cli":
-            res = _call_anthropic_cli(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+            res = _call_anthropic_cli(model, system_prompt, user_msg, "")
         elif transport == "api":
             if _anthropic is None:
                 raise RuntimeError("transport='api' but ANTHROPIC_API_KEY is not set.")
-            res = _call_anthropic(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+            res = _call_anthropic(model, system_prompt, user_msg, "")
         else:  # auto — let the router pick CLI (subscription) or SDK
             res = _call_anthropic_router(
-                model, _CONVERGE_SYSTEM_PROMPT, user_msg, "",
+                model, system_prompt, user_msg, "",
                 tool_use_context=None, participant_label=info["label"],
             )
     elif provider == "gemini":
-        res = _call_gemini(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+        res = _call_gemini(model, system_prompt, user_msg, "")
     elif provider == "openai":
-        res = _call_openai(model, _CONVERGE_SYSTEM_PROMPT, user_msg, "")
+        res = _call_openai(model, system_prompt, user_msg, "")
     else:
-        raise RuntimeError(f"converge: unsupported provider {provider!r}")
+        raise RuntimeError(f"one-shot turn: unsupported provider {provider!r}")
     return (res.text or "").strip()
+
+
+def _judge_finding(info: dict, transport: str, user_msg: str) -> str:
+    """One verifier turn — pure text judgment, no tools. Returns reply text."""
+    return _oneshot_text(info, transport, _CONVERGE_SYSTEM_PROMPT, user_msg)
 
 
 def roundtable_converge(
@@ -3658,6 +4335,159 @@ def roundtable_converge(
         v: sum(1 for r in ledger if r["verdict"] == v) for v in _VALID_VERDICTS
     }
     return {"thread_id": thread_id, "ledger": ledger, "summary": summary}
+
+
+# ─── Thread compaction ───────────────────────────────────────────────────
+
+# Fewer messages than this in the would-be-compacted prefix isn't worth a
+# summariser turn — the summary would be as long as the originals.
+_COMPACT_MIN_MESSAGES = 2
+# Per-artifact cap when re-showing latest artifact versions after the
+# summary; middle-truncated beyond this so one huge artifact can't undo
+# the compaction it rode in on.
+_COMPACT_ARTIFACT_CHAR_CAP = int(
+    os.environ.get("CLAUDE_ROUNDTABLE_COMPACT_ARTIFACT_CHAR_CAP", "30000")
+)
+
+_COMPACT_SYSTEM_PROMPT = (
+    "You are compressing the transcript of a multi-AI roundtable so the "
+    "discussion can continue in less context. Write a dense summary that "
+    "preserves, in this order: (1) decisions reached and why; (2) each "
+    "participant's current position, BY NAME, including unresolved "
+    "disagreements; (3) open questions and pending work; (4) hard facts "
+    "established — file:line references, measurements, verdicts, exact "
+    "identifiers — verbatim, never paraphrased away. Do not editorialise "
+    "or add recommendations of your own. Write it as briefing prose "
+    "addressed to the panel, not commentary about summarising."
+)
+
+
+def roundtable_compact(
+    thread_id: int, keep_last: int = 10,
+    summarizer: str = "claude-opus", transport: str = "cli",
+) -> dict:
+    """Compact a long thread: replace older turns, in what participants
+    see, with a model-written summary — keeping the last ``keep_last``
+    messages verbatim.
+
+    Every ask re-sends the whole transcript, so a long debate's cost grows
+    with its history and eventually hits the trim cap (older turns silently
+    dropped). Compaction spends one summariser turn to convert that history
+    into a dense briefing: ``summarizer`` (default ``claude-opus`` on the
+    free CLI ``transport``, like ``roundtable_converge``) preserves
+    decisions, per-participant positions, open questions, and hard facts.
+    The latest version of any artifact whose announcement falls inside the
+    compacted range is re-shown after the summary, so the panel never loses
+    the code under review.
+
+    Non-destructive: raw messages stay in the DB. ``roundtable_history``
+    shows the compacted view by default (what a participant would see) and
+    the originals with ``raw=True``; ``roundtable_fork`` always copies raw
+    history. Re-compacting later summarises the previous summary plus the
+    turns since — it never re-reads already-compacted originals.
+
+    Returns ``{"thread_id", "compacted_upto_idx", "messages_compacted",
+    "kept_verbatim", "summary_chars", "artifacts_reshown"}``.
+    """
+    if keep_last < 0:
+        raise ValueError(f"keep_last must be >= 0; got {keep_last}")
+    if transport not in _VALID_CONVERGE_TRANSPORTS:
+        raise ValueError(
+            f"transport must be one of {sorted(_VALID_CONVERGE_TRANSPORTS)}; "
+            f"got {transport!r}"
+        )
+    thread = _thread_row(thread_id)
+    if thread is None:
+        raise ValueError(f"No such thread: {thread_id}")
+    if thread.get("closed_at"):
+        raise RuntimeError(f"Thread {thread_id} is closed — nothing to compact for.")
+    info = _resolve_participant(summarizer)
+
+    effective = _effective_messages(thread_id)
+    cut = effective[: len(effective) - keep_last] if keep_last else list(effective)
+    prev = _compaction_row(thread_id)
+    if prev is not None:
+        # Drop nothing that's already covered: the synthetic summary message
+        # carries prev's upto_idx, so "new since last compaction" is
+        # everything strictly after it.
+        new_in_cut = [m for m in cut if m["idx"] > prev["upto_idx"]]
+        if not new_in_cut:
+            raise ValueError(
+                f"nothing new to compact on thread {thread_id} — the "
+                f"existing compaction already covers idx <= {prev['upto_idx']} "
+                f"and keep_last={keep_last} retains the rest."
+            )
+    if len(cut) < _COMPACT_MIN_MESSAGES:
+        raise ValueError(
+            f"only {len(cut)} message(s) would be compacted on thread "
+            f"{thread_id} (keep_last={keep_last}) — not worth a summariser "
+            f"turn; lower keep_last or let the thread grow."
+        )
+    upto_idx = cut[-1]["idx"]
+    cutoff_ts = cut[-1]["ts"]
+
+    trimmed = _trim_messages_to_cap(cut, PROMPT_CHAR_CAP, for_participant_label="")
+    prefix_text = _format_transcript(trimmed, for_participant_label="")
+    summary = _oneshot_text(info, transport, _COMPACT_SYSTEM_PROMPT, prefix_text)
+    if not summary:
+        raise RuntimeError(
+            f"summarizer {summarizer!r} returned an empty summary — thread "
+            f"left uncompacted."
+        )
+
+    # Re-show the latest version of every artifact announced inside the
+    # compacted range (announcement ts <= cutoff). Artifacts announced in
+    # the kept tail are still visible there and are skipped.
+    with _db_lock:
+        latest_rows = _conn().execute(
+            "SELECT a.name, a.version, a.content, a.ts FROM artifacts a "
+            "JOIN (SELECT name, MAX(version) AS v FROM artifacts "
+            "      WHERE thread_id = ? GROUP BY name) m "
+            "ON a.name = m.name AND a.version = m.v "
+            "WHERE a.thread_id = ? ORDER BY a.name",
+            (thread_id, thread_id),
+        ).fetchall()
+    artifact_sections: list[str] = []
+    for name, version, content, ts in latest_rows:
+        if ts > cutoff_ts:
+            continue
+        shown = _truncate_message_body(
+            {"content": content}, _COMPACT_ARTIFACT_CHAR_CAP,
+        )["content"]
+        artifact_sections.append(
+            f"=== Artifact {name!r} (v{version}, latest) ===\n{shown}\n"
+            f"=== End artifact ==="
+        )
+
+    body = (
+        f"[compacted transcript: messages up to idx {upto_idx} are "
+        f"summarised below; the full originals remain available to the "
+        f"orchestrator via roundtable_history(raw=True)]\n\n{summary}"
+    )
+    if artifact_sections:
+        body += (
+            "\n\n=== Artifacts under discussion (latest versions, re-shown "
+            "after compaction) ===\n" + "\n\n".join(artifact_sections)
+        )
+
+    now = time.time()
+    with _db_lock:
+        _conn().execute(
+            "INSERT OR REPLACE INTO compactions(thread_id, upto_idx, summary, "
+            "created_at) VALUES(?, ?, ?, ?)",
+            (thread_id, upto_idx, body, now),
+        )
+    raw_compacted = sum(
+        1 for m in _thread_messages(thread_id) if m["idx"] <= upto_idx
+    )
+    return {
+        "thread_id": thread_id,
+        "compacted_upto_idx": upto_idx,
+        "messages_compacted": raw_compacted,
+        "kept_verbatim": len(effective) - len(cut),
+        "summary_chars": len(body),
+        "artifacts_reshown": len(artifact_sections),
+    }
 
 
 def roundtable_set_artifact(
@@ -3886,7 +4716,7 @@ def roundtable_fork(
     }
 
 
-def roundtable_history(thread_id: int, last_n: int = 0) -> str:
+def roundtable_history(thread_id: int, last_n: int = 0, raw: bool = False) -> str:
     """Return the formatted transcript of a thread.
 
     ``last_n=0`` (default) returns everything. A positive value returns
@@ -3896,18 +4726,25 @@ def roundtable_history(thread_id: int, last_n: int = 0) -> str:
 
     Format matches what participants see (``[speaker]:\\ncontent``),
     so this also doubles as a way to debug what a participant would have
-    seen if asked right now.
+    seen if asked right now — on a compacted thread (see
+    ``roundtable_compact``) that means the summary plus the kept tail.
+    ``raw=True`` bypasses compaction and returns every original message.
     """
     thread = _thread_row(thread_id)
     if thread is None:
         raise ValueError(f"No such thread: {thread_id}")
-    all_messages = _thread_messages(thread_id)
+    all_messages = (
+        _thread_messages(thread_id) if raw else _effective_messages(thread_id)
+    )
     total = len(all_messages)
     messages = all_messages[-last_n:] if last_n > 0 else all_messages
+    compact_note = ""
+    if not raw and _compaction_row(thread_id) is not None:
+        compact_note = " (compacted view — raw=True for full history)"
     header = (
         f"# Thread {thread['id']}: {thread['topic']}\n"
         f"# Participants: {', '.join(thread.get('participants') or []) or '(none registered)'}\n"
-        f"# Messages: {total}"
+        f"# Messages: {total}{compact_note}"
         + (" (showing last %d)" % last_n if last_n > 0 else "")
         + "\n\n"
     )
