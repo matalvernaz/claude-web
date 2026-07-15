@@ -1274,3 +1274,121 @@ async def test_api_usage_live_happy_path_never_returns_token(monkeypatch) -> Non
     assert out["account"]["email"] == "x@y.z"
     assert out["limits"][0]["label"] == "Session (5-hour window)"
     assert "sekrit-token" not in json.dumps(out)
+
+
+# ─── Overage (pay-as-you-go) gate decision ─────────────────────────────────
+
+def _rli(status=None, rate_limit_type=None, overage_status=None) -> dict:
+    """Build a raw rate-limit dict (camelCase keys, as the CLI reports them)."""
+    d: dict = {}
+    if status is not None:
+        d["status"] = status
+    if rate_limit_type is not None:
+        d["rateLimitType"] = rate_limit_type
+    if overage_status is not None:
+        d["overageStatus"] = overage_status
+    return d
+
+
+@pytest.mark.parametrize("rli,expected", [
+    # Plan window at the wall, overage available -> gate before it bills.
+    (_rli("rejected", "five_hour", "allowed"), True),
+    (_rli("rejected", "seven_day", "allowed"), True),
+    (_rli("rejected", "seven_day_opus", "allowed_warning"), True),
+    # Approaching the wall, overage available -> warn-early gate.
+    (_rli("allowed_warning", "five_hour", "allowed"), True),
+    # Already on the overage bucket -> definitely spending credits.
+    (_rli("allowed", "overage"), True),
+    (_rli("allowed_warning", "overage"), True),
+    # Plan headroom -> no gate.
+    (_rli("allowed", "five_hour", "allowed"), False),
+    # Plan exhausted but overage unavailable -> the CLI stops on its own.
+    (_rli("rejected", "five_hour"), False),
+    (_rli("rejected", "five_hour", "rejected"), False),
+    # Overage bucket itself rejected (disabled/exhausted) -> no spend possible.
+    (_rli("rejected", "overage"), False),
+    # Unknown / missing -> conservative False.
+    (None, False),
+    ({}, False),
+    (_rli("rejected", "some_future_window", "allowed"), False),
+    ("not-a-dict", False),
+])
+def test_overage_should_gate(rli, expected: bool) -> None:
+    assert app_module._overage_should_gate(rli) is expected
+
+
+def test_load_rate_limit_unwraps_envelope(tmp_path, monkeypatch) -> None:
+    cache = tmp_path / "rate_limit.json"
+    info = {"status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed"}
+    cache.write_text(json.dumps({"info": info, "captured_at": 123}), encoding="utf-8")
+    monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", cache)
+    assert app_module._load_rate_limit() == info
+    assert app_module._overage_should_gate(app_module._load_rate_limit()) is True
+
+
+def test_load_rate_limit_missing_returns_none(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", tmp_path / "nope.json")
+    assert app_module._load_rate_limit() is None
+
+
+def _capture_question(run):
+    """Record emitted events; signal when the gate's question card appears."""
+    events: list[dict] = []
+    prompt = asyncio.Event()
+
+    def _emit(evt: dict) -> None:
+        events.append(evt)
+        if evt.get("type") == "question_request":
+            prompt.set()
+
+    run.emit = _emit  # type: ignore[method-assign]
+    return events, prompt
+
+
+def _answer(request_id: str, label) -> None:
+    """Resolve the gate future the way POST /api/permission does for a card."""
+    app_module.PENDING[request_id]["future"].set_result({
+        "decision": "answer",
+        "payload": {"answers": {app_module._OVERAGE_GATE_QUESTION: label}},
+    })
+
+
+async def test_gate_overage_keep_going_sets_conversation_consent() -> None:
+    run = app_module.ActiveRun("overage-keep")
+    events, prompt = _capture_question(run)
+
+    task = asyncio.ensure_future(app_module._gate_overage(run))
+    await asyncio.wait_for(prompt.wait(), timeout=2)
+    rid = next(e["id"] for e in events if e.get("type") == "question_request")
+    _answer(rid, app_module._OVERAGE_GATE_KEEP)
+
+    assert await asyncio.wait_for(task, timeout=2) is True
+    assert run.overage_consent is True
+    # Consent short-circuits later gates with no fresh prompt.
+    events.clear()
+    assert await app_module._gate_overage(run) is True
+    assert not events
+
+
+async def test_gate_overage_stop_holds_without_consent() -> None:
+    run = app_module.ActiveRun("overage-stop")
+    events, prompt = _capture_question(run)
+
+    task = asyncio.ensure_future(app_module._gate_overage(run))
+    await asyncio.wait_for(prompt.wait(), timeout=2)
+    rid = next(e["id"] for e in events if e.get("type") == "question_request")
+    _answer(rid, app_module._OVERAGE_GATE_STOP)
+
+    assert await asyncio.wait_for(task, timeout=2) is False
+    assert run.overage_consent is False
+
+
+async def test_gate_overage_timeout_defaults_to_stop(monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "PERMISSION_TIMEOUT_SECONDS", 0.05)
+    run = app_module.ActiveRun("overage-timeout")
+    events: list[dict] = []
+    run.emit = events.append  # type: ignore[method-assign]
+
+    assert await asyncio.wait_for(app_module._gate_overage(run), timeout=2) is False
+    assert run.overage_consent is False
+    assert any(e.get("type") == "permission_timeout" for e in events)

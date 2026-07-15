@@ -2475,6 +2475,28 @@
       if (obj.queue_id && clearQueueEntryById(obj.queue_id)) {
         announce("Queued message cancelled.");
       }
+    } else if (obj.type === "rate_limit") {
+      // Non-blocking heads-up as the plan limit nears. The keep-going/stop
+      // choice itself arrives as a question card at the next turn boundary.
+      // Dedup on status+window so a repeated event doesn't re-announce.
+      const key = obj.status + ":" + (obj.rate_limit_type || "");
+      if ((obj.status === "allowed_warning" || obj.status === "rejected")
+          && key !== handleSSEEvent._lastRateLimitKey) {
+        handleSSEEvent._lastRateLimitKey = key;
+        announce(obj.status === "rejected"
+          ? "Plan limit reached. You'll be asked before any usage credits are spent."
+          : "Approaching your Claude plan limit.");
+      }
+    } else if (obj.type === "overage_declined") {
+      // Plan limit reached and the user declined to continue on usage credits.
+      // The message was held, not sent — clear its chip and say so.
+      if (obj.queue_id) clearQueueEntryById(obj.queue_id);
+      discardPartial(ctx);
+      setStreaming(false);
+      setStatus("Held — declined usage credits.");
+      const preview = obj.text_preview ? ' ("' + obj.text_preview + '")' : "";
+      announce("Message held" + preview
+        + ". You declined usage credits; resend after your plan resets.");
     } else if (obj.type === "stopped") {
       discardPartial(ctx);
       setActiveTodoLabel(null);

@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
+    RateLimitEvent,
     ResultMessage,
     StreamEvent,
     SystemMessage,
@@ -5253,6 +5254,12 @@ class ActiveRun:
         # mid-turn and be silently consumed/discarded.
         self.client: Optional[Any] = None  # ClaudeSDKClient
         self.client_write_lock: asyncio.Lock = asyncio.Lock()
+        # Pay-as-you-go gate state. rate_limit_info holds the latest raw
+        # rate-limit dict the CLI reported (camelCase keys, or None before the
+        # first report); overage_consent records a "keep going on credits"
+        # choice for the life of this conversation so the gate asks once.
+        self.rate_limit_info: Optional[dict] = None
+        self.overage_consent: bool = False
 
     def emit(self, event: dict) -> None:
         # Tag with a monotonic per-run index so the browser can dedupe an
@@ -7947,6 +7954,17 @@ async def api_chat(
                     # was already queued during the run-creation window stays
                     # in the queue — the driver loop's user_get branch will
                     # pop them in order once we're between turns.
+                    # First-turn overage gate. Consent is per-conversation, so
+                    # a fresh chat opened while the plan is already exhausted
+                    # would otherwise bill credits on turn one before the
+                    # in-loop gate runs. Decide from the persisted state (the
+                    # CLI hasn't reported this session's state yet). Declining
+                    # ends the run without a turn; the outer finally runs
+                    # finish(), and __aexit__ tears down the just-spawned CLI.
+                    if not run.overage_consent and _overage_should_gate(_load_rate_limit()):
+                        if not await _gate_overage(run):
+                            _emit_overage_declined(run, {"text": message})
+                            return
                     async with run.client_write_lock:
                         await _send_to_client(client, effective_message, image_blocks)
                         run.client = client
@@ -8365,6 +8383,22 @@ async def api_chat(
                                 )
                                 popped_user_item = None
                                 continue
+                            # Turn-boundary overage gate: if starting this turn
+                            # would spend pay-as-you-go credits and the user
+                            # hasn't opted in this conversation, ask first.
+                            # Decline holds the message (clears its chip) rather
+                            # than billing. The gate's ≤15min wait stays inside
+                            # the 30min delivery-ack window, so blocking here
+                            # can't trip a false "message lost".
+                            if not run.overage_consent and _overage_should_gate(run.rate_limit_info):
+                                if not await _gate_overage(run):
+                                    _emit_overage_declined(run, item)
+                                    if ack is not None and not ack.done():
+                                        ack.set_exception(_DeliveryAlreadyReported(
+                                            "usage-credit prompt declined"
+                                        ))
+                                    popped_user_item = None
+                                    continue
                             try:
                                 await _send_user_message(
                                     client,
@@ -8418,7 +8452,14 @@ async def api_chat(
 
                         # Timeout fired — four sub-cases:
                         if (run.between_turns and run.pending_notifications
-                                and not cap_reached):
+                                and not cap_reached
+                                # Never auto-fire onto pay-as-you-go credits
+                                # without consent: auto-fire is unattended so it
+                                # can't prompt. Hold (and, after grace, drop)
+                                # the notifications until the user's next gated
+                                # message instead.
+                                and not (not run.overage_consent
+                                         and _overage_should_gate(run.rate_limit_info))):
                             # Grace period elapsed with notifications buffered:
                             # auto-fire a synth user message.
                             action = _drain_pending_for_auto_fire()
@@ -9270,6 +9311,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             rli = data.get("rate_limit_info") or {}
             if rli:
                 _save_rate_limit(rli)
+                if run is not None:
+                    run.rate_limit_info = rli
             return [{
                 "type": "system",
                 "subtype": "init",
@@ -9278,6 +9321,26 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 "permissionMode": data.get("permissionMode"),
             }]
         return []
+    if isinstance(msg, RateLimitEvent):
+        # Live plan-usage transition (allowed → allowed_warning → rejected, or a
+        # flip onto the overage bucket). Cache it for the turn-boundary gate and
+        # surface a non-blocking status event so the UI can warn as the limit
+        # nears. The keep-going/stop prompt itself fires at the next turn
+        # boundary (see _gate_overage), never mid-turn.
+        info = msg.rate_limit_info
+        raw = info.raw if isinstance(info.raw, dict) else {}
+        if run is not None and raw:
+            run.rate_limit_info = raw
+        if raw:
+            _save_rate_limit(raw)
+        return [{
+            "type": "rate_limit",
+            "status": info.status,
+            "rate_limit_type": info.rate_limit_type,
+            "utilization": info.utilization,
+            "resets_at": info.resets_at,
+            "overage_status": info.overage_status,
+        }]
     if isinstance(msg, AssistantMessage):
         out = []
         message_blocks = []
@@ -9475,6 +9538,149 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
 
 
 # ─── Usage tracking ───────────────────────────────────────────────────────────
+
+
+# ─── Pay-as-you-go (overage) gate ──────────────────────────────────────────
+# When a subscription plan's rate-limit window is exhausted and the account has
+# extra usage enabled, Anthropic silently continues on pay-as-you-go credits.
+# This gate interposes a per-conversation choice before that happens, so
+# credits are never spent without an explicit click — even when extra usage is
+# turned on account-side.
+
+# Rate-limit windows that draw down the subscription plan (everything except
+# the pay-as-you-go bucket itself).
+_PLAN_RATE_LIMIT_TYPES = frozenset(
+    {"five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"}
+)
+
+# Question-card copy. The question text doubles as the answers-dict key the
+# browser posts back (see renderQuestionCard in app.js), so keep it stable.
+_OVERAGE_GATE_QUESTION = (
+    "Your Claude plan limit is reached. Keep going on pay-as-you-go usage credits?"
+)
+_OVERAGE_GATE_KEEP = "Keep going (use credits)"
+_OVERAGE_GATE_STOP = "Stop here"
+
+
+def _overage_should_gate(rli: Optional[dict]) -> bool:
+    """True if continuing now would spend pay-as-you-go credits.
+
+    Fires when a plan window is approaching (``allowed_warning``) or at
+    (``rejected``) its limit *and* overage is available to absorb the overflow,
+    or when the reported window is already the ``overage`` bucket. Returns False
+    when there's plan headroom, or when overage is unavailable — in that case
+    the CLI stops on its own and there's nothing to gate.
+
+    Reads the raw CLI dict (camelCase keys) so it works against both the
+    persisted cache and a live RateLimitEvent's ``.raw``.
+    """
+    if not isinstance(rli, dict):
+        return False
+    status = rli.get("status")
+    rl_type = rli.get("rateLimitType")
+    overage_status = rli.get("overageStatus")
+    if rl_type == "overage":
+        return status in ("allowed", "allowed_warning")
+    if rl_type in _PLAN_RATE_LIMIT_TYPES and status in ("allowed_warning", "rejected"):
+        return overage_status in ("allowed", "allowed_warning")
+    return False
+
+
+def _load_rate_limit() -> Optional[dict]:
+    """Return the last-seen raw rate-limit dict from disk, or None.
+
+    Unwraps the ``{"info": ..., "captured_at": ...}`` envelope written by
+    _save_rate_limit. Used by the first-turn gate, which decides before the
+    freshly-spawned CLI has reported this session's rate-limit state.
+    """
+    try:
+        if RATE_LIMIT_CACHE.exists():
+            data = json.loads(RATE_LIMIT_CACHE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("info"), dict):
+                return data["info"]
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _emit_overage_declined(run: "ActiveRun", item: dict) -> None:
+    """Tell the UI a message was held back because the user declined credits.
+
+    Carries the queue id so the browser can clear the pending chip, plus a text
+    preview and the plan-reset timestamp so the user knows what was held and
+    when it can go through.
+    """
+    run.emit({
+        "type": "overage_declined",
+        "queue_id": item.get("queue_id"),
+        "text_preview": (item.get("text") or "")[:120],
+        "resets_at": (run.rate_limit_info or {}).get("resetsAt"),
+    })
+
+
+async def _gate_overage(run: "ActiveRun") -> bool:
+    """Ask whether to continue on pay-as-you-go credits. Return True to proceed.
+
+    Reuses the question-card plumbing: a PENDING future resolved by
+    POST /api/permission/{id}. Consent is remembered for the rest of the
+    conversation via ``run.overage_consent`` so the prompt appears once, not
+    every turn. A timeout or a stop resolves to False — credits are never spent
+    without an explicit "keep going".
+    """
+    if run.overage_consent:
+        return True
+    request_id = str(uuid_mod.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
+    try:
+        run.emit({
+            "type": "question_request",
+            "id": request_id,
+            "questions": [{
+                "question": _OVERAGE_GATE_QUESTION,
+                "header": "Usage credits",
+                "multiSelect": False,
+                "options": [
+                    {"label": _OVERAGE_GATE_KEEP,
+                     "description": "Continue this conversation, billing to pay-as-you-go credits."},
+                    {"label": _OVERAGE_GATE_STOP,
+                     "description": "Don't send. Wait until your plan limit resets."},
+                ],
+            }],
+            "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+        })
+        try:
+            decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            run.emit({
+                "type": "permission_timeout", "id": request_id,
+                "tool": "overage_gate",
+                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+            })
+            return False
+    finally:
+        PENDING.pop(request_id, None)
+    run.emit({
+        "type": "permission_resolved", "id": request_id,
+        "tool": "overage_gate", "decision": decision.get("decision"),
+    })
+    if decision.get("interrupted"):
+        return False
+    payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+    answers = (payload or {}).get("answers") or {}
+    chosen = answers.get(_OVERAGE_GATE_QUESTION)
+    if chosen is None and len(answers) == 1:
+        # Fall back to the sole answer if the browser keyed it differently.
+        chosen = next(iter(answers.values()))
+    if chosen == _OVERAGE_GATE_KEEP:
+        run.overage_consent = True
+        log.info("overage consent granted run=%s owner=%s", run.run_id, run.owner_sub or "?")
+        return True
+    log.info(
+        "overage declined run=%s owner=%s decision=%s",
+        run.run_id, run.owner_sub or "?", decision.get("decision"),
+    )
+    return False
 
 
 def _save_rate_limit(rli: dict) -> None:
