@@ -7961,7 +7961,8 @@ async def api_chat(
                     # CLI hasn't reported this session's state yet). Declining
                     # ends the run without a turn; the outer finally runs
                     # finish(), and __aexit__ tears down the just-spawned CLI.
-                    if not run.overage_consent and _overage_should_gate(_load_rate_limit()):
+                    if not run.overage_consent and _overage_should_gate(
+                            _load_rate_limit(run.account_slot)):
                         if not await _gate_overage(run):
                             _emit_overage_declined(run, {"text": message})
                             return
@@ -9309,10 +9310,12 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         if msg.subtype == "init":
             data = msg.data or {}
             rli = data.get("rate_limit_info") or {}
-            if rli:
-                _save_rate_limit(rli)
-                if run is not None:
-                    run.rate_limit_info = rli
+            if rli and run is not None:
+                # No run means no way to attribute the info to a credential
+                # slot, so it isn't cached (misfiling it would re-poison the
+                # cross-account gate this cache is keyed to prevent).
+                _save_rate_limit(rli, run.account_slot)
+                run.rate_limit_info = rli
             return [{
                 "type": "system",
                 "subtype": "init",
@@ -9331,8 +9334,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         raw = info.raw if isinstance(info.raw, dict) else {}
         if run is not None and raw:
             run.rate_limit_info = raw
-        if raw:
-            _save_rate_limit(raw)
+            _save_rate_limit(raw, run.account_slot)
         return [{
             "type": "rate_limit",
             "status": info.status,
@@ -9340,6 +9342,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "utilization": info.utilization,
             "resets_at": info.resets_at,
             "overage_status": info.overage_status,
+            # Which account the warning is about — the browser folds it into
+            # its announce-dedup key so a mid-chat account switch doesn't
+            # swallow the new account's first warning.
+            "account_slot": run.account_slot if run is not None else None,
         }]
     if isinstance(msg, AssistantMessage):
         out = []
@@ -9586,20 +9592,33 @@ def _overage_should_gate(rli: Optional[dict]) -> bool:
     return False
 
 
-def _load_rate_limit() -> Optional[dict]:
-    """Return the last-seen raw rate-limit dict from disk, or None.
+def _rate_limit_slots() -> dict:
+    """Parse RATE_LIMIT_CACHE's per-slot map. {} on missing/corrupt/legacy.
+
+    Legacy files (pre-slot ``{"info": ...}`` at top level) have no account
+    attribution, so they read as empty rather than being guessed onto a slot;
+    the map repopulates on the next RateLimitEvent.
+    """
+    try:
+        data = json.loads(RATE_LIMIT_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    slots = data.get("slots") if isinstance(data, dict) else None
+    return slots if isinstance(slots, dict) else {}
+
+
+def _load_rate_limit(slot: str) -> Optional[dict]:
+    """Return the last-seen raw rate-limit dict for one credential slot.
 
     Unwraps the ``{"info": ..., "captured_at": ...}`` envelope written by
     _save_rate_limit. Used by the first-turn gate, which decides before the
-    freshly-spawned CLI has reported this session's rate-limit state.
+    freshly-spawned CLI has reported this session's rate-limit state — it
+    must only ever see the spawning slot's window, or switching off an
+    exhausted account would gate the fresh one (and vice versa).
     """
-    try:
-        if RATE_LIMIT_CACHE.exists():
-            data = json.loads(RATE_LIMIT_CACHE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("info"), dict):
-                return data["info"]
-    except (OSError, ValueError):
-        return None
+    entry = _rate_limit_slots().get(slot)
+    if isinstance(entry, dict) and isinstance(entry.get("info"), dict):
+        return entry["info"]
     return None
 
 
@@ -9683,12 +9702,20 @@ async def _gate_overage(run: "ActiveRun") -> bool:
     return False
 
 
-def _save_rate_limit(rli: dict) -> None:
-    """Atomic write so a concurrent finish from another turn can't leave the
-    file half-written; the read in /api/usage would then JSON-fail and silently
-    drop the rate-limit panel."""
+def _save_rate_limit(rli: dict, slot: str) -> None:
+    """Cache the latest rate-limit dict under its credential slot.
+
+    Per-slot map so two accounts driven from the same chat (or two tabs on
+    two slots) don't overwrite each other's window state. Atomic replace so
+    a concurrent finish from another turn can't leave the file half-written;
+    the read in /api/usage would then JSON-fail and silently drop the
+    rate-limit panel. The read-modify-write needs no lock: every caller is
+    synchronous code on the event loop.
+    """
     try:
-        payload = json.dumps({"info": rli, "captured_at": int(time.time())})
+        slots = _rate_limit_slots()
+        slots[slot] = {"info": rli, "captured_at": int(time.time())}
+        payload = json.dumps({"slots": slots})
         tmp = RATE_LIMIT_CACHE.with_suffix(RATE_LIMIT_CACHE.suffix + ".tmp")
         tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, RATE_LIMIT_CACHE)
@@ -9783,9 +9810,13 @@ def _is_billed_row(row: dict) -> bool:
     return row.get("credential_mode") == "api_key"
 
 
-def _compute_usage_payload(user_sub: Optional[str]) -> dict:
+def _compute_usage_payload(user_sub: Optional[str],
+                           rl_slot: Optional[str] = None) -> dict:
     """Synchronous body of /api/usage — invoked on a worker thread so a fat
     usage.jsonl doesn't block the event loop.
+
+    ``rl_slot`` picks which credential slot's cached rate-limit envelope to
+    return (None omits it — used for slots the caller can't see).
 
     The full file is scanned per call because today's rows are interleaved
     with history. The naive linear scan is fine up to ~100k rows; rotate
@@ -9901,11 +9932,10 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
         )
 
     rate_limit = None
-    try:
-        if RATE_LIMIT_CACHE.exists():
-            rate_limit = json.loads(RATE_LIMIT_CACHE.read_text(encoding="utf-8"))
-    except Exception:
-        rate_limit = None
+    if rl_slot is not None:
+        entry = _rate_limit_slots().get(rl_slot)
+        if isinstance(entry, dict) and isinstance(entry.get("info"), dict):
+            rate_limit = entry
 
     currency_code = currency.resolve_currency(os.getenv("CLAUDE_WEB_CURRENCY"))
     rate = currency.usd_rate(currency_code)
@@ -9939,7 +9969,13 @@ def _compute_usage_payload(user_sub: Optional[str]) -> dict:
 
 @app.get("/api/usage")
 async def api_usage(request: Request, user: dict = Depends(auth.require_user)):
-    """Aggregate today's usage and return whatever rate-limit info we last saw.
+    """Aggregate today's usage plus the rate-limit info last seen for one slot.
+
+    ``?slot=`` takes the account picker's value like /api/usage/live, so the
+    dialog's rate-limit block describes the account it's headed with rather
+    than whichever slot happened to report last. Unknown/invisible slots
+    just omit the block — a 404 here would take the whole dialog down with
+    it, and the rest of the payload is slot-independent.
 
     Delegates the disk scan + JSON parsing to a worker thread because
     usage.jsonl grows monotonically. With a few hundred rows it's fine on
@@ -9947,7 +9983,10 @@ async def api_usage(request: Request, user: dict = Depends(auth.require_user)):
     blocking work, which starves every other in-flight request and stalls
     SSE streams. asyncio.to_thread is the minimal-blast-radius fix.
     """
-    return await asyncio.to_thread(_compute_usage_payload, user.get("sub"))
+    slot: Optional[str] = request.query_params.get("slot") or "shared"
+    if not _account_slot_visible(user.get("sub"), slot):
+        slot = None
+    return await asyncio.to_thread(_compute_usage_payload, user.get("sub"), slot)
 
 
 def _usage_history_payload(user_sub: Optional[str], days: int = 30) -> dict:

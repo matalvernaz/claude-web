@@ -2478,14 +2478,24 @@
     } else if (obj.type === "rate_limit") {
       // Non-blocking heads-up as the plan limit nears. The keep-going/stop
       // choice itself arrives as a question card at the next turn boundary.
-      // Dedup on status+window so a repeated event doesn't re-announce.
-      const key = obj.status + ":" + (obj.rate_limit_type || "");
+      // Dedup on account+status+window so a repeated event doesn't
+      // re-announce — the account is part of the key so a mid-chat account
+      // switch can't swallow the new account's first warning, and the
+      // announcement names the account so it's clear whose limit it is.
+      const key = (obj.account_slot || "") + ":" + obj.status + ":" + (obj.rate_limit_type || "");
       if ((obj.status === "allowed_warning" || obj.status === "rejected")
           && key !== handleSSEEvent._lastRateLimitKey) {
         handleSSEEvent._lastRateLimitKey = key;
+        const acct = document.getElementById("account-select");
+        let acctSuffix = "";
+        if (acct && acct.options.length > 1 && obj.account_slot) {
+          for (const opt of acct.options) {
+            if (opt.value === obj.account_slot) { acctSuffix = " on " + opt.text; break; }
+          }
+        }
         announce(obj.status === "rejected"
-          ? "Plan limit reached. You'll be asked before any usage credits are spent."
-          : "Approaching your Claude plan limit.");
+          ? "Plan limit reached" + acctSuffix + ". You'll be asked before any usage credits are spent."
+          : "Approaching your Claude plan limit" + acctSuffix + ".");
       }
     } else if (obj.type === "overage_declined") {
       // Plan limit reached and the user declined to continue on usage credits.
@@ -4096,7 +4106,9 @@
       // fetch them together. History is best-effort — a failure there still
       // shows Today rather than erroring the whole dialog.
       const [uR, hR] = await Promise.all([
-        fetch("/api/usage"),
+        // Same slot as the live fetch, so the cached rate-limit block
+        // describes the account named in the dialog heading.
+        fetch("/api/usage?slot=" + encodeURIComponent(slot)),
         fetch("/api/usage/history?days=30").catch(() => null),
       ]);
       if (!uR.ok) throw new Error("HTTP " + uR.status);

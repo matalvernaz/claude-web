@@ -1320,15 +1320,43 @@ def test_overage_should_gate(rli, expected: bool) -> None:
 def test_load_rate_limit_unwraps_envelope(tmp_path, monkeypatch) -> None:
     cache = tmp_path / "rate_limit.json"
     info = {"status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed"}
-    cache.write_text(json.dumps({"info": info, "captured_at": 123}), encoding="utf-8")
+    cache.write_text(
+        json.dumps({"slots": {"shared": {"info": info, "captured_at": 123}}}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", cache)
-    assert app_module._load_rate_limit() == info
-    assert app_module._overage_should_gate(app_module._load_rate_limit()) is True
+    assert app_module._load_rate_limit("shared") == info
+    assert app_module._overage_should_gate(app_module._load_rate_limit("shared")) is True
 
 
 def test_load_rate_limit_missing_returns_none(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", tmp_path / "nope.json")
-    assert app_module._load_rate_limit() is None
+    assert app_module._load_rate_limit("shared") is None
+
+
+def test_load_rate_limit_is_per_slot(tmp_path, monkeypatch) -> None:
+    """One slot's exhausted window must never gate a run on another slot."""
+    monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", tmp_path / "rate_limit.json")
+    rejected = {"status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed"}
+    fine = {"status": "allowed", "rateLimitType": "five_hour", "overageStatus": "allowed"}
+    app_module._save_rate_limit(rejected, "shared")
+    app_module._save_rate_limit(fine, "cred:7")
+    assert app_module._load_rate_limit("shared") == rejected
+    assert app_module._load_rate_limit("cred:7") == fine
+    assert app_module._overage_should_gate(app_module._load_rate_limit("cred:7")) is False
+    assert app_module._load_rate_limit("cred:8") is None
+
+
+def test_load_rate_limit_ignores_legacy_single_account_file(tmp_path, monkeypatch) -> None:
+    """Pre-slot cache files carry no account attribution — read as empty."""
+    cache = tmp_path / "rate_limit.json"
+    info = {"status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed"}
+    cache.write_text(json.dumps({"info": info, "captured_at": 123}), encoding="utf-8")
+    monkeypatch.setattr(app_module, "RATE_LIMIT_CACHE", cache)
+    assert app_module._load_rate_limit("shared") is None
+    # A save on top of the legacy file upgrades it to the per-slot map.
+    app_module._save_rate_limit(info, "shared")
+    assert app_module._load_rate_limit("shared") == info
 
 
 def _capture_question(run):
