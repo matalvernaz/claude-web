@@ -39,6 +39,15 @@
   const apikeyError = $("apikey-error");
 
   let activeCredId = null;
+  // Per-credential endpoints are /api/account/credentials/<id>/...; the
+  // shared slot uses the pseudo-id "shared" and its own /api/account/shared/
+  // family (admin-gated server-side). Same flow shapes either way, so the
+  // rest of this file doesn't care which kind is active.
+  function credUrl(id, tail) {
+    return id === "shared"
+      ? `/api/account/shared/${tail}`
+      : `/api/account/credentials/${id}/${tail}`;
+  }
   let pollHandle = null;
   let pollInFlight = false;
   const POLL_MS = 1500;
@@ -70,6 +79,14 @@
   function openSignin(credId, label) {
     activeCredId = credId;
     setText(signinLabel, label);
+    const intro = $("signin-intro");
+    if (intro) {
+      intro.textContent = credId === "shared"
+        ? "Pick whichever flow matches the Claude account you're connecting. "
+          + "This is the shared account — everyone on this claude-web uses it."
+        : "Pick whichever flow matches the Claude account you're connecting. "
+          + "This is your account — only you can use it from claude-web.";
+    }
     clearOauthState();
     show(signinSection);
     signinSection.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -80,7 +97,7 @@
     if (activeCredId != null) {
       // Best-effort: cancel any flow we kicked off for this cred so a
       // background driver doesn't keep a stale subprocess alive.
-      fetch(`/api/account/credentials/${activeCredId}/oauth/cancel`, { method: "POST" })
+      fetch(credUrl(activeCredId, "oauth/cancel"), { method: "POST" })
         .catch(() => {});
     }
     activeCredId = null;
@@ -137,7 +154,7 @@
 
   async function fetchCredStatus(credId) {
     try {
-      const r = await fetch(`/api/account/credentials/${credId}/status`);
+      const r = await fetch(credUrl(credId, "status"));
       if (!r.ok) return null;
       return await r.json();
     } catch { return null; }
@@ -192,7 +209,7 @@
       oauthStart.disabled = true;
       const variant = (new FormData(oauthForm)).get("variant") || "claudeai";
       try {
-        const r = await fetch(`/api/account/credentials/${activeCredId}/oauth/start`, {
+        const r = await fetch(credUrl(activeCredId, "oauth/start"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ variant }),
@@ -220,7 +237,7 @@
       setText(oauthStatus, "Exchanging code with Anthropic…");
       startPolling(activeCredId);
       try {
-        const r = await fetch(`/api/account/credentials/${activeCredId}/oauth/code`, {
+        const r = await fetch(credUrl(activeCredId, "oauth/code"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ code }),
@@ -243,7 +260,7 @@
       if (activeCredId == null) return;
       stopPolling();
       try {
-        await fetch(`/api/account/credentials/${activeCredId}/oauth/cancel`, { method: "POST" });
+        await fetch(credUrl(activeCredId, "oauth/cancel"), { method: "POST" });
       } catch (_) {}
       clearOauthState();
     });
@@ -266,7 +283,7 @@
       apikeySubmit.disabled = true;
       setText(apikeyStatus, "Saving…");
       try {
-        const r = await fetch(`/api/account/credentials/${activeCredId}/apikey`, {
+        const r = await fetch(credUrl(activeCredId, "apikey"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ api_key: apiKey }),

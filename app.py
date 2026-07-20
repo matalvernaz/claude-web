@@ -7059,6 +7059,105 @@ async def api_credentials_oauth_cancel(
     return {"ok": True}
 
 
+# ─── Shared-slot re-auth from /account ───────────────────────────────────────
+# The /setup endpoints lock after first configuration (ENABLE_SETUP=auto), so
+# an expired/revoked SHARED credential had no browser-side recovery: the
+# per-credential rows on /account each carry a sign-in button, the shared row
+# didn't. These mirror the per-cred flow endpoints onto the shared CLI home
+# (setup_flow's default flow key + home=None).
+
+
+def _shared_reauth_allowed(user: dict) -> bool:
+    """Whether this user may re-run the shared credential's sign-in from
+    /account. Same policy as _require_setup_access minus the
+    ENABLE_SETUP=auto first-configuration lock: that lock exists so the
+    public-ish /setup page can't be replayed after provisioning, but a
+    deliberate re-auth of an already-provisioned slot by an authorized
+    operator is the recovery path for an expired/revoked token.
+    ``ENABLE_SETUP=false`` stays a hard lock, and any configured admin list
+    still applies."""
+    if ENABLE_SETUP == "false":
+        return False
+    if PER_USER_SESSIONS or ADMIN_EMAILS:
+        return (user.get("email") or "").lower() in ADMIN_EMAILS
+    return True
+
+
+def _require_shared_reauth(user: dict) -> None:
+    if not _shared_reauth_allowed(user):
+        raise HTTPException(
+            403, "shared-credential changes are locked on this install",
+        )
+
+
+@app.get("/api/account/shared/status")
+async def api_shared_status(user: dict = Depends(auth.require_user)):
+    flow = setup_flow.current_flow()
+    return {
+        "credential": {"configured": setup_flow.is_configured()},
+        "flow": flow.to_public() if flow else None,
+    }
+
+
+@app.post("/api/account/shared/oauth/start")
+async def api_shared_oauth_start(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    _require_shared_reauth(user)
+    body = await request.json()
+    variant = body.get("variant", "claudeai")
+    if variant not in ("claudeai", "console"):
+        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    state = await setup_flow.start_oauth(variant)
+    log.info("shared re-auth started by %s", user.get("email") or user.get("sub"))
+    return state.to_public()
+
+
+@app.post("/api/account/shared/oauth/code")
+async def api_shared_oauth_code(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    _require_shared_reauth(user)
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    if not code:
+        raise HTTPException(400, "code is required")
+    if len(code) > 200_000:
+        raise HTTPException(400, "code too long")
+    try:
+        state = await setup_flow.submit_code(code)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+    return {
+        "configured": setup_flow.is_configured(),
+        "flow": state.to_public(),
+    }
+
+
+@app.post("/api/account/shared/oauth/cancel")
+async def api_shared_oauth_cancel(user: dict = Depends(auth.require_user)):
+    _require_shared_reauth(user)
+    await setup_flow.cancel_flow()
+    return {"ok": True}
+
+
+@app.post("/api/account/shared/apikey")
+async def api_shared_apikey(
+    request: Request, user: dict = Depends(auth.require_user),
+):
+    _require_shared_reauth(user)
+    body = await request.json()
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(400, "api_key is required")
+    try:
+        setup_flow.save_api_key(api_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    log.info("shared api key replaced by %s", user.get("email") or user.get("sub"))
+    return {"configured": setup_flow.is_configured()}
+
+
 @app.post("/api/account/credentials/{cred_id}/apikey")
 async def api_credentials_apikey(
     cred_id: int,
@@ -11102,6 +11201,7 @@ async def account_page(request: Request, user: dict = Depends(auth.require_user)
             "user": user,
             "account": _account_payload(user),
             "site_title": SITE_TITLE,
+            "shared_reauth_allowed": _shared_reauth_allowed(user),
         },
     )
     response.headers["Cache-Control"] = "no-store"

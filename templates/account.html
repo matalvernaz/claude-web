@@ -31,6 +31,11 @@
         <li class="cred-item cred-shared">
           <span class="cred-label">{{ account.shared_label }}</span>
           <span class="cred-meta">Shared with everyone</span>
+          {% if shared_reauth_allowed %}
+            <span class="cred-actions">
+              <button type="button" class="cred-setup" data-cred-id="shared">Sign in again</button>
+            </span>
+          {% endif %}
         </li>
         {% for c in account.credentials %}
           <li class="cred-item" data-cred-id="{{ c.id }}">
@@ -67,7 +72,7 @@
 
     <section id="signin-section" aria-labelledby="signin-heading" class="setup-card" hidden>
       <h2 id="signin-heading">Sign in to <span id="signin-label"></span></h2>
-      <p>
+      <p id="signin-intro">
         Pick whichever flow matches the Claude account you're connecting.
         This is your account — only you can use it from claude-web.
       </p>
