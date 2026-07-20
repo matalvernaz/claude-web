@@ -12,6 +12,8 @@
   const sessionList = document.getElementById("session-list");
   const headerCostEl = document.getElementById("header-cost");
   const modelSelect = document.getElementById("model-select");
+  const providerSelect = document.getElementById("provider-select");
+  const providerSelectLabel = document.getElementById("provider-select-label");
   const permModeSelect = document.getElementById("permission-mode-select");
   const effortSelect = document.getElementById("effort-select");
   const effortSelectLabel = document.getElementById("effort-select-label");
@@ -50,6 +52,14 @@
   const EFFORT_KEY = "claude-web.effort";
   const PERM_MODE_KEY = "claude-web.permission-mode";
   const PROJECT_KEY = "claude-web.project";
+  const PROVIDER_KEY = "claude-web.provider";
+  // Per-provider model memory: each provider's model list is disjoint, so
+  // remembering one pick per provider means toggling back and forth doesn't
+  // lose either choice. "claude-web.model" stays Claude's key for
+  // backward-compat with existing installs.
+  function modelKeyFor(provider) {
+    return provider === "claude" ? MODEL_KEY : MODEL_KEY + "." + provider;
+  }
 
   // One-shot flag armed by /fork: the next send branches the conversation
   // into a new session (server passes fork_session=True) instead of
@@ -489,10 +499,10 @@
         modelSelect.value = lastSeenModel || "";
         return;
       }
-      safeSet(localStorage, MODEL_KEY, newModel);
+      safeSet(localStorage, modelKeyFor(currentProvider()), newModel);
       lastSeenModel = newModel || lastSeenModel;
       renderContextMeter();
-      syncEffortVisibility();
+      rebuildEffortOptions();
       // With a live conversation, switch the running CLI's model in place via
       // set_model so it takes effect from the next turn. Without one, the pick
       // rides the next /api/chat spawn (which reads the model field).
@@ -591,6 +601,136 @@
       safeSet(localStorage, PROJECT_KEY, projectSelect.value);
     });
   }
+
+  // ── AI provider picker ─────────────────────────────────────────────────
+  // Hidden until /api/providers reports more than one available provider,
+  // so a Claude-only install renders exactly as before. Provider is fixed
+  // per conversation: changing it with a session open starts a new chat
+  // (the server refuses cross-provider resumes). Each provider brings its
+  // own model list; the shared MODEL_* maps merge both lists because the
+  // key spaces are disjoint (claude-* vs gpt-*).
+  const PROVIDERS = { claude: null, codex: null };
+  function currentProvider() {
+    return (providerSelect && providerSelect.value) || "claude";
+  }
+  function providerCapabilities(key) {
+    const p = PROVIDERS[key || currentProvider()];
+    return (p && p.capabilities) || {
+      plan_mode: true, fork: true, rewind: true,
+      permission_modes: true, accounts: true,
+    };
+  }
+
+  function rebuildModelOptions(provider) {
+    if (!modelSelect) return;
+    const p = PROVIDERS[provider];
+    if (!p || !p.models || !p.models.length) return;
+    modelSelect.innerHTML = "";
+    for (const m of p.models) {
+      const o = document.createElement("option");
+      o.value = m.key || "";
+      o.textContent = m.label || m.key || "Default";
+      modelSelect.appendChild(o);
+    }
+    const saved = safeGet(localStorage, modelKeyFor(provider));
+    if (saved !== null && [...modelSelect.options].some((o) => o.value === saved)) {
+      modelSelect.value = saved;
+    } else if (provider === "codex") {
+      const dflt = p.models.find((m) => m.is_default) || p.models[0];
+      if (dflt) modelSelect.value = dflt.key;
+    }
+    lastSeenModel = modelSelect.value || null;
+  }
+
+  function rebuildEffortOptions() {
+    if (!effortSelect) return;
+    const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
+    const saved = effortSelect.value;
+    effortSelect.innerHTML = "";
+    const dflt = document.createElement("option");
+    dflt.value = "";
+    dflt.textContent = "Default effort";
+    effortSelect.appendChild(dflt);
+    for (const e of efforts) {
+      const o = document.createElement("option");
+      o.value = e;
+      o.textContent = e;
+      effortSelect.appendChild(o);
+    }
+    if ([...effortSelect.options].some((o) => o.value === saved)) {
+      effortSelect.value = saved;
+    }
+    syncEffortVisibility();
+  }
+
+  // Show/hide the Claude-only header controls and swap the model list.
+  function applyProviderUI(provider) {
+    const caps = providerCapabilities(provider);
+    const permLabel = permModeSelect && permModeSelect.closest("label");
+    if (permLabel) permLabel.hidden = !caps.permission_modes;
+    const acctLabel = accountSelect && accountSelect.closest("label");
+    if (acctLabel) acctLabel.hidden = !caps.accounts;
+    rebuildModelOptions(provider);
+    rebuildEffortOptions();
+    renderContextMeter();
+  }
+
+  async function initProviders() {
+    let payload = null;
+    try {
+      const r = await fetch("/api/providers");
+      if (r.ok) payload = await r.json();
+    } catch (_) { /* provider combo just stays hidden */ }
+    const provs = (payload && payload.providers) || [];
+    for (const p of provs) {
+      PROVIDERS[p.key] = p;
+      for (const m of p.models || []) {
+        if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
+        MODEL_EFFORTS[m.key || ""] = MODEL_EFFORTS[m.key || ""] || m.efforts || [];
+        if (!(m.key in MODEL_BETAS)) MODEL_BETAS[m.key || ""] = m.betas || [];
+        if (!(m.key in MODEL_ADVISOR)) MODEL_ADVISOR[m.key || ""] = m.advisor || "";
+      }
+    }
+    const available = provs.filter((p) => p.available);
+    if (!providerSelect || available.length < 2) return;
+    providerSelect.innerHTML = "";
+    for (const p of available) {
+      const o = document.createElement("option");
+      o.value = p.key;
+      o.textContent = p.label;
+      providerSelect.appendChild(o);
+    }
+    if (providerSelectLabel) providerSelectLabel.hidden = false;
+    const saved = safeGet(localStorage, PROVIDER_KEY);
+    if (saved && [...providerSelect.options].some((o) => o.value === saved)) {
+      providerSelect.value = saved;
+    }
+    // A session pinned in the URL wins over the saved pick; loadSession
+    // realigns the picker from the session payload's provider field.
+    if (currentProvider() !== "claude" && !sessionId) {
+      applyProviderUI(currentProvider());
+    }
+    providerSelect.addEventListener("change", () => {
+      const provider = currentProvider();
+      safeSet(localStorage, PROVIDER_KEY, provider);
+      const label = [...providerSelect.options].find((o) => o.value === provider);
+      if (sessionId) {
+        // Provider is fixed per conversation — leaving one means leaving
+        // the chat. Reuse the New-chat reset so every piece of per-run
+        // state is dropped consistently.
+        newChatBtn.click();
+        announce(`Switched to ${label ? label.textContent : provider}. Started a new chat.`);
+      } else {
+        announce(`Switched to ${label ? label.textContent : provider}.`);
+      }
+      applyProviderUI(provider);
+    });
+  }
+  // Kept as a promise so a boot-time ?session= load can await the provider
+  // list before realigning the picker — otherwise a codex session opened
+  // from a URL races the fetch, misses the realign, and every send would
+  // carry provider=claude into the server's cross-provider guard (400).
+  const providersReady = initProviders();
 
   // Account slot toggle (shared vs one of the user's personal credentials).
   // The select value is "shared" or "cred:<id>". Mirrors the personality
@@ -929,6 +1069,18 @@
     queueRebindFromRunId = null;
     streamGeneration++;
     sessionId = id || "";
+    // Realign the provider picker to the loaded session. Sessions are
+    // provider-bound, so a codex session opened while the picker says
+    // Claude (or vice versa) must flip the whole header state — model
+    // list, effort options, hidden controls — before any send.
+    await providersReady;
+    const sessProvider = data.provider === "codex" ? "codex" : "claude";
+    if (providerSelect && currentProvider() !== sessProvider
+        && [...providerSelect.options].some((o) => o.value === sessProvider)) {
+      providerSelect.value = sessProvider;
+      safeSet(localStorage, PROVIDER_KEY, sessProvider);
+      applyProviderUI(sessProvider);
+    }
     // Use ?? not || so the loaded session's own (possibly empty) project
     // wins over the URL-pinned project — otherwise switching to an
     // unprojected session keeps applying the previous project to sends.
@@ -1898,8 +2050,14 @@
       if (sessionId) fd.append("session_id", sessionId);
       const project = currentProject();
       if (project) fd.append("project", project);
+      const provider = currentProvider();
+      fd.append("provider", provider);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
-      if (permModeSelect && permModeSelect.value) fd.append("permission_mode", permModeSelect.value);
+      // Permission modes and account slots are Claude concepts; Codex runs
+      // always gate through approval prompts and use host-level auth.
+      if (provider === "claude" && permModeSelect && permModeSelect.value) {
+        fd.append("permission_mode", permModeSelect.value);
+      }
       if (effortSelect && effortSelect.value && effortSupported()) {
         fd.append("effort", effortSelect.value);
       }
@@ -1914,7 +2072,7 @@
       }
       // Picker value as session-scoped account override — same per-session
       // binding as personality, so two tabs run under two accounts at once.
-      if (accountSelect && accountSelect.value) {
+      if (provider === "claude" && accountSelect && accountSelect.value) {
         fd.append("account_slot", accountSelect.value);
       }
       for (const img of entry.images) {
@@ -4535,6 +4693,12 @@
       time.setAttribute("datetime", s.mtime);
       time.textContent = formatTime(s.mtime);
       meta.appendChild(time);
+      if (s.provider && s.provider !== "claude") {
+        const prov = document.createElement("span");
+        prov.className = "session-provider";
+        prov.textContent = s.provider === "codex" ? "Codex" : s.provider;
+        meta.appendChild(prov);
+      }
       if (s.project_path || s.project) {
         const proj = document.createElement("span");
         proj.className = "session-project";

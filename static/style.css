@@ -570,6 +570,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   border-radius: 3px;
   white-space: nowrap;
 }
+.session-provider {
+  font-size: 0.7rem;
+  color: #888;
+  background: var(--bg);
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  border: 1px solid #888;
+  white-space: nowrap;
+}
 
 /* ─── Image attachments ───────────────────────────────────────────────── */
 .attachments {

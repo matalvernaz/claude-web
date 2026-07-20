@@ -67,6 +67,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
+import codex_provider
 import currency
 import setup_flow
 
@@ -431,6 +432,84 @@ def _models_payload() -> list[dict]:
          "advisor": m.get("advisor_model") or ""}
         for m in KNOWN_MODELS
     ]
+
+
+# ─── AI providers ─────────────────────────────────────────────────────────────
+# The chat header offers a provider picker next to the model picker. "claude"
+# is the native path (KNOWN_MODELS + the Claude Agent SDK driver); "codex"
+# drives OpenAI's Codex via `codex app-server` (see codex_provider.py) and
+# only appears when the CLI is installed and signed in. A provider is fixed
+# for the life of a conversation — models can change mid-chat (per-turn on
+# Codex, set_model on Claude), providers cannot.
+
+VALID_PROVIDERS = ("claude", "codex")
+
+# Codex thread ids double as claude-web session ids. Runtime knobs like
+# approval policy and sandbox mode live in codex_provider.py.
+CODEX_PROVIDER_LABEL = "Codex (OpenAI)"
+
+
+async def _providers_payload() -> list[dict]:
+    """Provider list for the header combo, fetched by the browser after
+    load (not embedded at render time: the Codex model list needs the
+    app-server, and first spawn shouldn't block the page).
+
+    Capabilities tell the frontend which Claude-only controls to hide for
+    a Codex conversation rather than letting them 400 server-side.
+    """
+    claude_entry = {
+        "key": "claude",
+        "label": "Claude",
+        "available": True,
+        "reason": None,
+        "models": _models_payload(),
+        "capabilities": {
+            "plan_mode": True, "fork": True, "rewind": True,
+            "permission_modes": True, "accounts": True,
+        },
+    }
+    codex_avail = codex_provider.availability()
+    codex_entry = {
+        "key": "codex",
+        "label": CODEX_PROVIDER_LABEL,
+        "available": bool(codex_avail["available"]),
+        "reason": codex_avail["reason"],
+        "models": [],
+        "capabilities": {
+            "plan_mode": False, "fork": False, "rewind": False,
+            "permission_modes": False, "accounts": False,
+        },
+    }
+    if codex_entry["available"]:
+        try:
+            server = await codex_provider.CodexAppServer.get()
+            models = await server.models()
+            codex_entry["models"] = [
+                {"key": m["key"], "label": m["label"], "context": None,
+                 "efforts": m["efforts"] or [],
+                 "default_effort": m.get("default_effort"),
+                 "betas": [], "advisor": "",
+                 "is_default": m.get("is_default", False)}
+                for m in models
+            ]
+        except Exception as e:
+            # Signed in but the server won't start / list — degrade to
+            # unavailable with the reason instead of a picker that 500s.
+            log.warning("codex model list failed: %s", e)
+            codex_entry["available"] = False
+            codex_entry["reason"] = f"codex app-server error: {e}"
+    return [claude_entry, codex_entry]
+
+
+def _codex_models_by_key() -> dict[str, dict]:
+    """Synchronous view of the Codex model-list cache for request
+    validation. Empty until the first /api/providers fetch has run —
+    api_chat treats an unknown-but-nonempty model key as invalid only
+    when the cache is warm, and otherwise passes it through (the
+    app-server rejects a genuinely bad id with a clear error)."""
+    inst = codex_provider.CodexAppServer._instance
+    cache = inst._models_cache if inst is not None else None
+    return {m["key"]: m for m in (cache or [])}
 
 # Optional reliability/cost knobs forwarded to the SDK on every fresh spawn.
 # CLAUDE_WEB_FALLBACK_MODEL: model id the CLI retries with when the primary
@@ -870,6 +949,84 @@ def list_sessions(user: Optional[dict] = None) -> list[dict]:
             "project_path": r["project_path"],
             "title": title,
             "mtime": r["mtime"],
+            "provider": "claude",
+        })
+    out.extend(_codex_sessions_for_list(user))
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out[:MAX_LISTED_SESSIONS]
+
+
+def _record_codex_session(
+    thread_id: str, owner_sub: Optional[str], project_key: Optional[str],
+    title: str, model: Optional[str],
+) -> None:
+    """Upsert the codex_session registry row. COALESCE keeps the original
+    title/model when a later touch doesn't carry them (mirrors
+    _persist_run_meta's convention)."""
+    now = time.time()
+    try:
+        _state_db().execute(
+            """
+            INSERT INTO codex_session(thread_id, owner_sub, project_key,
+                                      title, model, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                title=COALESCE(NULLIF(excluded.title, ''), codex_session.title),
+                model=COALESCE(excluded.model, codex_session.model),
+                updated_at=excluded.updated_at
+            """,
+            (thread_id, owner_sub, project_key, (title or "")[:MAX_TITLE_CHARS],
+             model, now, now),
+        )
+    except sqlite3.Error as e:
+        log.warning("record_codex_session failed: %s", e)
+
+
+def _codex_session_row(thread_id: str) -> Optional[dict]:
+    try:
+        row = _state_db().execute(
+            "SELECT thread_id, owner_sub, project_key, title, model, "
+            "created_at, updated_at FROM codex_session WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {
+        "thread_id": row[0], "owner_sub": row[1], "project_key": row[2],
+        "title": row[3], "model": row[4], "created_at": row[5],
+        "updated_at": row[6],
+    }
+
+
+def _codex_sessions_for_list(user: Optional[dict]) -> list[dict]:
+    """codex_session rows shaped like list_sessions entries. Visibility
+    mirrors _user_can_see_session: ownerless rows are visible to all."""
+    try:
+        rows = _state_db().execute(
+            "SELECT thread_id, owner_sub, project_key, title, updated_at "
+            "FROM codex_session ORDER BY updated_at DESC LIMIT ?",
+            (MAX_LISTED_SESSIONS,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    sub = (user or {}).get("sub")
+    for thread_id, owner_sub, project_key, title, updated_at in rows:
+        if PER_USER_SESSIONS and user is not None and owner_sub and owner_sub != sub:
+            continue
+        try:
+            project_path = str(_resolve_project(project_key or ""))
+        except HTTPException:
+            project_path = project_key or ""
+        out.append({
+            "id": thread_id,
+            "project": project_key,
+            "project_path": project_path,
+            "title": (title or "").strip() or thread_id[:8],
+            "mtime": int(updated_at),
+            "provider": "codex",
         })
     return out
 
@@ -1480,6 +1637,20 @@ def _state_db() -> sqlite3.Connection:
             name TEXT PRIMARY KEY,
             disabled_at REAL NOT NULL,
             disabled_by TEXT
+        )""")
+        # Codex conversations. Claude sessions are discovered from the CLI's
+        # on-disk JSONL; Codex threads live in ~/.codex's own store, so the
+        # sidebar/list/reopen paths need this registry to know a session id
+        # is a Codex thread (and what to show for it) without spawning the
+        # app-server. thread_id doubles as the claude-web session id.
+        conn.execute("""CREATE TABLE IF NOT EXISTS codex_session (
+            thread_id TEXT PRIMARY KEY,
+            owner_sub TEXT,
+            project_key TEXT,
+            title TEXT,
+            model TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
         )""")
         _migrate_user_account_legacy(conn)
         _seed_personalities(conn)
@@ -5260,6 +5431,20 @@ class ActiveRun:
         # choice for the life of this conversation so the gate asks once.
         self.rate_limit_info: Optional[dict] = None
         self.overage_consent: bool = False
+        # AI provider this run is bound to ("claude" | "codex"). Fixed for
+        # the life of the conversation; api_chat dispatches on it and the
+        # control endpoints branch where Codex semantics differ.
+        self.provider: str = "claude"
+        # Codex-only state. thread_id doubles as the session id; turn_id is
+        # the in-flight turn (turn/interrupt needs both). effort/model are
+        # the values the next turn/start will send (per-turn on Codex, so a
+        # mid-chat model switch is just a field write here). token_usage
+        # caches the latest thread/tokenUsage payload for the context-usage
+        # endpoint.
+        self.codex_turn_id: Optional[str] = None
+        self.codex_model_id: Optional[str] = None
+        self.codex_effort: Optional[str] = None
+        self.codex_token_usage: Optional[dict] = None
 
     def emit(self, event: dict) -> None:
         # Tag with a monotonic per-run index so the browser can dedupe an
@@ -5758,6 +5943,11 @@ async def _install_restart_machinery() -> None:
 async def _mark_shutting_down() -> None:
     global SHUTTING_DOWN
     SHUTTING_DOWN = True
+    # Terminate the shared codex app-server child (best-effort; the systemd
+    # cgroup sweep catches it anyway on unit restart).
+    inst = codex_provider.CodexAppServer._instance
+    if inst is not None:
+        inst.shutdown()
 
 
 def _require_restart_admin(user: dict) -> None:
@@ -6242,6 +6432,15 @@ async def api_projects(user: dict = Depends(auth.require_user)):
     }
 
 
+@app.get("/api/providers")
+async def api_providers(user: dict = Depends(auth.require_user)):
+    """Provider list for the header combo. Fetched by the browser after
+    page load; the first call with Codex signed in spawns the shared
+    app-server to read its model list, so this can take a couple of
+    seconds once per process lifetime."""
+    return {"providers": await _providers_payload()}
+
+
 @app.get("/api/sessions")
 async def api_sessions(user: dict = Depends(auth.require_user)):
     return list_sessions(user)
@@ -6334,6 +6533,42 @@ async def api_sessions_search(
     return {"query": q, "hits": hits}
 
 
+async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
+    """api_session response for a Codex thread: transcript via thread/read
+    on the shared app-server (codex's rollout store is the source of truth,
+    like the CLI JSONL is for Claude sessions). A read failure degrades to
+    an empty history rather than a 500 — the live_run attach still lets an
+    in-flight conversation reconnect."""
+    messages: list[dict] = []
+    try:
+        server = await codex_provider.CodexAppServer.get()
+        resp = await server.request(
+            "thread/read", {"threadId": sid, "includeTurns": True},
+        )
+        messages = codex_provider.thread_transcript(
+            (resp or {}).get("thread") or {}, TOOL_RESULT_PREVIEW * 4,
+        )
+    except Exception as e:
+        log.warning("codex thread/read failed for %s: %s", sid, e)
+    live = _existing_run_for_session(sid)
+    live_run = None
+    if live is not None and (not live.owner_sub or live.owner_sub == user.get("sub")):
+        live_run = {
+            "run_id": live.run_id,
+            "active": not live.done,
+            "between_turns": live.between_turns,
+            "next_idx": live._next_idx,
+            "pending_prompts": _pending_prompts_for_run(live),
+        }
+    return {
+        "id": sid,
+        "project": row.get("project_key"),
+        "messages": messages,
+        "live_run": live_run,
+        "provider": "codex",
+    }
+
+
 @app.get("/api/sessions/{sid}")
 async def api_session(
     sid: str,
@@ -6344,6 +6579,9 @@ async def api_session(
     if not _user_can_see_session(sid, user):
         # Mimic 404 rather than 403 so we don't leak existence to non-owners.
         return JSONResponse({"error": "not found"}, status_code=404)
+    codex_row = _codex_session_row(sid)
+    if codex_row is not None:
+        return await _codex_session_payload(sid, codex_row, user)
     path = _find_session_path(sid, project)
     if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -6378,6 +6616,7 @@ async def api_session(
         "project": project_key,
         "messages": messages,
         "live_run": live_run,
+        "provider": "claude",
     }
 
 
@@ -6417,6 +6656,26 @@ async def api_delete_session(
     sid = _safe_id(sid)
     if not _user_can_see_session(sid, user):
         return JSONResponse({"error": "not found"}, status_code=404)
+    if _codex_session_row(sid) is not None:
+        active = _existing_run_for_session(sid)
+        if active is not None:
+            raise HTTPException(409, "session is active — stop the run before deleting")
+        # Best-effort delete of the thread in codex's own store; the sidebar
+        # entry (our registry row) goes regardless so the delete is honoured
+        # even when the app-server is unavailable.
+        try:
+            server = await codex_provider.CodexAppServer.get()
+            await server.request("thread/delete", {"threadId": sid})
+        except Exception as e:
+            log.warning("codex thread/delete failed for %s: %s", sid, e)
+        try:
+            _state_db().execute(
+                "DELETE FROM codex_session WHERE thread_id = ?", (sid,))
+            _state_db().execute(
+                "DELETE FROM session_owners WHERE session_id = ?", (sid,))
+        except sqlite3.Error:
+            pass
+        return {"ok": True}
     path = _find_session_path(sid, project)
     if path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -7280,6 +7539,389 @@ def _compose_auto_fire_message(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ─── Codex run driver ─────────────────────────────────────────────────────────
+# The Codex analog of the ClaudeSDKClient driver inside api_chat. One shared
+# `codex app-server` process serves every Codex run (the protocol is
+# thread-scoped); this driver owns one thread on it: start/resume the
+# thread, feed queued user input as turns, translate notifications into the
+# same SSE events the Claude path emits, and bridge approval requests into
+# _gate_tool_permission so the existing permission cards drive them.
+
+
+class _CodexRunClient:
+    """Published to run.client so /api/chat/stop's client.interrupt() works
+    unchanged. Interrupt needs the live turn id; without one (turn not
+    started yet) it raises and the stop endpoint falls back to task
+    cancellation, same as a pre-init Claude run."""
+
+    def __init__(self, server: "codex_provider.CodexAppServer", run: "ActiveRun"):
+        self._server = server
+        self._run = run
+
+    async def interrupt(self) -> None:
+        if not self._run.codex_turn_id or not self._run.session_id:
+            raise RuntimeError("no in-flight codex turn to interrupt")
+        await self._server.request("turn/interrupt", {
+            "threadId": self._run.session_id,
+            "turnId": self._run.codex_turn_id,
+        })
+
+
+def _codex_result_event(run: "ActiveRun", *, interrupted: bool,
+                        failed: bool, error_message: str = "",
+                        duration_ms: Optional[int] = None) -> dict:
+    """Assemble the end-of-turn result event from cached codex state, in
+    the ResultMessage shape the frontend already renders. Costs aren't
+    reported by the app-server, so total_cost_usd stays None (the usage
+    line falls back to token counts)."""
+    tokens = codex_provider.usage_tokens(run.codex_token_usage or {})
+    if interrupted:
+        subtype = "interrupted"
+    elif failed:
+        subtype = "error_during_execution"
+    else:
+        subtype = "success"
+    return {
+        "type": "result",
+        "is_error": bool(failed and not interrupted),
+        "result": error_message or None,
+        "errors": [error_message] if (failed and error_message) else [],
+        "duration_ms": duration_ms,
+        "total_cost_usd": None,
+        "cost_is_billed": True,
+        "session_id": run.session_id,
+        "subtype": subtype,
+        "stop_reason": None,
+        "num_turns": None,
+        **tokens,
+        "cache_5m_input_tokens": None,
+        "cache_1h_input_tokens": None,
+        "permission_denials": [],
+    }
+
+
+async def _codex_driver(
+    run: "ActiveRun",
+    *,
+    initial_text: str,
+    initial_images: list[dict],
+    resume_thread_id: Optional[str],
+    model_id: str,
+    effort: str,
+    cwd: Path,
+    personality_append: str,
+    first_prompt_title: str,
+) -> None:
+    """Own one Codex thread for the life of this run.
+
+    External contract matches the Claude driver: consumes
+    run.user_input_queue (honouring canceled/committed ids and delivery
+    acks), flips run.between_turns at turn boundaries, publishes
+    run.client for stop, emits the v1 SSE event shapes, and calls
+    run.finish() on the way out.
+    """
+    run.codex_model_id = model_id or None
+    run.codex_effort = effort or None
+    # fileChange approval params don't repeat the file list; remember each
+    # item's tool input from item/started so the approval card can show it.
+    item_inputs: dict[str, dict] = {}
+    partial_buf: list[str] = []
+
+    def _flush_codex_partial() -> None:
+        if partial_buf:
+            run.emit_transient({"type": "partial_text", "text": "".join(partial_buf)})
+            partial_buf.clear()
+
+    async def _approvals(method: str, params: dict) -> dict:
+        # Map an app-server approval request onto the existing permission
+        # gate. claude-web's own per-session allowlist provides the
+        # "allow for session" semantics, so the wire answer is always
+        # plain accept/decline — acceptForSession is intentionally unused.
+        if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
+            tool, tool_input = codex_provider.TOOL_COMMAND, {}
+            cmd = params.get("command")
+            if isinstance(cmd, list):
+                cmd = " ".join(str(c) for c in cmd)
+            tool_input["command"] = str(cmd or "")
+            if params.get("cwd"):
+                tool_input["cwd"] = params["cwd"]
+            if params.get("reason"):
+                tool_input["reason"] = params["reason"]
+        elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
+            tool = codex_provider.TOOL_PATCH
+            tool_input = dict(item_inputs.get(str(params.get("itemId") or "")) or {})
+            if params.get("reason"):
+                tool_input["reason"] = params["reason"]
+            if not tool_input:
+                tool_input = {"files": ["(unknown)"]}
+        elif method == "item/tool/requestUserInput":
+            # Experimental TUI-side prompt. Answer "no answers" so the tool
+            # proceeds like the Claude question-timeout path does, instead
+            # of stalling the turn on a card the UI can't render yet.
+            return {"answers": {}}
+        else:
+            log.warning("codex approval %s unhandled — declining", method)
+            return {"decision": "decline"}
+        decision = await _gate_tool_permission(run, tool, tool_input)
+        if isinstance(decision, PermissionResultAllow):
+            return {"decision": "accept"}
+        return {"decision": "decline"}
+
+    server: Optional[codex_provider.CodexAppServer] = None
+    thread_id: Optional[str] = None
+    notif_q: Optional[asyncio.Queue] = None
+    try:
+        try:
+            server = await codex_provider.CodexAppServer.get()
+            thread_params: dict[str, Any] = {
+                "cwd": str(cwd),
+                "approvalPolicy": codex_provider.APPROVAL_POLICY,
+                "sandbox": codex_provider.SANDBOX_MODE,
+            }
+            if model_id:
+                thread_params["model"] = model_id
+            if personality_append:
+                thread_params["developerInstructions"] = personality_append
+            if resume_thread_id:
+                thread_params["threadId"] = resume_thread_id
+                resp = await server.request("thread/resume", thread_params)
+            else:
+                resp = await server.request("thread/start", thread_params)
+        except Exception as e:
+            run.emit({
+                "type": "error",
+                "message": f"Codex failed to start: {e}",
+            })
+            return
+        thread = (resp or {}).get("thread") or {}
+        thread_id = thread.get("id") or resume_thread_id
+        if not thread_id:
+            run.emit({"type": "error",
+                      "message": "Codex did not report a thread id."})
+            return
+        notif_q = server.subscribe(thread_id)
+        server.set_request_handler(thread_id, _approvals)
+        run.client = _CodexRunClient(server, run)
+        # Same init shape the Claude path emits: ActiveRun.emit()'s hook
+        # indexes the session id, claims ownership, and binds
+        # personality/account rows off this event.
+        run.emit({
+            "type": "system", "subtype": "init",
+            "session_id": thread_id,
+            "model": model_id or thread.get("model"),
+            "permissionMode": "default",
+            "provider": "codex",
+        })
+        _record_codex_session(
+            thread_id, run.owner_sub, run.project_key,
+            first_prompt_title, model_id or None,
+        )
+
+        async def _start_turn(text: str, image_blocks: list[dict]) -> bool:
+            """turn/start with the run's current model/effort. Returns
+            False when the request itself failed (turn never opened)."""
+            input_items: list[dict] = []
+            if text:
+                input_items.append({"type": "text", "text": text})
+            for path in _codex_image_paths(image_blocks, run.run_id):
+                input_items.append({"type": "localImage", "path": path})
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "input": input_items,
+            }
+            if run.codex_model_id:
+                params["model"] = run.codex_model_id
+            if run.codex_effort:
+                params["effort"] = run.codex_effort
+            try:
+                await server.request("turn/start", params)
+            except Exception as e:
+                run.emit({"type": "error",
+                          "message": f"Codex turn failed to start: {e}"})
+                return False
+            run.between_turns = False
+            run.interrupting = False
+            item_inputs.clear()
+            return True
+
+        if not await _start_turn(initial_text, initial_images):
+            return
+
+        turn_started_mono = time.monotonic()
+        while True:
+            # Race the notification stream against queued user input.
+            # Between turns a popped message opens the next turn; mid-turn
+            # it's delivered via turn/steer (codex's native mid-turn
+            # injection), so the delivery ack fires promptly either way.
+            notif_get = asyncio.create_task(notif_q.get())
+            user_get = asyncio.create_task(run.user_input_queue.get())
+            timeout = (SESSION_IDLE_TIMEOUT_MS if run.between_turns
+                       else MIDTURN_SILENCE_TIMEOUT_MS) / 1000
+            try:
+                done, _ = await asyncio.wait(
+                    {notif_get, user_get}, timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for t in (notif_get, user_get):
+                    if not t.done():
+                        t.cancel()
+            if not done:
+                if run.between_turns:
+                    log.info("codex run %s idle timeout", run.run_id)
+                else:
+                    run.emit({
+                        "type": "error",
+                        "message": "Codex went silent mid-turn; closing the "
+                                   "run. Send a new message to resume the "
+                                   "conversation.",
+                    })
+                break
+
+            if user_get in done:
+                item = user_get.result()
+                qid = item.get("queue_id")
+                ack = item.get("delivered")
+                if qid and qid in run.canceled_input_ids:
+                    run.canceled_input_ids.discard(qid)
+                    if ack is not None and not ack.done():
+                        ack.set_exception(_DeliveryAlreadyReported("recalled"))
+                else:
+                    if qid:
+                        run.committed_input_ids.add(qid)
+                    delivered_ok = True
+                    if run.between_turns:
+                        delivered_ok = await _start_turn(
+                            item.get("text") or "", item.get("image_blocks") or [],
+                        )
+                        turn_started_mono = time.monotonic()
+                    else:
+                        try:
+                            await server.request("turn/steer", {
+                                "threadId": thread_id,
+                                "input": [{"type": "text",
+                                           "text": item.get("text") or ""}],
+                            })
+                        except Exception as e:
+                            log.warning("codex steer failed: %s", e)
+                            delivered_ok = False
+                            _emit_lost_input(
+                                run, item.get("text") or "",
+                                f"Codex rejected the mid-turn message ({e}); "
+                                "send it again",
+                                queue_id=qid,
+                            )
+                            if ack is not None and not ack.done():
+                                ack.set_exception(_DeliveryAlreadyReported(
+                                    "steer failed; lost_input already emitted"
+                                ))
+                    if delivered_ok and ack is not None and not ack.done():
+                        ack.set_result(True)
+
+            if notif_get in done:
+                notif = notif_get.result()
+                method = notif.get("method") or ""
+                params = notif.get("params") or {}
+                if method == codex_provider.SERVER_EXITED_METHOD:
+                    run.emit({
+                        "type": "error",
+                        "message": "The codex app-server exited. Send a new "
+                                   "message to resume this conversation.",
+                    })
+                    break
+                elif method == "turn/started":
+                    run.codex_turn_id = (params.get("turn") or {}).get("id")
+                    run.between_turns = False
+                    turn_started_mono = time.monotonic()
+                elif method == "item/agentMessage/delta":
+                    partial_buf.append(params.get("delta") or "")
+                    joined = "".join(partial_buf)
+                    if len(joined) >= _PARTIAL_FLUSH_CHARS or "\n" in joined:
+                        _flush_codex_partial()
+                elif method in ("item/started", "item/completed"):
+                    item = params.get("item") or {}
+                    completed = method == "item/completed"
+                    if completed and item.get("type") == "agentMessage":
+                        _flush_codex_partial()
+                    if not completed and isinstance(item.get("id"), str):
+                        if item.get("type") == "fileChange":
+                            item_inputs[item["id"]] = codex_provider.patch_input(item)
+                    for ev in codex_provider.item_events(
+                        item, completed=completed, session_id=thread_id,
+                        preview_cap=TOOL_RESULT_PREVIEW * 4,
+                    ):
+                        run.emit(ev)
+                elif method == "thread/tokenUsage/updated":
+                    run.codex_token_usage = params.get("tokenUsage") or {}
+                elif method in ("turn/completed", "turn/failed"):
+                    _flush_codex_partial()
+                    turn = params.get("turn") or {}
+                    err = (turn.get("error") or {})
+                    err_msg = err.get("message") if isinstance(err, dict) else str(err or "")
+                    interrupted = run.interrupting
+                    failed = method == "turn/failed" or bool(err_msg)
+                    duration = int((time.monotonic() - turn_started_mono) * 1000)
+                    run.emit(_codex_result_event(
+                        run, interrupted=interrupted,
+                        failed=failed and not interrupted,
+                        error_message=err_msg or "",
+                        duration_ms=duration,
+                    ))
+                    run.interrupting = False
+                    run.codex_turn_id = None
+                    run.between_turns = True
+                    run.turn_started_at = time.monotonic()
+                    _persist_run_meta(run)
+                    _record_codex_session(thread_id, run.owner_sub,
+                                          run.project_key, "", None)
+                    _notify_turn_complete(run)
+                elif method == "error":
+                    msg_text = params.get("message") or params.get("error") or ""
+                    if msg_text:
+                        run.emit({"type": "error", "message": str(msg_text)})
+                # Remaining notification types (status changes, deltas for
+                # reasoning summaries, plan updates) are presentation-only
+                # duplicates of the item events above — dropped on purpose.
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("codex driver crashed for run %s", run.run_id)
+        run.emit({
+            "type": "error",
+            "message": "The Codex driver hit an internal error; this "
+                       "conversation can be resumed with a new message.",
+        })
+    finally:
+        # Mirror the Claude driver: finish() only. The run stays in
+        # ACTIVE_RUNS (done=True) so reconnecting clients can replay it;
+        # _gc_runs reaps it later.
+        if server is not None and thread_id:
+            server.unsubscribe(thread_id)
+        run.client = None
+        run.finish()
+        _persist_run_meta(run)
+
+
+def _codex_image_paths(image_blocks: list[dict], run_id: str) -> list[str]:
+    """Materialize uploaded base64 image blocks as temp files for codex's
+    localImage input items (the app-server takes paths, not payloads)."""
+    exts = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+            "image/webp": ".webp"}
+    paths: list[str] = []
+    for i, blk in enumerate(image_blocks or []):
+        src = (blk or {}).get("source") or {}
+        if src.get("type") != "base64" or not src.get("data"):
+            continue
+        ext = exts.get(src.get("media_type") or "", ".png")
+        p = Path(tempfile.gettempdir()) / f"claude-web-codex-{run_id}-{i}{ext}"
+        try:
+            p.write_bytes(base64.b64decode(src["data"]))
+            paths.append(str(p))
+        except (OSError, ValueError) as e:
+            log.warning("codex image materialize failed: %s", e)
+    return paths
+
+
 @app.post("/api/chat")
 async def api_chat(
     request: Request,
@@ -7293,6 +7935,7 @@ async def api_chat(
     personality_id: Optional[int] = Form(default=None),
     account_slot: str = Form(default=""),
     queue_id: str = Form(default=""),
+    provider: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -7310,7 +7953,34 @@ async def api_chat(
     """
     if RESTART_STATE["pending"]:
         return JSONResponse({"error": "restart_pending"}, status_code=503)
-    if not setup_flow.is_configured():
+    # Provider resolution before the setup gate: an explicit field wins;
+    # otherwise a session id registered as a Codex thread infers "codex"
+    # (covers stale frontends that omit the field on resume); everything
+    # else is the native Claude path. The provider is fixed per
+    # conversation, so a mismatch between the field and the session's
+    # registry entry is a client bug — reject rather than let the wrong
+    # backend resume-and-fork the transcript.
+    if session_id:
+        session_id = _safe_id(session_id)
+    provider = (provider or "").strip().lower()
+    if provider and provider not in VALID_PROVIDERS:
+        raise HTTPException(400, "unknown provider")
+    _codex_sess = _codex_session_row(session_id) if session_id else None
+    if not provider:
+        provider = "codex" if _codex_sess else "claude"
+    elif provider == "codex" and session_id and _codex_sess is None:
+        raise HTTPException(400, "unknown codex session")
+    elif provider == "claude" and _codex_sess is not None:
+        raise HTTPException(400, "session belongs to the codex provider")
+    if provider == "codex":
+        _codex_avail = codex_provider.availability()
+        if not _codex_avail["available"]:
+            return JSONResponse(
+                {"error": "codex_not_configured",
+                 "detail": _codex_avail["reason"]},
+                status_code=503,
+            )
+    elif not setup_flow.is_configured():
         return JSONResponse(
             {"error": "claude_not_configured", "setup_url": "/setup"},
             status_code=503,
@@ -7339,22 +8009,40 @@ async def api_chat(
         session_id = _safe_id(session_id)
 
     cwd = _resolve_project(project)
-    if model and model not in MODELS_BY_KEY:
-        raise HTTPException(400, "unknown model")
-    selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
+    effort = (effort or "").strip().lower()
+    if provider == "codex":
+        # Codex model keys are the app-server's ids, cached after the first
+        # /api/providers fetch. A cold cache passes unknown keys through —
+        # the app-server rejects a bad id with a clear error — but plan
+        # mode and forking are Claude concepts with no Codex analog, so
+        # those fail fast here regardless.
+        _codex_models = _codex_models_by_key()
+        if model and _codex_models and model not in _codex_models:
+            raise HTTPException(400, "unknown model")
+        selected_model = _codex_models.get(model, {}) if model else {}
+        if permission_mode == "plan":
+            raise HTTPException(400, "plan mode is not available with Codex")
+        if fork:
+            raise HTTPException(400, "forking is not available with Codex")
+        if (effort and selected_model
+                and effort not in (selected_model.get("efforts") or [])):
+            raise HTTPException(400, "model does not support this effort level")
+    else:
+        if model and model not in MODELS_BY_KEY:
+            raise HTTPException(400, "unknown model")
+        selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
+        # Effort rides the model's semantics: a spawn-time CLI flag, so it
+        # applies to fresh spawns and an existing run keeps its level. Validate
+        # against the picked variant (the "" key is the explicit default entry)
+        # so an unsupported level can't reach the CLI as a bad --effort arg.
+        if effort and effort not in (MODELS_BY_KEY.get(model or "", {}).get("efforts") or []):
+            raise HTTPException(400, "model does not support this effort level")
     # Clamp the picker's initial permission mode; an unknown value (or none)
     # falls back to prompt-on-dangerous. Used to spawn the run in the chosen
     # mode (e.g. starting straight in plan mode) and to seed the mirror.
     _init_permission_mode = (
         permission_mode if permission_mode in _VALID_PERMISSION_MODES else "default"
     )
-    # Effort rides the model's semantics: a spawn-time CLI flag, so it
-    # applies to fresh spawns and an existing run keeps its level. Validate
-    # against the picked variant (the "" key is the explicit default entry)
-    # so an unsupported level can't reach the CLI as a bad --effort arg.
-    effort = (effort or "").strip().lower()
-    if effort and effort not in (MODELS_BY_KEY.get(model or "", {}).get("efforts") or []):
-        raise HTTPException(400, "model does not support this effort level")
 
     image_blocks, _image_meta = await _read_uploaded_images(images)
 
@@ -7379,6 +8067,13 @@ async def api_chat(
             session_id=session_id or None,
             override_slot=account_slot or None,
         )
+        if provider == "codex":
+            # Codex auth is host-level (auth.json / OPENAI_API_KEY); the
+            # per-user Claude credential slots don't apply. Pinning the slot
+            # to "shared" also keeps the account-toggle respawn comparison
+            # below (and in /api/chat/send) inert for Codex runs — toggling
+            # a Claude credential must not tear down a Codex conversation.
+            account = {"slot": "shared", "env": {}, "label": SHARED_ACCOUNT_LABEL}
         personality_for_run = _resolve_personality_for_run(
             user,
             session_id=session_id or None,
@@ -7544,6 +8239,7 @@ async def api_chat(
             account_slot=account["slot"],
             personality_id=active_personality_id,
         )
+        run.provider = provider
         # Seed the permission-mode mirror with the user's initial pick and
         # record the spawn model key, so both are accurate from the first turn
         # rather than only after the model drives EnterPlanMode.
@@ -7584,13 +8280,31 @@ async def api_chat(
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
     # echoes assistant content and tool results back).
-    run.emit({"type": "run_started", "run_id": run_id, "project": run.project_key, "model": model or None})
+    run.emit({"type": "run_started", "run_id": run_id, "project": run.project_key, "model": model or None, "provider": provider})
     run.emit({
         "type": "user_prompt",
         "text": message,
         "image_count": len(image_blocks),
         "file_count": len(file_metas),
     })
+
+    if provider == "codex":
+        # The Codex driver owns everything from here (thread lifecycle,
+        # event translation, approvals); the rest of this handler is the
+        # Claude SDK path.
+        run.task = asyncio.create_task(_codex_driver(
+            run,
+            initial_text=effective_message,
+            initial_images=image_blocks,
+            resume_thread_id=sid_in,
+            model_id=(selected_model.get("model") or model or ""),
+            effort=effort,
+            cwd=cwd,
+            personality_append=personality_for_run["append"],
+            first_prompt_title=message.strip().splitlines()[0][:80] if message.strip() else "",
+        ))
+        run.task.add_done_callback(_log_task_exception)
+        return _stream_run_response(run)
 
     async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context):
         # Audit-trail logging: every tool invocation produces exactly one
@@ -8644,7 +9358,9 @@ async def api_chat_send(
         return JSONResponse(
             {"ok": False, "error": "personality_changed"}, status_code=409,
         )
-    if run.account_slot != account["slot"]:
+    # Claude credential slots don't apply to Codex runs (host-level OpenAI
+    # auth); toggling one must not tear down a Codex conversation.
+    if run.provider != "codex" and run.account_slot != account["slot"]:
         _supersede_run(run, "account_changed")
         return JSONResponse(
             {"ok": False, "error": "account_changed"}, status_code=409,
@@ -8762,6 +9478,8 @@ async def api_chat_rewind(
                  "while the conversation's CLI is still alive",
         )
     _require_owner(run, user)
+    if run.provider == "codex":
+        raise HTTPException(400, "file rewind is not available with Codex")
     if not run.between_turns:
         raise HTTPException(409, "turn in flight — stop it before rewinding")
     client = run.client
@@ -8974,6 +9692,11 @@ async def api_chat_permission_mode(
     if mode not in _VALID_PERMISSION_MODES:
         raise HTTPException(400, f"invalid permission mode {mode!r}")
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        raise HTTPException(
+            400, "permission modes are not available with Codex — every "
+                 "escalation prompts for approval",
+        )
     try:
         async with run.client_write_lock:
             await client.set_permission_mode(mode)
@@ -9005,9 +9728,22 @@ async def api_chat_set_model(
     beta-compatible switches. The same guard covers ``advisor_model`` entries
     — ``--advisor`` only attaches at spawn.
     """
+    run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        # Codex takes the model per turn (turn/start), so a mid-chat switch
+        # is just a field write — the next turn picks it up, no client call.
+        codex_models = _codex_models_by_key()
+        if model and codex_models and model not in codex_models:
+            raise HTTPException(400, f"unknown model {model!r}")
+        entry = codex_models.get(model, {}) if model else {}
+        run.codex_model_id = entry.get("model") or model or None
+        run.model = model
+        label = entry.get("label") or model or "Default"
+        run.emit({"type": "model_changed", "model": model, "label": label})
+        log.info("codex model set run=%s model=%s", run.run_id, model or "(default)")
+        return {"ok": True, "model": model, "label": label}
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, f"unknown model {model!r}")
-    run, client = _live_run_or_400(session_id, user)
     entry = MODELS_BY_KEY.get(model, {}) if model else {}
     sdk_model = entry.get("model") or None
     if entry.get("plan_model") and run.permission_mode == "plan":
@@ -9042,6 +9778,8 @@ async def api_chat_stop_task(
     if not task_id:
         raise HTTPException(400, "task_id required")
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        raise HTTPException(400, "background tasks are not available with Codex")
     try:
         async with run.client_write_lock:
             await client.stop_task(task_id)
@@ -9061,7 +9799,32 @@ async def api_chat_context_usage(
     tokens, total, max, percentage, model). Read-only, so no write lock: it
     stays responsive even mid-turn.
     """
-    _, client = _live_run_or_400(session_id, user)
+    run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        # No control verb on the app-server for this; synthesize the same
+        # shape from the latest thread/tokenUsage notification.
+        raw = run.codex_token_usage or {}
+        total_bucket = raw.get("total") or {}
+        total = total_bucket.get("totalTokens") or 0
+        max_tokens = (raw.get("contextWindow")
+                      or raw.get("modelContextWindow") or 0)
+        categories = [
+            {"name": name, "tokens": total_bucket.get(key) or 0}
+            for name, key in (
+                ("Input", "inputTokens"),
+                ("Cached input", "cachedInputTokens"),
+                ("Output", "outputTokens"),
+                ("Reasoning output", "reasoningOutputTokens"),
+            )
+            if total_bucket.get(key)
+        ]
+        return {"ok": True, "usage": {
+            "totalTokens": total,
+            "maxTokens": max_tokens,
+            "percentage": (total / max_tokens * 100) if max_tokens else 0,
+            "model": run.codex_model_id,
+            "categories": categories,
+        }}
     try:
         usage = await client.get_context_usage()
     except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
@@ -9076,7 +9839,9 @@ async def api_chat_mcp_status(
     """Live MCP server status via ``ClaudeSDKClient.get_mcp_status()`` —
     per-server name/status/tools/error. Read-only; no write lock.
     """
-    _, client = _live_run_or_400(session_id, user)
+    _run_ck, client = _live_run_or_400(session_id, user)
+    if _run_ck.provider == "codex":
+        raise HTTPException(400, "MCP status is not available with Codex (configure MCP in ~/.codex/config.toml)")
     try:
         status = await client.get_mcp_status()
     except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim
@@ -9097,6 +9862,8 @@ async def api_chat_mcp_toggle(
     if not server:
         raise HTTPException(400, "server required")
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        raise HTTPException(400, "MCP toggling is not available with Codex")
     try:
         async with run.client_write_lock:
             await client.toggle_mcp_server(server, enabled)
@@ -9117,6 +9884,8 @@ async def api_chat_mcp_reconnect(
     if not server:
         raise HTTPException(400, "server required")
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "codex":
+        raise HTTPException(400, "MCP reconnect is not available with Codex")
     try:
         async with run.client_write_lock:
             await client.reconnect_mcp_server(server)
@@ -9136,7 +9905,9 @@ async def api_chat_server_info(
     round-trip). Lets the command palette reflect what the live CLI actually
     offers instead of only the hardcoded builtin list.
     """
-    _, client = _live_run_or_400(session_id, user)
+    _run_ck, client = _live_run_or_400(session_id, user)
+    if _run_ck.provider == "codex":
+        raise HTTPException(400, "server info is not available with Codex")
     try:
         info = await client.get_server_info()
     except Exception as exc:  # noqa: BLE001 — surface the CLI's reason verbatim

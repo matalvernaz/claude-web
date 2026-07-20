@@ -7,6 +7,7 @@ A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) 
 - Reads sessions directly from `~/.claude/projects/<project>/*.jsonl`, so the UI and the host-shell `claude` CLI share state — start a chat in one, resume it in the other.
 - OIDC sign-in (Keycloak, Authentik, Authelia, Auth0, Google, …) with optional email- or group-based allowlists.
 - One container, one `.env` file, no separate database.
+- Optional second AI provider: install the OpenAI `codex` CLI and sign it in (`codex login`, or set `OPENAI_API_KEY`) and a provider picker appears next to the model picker. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, and mid-chat model switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
 
 > ## Trust model — read this first
 >

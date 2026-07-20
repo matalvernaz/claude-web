@@ -28,6 +28,12 @@
     <div class="header-actions">
       <button type="button" id="perm-waiting" class="perm-waiting" hidden>1 approval waiting</button>
       <button type="button" id="toggle-sessions" aria-controls="sessions-panel" aria-expanded="true">Sessions</button>
+      <label class="header-select" for="provider-select" id="provider-select-label" hidden>
+        <span class="sr-only">AI provider</span>
+        <select id="provider-select" aria-label="AI provider" title="Which AI runs this conversation. More providers appear here once their CLI is installed and signed in. Switching provider starts a new chat.">
+          <option value="claude" selected>Claude</option>
+        </select>
+      </label>
       <label class="header-select" for="model-select">
         <span class="sr-only">Model</span>
         <select id="model-select" aria-label="Model">
