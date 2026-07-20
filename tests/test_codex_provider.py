@@ -350,8 +350,56 @@ def test_api_providers_payload(client, monkeypatch):
     assert provs["claude"]["available"] is True
     assert provs["claude"]["models"]
     assert provs["claude"]["capabilities"]["plan_mode"] is True
+    # Usage dialog is Claude-only; codex hides it (capability drives the UI).
+    assert provs["claude"]["capabilities"]["usage"] is True
     assert provs["codex"]["available"] is False
     assert provs["codex"]["capabilities"]["plan_mode"] is False
+    assert provs["codex"]["capabilities"]["usage"] is False
+
+
+async def test_codex_gate_decision_maps_to_wire_values(client, monkeypatch):
+    """The codex approval gate offers allow-session (unlike Bash on the
+    Claude path) and answers in codex's vocabulary."""
+    import app as app_module
+
+    run = app_module.ActiveRun("run-gate")
+    captured = {}
+
+    async def fake_await(run_, tool, tool_input, sig, allow_session_supported):
+        captured["allow_session_supported"] = allow_session_supported
+        captured["tool"] = tool
+        return captured.pop("_inject")
+
+    monkeypatch.setattr(app_module, "_await_permission_decision", fake_await)
+
+    captured["_inject"] = "allow"
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "ls"}) == "accept"
+    # Bash is coarse-signature on the Claude path, but codex still offers
+    # session approval (codex owns the matching).
+    assert captured["allow_session_supported"] is True
+
+    captured["_inject"] = "allow_session"
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "ls"}) == "acceptForSession"
+
+    captured["_inject"] = "deny"
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "ls"}) == "decline"
+
+    # No-answer timeout (helper returns None) declines.
+    captured["_inject"] = None
+    assert await app_module._codex_gate_decision(
+        run, "ApplyPatch", {"files": ["a.py"]}) == "decline"
+
+
+async def test_codex_gate_decision_declines_while_interrupting(client):
+    import app as app_module
+
+    run = app_module.ActiveRun("run-int")
+    run.interrupting = True
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "rm -rf /"}) == "decline"
 
 
 def test_codex_result_event_shapes(client):

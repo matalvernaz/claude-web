@@ -613,11 +613,22 @@
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
   }
+  // Display name of the active assistant, for turn-status strings and
+  // announcements. Falls back to the picker's own label so a future third
+  // provider needs no change here.
+  function assistantLabel() {
+    const p = currentProvider();
+    if (providerSelect) {
+      const opt = [...providerSelect.options].find((o) => o.value === p);
+      if (opt) return opt.textContent.replace(/\s*\(.*\)$/, "");
+    }
+    return p === "codex" ? "Codex" : "Claude";
+  }
   function providerCapabilities(key) {
     const p = PROVIDERS[key || currentProvider()];
     return (p && p.capabilities) || {
       plan_mode: true, fork: true, rewind: true,
-      permission_modes: true, accounts: true,
+      permission_modes: true, accounts: true, usage: true,
     };
   }
 
@@ -670,6 +681,11 @@
     if (permLabel) permLabel.hidden = !caps.permission_modes;
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
+    // The Usage dialog + running header cost are Anthropic plan/cost data;
+    // hide both when the provider can't populate them (Codex).
+    const usageBtnEl = document.getElementById("show-usage");
+    if (usageBtnEl) usageBtnEl.hidden = !caps.usage;
+    if (headerCostEl) headerCostEl.hidden = !caps.usage;
     rebuildModelOptions(provider);
     rebuildEffortOptions();
     renderContextMeter();
@@ -1072,10 +1088,14 @@
     // Realign the provider picker to the loaded session. Sessions are
     // provider-bound, so a codex session opened while the picker says
     // Claude (or vice versa) must flip the whole header state — model
-    // list, effort options, hidden controls — before any send.
+    // list, effort options, hidden controls — before any send. Apply
+    // unconditionally (not only on a mismatch): a boot with the saved
+    // provider already matching the session still needs the DOM applied,
+    // since initProviders skips the apply whenever a URL session is
+    // present (it can't know the session's provider yet).
     await providersReady;
     const sessProvider = data.provider === "codex" ? "codex" : "claude";
-    if (providerSelect && currentProvider() !== sessProvider
+    if (providerSelect
         && [...providerSelect.options].some((o) => o.value === sessProvider)) {
       providerSelect.value = sessProvider;
       safeSet(localStorage, PROVIDER_KEY, sessProvider);
@@ -1670,7 +1690,7 @@
         // Dropped before the CLI saw it. A matching queued_input_cancelled
         // event also arrives and is idempotent via clearQueueEntryById.
         removeQueueEntry(entry);
-        announce("Cancelled before Claude saw it.");
+        announce("Cancelled before " + assistantLabel() + " saw it.");
       } else {
         // already_delivered: it's running. Interrupt the turn — the chip
         // clears when the interrupted result lands.
@@ -1862,7 +1882,7 @@
     const rid = currentRunId;
     setStreaming(true);
     startGerunds();
-    announce("Sent. Claude is responding.");
+    announce("Sent. " + assistantLabel() + " is responding.");
     // The POST itself isn't bound to currentAbort (which owns the SSE
     // reader). A separate controller lets a Stop click — which calls
     // currentAbort.abort() AND posts /api/chat/stop — also cut the
@@ -1911,7 +1931,7 @@
         // Server-side input queue is full — the run is alive and mid-turn,
         // so keep the stream and the streaming state. The entry stays (or
         // is put back) in the local queue and retries after the next result.
-        setStatus("Claude's input queue is full — message held locally; it will retry when the turn ends.");
+        setStatus(assistantLabel() + "'s input queue is full — message held locally; it will retry when the turn ends.");
         announce("Input queue full. Your message is held and will retry.");
         return { ok: false, mode: "queue_full" };
       }
@@ -2041,7 +2061,7 @@
     const myAbort = new AbortController();
     currentAbort = myAbort;
     startGerunds();
-    announce("Sent. Claude is responding.");
+    announce("Sent. " + assistantLabel() + " is responding.");
     let ok = false;
     try {
       const fd = new FormData();
@@ -2089,7 +2109,7 @@
           throw new Error("Server restart in progress — wait a few seconds and resend.");
         }
         if (code === "queue_full") {
-          throw new Error("Claude's input queue for this session is full — wait for the current turn and resend.");
+          throw new Error(assistantLabel() + "'s input queue for this session is full — wait for the current turn and resend.");
         }
         throw new Error("HTTP " + r.status);
       }
@@ -3924,7 +3944,7 @@
       // #status is aria-hidden, so a screen-reader user gets no feedback that
       // the decision failed and Claude is still blocked — announce it.
       setStatus("Failed to send decision: " + err.message);
-      announce("Failed to send decision. Claude is still waiting — try again.");
+      announce("Failed to send decision. " + assistantLabel() + " is still waiting — try again.");
       return false;
     }
   }

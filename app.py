@@ -465,7 +465,7 @@ async def _providers_payload() -> list[dict]:
         "models": _models_payload(),
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
-            "permission_modes": True, "accounts": True,
+            "permission_modes": True, "accounts": True, "usage": True,
         },
     }
     codex_avail = codex_provider.availability()
@@ -478,6 +478,12 @@ async def _providers_payload() -> list[dict]:
         "capabilities": {
             "plan_mode": False, "fork": False, "rewind": False,
             "permission_modes": False, "accounts": False,
+            # The Usage dialog + header cost are Anthropic plan/cost data
+            # (today's spend, plan rate limits, 30-day history) — none of it
+            # applies to a codex conversation, and the app-server reports no
+            # per-turn cost, so the header hides both. Per-conversation token
+            # usage still shows via the context "Details" button.
+            "usage": False,
         },
     }
     if codex_entry["available"]:
@@ -1400,55 +1406,16 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
             )
             return PermissionResultAllow()
 
-        request_id = str(uuid_mod.uuid4())
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
-        try:
-            run.emit({
-                "type": "permission_request",
-                "id": request_id,
-                "tool": tool_name,
-                "input": tool_input,
-                "signature": sig,
-                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
-                "allow_session_supported": allow_session_supported,
-            })
-            try:
-                decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                log.info(
-                    "perm timeout tool=%s sig=%r run=%s owner=%s after=%ss",
-                    tool_name, sig, run.run_id, owner, PERMISSION_TIMEOUT_SECONDS,
-                )
-                run.emit({
-                    "type": "permission_timeout",
-                    "id": request_id,
-                    "tool": tool_name,
-                    "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
-                })
-                return PermissionResultDeny(
-                    message=(
-                        f"Permission request timed out after "
-                        f"{PERMISSION_TIMEOUT_SECONDS}s with no user response."
-                    ),
-                )
-        finally:
-            PENDING.pop(request_id, None)
-
-        d = decision.get("decision")
-        log.info(
-            "perm decision=%s tool=%s sig=%r run=%s owner=%s",
-            d, tool_name, sig, run.run_id, owner,
+        d = await _await_permission_decision(
+            run, tool_name, tool_input, sig, allow_session_supported,
         )
-        # Persist the resolution so replays render this card as decided.
-        # Without it a reconnect re-renders the request as pending and a
-        # click 404s (PENDING is in-process and long gone).
-        run.emit({
-            "type": "permission_resolved",
-            "id": request_id,
-            "tool": tool_name,
-            "decision": d,
-        })
+        if d is None:
+            return PermissionResultDeny(
+                message=(
+                    f"Permission request timed out after "
+                    f"{PERMISSION_TIMEOUT_SECONDS}s with no user response."
+                ),
+            )
         if d == "allow":
             return PermissionResultAllow()
         if d == "allow_session":
@@ -1465,6 +1432,90 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
                 )
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied permission via web UI.")
+
+
+async def _await_permission_decision(
+    run, tool_name: str, tool_input: dict[str, Any], sig: str,
+    allow_session_supported: bool,
+) -> Optional[str]:
+    """Emit a permission_request, await the browser's resolution, echo a
+    permission_resolved event, and return the raw decision string
+    ("allow" / "allow_session" / "deny"). Returns None on timeout (after
+    emitting permission_timeout) so the caller picks the no-answer default
+    that fits its backend. Shared by the Claude allowlist gate above and
+    the Codex approval bridge, which map the raw decision differently."""
+    owner = run.owner_sub or "?"
+    request_id = str(uuid_mod.uuid4())
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
+    try:
+        run.emit({
+            "type": "permission_request",
+            "id": request_id,
+            "tool": tool_name,
+            "input": tool_input,
+            "signature": sig,
+            "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+            "allow_session_supported": allow_session_supported,
+        })
+        try:
+            decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            log.info(
+                "perm timeout tool=%s sig=%r run=%s owner=%s after=%ss",
+                tool_name, sig, run.run_id, owner, PERMISSION_TIMEOUT_SECONDS,
+            )
+            run.emit({
+                "type": "permission_timeout",
+                "id": request_id,
+                "tool": tool_name,
+                "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
+            })
+            return None
+    finally:
+        PENDING.pop(request_id, None)
+
+    d = decision.get("decision")
+    log.info(
+        "perm decision=%s tool=%s sig=%r run=%s owner=%s",
+        d, tool_name, sig, run.run_id, owner,
+    )
+    # Persist the resolution so replays render this card as decided. Without
+    # it a reconnect re-renders the request as pending and a click 404s
+    # (PENDING is in-process and long gone).
+    run.emit({
+        "type": "permission_resolved",
+        "id": request_id,
+        "tool": tool_name,
+        "decision": d,
+    })
+    return d
+
+
+async def _codex_gate_decision(run, tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Codex approval → codex wire decision ("accept" / "acceptForSession"
+    / "decline").
+
+    Unlike the Claude gate this always offers "Allow this session": codex
+    keeps its OWN session-scoped approval cache keyed by its command
+    matching (finer than claude-web's first-word Bash signature), so
+    answering acceptForSession safely suppresses future prompts for the
+    same command without claude-web tracking anything. A no-answer timeout
+    declines. The sig lock still serializes identical concurrent prompts in
+    one turn so a batch doesn't stack duplicate cards."""
+    sig = _tool_signature(tool_name, tool_input)
+    gate = run.sig_locks.setdefault((tool_name, sig), asyncio.Lock())
+    async with gate:
+        if run.interrupting:
+            return "decline"
+        d = await _await_permission_decision(
+            run, tool_name, tool_input, sig, allow_session_supported=True,
+        )
+        if d == "allow":
+            return "accept"
+        if d == "allow_session":
+            return "acceptForSession"
+        return "decline"
 
 
 # ─── State persistence (sqlite-backed run + event store) ─────────────────────
@@ -7633,10 +7684,11 @@ async def _codex_driver(
             partial_buf.clear()
 
     async def _approvals(method: str, params: dict) -> dict:
-        # Map an app-server approval request onto the existing permission
-        # gate. claude-web's own per-session allowlist provides the
-        # "allow for session" semantics, so the wire answer is always
-        # plain accept/decline — acceptForSession is intentionally unused.
+        # Map an app-server approval request onto the permission UI. The
+        # decision is answered in codex's own vocabulary
+        # (accept/acceptForSession/decline) so "Allow this session" delegates
+        # future-prompt suppression to codex's approval cache — see
+        # _codex_gate_decision.
         if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
             tool, tool_input = codex_provider.TOOL_COMMAND, {}
             cmd = params.get("command")
@@ -7662,10 +7714,7 @@ async def _codex_driver(
         else:
             log.warning("codex approval %s unhandled — declining", method)
             return {"decision": "decline"}
-        decision = await _gate_tool_permission(run, tool, tool_input)
-        if isinstance(decision, PermissionResultAllow):
-            return {"decision": "accept"}
-        return {"decision": "decline"}
+        return {"decision": await _codex_gate_decision(run, tool, tool_input)}
 
     server: Optional[codex_provider.CodexAppServer] = None
     thread_id: Optional[str] = None
