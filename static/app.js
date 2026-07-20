@@ -1253,7 +1253,7 @@
     header.className = "msg-header";
     const r = document.createElement("h3");
     r.className = "role";
-    r.textContent = role === "user" ? "You" : role === "assistant" ? "Claude" : role;
+    r.textContent = role === "user" ? "You" : role === "assistant" ? assistantLabel() : role;
     header.appendChild(r);
     const b = document.createElement("div");
     b.className = "body";
@@ -3585,7 +3585,7 @@
     permDialog.appendChild(title);
 
     if (entry.kind === "permission") {
-      title.textContent = `Claude wants to use ${req.tool}${countSuffix}`;
+      title.textContent = `${assistantLabel()} wants to use ${req.tool}${countSuffix}`;
       const detail = document.createElement("div");
       detail.className = "permission-input-wrap";
       appendPermissionPayload(detail, req.tool, req.input || {});
@@ -3736,6 +3736,10 @@
     card.setAttribute("role", "group");
     if (req.id) card.dataset.requestId = req.id;
     card.dataset.state = "pending";
+    // Tool name for the collapsed-summary readback in resolvePermCardDom —
+    // the heading text is now provider-aware ("Codex wants to use …"), so it's
+    // no longer safe to recover the tool by stripping a fixed heading prefix.
+    card.dataset.tool = req.tool;
 
     // h3 (not div) so NVDA's H-key heading navigation finds the card —
     // a permission prompt is the most urgent thing on screen, it should
@@ -3745,7 +3749,7 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = `Claude wants to use ${req.tool}`;
+    heading.textContent = `${assistantLabel()} wants to use ${req.tool}`;
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
     card.setAttribute("aria-describedby", detailId);
@@ -3871,8 +3875,8 @@
   }
 
   // Replace a pending card with a compact record of the decision. Prefer a
-  // semantic summary line (the heading already says "Claude wants to use
-  // {tool}", and the path is in .permission-input-path for Edit/Write)
+  // semantic summary line (the tool name is stashed on card.dataset.tool at
+  // card creation, and the path is in .permission-input-path for Edit/Write)
   // over the first line of the diff body.
   const PERM_LABELS = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
 
@@ -3881,7 +3885,7 @@
     card.dataset.state = "resolved";
     const summary = document.createElement("article");
     summary.className = "msg permission-resolved";
-    const heading = card.querySelector(".role")?.textContent?.replace(/^Claude wants to use\s+/, "") || "tool";
+    const heading = card.dataset.tool || "tool";
     const path = card.querySelector(".permission-input-path")?.textContent?.trim();
     const firstInput = card.querySelector(".permission-input")?.textContent?.split("\n")[0]?.trim();
     const detail = path || firstInput || "";
