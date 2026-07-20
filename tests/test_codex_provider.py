@@ -468,3 +468,98 @@ def test_codex_session_history_payload(client, monkeypatch):
     assert data["provider"] == "codex"
     assert data["messages"][0] == {"role": "user", "text": "hey codex"}
     assert data["messages"][1] == {"role": "assistant", "text": "hey matt"}
+
+
+def test_codex_usage_endpoint_chatgpt_auth(client, monkeypatch):
+    monkeypatch.setattr(
+        codex_provider, "availability",
+        lambda: {"available": True, "reason": None},
+    )
+
+    class _FakeServer:
+        async def account_usage(self):
+            return {
+                "account": {"type": "chatgpt"}, "auth_mode": "chatgpt",
+                "rate_limits": {"rateLimits": {
+                    "primary": {"usedPercent": 12, "resetsAt": 1784550000,
+                                "windowDurationMins": 300}}},
+                "token_usage": {"summary": {"lifetimeTokens": 5000},
+                                "dailyUsageBuckets": [{"startDate": "2026-07-20",
+                                                       "tokens": 900}]},
+                "unavailable_reason": None,
+            }
+
+    async def _fake_get():
+        return _FakeServer()
+
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "get", staticmethod(_fake_get))
+    r = client.get("/api/codex/usage")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["available"] is True
+    assert d["auth_mode"] == "chatgpt"
+    assert d["rate_limits"]["rateLimits"]["primary"]["usedPercent"] == 12
+    assert d["token_usage"]["summary"]["lifetimeTokens"] == 5000
+
+
+def test_codex_usage_endpoint_apikey_degrades(client, monkeypatch):
+    monkeypatch.setattr(
+        codex_provider, "availability",
+        lambda: {"available": True, "reason": None},
+    )
+
+    class _FakeServer:
+        async def account_usage(self):
+            return {
+                "account": {"type": "apiKey"}, "auth_mode": "apiKey",
+                "rate_limits": None, "token_usage": None,
+                "unavailable_reason": "chatgpt authentication required to read rate limits",
+            }
+
+    async def _fake_get():
+        return _FakeServer()
+
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "get", staticmethod(_fake_get))
+    r = client.get("/api/codex/usage")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["available"] is True
+    assert d["auth_mode"] == "apiKey"
+    assert d["rate_limits"] is None
+    assert "chatgpt" in d["unavailable_reason"].lower()
+
+
+def test_codex_usage_endpoint_unavailable(client, monkeypatch):
+    monkeypatch.setattr(
+        codex_provider, "availability",
+        lambda: {"available": False, "reason": "codex CLI not installed"},
+    )
+    r = client.get("/api/codex/usage")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["available"] is False
+    assert "not installed" in d["reason"]
+
+
+async def test_codex_account_usage_folds_rpc_errors():
+    """account_usage reports the ChatGPT-auth rejection as a reason instead
+    of raising, so an API-key login still returns the account-type line."""
+    server = codex_provider.CodexAppServer()
+    calls = {}
+
+    async def fake_request(method, params=None, timeout=codex_provider.REQUEST_TIMEOUT_S):
+        calls[method] = True
+        if method == "account/read":
+            return {"account": {"type": "apiKey"}, "requiresOpenaiAuth": True}
+        raise codex_provider.CodexRPCError(
+            method, {"code": -32600,
+                     "message": "chatgpt authentication required to read rate limits"})
+
+    server.request = fake_request
+    out = await server.account_usage()
+    assert out["auth_mode"] == "apiKey"
+    assert out["rate_limits"] is None
+    assert "chatgpt" in out["unavailable_reason"].lower()
+    assert "account/usage/read" in calls  # still attempted

@@ -11060,6 +11060,35 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     }
 
 
+@app.get("/api/codex/usage")
+async def api_codex_usage(
+    session_id: str = "", user: dict = Depends(auth.require_user),
+):
+    """Codex account usage for the Usage dialog's codex view.
+
+    Account rate-limits + token usage come from the app-server (ChatGPT-auth
+    only; API-key logins get ``unavailable_reason`` instead). ``session_id``
+    folds in the live conversation's cumulative token totals so an API-key
+    login — where no account data is available — still sees something
+    concrete."""
+    avail = codex_provider.availability()
+    if not avail["available"]:
+        return {"available": False, "reason": avail["reason"]}
+    payload: dict = {"available": True}
+    try:
+        server = await codex_provider.CodexAppServer.get()
+        payload.update(await server.account_usage())
+    except Exception as e:  # noqa: BLE001 — surface the reason, don't 500 the dialog
+        return {"available": False, "reason": str(e)}
+    if session_id:
+        run = _existing_run_for_session(_safe_id(session_id))
+        if (run is not None and run.provider == "codex"
+                and (not run.owner_sub or run.owner_sub == user.get("sub"))):
+            payload["conversation_tokens"] = codex_provider.usage_tokens(
+                run.codex_token_usage or {})
+    return payload
+
+
 @app.get("/account")
 async def account_page(request: Request, user: dict = Depends(auth.require_user)):
     """Per-user credential management — add/remove/rename Claude accounts.

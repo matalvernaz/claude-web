@@ -373,6 +373,46 @@ class CodexAppServer:
             self._models_cache = models
             return models
 
+    async def account_usage(self) -> dict:
+        """Account-level usage for the Usage dialog's codex view.
+
+        ``account/rateLimits/read`` and ``account/usage/read`` require
+        ChatGPT-subscription auth — on API-key auth the app-server rejects
+        them ("chatgpt authentication required"). Each piece is fetched
+        independently and a rejection is folded into ``unavailable_reason``
+        rather than failing the whole call, so an API-key login still gets
+        the account-type line and a clear explanation.
+
+        Shapes are passed through nearly verbatim (camelCase) for the
+        frontend to render; see the app-server schema RateLimitSnapshot /
+        AccountTokenUsageSummary."""
+        out: dict = {
+            "account": None, "auth_mode": None,
+            "rate_limits": None, "token_usage": None,
+            "unavailable_reason": None,
+        }
+        try:
+            acct = await self.request("account/read", {})
+            account = (acct or {}).get("account") or {}
+            out["account"] = account
+            out["auth_mode"] = account.get("type")
+        except CodexError as e:
+            out["unavailable_reason"] = str(e)
+            return out
+        try:
+            out["rate_limits"] = await self.request("account/rateLimits/read", {})
+        except CodexRPCError as e:
+            out["unavailable_reason"] = e.error.get("message") or str(e)
+        except CodexError as e:
+            out["unavailable_reason"] = str(e)
+        try:
+            out["token_usage"] = await self.request("account/usage/read", {})
+        except CodexError:
+            # Same auth gate as rate limits; the reason from that call already
+            # explains it, so don't overwrite it.
+            pass
+        return out
+
 
 # ─── Notification → SSE-event translation ─────────────────────────────────────
 # Pure functions: Codex protocol dicts in, the frontend's v1 stream-json

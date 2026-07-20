@@ -681,10 +681,10 @@
     if (permLabel) permLabel.hidden = !caps.permission_modes;
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
-    // The Usage dialog + running header cost are Anthropic plan/cost data;
-    // hide both when the provider can't populate them (Codex).
-    const usageBtnEl = document.getElementById("show-usage");
-    if (usageBtnEl) usageBtnEl.hidden = !caps.usage;
+    // The running header cost is Anthropic $-spend; hide it when the provider
+    // can't populate it (Codex reports no per-turn cost). The Usage button
+    // stays visible for every provider — the dialog itself branches on the
+    // active provider and shows whatever that backend exposes.
     if (headerCostEl) headerCostEl.hidden = !caps.usage;
     rebuildModelOptions(provider);
     rebuildEffortOptions();
@@ -4272,6 +4272,21 @@
     usageBody.textContent = "Loading…";
     if (typeof usageDialog.showModal === "function") usageDialog.showModal();
     else usageDialog.setAttribute("open", "open");
+    if (currentProvider() === "codex") {
+      let data = null;
+      try {
+        const url = "/api/codex/usage"
+          + (sessionId ? "?session_id=" + encodeURIComponent(sessionId) : "");
+        const r = await fetch(url);
+        if (r.ok) data = await r.json();
+        else data = { available: false, reason: "HTTP " + r.status };
+      } catch (e) {
+        data = { available: false, reason: "network error" };
+      }
+      if (seq !== usageOpenSeq) return;
+      renderCodexUsage(data);
+      return;
+    }
     const slot = accountSelect && accountSelect.value ? accountSelect.value : "shared";
     const slotLabel = accountSelect && accountSelect.selectedIndex >= 0
       ? accountSelect.options[accountSelect.selectedIndex].text
@@ -4306,6 +4321,107 @@
     if (seq !== usageOpenSeq) return;
     renderLiveUsage(live, slotLabel);
   });
+
+  // Codex usage view. Account rate-limits + token usage are ChatGPT-auth
+  // only; an API-key login gets an explanation plus this conversation's
+  // token totals (the one usage signal the app-server gives on any auth).
+  function renderCodexUsage(data) {
+    if (!data || !data.available) {
+      usageBody.innerHTML = `<p class="usage-note">${htmlEscape(
+        "Codex usage unavailable: " + ((data && data.reason) || "unknown error"))}</p>`;
+      announce("Codex usage unavailable.");
+      return;
+    }
+    const fmt = new Intl.NumberFormat();
+    const spoken = [];
+    let html = "<h3>Codex (OpenAI)</h3>";
+
+    const authMode = data.auth_mode === "apiKey" ? "API key"
+      : data.auth_mode === "chatgpt" ? "ChatGPT sign-in"
+      : (data.auth_mode || "unknown");
+    html += `<div class="summary"><span>Auth: ${htmlEscape(authMode)}</span></div>`;
+
+    // This conversation's cumulative tokens (present when opened from a live
+    // codex chat) — the concrete number an API-key login can still see.
+    const ct = data.conversation_tokens || {};
+    const convTotal = (ct.input_tokens || 0) + (ct.output_tokens || 0);
+    if (convTotal > 0) {
+      html += `<h4>This conversation</h4><p class="usage-note">`
+        + `${fmt.format(convTotal)} tokens `
+        + `(${fmt.format(ct.input_tokens || 0)} in, ${fmt.format(ct.output_tokens || 0)} out`
+        + (ct.cache_read_input_tokens ? `, ${fmt.format(ct.cache_read_input_tokens)} cached` : "")
+        + `)</p>`;
+      spoken.push(`this conversation ${fmt.format(convTotal)} tokens`);
+    }
+
+    // Account plan windows (ChatGPT auth). rate_limits.rateLimits is the
+    // RateLimitSnapshot; primary/secondary are usage windows.
+    const snap = (data.rate_limits && data.rate_limits.rateLimits) || null;
+    const windows = [];
+    if (snap) {
+      if (snap.primary) windows.push(["Primary", snap.primary]);
+      if (snap.secondary) windows.push(["Secondary", snap.secondary]);
+    }
+    if (windows.length) {
+      html += `<h4>Plan limits</h4><table><thead><tr><th>Window</th><th>Used</th><th>Resets</th></tr></thead><tbody>`;
+      for (const [name, w] of windows) {
+        const durLabel = codexWindowLabel(w.windowDurationMins);
+        const reset = w.resetsAt ? new Date(w.resetsAt * 1000) : null;
+        const resetText = reset && !isNaN(reset)
+          ? `${reset.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} (${humanIn(reset)})`
+          : "—";
+        const pct = typeof w.usedPercent === "number" ? `${w.usedPercent}%` : "—";
+        html += `<tr><td>${htmlEscape(name + durLabel)}</td><td>${pct}</td><td>${resetText}</td></tr>`;
+        if (typeof w.usedPercent === "number") spoken.push(`${name} ${w.usedPercent} percent`);
+      }
+      html += `</tbody></table>`;
+    }
+
+    // Token-usage summary + daily history (ChatGPT auth).
+    const tu = data.token_usage || {};
+    const sum = tu.summary || {};
+    if (sum.lifetimeTokens != null || sum.peakDailyTokens != null) {
+      const bits = [];
+      if (sum.lifetimeTokens != null) bits.push(`Lifetime ${fmt.format(sum.lifetimeTokens)} tokens`);
+      if (sum.peakDailyTokens != null) bits.push(`peak day ${fmt.format(sum.peakDailyTokens)}`);
+      if (sum.currentStreakDays != null) bits.push(`${sum.currentStreakDays}-day streak`);
+      html += `<h4>Account tokens</h4><p class="usage-note">${htmlEscape(bits.join(" · "))}</p>`;
+    }
+    const buckets = Array.isArray(tu.dailyUsageBuckets) ? tu.dailyUsageBuckets : [];
+    if (buckets.length) {
+      html += `<table><thead><tr><th>Day</th><th>Tokens</th></tr></thead><tbody>`;
+      for (const b of buckets.slice(-30).reverse()) {
+        html += `<tr><td>${htmlEscape(b.startDate || "?")}</td><td>${fmt.format(b.tokens || 0)}</td></tr>`;
+      }
+      html += `</tbody></table>`;
+    }
+
+    // API-key auth (or any account-data failure): explain and point at the
+    // OpenAI dashboard for real billing/usage.
+    if (!windows.length && !buckets.length) {
+      const reason = data.unavailable_reason || "";
+      const note = /chatgpt/i.test(reason)
+        ? "Plan limits and account token usage need ChatGPT sign-in (run `codex login`). "
+          + "This login uses an API key — billing and usage are on the OpenAI dashboard "
+          + "(platform.openai.com/usage)."
+        : (reason
+            ? "Account usage unavailable: " + reason
+            : "No account usage data available for this login.");
+      html += `<p class="usage-note">${htmlEscape(note)}</p>`;
+    }
+
+    usageBody.innerHTML = html;
+    announce("Codex usage" + (spoken.length ? ": " + spoken.join(", ") : " loaded"));
+  }
+
+  // "Primary" + a window-duration hint, e.g. " (5h)" or " (weekly)".
+  function codexWindowLabel(mins) {
+    if (!mins) return "";
+    if (mins % 10080 === 0) return " (weekly)";
+    if (mins % 1440 === 0) return ` (${mins / 1440}d)`;
+    if (mins % 60 === 0) return ` (${mins / 60}h)`;
+    return ` (${mins}m)`;
+  }
 
   function renderUsage(data, slotLabel) {
     const t = data.today || {};
