@@ -307,11 +307,12 @@ def test_api_chat_codex_rejects_plan_and_fork(client, monkeypatch):
         codex_provider, "availability",
         lambda: {"available": True, "reason": None},
     )
-    r = client.post("/api/chat", data={
-        "message": "hi", "provider": "codex", "permission_mode": "plan",
-    })
-    assert r.status_code == 400
-    assert "plan mode" in r.text
+    for mode in ("plan", "dontAsk", "auto"):
+        r = client.post("/api/chat", data={
+            "message": "hi", "provider": "codex", "permission_mode": mode,
+        })
+        assert r.status_code == 400
+        assert f"{mode} mode" in r.text
     r = client.post("/api/chat", data={
         "message": "hi", "provider": "codex", "fork": "true",
     })
@@ -355,6 +356,10 @@ def test_api_providers_payload(client, monkeypatch):
     assert provs["codex"]["available"] is False
     assert provs["codex"]["capabilities"]["plan_mode"] is False
     assert provs["codex"]["capabilities"]["usage"] is False
+    # The frontend hides selector options not in this list.
+    assert provs["codex"]["capabilities"]["permission_modes"] == [
+        "default", "acceptEdits", "bypassPermissions",
+    ]
 
 
 async def test_codex_gate_decision_maps_to_wire_values(client, monkeypatch):
@@ -400,6 +405,80 @@ async def test_codex_gate_decision_declines_while_interrupting(client):
     run.interrupting = True
     assert await app_module._codex_gate_decision(
         run, "Bash", {"command": "rm -rf /"}) == "decline"
+
+
+def test_approval_policy_for_mode():
+    assert (codex_provider.approval_policy_for_mode("default")
+            == codex_provider.APPROVAL_POLICY)
+    assert (codex_provider.approval_policy_for_mode("acceptEdits")
+            == codex_provider.APPROVAL_POLICY)
+    assert codex_provider.approval_policy_for_mode("bypassPermissions") == "never"
+
+
+async def test_codex_gate_decision_mode_short_circuits(client, monkeypatch):
+    """bypassPermissions accepts everything and acceptEdits accepts patches
+    without emitting a permission card — mirrors the Claude SDK's mode
+    short-circuits that run before can_use_tool."""
+    import app as app_module
+
+    async def no_card(*a, **k):
+        raise AssertionError("permission card emitted despite mode short-circuit")
+
+    monkeypatch.setattr(app_module, "_await_permission_decision", no_card)
+
+    run = app_module.ActiveRun("run-bypass")
+    run.permission_mode = "bypassPermissions"
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "make deploy"}) == "accept"
+    assert await app_module._codex_gate_decision(
+        run, "ApplyPatch", {"files": ["a.py"]}) == "accept"
+
+    run = app_module.ActiveRun("run-edits")
+    run.permission_mode = "acceptEdits"
+    assert await app_module._codex_gate_decision(
+        run, "ApplyPatch", {"files": ["a.py"]}) == "accept"
+
+
+async def test_codex_gate_accept_edits_still_gates_commands(client, monkeypatch):
+    import app as app_module
+
+    async def fake_await(run_, tool, tool_input, sig, allow_session_supported):
+        return "deny"
+
+    monkeypatch.setattr(app_module, "_await_permission_decision", fake_await)
+    run = app_module.ActiveRun("run-edits-cmd")
+    run.permission_mode = "acceptEdits"
+    assert await app_module._codex_gate_decision(
+        run, "Bash", {"command": "make deploy"}) == "decline"
+
+
+def test_api_chat_permission_mode_codex(client):
+    """Codex runs accept the supported subset (no client call to make) and
+    reject Claude-only modes."""
+    import types
+
+    import app as app_module
+
+    run = app_module.ActiveRun("run-pm")
+    run.provider = "codex"
+    run.session_id = "t-pm"
+    run.client = object()
+    run.task = types.SimpleNamespace(done=lambda: False)
+    app_module.ACTIVE_RUNS_BY_SESSION["t-pm"] = run
+    try:
+        r = client.post("/api/chat/permission-mode", data={
+            "session_id": "t-pm", "mode": "bypassPermissions",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"ok": True, "mode": "bypassPermissions"}
+        assert run.permission_mode == "bypassPermissions"
+        r = client.post("/api/chat/permission-mode", data={
+            "session_id": "t-pm", "mode": "plan",
+        })
+        assert r.status_code == 400
+        assert run.permission_mode == "bypassPermissions"
+    finally:
+        app_module.ACTIVE_RUNS_BY_SESSION.pop("t-pm", None)
 
 
 def test_codex_result_event_shapes(client):

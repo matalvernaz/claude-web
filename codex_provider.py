@@ -25,10 +25,13 @@ Design notes:
 - OS sandboxing: this host's vendor kernel lacks Landlock, and claude-web's
   trust model is human-in-the-loop approval rather than kernel confinement
   (the Claude path runs unsandboxed behind ``can_use_tool``). Codex runs
-  therefore default to ``danger-full-access`` + ``approvalPolicy=untrusted``,
-  which routes every non-trivial command through the browser approval UI —
-  the same posture as the Claude side. Both knobs have env overrides for
-  hosts where the bundled bubblewrap sandbox works.
+  therefore use ``danger-full-access`` and gate on ``approvalPolicy``
+  instead, driven by the same per-conversation permission-mode selector the
+  Claude side uses (see ``CODEX_PERMISSION_MODES``): "default" maps to
+  ``untrusted`` (every non-trivial command prompts in the browser),
+  "bypassPermissions" to ``never``, and "acceptEdits" keeps ``untrusted``
+  while app.py's approval bridge auto-accepts patch approvals. Both env
+  knobs remain as overrides for hosts where the bundled sandbox works.
 """
 
 import asyncio
@@ -50,6 +53,23 @@ CODEX_BIN_ENV = "CLAUDE_WEB_CODEX_BIN"
 # (read-only basics). Matches the Claude path's SAFE_TOOLS + gate posture.
 APPROVAL_POLICY = os.environ.get("CLAUDE_WEB_CODEX_APPROVAL", "untrusted")
 SANDBOX_MODE = os.environ.get("CLAUDE_WEB_CODEX_SANDBOX", "danger-full-access")
+
+# The subset of claude-web permission modes a Codex conversation supports.
+# With the sandbox pinned to danger-full-access (no Landlock on this
+# kernel), codex's approvalPolicy collapses to two useful notches — ask
+# for everything untrusted, or never ask — so "acceptEdits" keeps the
+# untrusted policy and relies on app.py's approval bridge to auto-accept
+# patch approvals. plan/dontAsk/auto are Claude-only and rejected at send.
+CODEX_PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions")
+
+
+def approval_policy_for_mode(permission_mode: str) -> str:
+    """codex approvalPolicy for a claude-web permission mode. Sent on
+    thread/start, thread/resume, and every turn/start, so a mid-chat mode
+    switch takes effect on the next turn without touching the thread."""
+    if permission_mode == "bypassPermissions":
+        return "never"
+    return APPROVAL_POLICY
 
 # JSON-RPC request timeout. thread/start and model/list do network work on
 # first use; generous but bounded so a wedged server surfaces as an error

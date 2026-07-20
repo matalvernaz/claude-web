@@ -677,8 +677,27 @@
   // Show/hide the Claude-only header controls and swap the model list.
   function applyProviderUI(provider) {
     const caps = providerCapabilities(provider);
+    // permission_modes: true = every mode, array = that subset, falsy = none.
+    const permModes = caps.permission_modes;
+    const allowedModes = Array.isArray(permModes) ? permModes : null;
     const permLabel = permModeSelect && permModeSelect.closest("label");
-    if (permLabel) permLabel.hidden = !caps.permission_modes;
+    if (permLabel) permLabel.hidden = !permModes || (allowedModes && !allowedModes.length);
+    if (permModeSelect) {
+      for (const o of permModeSelect.options) {
+        o.hidden = !!allowedModes && !allowedModes.includes(o.value);
+      }
+      if (allowedModes && !allowedModes.includes(permModeSelect.value)) {
+        // Clamp the display only — change events don't fire on programmatic
+        // sets, so the saved preference survives for providers that support
+        // the mode.
+        permModeSelect.value = "default";
+      } else if (!allowedModes) {
+        const saved = safeGet(localStorage, PERM_MODE_KEY);
+        if (saved && [...permModeSelect.options].some((o) => o.value === saved)) {
+          permModeSelect.value = saved;
+        }
+      }
+    }
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
     // The running header cost is Anthropic $-spend; hide it when the provider

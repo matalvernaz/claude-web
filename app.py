@@ -456,6 +456,8 @@ async def _providers_payload() -> list[dict]:
 
     Capabilities tell the frontend which Claude-only controls to hide for
     a Codex conversation rather than letting them 400 server-side.
+    ``permission_modes`` is ``True`` (every mode in the selector) or a list
+    of supported mode values; the frontend hides unlisted options.
     """
     claude_entry = {
         "key": "claude",
@@ -477,7 +479,8 @@ async def _providers_payload() -> list[dict]:
         "models": [],
         "capabilities": {
             "plan_mode": False, "fork": False, "rewind": False,
-            "permission_modes": False, "accounts": False,
+            "permission_modes": list(codex_provider.CODEX_PERMISSION_MODES),
+            "accounts": False,
             # The Usage dialog + header cost are Anthropic plan/cost data
             # (today's spend, plan rate limits, 30-day history) — none of it
             # applies to a codex conversation, and the app-server reports no
@@ -1503,6 +1506,19 @@ async def _codex_gate_decision(run, tool_name: str, tool_input: dict[str, Any]) 
     same command without claude-web tracking anything. A no-answer timeout
     declines. The sig lock still serializes identical concurrent prompts in
     one turn so a batch doesn't stack duplicate cards."""
+    # Mode short-circuits, mirroring what the Claude SDK does before
+    # can_use_tool is ever called. approvalPolicy only updates at the next
+    # turn/start, so these also catch approvals already in flight when the
+    # user flips the mode mid-turn.
+    if run.permission_mode == "bypassPermissions":
+        log.info("perm codex-auto-accept tool=%s mode=bypassPermissions run=%s",
+                 tool_name, run.run_id)
+        return "accept"
+    if (run.permission_mode == "acceptEdits"
+            and tool_name == codex_provider.TOOL_PATCH):
+        log.info("perm codex-auto-accept tool=%s mode=acceptEdits run=%s",
+                 tool_name, run.run_id)
+        return "accept"
     sig = _tool_signature(tool_name, tool_input)
     gate = run.sig_locks.setdefault((tool_name, sig), asyncio.Lock())
     async with gate:
@@ -7823,7 +7839,8 @@ async def _codex_driver(
             server = await codex_provider.CodexAppServer.get()
             thread_params: dict[str, Any] = {
                 "cwd": str(cwd),
-                "approvalPolicy": codex_provider.APPROVAL_POLICY,
+                "approvalPolicy": codex_provider.approval_policy_for_mode(
+                    run.permission_mode),
                 "sandbox": codex_provider.SANDBOX_MODE,
             }
             if model_id:
@@ -7876,6 +7893,10 @@ async def _codex_driver(
             params: dict[str, Any] = {
                 "threadId": thread_id,
                 "input": input_items,
+                # Tracks the live permission mode so a mid-chat switch
+                # (POST /api/chat/permission-mode) applies from this turn on.
+                "approvalPolicy": codex_provider.approval_policy_for_mode(
+                    run.permission_mode),
             }
             if run.codex_model_id:
                 params["model"] = run.codex_model_id
@@ -8168,8 +8189,10 @@ async def api_chat(
         if model and _codex_models and model not in _codex_models:
             raise HTTPException(400, "unknown model")
         selected_model = _codex_models.get(model, {}) if model else {}
-        if permission_mode == "plan":
-            raise HTTPException(400, "plan mode is not available with Codex")
+        if (permission_mode
+                and permission_mode not in codex_provider.CODEX_PERMISSION_MODES):
+            raise HTTPException(
+                400, f"{permission_mode} mode is not available with Codex")
         if fork:
             raise HTTPException(400, "forking is not available with Codex")
         if (effort and selected_model
@@ -9836,15 +9859,25 @@ async def api_chat_permission_mode(
     ``run.permission_mode`` was until now a read-only mirror the model drove
     (EnterPlanMode → "plan", approved ExitPlanMode → "acceptEdits"); this lets
     the user drive it too.
+
+    Codex runs support the CODEX_PERMISSION_MODES subset. There is no
+    client call to make: the mode lands in ``run.permission_mode``, which
+    the driver reads on every turn/start (approvalPolicy) and the approval
+    bridge reads on every in-flight request (_codex_gate_decision).
     """
     if mode not in _VALID_PERMISSION_MODES:
         raise HTTPException(400, f"invalid permission mode {mode!r}")
     run, client = _live_run_or_400(session_id, user)
     if run.provider == "codex":
-        raise HTTPException(
-            400, "permission modes are not available with Codex — every "
-                 "escalation prompts for approval",
-        )
+        if mode not in codex_provider.CODEX_PERMISSION_MODES:
+            raise HTTPException(
+                400, f"{mode} mode is not available with Codex")
+        run.permission_mode = mode
+        run.emit({"type": "permission_mode_changed", "mode": mode,
+                  "source": "user"})
+        log.info("permission mode set run=%s mode=%s provider=codex",
+                 run.run_id, mode)
+        return {"ok": True, "mode": mode}
     try:
         async with run.client_write_lock:
             await client.set_permission_mode(mode)
