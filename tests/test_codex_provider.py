@@ -10,6 +10,7 @@ sessions from cross-contaminating.
 import asyncio
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +20,18 @@ import codex_provider
 # ─── item_events translation ──────────────────────────────────────────────────
 
 CAP = 800
+
+
+def test_frontend_sends_permission_mode_for_codex():
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+    send_one = source.index("async function sendOne")
+    start = source.index("const provider = currentProvider();", send_one)
+    end = source.index("if (effortSelect", start)
+    form_block = source[start:end]
+
+    assert 'provider === "claude"' not in form_block
+    assert "providerCapabilities(provider).permission_modes" in form_block
+    assert 'fd.append("permission_mode", permModeSelect.value)' in form_block
 
 
 def test_agent_message_completed_becomes_assistant_text():

@@ -2157,9 +2157,11 @@
       const provider = currentProvider();
       fd.append("provider", provider);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
-      // Permission-mode delivery remains provider-specific; account slots are
-      // shared UI semantics and both backends resolve them server-side.
-      if (provider === "claude" && permModeSelect && permModeSelect.value) {
+      // Both backends resolve their advertised permission-mode subset
+      // server-side. Include the persisted picker value on the first turn so
+      // Codex does not silently start in "default" while displaying bypass.
+      if (permModeSelect && permModeSelect.value &&
+          providerCapabilities(provider).permission_modes) {
         fd.append("permission_mode", permModeSelect.value);
       }
       if (effortSelect && effortSelect.value && effortSupported()) {
