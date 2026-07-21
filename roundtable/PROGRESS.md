@@ -1,6 +1,26 @@
 # roundtable-mcp — improvement work: progress & plan
 
-_Last updated: 2026-07-03._
+_Last updated: 2026-07-21._
+
+## 2026-07-21 — task-aware coding workflows across MCP and web
+
+- Added `roundtable_coding_task`, the primary one-call MCP operation for
+  `general`, `debug`, `review`, `plan`, `implement`, `test`, and `explain`.
+  It auto-binds the active repository read-only, assigns independent panel
+  lenses, and applies a task-specific synthesis contract. Low-level tools stay
+  available for manual orchestration.
+- Review mode captures the current working diff, requests JSON-Schema-valid
+  findings, de-duplicates and severity-sorts them, caps verification at
+  `CLAUDE_ROUNDTABLE_REVIEW_MAX_FINDINGS` (default 8), and runs cited locations
+  through `roundtable_converge` before synthesis. Clean/non-git fallbacks use
+  repo tools and explicitly mark the result unverified; prior diff artifacts
+  cannot silently stand in for the current tree.
+- `/roundtable` consumes the same profiles/schema/prompts. New SSE milestones:
+  `grounded`, `verify_start`, `verify_done`; the final card exposes the
+  confirmed/refuted/unresolved ledger.
+- FastMCP now exposes 25 tools. Offline core + HTTP/SSE coverage lives in
+  `tests/test_roundtable_workflows.py` and
+  `tests/test_roundtable_web_workflows.py`.
 
 ## 2026-07-03 — panel tool-loop exhaustion fix (the "[empty response from provider]" bug)
 

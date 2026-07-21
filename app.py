@@ -12622,6 +12622,10 @@ async def roundtable_page(
         }
         for name, info in participants_info.items()
     ]
+    coding_profiles = [
+        {"key": key, **profile}
+        for key, profile in roundtable_core.roundtable_coding_profiles().items()
+    ]
     response = templates.TemplateResponse(
         request, "roundtable.html", {
             "user": user,
@@ -12631,6 +12635,7 @@ async def roundtable_page(
             "default_project": _sanitize_project_key(DEFAULT_CWD),
             "participants": participants,
             "participants_json": json.dumps(participants),
+            "coding_profiles": coding_profiles,
         },
     )
     response.headers["Cache-Control"] = "no-store"
@@ -13047,56 +13052,15 @@ _ASSISTANT_UPLOAD_MAX_BYTES = int(
 
 
 def _assistant_synth_prompt(
-    panel: list[str], synthesizer_label: str, has_artifacts: bool,
+    task: str, panel: list[str], synthesizer_label: str, has_artifacts: bool,
+    verification: Optional[dict] = None,
 ) -> str:
-    """Orchestrator note posted to the thread right before the synthesizer
-    is asked. Tells the synthesizer how to digest the panel's responses
-    into a single answer for the user.
-
-    We embed the panel labels so the synthesizer can name them when it
-    wants to attribute a point — but we tell it to synthesize, not
-    restate, so the user gets a coherent answer rather than three
-    reviewers summarised in sequence.
-
-    When the thread has any code artifact attached (``has_artifacts`` is
-    True), we also ask the synthesizer to end with one or more unified
-    diffs inside ``‍`diff`` fences — the in-browser "Apply" button
-    parses those out an' patches the file with the user's consent. The
-    fence header MUST include the artifact's filename so the apply path
-    knows which file to target.
-    """
-    panel_label_list = ", ".join(panel) if panel else "(no panel participants)"
-    base = (
-        f"You are {synthesizer_label}, acting as the user's assistant. "
-        f"The panel ({panel_label_list}) has just answered the user's most "
-        f"recent question. Your job is to synthesize ONE response the user "
-        f"can act on:\n"
-        f"- Answer the user's question directly first; this is the lede.\n"
-        f"- Flag any meaningful disagreement between the panel briefly — "
-        f"don't restate each panelist's whole reply.\n"
-        f"- If concrete next steps fall out naturally, include them.\n"
-        f"- Plain prose by default; use bullets only when the panel's "
-        f"recommendations genuinely form a list.\n"
-        f"- If the panel reached no clear consensus, say so honestly and "
-        f"name the specific question that would resolve it.\n"
-        f"- Address the user directly. Don't write as if you were "
-        f"observing the panel from outside; you ARE the panel's chosen "
-        f"spokesperson."
+    """Build the shared task-specific synthesis contract for the web flow."""
+    rt = _require_roundtable()
+    panel_labels = [rt.PARTICIPANTS[key]["label"] for key in panel]
+    return rt.roundtable_coding_synthesis_prompt(
+        task, panel_labels, synthesizer_label, has_artifacts, verification,
     )
-    if has_artifacts:
-        base += (
-            "\n\nIf — and only if — the user is asking for a code change to "
-            "one of the attached artifacts AND the panel has reached enough "
-            "agreement to commit to a specific fix, end your answer with one "
-            "or more unified diffs in ```diff fences. The fence header line "
-            "MUST be exactly ```diff filename.ext (no other text on that "
-            "line). Use realistic file-relative paths. If yer not "
-            "sufficiently confident or the user just asked a question, do "
-            "NOT include a diff — explain in prose instead. The user will "
-            "click an 'Apply' button to commit a diff; do not write code "
-            "they should paste manually if a diff is more useful."
-        )
-    return base
 
 
 # Match a fenced diff block whose opening fence carries a filename:
@@ -13299,22 +13263,29 @@ def _make_roundtable_permission_callback(
 async def api_roundtable_assistant(
     request: Request,
     prompt: str = Form(...),
+    task: str = Form("general"),
     project_key: str = Form(""),
     thread_id: Optional[int] = Form(None),
     participants_csv: str = Form(""),
     effort: str = Form("medium"),
     synthesizer: str = Form(""),
     web_search: bool = Form(False),
+    capture_working_diff: bool = Form(True),
+    verify_review: bool = Form(True),
+    diff_base: str = Form("HEAD"),
     user: dict = Depends(auth.require_user),
 ):
     """Stream the 'ask the panel' flow as Server-Sent Events.
 
     Returns ``text/event-stream`` with these events in order:
         created       — thread_id resolved (new or existing)
+        grounded      — project binding / working-diff capture result
         attached      — file uploads turned into artifacts (zero or more)
         prompt_posted — user's turn committed to the transcript
         panel_start   — parallel ask kicking off, lists participants
         panel_done    — parallel ask returned with per-participant sizes
+        verify_start  — grounded review findings are being checked
+        verify_done   — confirmed/refuted/unresolved ledger is ready
         synth_start   — synthesizer ask kicking off
         done          — final synthesis + extracted patches + full payload
         error         — fatal failure at any step
@@ -13325,9 +13296,10 @@ async def api_roundtable_assistant(
     inside the synthesizer turn is a follow-up — would need streaming
     support in roundtable.core.
 
-    Inputs match the prior JSON endpoint: prompt + optional thread_id +
-    project_key + file uploads + per-call participants_csv / effort /
-    synthesizer overrides.
+    ``task`` selects a shared coding workflow. Review mode captures the
+    selected project's working diff and runs schema-valid findings through
+    grounded source verification; the other modes use task-specific panel
+    roles over the same permission-gated project context.
     """
     rt = _require_roundtable()
     if RESTART_STATE["pending"]:
@@ -13336,6 +13308,17 @@ async def api_roundtable_assistant(
     prompt_str = (prompt or "").strip()
     if not prompt_str:
         raise HTTPException(400, "prompt is required")
+    task_key = (task or "general").strip().lower()
+    coding_profiles = rt.roundtable_coding_profiles()
+    if task_key not in coding_profiles:
+        raise HTTPException(
+            400,
+            f"Unknown coding task {task!r}. Known: {sorted(coding_profiles)}",
+        )
+    task_profile = coding_profiles[task_key]
+    diff_base_norm = (diff_base or "HEAD").strip() or "HEAD"
+    if diff_base_norm.startswith("-"):
+        raise HTTPException(400, f"invalid diff base {diff_base_norm!r}")
     if thread_id is not None:
         # Continuing an existing thread — must own it. A new thread
         # (thread_id None) gets created later in the generator and is
@@ -13487,7 +13470,51 @@ async def api_roundtable_assistant(
                     "project_key": _roundtable_get_project(tid),
                     "thread_was_new": thread_was_new,
                     "tools_enabled": tool_use_context is not None,
+                    "task": task_key,
+                    "task_label": task_profile["label"],
                 }))
+
+                # Persist the same read-only core binding the MCP workflow
+                # uses. The web-only project map scopes ownership/apply; this
+                # core binding is what repo tools and grounded convergence read.
+                grounding: dict = {
+                    "repo_bound": False,
+                    "diff": None,
+                    "warning": None,
+                }
+                if bound_project_root is not None:
+                    try:
+                        await asyncio.to_thread(
+                            rt.roundtable_bind_repo,
+                            tid, str(bound_project_root),
+                            permission_policy="readonly",
+                        )
+                        grounding["repo_bound"] = True
+                        if task_key == "review" and capture_working_diff:
+                            try:
+                                grounding["diff"] = await asyncio.to_thread(
+                                    rt.roundtable_bind_diff,
+                                    tid, str(bound_project_root), diff_base_norm,
+                                )
+                            except (ValueError, RuntimeError) as exc:
+                                grounding["warning"] = (
+                                    f"working diff not captured: {exc}"
+                                )
+                                await asyncio.to_thread(
+                                    rt.roundtable_post,
+                                    thread_id=tid,
+                                    content=(
+                                        "Repository grounding note: "
+                                        f"{grounding['warning']}. Inspect the "
+                                        "current repository with tools; do not "
+                                        "treat an older working-diff artifact "
+                                        "as the current change."
+                                    ),
+                                    speaker="orchestrator",
+                                )
+                    except (ValueError, RuntimeError) as exc:
+                        grounding["warning"] = f"repository not bound: {exc}"
+                await event_queue.put(("grounded", grounding))
 
                 attached: list[dict] = []
                 for safe_name, content, byte_count in pending_artifacts:
@@ -13516,6 +13543,12 @@ async def api_roundtable_assistant(
                 await event_queue.put(("prompt_posted", {"speaker": speaker_label}))
 
                 panel_result: dict = {"responses": {}, "errors": {}}
+                verification: Optional[dict] = None
+                structured_result: Optional[dict] = None
+                panel_framing = rt.roundtable_coding_panel_prompt(task_key, panel)
+                review_artifact_available = bool(pending_artifacts) or bool(
+                    grounding["diff"]
+                )
                 if panel:
                     await event_queue.put(("panel_start", {
                         "participants": [
@@ -13524,15 +13557,36 @@ async def api_roundtable_assistant(
                         ],
                         "effort": effort_norm,
                         "web_search": web_search,
+                        "task": task_key,
+                        "structured": task_key == "review" and review_artifact_available,
                     }))
                     try:
-                        panel_result = await asyncio.to_thread(
-                            rt.roundtable_ask_parallel,
-                            thread_id=tid, participants=panel,
-                            prompt="", effort=effort_norm,
-                            web_search=web_search,
-                            tool_use_context=tool_use_context,
-                        )
+                        if task_key == "review" and review_artifact_available:
+                            structured_result = await asyncio.to_thread(
+                                rt.roundtable_ask_structured,
+                                thread_id=tid,
+                                participants=panel,
+                                schema=rt.roundtable_coding_review_schema(),
+                                prompt=panel_framing,
+                                effort=effort_norm,
+                            )
+                            panel_result = {
+                                "responses": {
+                                    key: json.dumps(value, indent=2)
+                                    for key, value in structured_result.get(
+                                        "results", {},
+                                    ).items()
+                                },
+                                "errors": structured_result.get("errors", {}),
+                            }
+                        else:
+                            panel_result = await asyncio.to_thread(
+                                rt.roundtable_ask_parallel,
+                                thread_id=tid, participants=panel,
+                                prompt=panel_framing, effort=effort_norm,
+                                web_search=web_search,
+                                tool_use_context=tool_use_context,
+                            )
                     except (ValueError, RuntimeError) as exc:
                         await event_queue.put(("error", {"message": f"panel: {exc}"}))
                         return
@@ -13543,24 +13597,115 @@ async def api_roundtable_assistant(
                         },
                         "errors": panel_result.get("errors", {}),
                         "unavailable": panel_unavailable,
+                        "structured": structured_result is not None,
+                    }))
+                else:
+                    await asyncio.to_thread(
+                        rt.roundtable_post,
+                        thread_id=tid, content=panel_framing,
+                        speaker="orchestrator",
+                    )
+
+                if task_key == "review" and structured_result is not None:
+                    collected = rt.roundtable_coding_review_findings(
+                        structured_result.get("results", {}),
+                    )
+                    findings = collected["findings"]
+                    if verify_review and grounding["repo_bound"] and findings:
+                        try:
+                            _roundtable_rate_limit_check(user, weight=len(findings))
+                        except HTTPException as exc:
+                            verification = {
+                                "status": "skipped",
+                                "reason": str(exc.detail),
+                            }
+                        else:
+                            await event_queue.put(("verify_start", {
+                                "findings": len(findings),
+                                "findings_total": collected["total"],
+                                "findings_omitted": collected["omitted"],
+                                "verifier": {
+                                    "key": synth_key,
+                                    "label": synth_info["label"],
+                                },
+                            }))
+                            try:
+                                converged = await asyncio.to_thread(
+                                    rt.roundtable_converge,
+                                    tid, findings,
+                                    verifier=synth_key,
+                                    transport="auto",
+                                )
+                                for ledger_row, finding in zip(
+                                    converged["ledger"], findings, strict=True,
+                                ):
+                                    ledger_row["reviewer"] = finding["reviewer"]
+                                    ledger_row["category"] = finding["category"]
+                                verification = {
+                                    "status": "completed",
+                                    "summary": converged["summary"],
+                                    "ledger": converged["ledger"],
+                                    "findings_total": collected["total"],
+                                    "findings_omitted": collected["omitted"],
+                                }
+                                await asyncio.to_thread(
+                                    rt.roundtable_post_verification_ledger,
+                                    tid, verification,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                log.warning(
+                                    "roundtable review verification failed: %s: %s",
+                                    type(exc).__name__, exc,
+                                )
+                                verification = {
+                                    "status": "skipped",
+                                    "reason": f"{type(exc).__name__}: {exc}",
+                                }
+                    elif not verify_review:
+                        verification = {
+                            "status": "skipped",
+                            "reason": "verification disabled",
+                        }
+                    elif not grounding["repo_bound"]:
+                        verification = {
+                            "status": "skipped",
+                            "reason": "no bound repository",
+                        }
+                    else:
+                        verification = {
+                            "status": "completed",
+                            "summary": {
+                                "confirmed": 0,
+                                "refuted": 0,
+                                "unresolved": 0,
+                            },
+                            "ledger": [],
+                            "findings_total": collected["total"],
+                            "findings_omitted": collected["omitted"],
+                        }
+                elif task_key == "review":
+                    verification = {
+                        "status": "skipped",
+                        "reason": (
+                            "no current review artifact was available for "
+                            "structured findings"
+                        ),
+                    }
+
+                if task_key == "review":
+                    await event_queue.put(("verify_done", verification or {
+                        "status": "skipped",
+                        "reason": "verification did not run",
                     }))
 
                 # Synthesizer step. The framing post is committed so the
                 # transcript shows exactly what produced the synthesis.
-                has_artifacts = bool(attached) or any(
-                    rt._latest_artifact_version(tid, name) > 0
-                    for (name, _, _) in pending_artifacts
+                has_artifacts = await asyncio.to_thread(
+                    rt.roundtable_has_artifacts, tid,
                 )
-                # Also check pre-existing artifacts on a continued thread.
-                if not has_artifacts and not thread_was_new:
-                    # Via the locked core helper on a worker thread — the core
-                    # connection is shared with core's own ask/post threads and
-                    # must not be touched unsynchronised from the event loop.
-                    has_artifacts = await asyncio.to_thread(
-                        rt.roundtable_has_artifacts, tid,
-                    )
                 synth_framing = _assistant_synth_prompt(
-                    panel, synth_info["label"], has_artifacts,
+                    task_key, panel, synth_info["label"], has_artifacts,
+                    verification,
                 )
                 await asyncio.to_thread(
                     rt.roundtable_post,
@@ -13606,6 +13751,10 @@ async def api_roundtable_assistant(
                 await event_queue.put(("done", {
                     "thread_id": tid,
                     "project_key": _roundtable_get_project(tid),
+                    "task": task_key,
+                    "task_label": task_profile["label"],
+                    "grounding": grounding,
+                    "verification": verification,
                     "synthesis": synthesis,
                     "synthesizer": {
                         "key": synth_key,

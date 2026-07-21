@@ -561,6 +561,35 @@ body.mode-advanced .assistant       { display: none; }
   background: rgba(122, 162, 247, 0.06);
 }
 
+.asst-verification {
+  margin: 0.75rem 0 0.5rem 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(122, 162, 247, 0.04);
+  font-size: 0.88rem;
+}
+
+.asst-verification h4,
+.asst-verification p {
+  margin: 0 0 0.4rem 0;
+}
+
+.asst-verification summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.asst-verification ol {
+  margin: 0.5rem 0 0 1.25rem;
+  padding: 0;
+}
+
+.asst-verification li {
+  margin: 0.35rem 0;
+  overflow-wrap: anywhere;
+}
+
 .asst-patches h4 {
   margin: 0 0 0.4rem 0;
   font-size: 0.9rem;
@@ -729,6 +758,28 @@ body.mode-advanced .assistant       { display: none; }
 
 .assistant-turn-knobs label {
   font-size: 0.9rem;
+}
+
+.assistant-turn-knobs select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.3rem 0.5rem;
+  font: inherit;
+}
+
+.assistant-task-description {
+  flex-basis: 100%;
+  margin: -0.1rem 0 0.2rem 0;
+  color: #aaa;
+  font-size: 0.82rem;
+}
+
+.assistant-review-options {
+  margin-top: 0.6rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
 }
 
 #assistant-submit {

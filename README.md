@@ -146,6 +146,26 @@ and assistant replies stream progressively as they're generated. Roundtable
 panel runs survive tab close: the work finishes server-side and the page
 rejoins (and replays) the run on reload.
 
+#### Roundtable coding workflows
+
+Roundtable is available through both `/roundtable` and the `roundtable` MCP
+server. Both surfaces call the vendored `roundtable/core.py` package and share
+the SQLite thread store, so a debate started by Claude through MCP is visible in
+the browser.
+
+The primary MCP operation is `roundtable_coding_task`. It composes the lower
+level thread tools into one coding workflow: select `general`, `debug`,
+`review`, `plan`, `implement`, `test`, or `explain`; bind the active repository
+read-only; ask independent panel roles; and have a synthesizer return one
+answer. Review mode additionally captures the working diff, requests
+schema-valid findings, and checks cited `file:line` locations against source
+before synthesis. Claude chooses whether to invoke MCP tools, so ask it to
+"use the roundtable" when consultation is mandatory rather than optional.
+
+The `/roundtable` assistant exposes the same task modes in a picker. Select a
+project to enable repository grounding. In Review changes mode, the advanced
+options control the diff base, working-diff capture, and grounded verification.
+
 #### Identity passed to the CLI
 
 Every spawned Claude CLI subprocess receives three env vars describing the signed-in user, so hooks and `CLAUDE.md` personalities can address people by name:

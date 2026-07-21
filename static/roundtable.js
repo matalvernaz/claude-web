@@ -29,10 +29,16 @@
   const asstSubmit = document.getElementById("assistant-submit");
   const asstStatus = document.getElementById("assistant-status");
   const asstError = document.getElementById("assistant-error");
+  const taskSelect = document.getElementById("assistant-task");
+  const taskDescription = document.getElementById("assistant-task-description");
   const overrideParticipants = document.getElementById("override-participants");
   const overrideSynthesizer = document.getElementById("override-synthesizer");
   const overrideEffort = document.getElementById("override-effort");
   const overrideWebSearch = document.getElementById("override-web-search");
+  const reviewOptions = document.getElementById("review-options");
+  const reviewDiffBase = document.getElementById("review-diff-base");
+  const captureWorkingDiff = document.getElementById("capture-working-diff");
+  const verifyReview = document.getElementById("verify-review");
 
   // ── Advanced elements (lazy-bound below) ────────────────────────
   const showClosed = document.getElementById("show-closed");
@@ -238,6 +244,14 @@
   }
 
   // ── Assistant flow ──────────────────────────────────────────────
+  function updateTaskControls() {
+    const option = taskSelect.options[taskSelect.selectedIndex];
+    taskDescription.textContent = option?.dataset.description || "";
+    reviewOptions.hidden = taskSelect.value !== "review";
+  }
+  taskSelect.addEventListener("change", updateTaskControls);
+  updateTaskControls();
+
   newConvBtn.addEventListener("click", () => {
     assistantThreadId = null;
     asstHistory.querySelectorAll(".asst-turn").forEach((el) => el.remove());
@@ -386,6 +400,52 @@
     // to execute it. Diff fences inside the markdown stay readable as
     // <pre><code> blocks; the apply buttons below sit beside them.
     article.appendChild(renderMarkdown(payload.synthesis));
+
+    // Grounded review ledger. The synthesis already incorporates this, but
+    // exposing the counts and cited evidence keeps the verification auditable
+    // without forcing the user into the advanced transcript.
+    if (payload.verification) {
+      const verification = payload.verification;
+      const section = document.createElement("section");
+      section.className = "asst-verification";
+      const heading = document.createElement("h4");
+      heading.textContent = "Grounded verification";
+      section.appendChild(heading);
+      if (verification.status === "completed") {
+        const summary = verification.summary || {};
+        const line = document.createElement("p");
+        line.textContent =
+          `${summary.confirmed || 0} confirmed · ` +
+          `${summary.refuted || 0} refuted · ` +
+          `${summary.unresolved || 0} unresolved`;
+        section.appendChild(line);
+        if ((verification.ledger || []).length) {
+          const details = document.createElement("details");
+          const summaryEl = document.createElement("summary");
+          summaryEl.textContent = `Show ${verification.ledger.length} checked findings`;
+          details.appendChild(summaryEl);
+          const list = document.createElement("ol");
+          for (const finding of verification.ledger) {
+            const item = document.createElement("li");
+            const location = finding.file
+              ? `${finding.file}:${finding.line || 1}`
+              : "unknown location";
+            item.textContent =
+              `${String(finding.verdict || "unresolved").toUpperCase()} — ` +
+              `${location} — ${finding.claim || "finding"}` +
+              (finding.evidence ? ` (${finding.evidence})` : "");
+            list.appendChild(item);
+          }
+          details.appendChild(list);
+          section.appendChild(details);
+        }
+      } else {
+        const skipped = document.createElement("p");
+        skipped.textContent = `Skipped: ${verification.reason || "verification unavailable"}`;
+        section.appendChild(skipped);
+      }
+      article.appendChild(section);
+    }
 
     // One "Apply" button per detected patch. We confirm before posting
     // and announce success/failure.
@@ -857,10 +917,25 @@
       switch (event) {
         case "created":
           assistantThreadId = data.thread_id;
+          state.taskLabel = data.task_label || "General";
           progress.textContent = data.thread_was_new
-            ? `Thread #${data.thread_id} created.`
-            : `Continuing thread #${data.thread_id}.`;
+            ? `${state.taskLabel} thread #${data.thread_id} created.`
+            : `Continuing ${state.taskLabel.toLowerCase()} thread #${data.thread_id}.`;
           announce(progress.textContent);
+          break;
+        case "grounded":
+          if (data.diff) {
+            progress.textContent =
+              `Project bound. Captured working diff v${data.diff.artifact_version} ` +
+              `(${data.diff.files_changed} changed, ${data.diff.untracked_included} untracked).`;
+          } else if (data.repo_bound) {
+            progress.textContent = data.warning
+              ? `Project bound. ${data.warning}`
+              : "Project bound for repository inspection.";
+          } else if (data.warning) {
+            progress.textContent = data.warning;
+          }
+          if (progress.textContent) announce(progress.textContent);
           break;
         case "attached":
           progress.textContent = `Attached ${data.name} (v${data.version}, ${data.bytes} bytes).`;
@@ -885,6 +960,23 @@
           announce(`Panel done. ${sizes || "no panel"}. Synthesizing now.`);
           break;
         }
+        case "verify_start":
+          progress.textContent =
+            `Verifying ${data.findings} finding${data.findings === 1 ? "" : "s"} ` +
+            `against source with ${data.verifier.label}…`;
+          announce(progress.textContent);
+          break;
+        case "verify_done":
+          if (data.status === "completed") {
+            progress.textContent =
+              `Verification done: ${data.summary.confirmed || 0} confirmed, ` +
+              `${data.summary.refuted || 0} refuted, ` +
+              `${data.summary.unresolved || 0} unresolved. Synthesizing…`;
+          } else {
+            progress.textContent = `Verification skipped: ${data.reason}. Synthesizing…`;
+          }
+          announce(progress.textContent);
+          break;
         case "synth_start":
           state.synthLabel = data.synthesizer.label;
           progress.textContent = `Synthesizing with ${data.synthesizer.label}…`;
@@ -970,6 +1062,7 @@
 
     const formData = new FormData();
     formData.append("prompt", prompt);
+    formData.append("task", taskSelect.value);
     formData.append("project_key", projectFilter.value);
     if (assistantThreadId != null) formData.append("thread_id", String(assistantThreadId));
     if (overrideParticipants.value.trim()) {
@@ -982,6 +1075,11 @@
     if (overrideWebSearch && overrideWebSearch.checked) {
       formData.append("web_search", "true");
     }
+    formData.append(
+      "capture_working_diff", captureWorkingDiff.checked ? "true" : "false",
+    );
+    formData.append("verify_review", verifyReview.checked ? "true" : "false");
+    formData.append("diff_base", reviewDiffBase.value.trim() || "HEAD");
     // A nameless File (filename="") is decoded server-side as a string, not
     // a file; guarantee a name so the upload isn't silently dropped.
     for (const f of asstFile.files || []) formData.append("files", f, f.name || "attachment");

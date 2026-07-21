@@ -1,7 +1,8 @@
 """FastMCP wrapper around ``roundtable.core``.
 
-Each public operation in ``core`` is registered as an MCP tool here.
-Most wrappers are trivial pass-throughs — they call straight into core
+Caller-facing operations in ``core`` are registered as MCP tools here.
+Prompt/schema helpers used internally by the web workflow stay unregistered.
+Most registered operations are trivial pass-throughs — they call straight into core
 and rely on its docstring (FastMCP introspects for the tool description)
 and signature (FastMCP introspects for the JSON-schema arguments). The
 MCP tool name matches the core function name so existing callers
@@ -71,11 +72,13 @@ def roundtable_ask_parallel(
 roundtable_ask_parallel.__doc__ = core.roundtable_ask_parallel.__doc__
 
 
-# Register each public operation as an MCP tool. We register by
+# Register each caller-facing operation as an MCP tool. We register by
 # reference for the trivial ones (signature + docstring live in core.py)
 # and register the explicit wrappers above for the two that take a
 # Callable parameter pydantic can't serialise.
 for _fn in (
+    core.roundtable_coding_task,
+    core.roundtable_coding_profiles,
     core.roundtable_create,
     core.roundtable_bind_repo,
     core.roundtable_bind_github,

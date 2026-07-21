@@ -4822,3 +4822,579 @@ def roundtable_participants() -> dict:
     }
 
 
+# ─── High-level coding workflows ────────────────────────────────────────
+#
+# The operations above are deliberately composable primitives. They are useful
+# to an orchestrator that already knows the roundtable protocol, but they leave
+# a chat model to rediscover the same create → bind → panel → verify → synth
+# sequence on every coding request. The coding-task operation below is the
+# opinionated entry point for both MCP callers and claude-web's assistant view.
+# The web route keeps its own streaming transport, but consumes these same
+# profiles, panel briefs, review schema, and synthesis contract.
+
+_CODING_TASK_PROFILES: dict[str, dict] = {
+    "general": {
+        "label": "General",
+        "description": "Balanced help for coding questions that do not fit a narrower workflow.",
+        "panel_goal": (
+            "Develop a concrete answer to the request, checking assumptions "
+            "against the repository when it is available."
+        ),
+        "lenses": [
+            "Solution designer: find the smallest complete approach that fits the existing code.",
+            "Skeptical verifier: challenge assumptions, edge cases, and integration risks.",
+        ],
+        "synthesis_goal": (
+            "Return the most useful answer or next action, with uncertainty and "
+            "tradeoffs only where they affect the decision."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+    "debug": {
+        "label": "Debug",
+        "description": "Find and falsify root causes, then propose the smallest verified fix.",
+        "panel_goal": (
+            "Diagnose the failure as a violated invariant. State the leading "
+            "hypothesis, what evidence confirms or falsifies it, and the smallest "
+            "root-cause fix. Do not treat a symptom workaround as a fix."
+        ),
+        "lenses": [
+            "Root-cause investigator: trace state and control flow to the first violated invariant.",
+            "Hypothesis falsifier: seek competing causes and design the decisive reproduction or test.",
+        ],
+        "synthesis_goal": (
+            "Lead with the diagnosed cause and evidence. Separate verified facts "
+            "from remaining hypotheses, then give the targeted fix and verification step."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+    "review": {
+        "label": "Review changes",
+        "description": "Review the working diff and verify concrete findings against source.",
+        "panel_goal": (
+            "Review the current change for defects introduced by the diff. Report "
+            "only actionable findings with a concrete failure mode and an exact "
+            "repository-relative file and line. Do not report style preferences."
+        ),
+        "lenses": [
+            "Correctness reviewer: trace data flow, state transitions, errors, races, and edge cases.",
+            "Risk reviewer: inspect security boundaries, compatibility, performance, and missing tests.",
+        ],
+        "synthesis_goal": (
+            "Produce a severity-ordered review. Include only defects supported by "
+            "the verification ledger; clearly label unresolved risks and omit refuted claims."
+        ),
+        "capture_diff": True,
+        "verified_review": True,
+    },
+    "plan": {
+        "label": "Plan",
+        "description": "Map the existing system and produce a scoped implementation plan.",
+        "panel_goal": (
+            "Reconstruct the relevant call graph or data flow before proposing work. "
+            "Identify constraints, decisions, affected files, and a staged implementation "
+            "with explicit verification. Do not write the implementation."
+        ),
+        "lenses": [
+            "System architect: map boundaries, ownership, data flow, and the existing pattern to extend.",
+            "Delivery critic: expose migration, rollout, compatibility, testing, and scope risks.",
+        ],
+        "synthesis_goal": (
+            "Return one recommended plan with ordered steps, named files or components, "
+            "decision points, and verification. Keep alternatives only when the tradeoff is material."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+    "implement": {
+        "label": "Implement",
+        "description": "Design a minimal code change that fits existing project patterns.",
+        "panel_goal": (
+            "Determine the smallest complete implementation that satisfies the request. "
+            "Inspect the surrounding code, preserve established conventions, and account "
+            "for integration and tests. Prefer an apply-ready diff over pasteable fragments."
+        ),
+        "lenses": [
+            "Implementation designer: specify the minimal coherent change and exact integration points.",
+            "Integration verifier: check contracts, compatibility, failure paths, and the tests that prove it.",
+        ],
+        "synthesis_goal": (
+            "Return the implementation decision and an apply-ready minimal patch when "
+            "the evidence is sufficient, followed by the exact verification commands."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+    "test": {
+        "label": "Test",
+        "description": "Design focused tests around real risks, regressions, and boundaries.",
+        "panel_goal": (
+            "Identify the behavior contract and the smallest tests that distinguish a "
+            "correct implementation from the likely failures. Reuse the project's test "
+            "style and avoid assertions that merely mirror implementation details."
+        ),
+        "lenses": [
+            "Failure-mode designer: cover boundaries, regressions, concurrency, and negative paths.",
+            "Test-quality critic: check determinism, realism, maintainability, and false-positive risk.",
+        ],
+        "synthesis_goal": (
+            "Return a prioritized test strategy or apply-ready tests, explaining what "
+            "each case proves and how to run the focused suite."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+    "explain": {
+        "label": "Explain",
+        "description": "Trace and explain code behavior from the repository evidence.",
+        "panel_goal": (
+            "Explain the requested behavior from the actual code. Trace the relevant "
+            "entry point, data flow, state changes, and boundaries; do not substitute a "
+            "generic description for repository evidence."
+        ),
+        "lenses": [
+            "Code-path tracer: reconstruct the behavior in execution order with file:line evidence.",
+            "Clarity critic: identify hidden assumptions, misleading names, and likely misconceptions.",
+        ],
+        "synthesis_goal": (
+            "Give a concise explanation at the user's apparent level, anchored to the "
+            "actual call path and highlighting the few details needed to reason about changes."
+        ),
+        "capture_diff": False,
+        "verified_review": False,
+    },
+}
+
+_CODING_REVIEW_FINDINGS_PER_PARTICIPANT = 6
+_CODING_REVIEW_MAX_FINDINGS = int(os.environ.get(
+    "CLAUDE_ROUNDTABLE_REVIEW_MAX_FINDINGS", "8",
+))
+
+_CODING_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "maxItems": _CODING_REVIEW_FINDINGS_PER_PARTICIPANT,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "file": {"type": "string"},
+                    "line": {"type": "integer", "minimum": 1},
+                    "proof": {"type": "string"},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "correctness", "security", "reliability",
+                            "performance", "compatibility", "testing",
+                        ],
+                    },
+                },
+                "required": [
+                    "claim", "file", "line", "proof", "severity", "category",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "findings"],
+    "additionalProperties": False,
+}
+
+
+def _coding_task_profile(task: str) -> tuple[str, dict]:
+    key = (task or "general").strip().lower()
+    profile = _CODING_TASK_PROFILES.get(key)
+    if profile is None:
+        raise ValueError(
+            f"Unknown coding task {task!r}. Known: {sorted(_CODING_TASK_PROFILES)}"
+        )
+    return key, profile
+
+
+def roundtable_coding_profiles() -> dict:
+    """List high-level coding workflows available to MCP and web callers.
+
+    Keys are accepted by ``roundtable_coding_task(task=...)``. The returned
+    metadata is presentation-safe; internal prompt text is intentionally not
+    exposed so callers select a behavior instead of copying prompt fragments.
+    """
+    return {
+        key: {
+            "label": value["label"],
+            "description": value["description"],
+            "capture_diff": value["capture_diff"],
+            "verified_review": value["verified_review"],
+        }
+        for key, value in _CODING_TASK_PROFILES.items()
+    }
+
+
+def roundtable_coding_panel_prompt(task: str, participants: list[str]) -> str:
+    """Build the shared independent-panel brief for a coding workflow."""
+    key, profile = _coding_task_profile(task)
+    assignments: list[str] = []
+    for idx, participant in enumerate(participants):
+        info = _resolve_participant(participant)
+        lens = profile["lenses"][idx % len(profile["lenses"])]
+        assignments.append(f"- {info['label']}: {lens}")
+    assigned = "\n".join(assignments) or "- No independent panel is configured."
+    return (
+        f"Coding workflow: {profile['label']} ({key}). The user's latest "
+        f"message is the task.\n\n"
+        f"Goal: {profile['panel_goal']}\n\n"
+        "Shared contract:\n"
+        "- Inspect the bound repository or attached artifacts before making "
+        "claims about the code.\n"
+        "- Cite repository-relative file:line locations for code-specific claims.\n"
+        "- Distinguish evidence from inference and say what would resolve any "
+        "remaining uncertainty.\n"
+        "- Stay within the requested scope; do not turn a targeted change into "
+        "an opportunistic refactor.\n\n"
+        "Independent lens assignments:\n"
+        f"{assigned}\n\n"
+        "Use only the lens assigned to your participant label. Do not merge or "
+        "predict the other panelists' answers; the synthesizer handles that."
+    )
+
+
+def roundtable_coding_review_schema() -> dict:
+    """Return a copy of the schema used for independently reviewable findings."""
+    return json.loads(json.dumps(_CODING_REVIEW_SCHEMA))
+
+
+def roundtable_coding_review_findings(results: dict) -> dict:
+    """Flatten, de-duplicate, severity-sort, and cap structured panel findings.
+
+    ``results`` is the ``results`` member returned by
+    ``roundtable_ask_structured``. The output is suitable for
+    ``roundtable_converge`` and retains reviewer/category metadata for the
+    final audit ledger.
+    """
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    findings: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for participant, payload in (results or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        label = PARTICIPANTS.get(participant, {}).get("label", participant)
+        for finding in payload.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            claim = str(finding.get("claim") or "").strip()
+            path = str(finding.get("file") or "").strip()
+            try:
+                line = int(finding.get("line") or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if not claim or not path or line < 1:
+                continue
+            identity = (path, line, re.sub(r"\s+", " ", claim).lower())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            findings.append({
+                "claim": claim,
+                "file": path,
+                "line": line,
+                "proof": str(finding.get("proof") or "").strip(),
+                "severity": str(finding.get("severity") or "medium").lower(),
+                "category": str(finding.get("category") or "correctness").lower(),
+                "reviewer": label,
+            })
+    findings.sort(key=lambda f: (
+        severity_order.get(f["severity"], 99), f["file"], f["line"], f["claim"],
+    ))
+    return {
+        "findings": findings[:_CODING_REVIEW_MAX_FINDINGS],
+        "total": len(findings),
+        "omitted": max(0, len(findings) - _CODING_REVIEW_MAX_FINDINGS),
+    }
+
+
+def roundtable_coding_synthesis_prompt(
+    task: str, panel_labels: list[str], synthesizer_label: str,
+    has_artifacts: bool, verification: Optional[dict] = None,
+) -> str:
+    """Build the final synthesis contract shared by MCP and web workflows."""
+    key, profile = _coding_task_profile(task)
+    panel_list = ", ".join(panel_labels) if panel_labels else "no independent panel"
+    base = (
+        f"You are {synthesizer_label}, synthesizing the {profile['label']} coding "
+        f"workflow. The independent panel ({panel_list}) has answered the user's "
+        "latest request. Produce one response the user can act on.\n\n"
+        "Synthesis contract:\n"
+        "- Answer the user's request directly; do not narrate the orchestration.\n"
+        "- Resolve panel disagreement against repository evidence. Mention a "
+        "disagreement only when it changes the decision.\n"
+        "- Never turn repeated speculation into consensus. Mark claims as "
+        "unverified when the source was not checked.\n"
+        "- Preserve the requested scope and the project's established patterns.\n"
+        f"- Completion target: {profile['synthesis_goal']}"
+    )
+    if key == "review":
+        if verification and verification.get("status") == "completed":
+            summary = verification.get("summary") or {}
+            base += (
+                "\n\nA grounded verification ledger appears in the transcript. "
+                f"It contains {summary.get('confirmed', 0)} confirmed, "
+                f"{summary.get('refuted', 0)} refuted, and "
+                f"{summary.get('unresolved', 0)} unresolved findings. Include "
+                "confirmed defects, omit refuted claims, and label unresolved "
+                "items as risks rather than facts."
+            )
+        else:
+            reason = (verification or {}).get("reason", "grounded verification was unavailable")
+            base += (
+                "\n\nGrounded finding verification did not complete "
+                f"({reason}). Do not present panel claims as verified facts."
+            )
+    if has_artifacts and key in {"debug", "review", "implement", "test", "general"}:
+        base += (
+            "\n\nIf and only if the requested outcome is a code change and the "
+            "evidence supports a specific fix, end with one or more unified diffs. "
+            "Each opening fence must be exactly ```diff path/to/file.ext on its "
+            "own line. Use repository-relative paths. Do not include a diff for a "
+            "question-only response or an unresolved diagnosis."
+        )
+    return base
+
+
+def _default_coding_panel(synthesizer: str) -> list[str]:
+    preferred = ["gemini-pro", "gpt-5"]
+    panel = [
+        name for name in preferred
+        if name != synthesizer and _participant_provider_available(name)
+    ]
+    if panel:
+        return panel
+    return [
+        name for name in PARTICIPANTS
+        if name != synthesizer and _participant_provider_available(name)
+    ][:2]
+
+
+def _coding_topic(prompt: str, limit: int = 80) -> str:
+    first_line = (prompt.strip().splitlines() or ["coding task"])[0]
+    return first_line if len(first_line) <= limit else first_line[:limit] + "…"
+
+
+def roundtable_post_verification_ledger(
+    thread_id: int, verification: dict,
+) -> None:
+    """Commit a grounded review ledger so later participants can audit it."""
+    roundtable_post(
+        thread_id,
+        "Grounded review verification ledger (source excerpts checked by the "
+        "verifier):\n" + json.dumps(verification, indent=2),
+        speaker="orchestrator",
+    )
+
+
+def roundtable_coding_task(
+    prompt: str, task: str = "general", working_directory: str = "",
+    thread_id: Optional[int] = None, participants: Optional[list[str]] = None,
+    synthesizer: str = "claude-opus", effort: str = "medium",
+    web_search: bool = False, diff_base: str = "HEAD",
+    capture_working_diff: bool = True, verify_review: bool = True,
+) -> dict:
+    """Run a complete multi-AI coding workflow in one MCP call.
+
+    This is the primary roundtable tool for coding requests. An AI should use
+    it when the user asks to consult the roundtable/panel, or when independent
+    review materially reduces risk. Use the lower-level tools only when manual
+    debate control is required.
+
+    ``task`` is one of ``general``, ``debug``, ``review``, ``plan``,
+    ``implement``, ``test``, or ``explain``. Each assigns distinct independent
+    panel lenses and a task-specific synthesis contract.
+
+    ``working_directory`` binds repository context read-only. Leave it empty to
+    use the MCP server's current working directory; pass it explicitly when the
+    active project is ambiguous. Review mode also captures the working diff
+    against ``diff_base`` by default. A clean or non-git tree falls back to
+    repo tools without failing the whole workflow.
+
+    Review mode requests schema-validated findings when an artifact is
+    available, caps them by severity, checks each cited ``file:line`` against
+    real source with ``roundtable_converge``, and gives the synthesizer the
+    confirmed/refuted/unresolved ledger. Other modes use independent free-form
+    panel responses grounded by the same repo binding.
+
+    ``thread_id`` continues an open workflow; omit it to create one. Returns
+    the thread id, grounding metadata, panel responses/errors, verification
+    ledger when applicable, and final ``synthesis``.
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    task_key, profile = _coding_task_profile(task)
+    synth_info = _resolve_participant(synthesizer)
+    panel = list(participants) if participants is not None else _default_coding_panel(synthesizer)
+    if len(set(panel)) != len(panel):
+        raise ValueError(f"Duplicate participants in {panel!r}.")
+    panel = [name for name in panel if name != synthesizer]
+    for name in panel:
+        _resolve_participant(name)
+
+    if thread_id is None:
+        created = roundtable_create(
+            topic=_coding_topic(prompt),
+            participants=list(dict.fromkeys([synthesizer, *panel])),
+        )
+        tid = int(created["thread_id"])
+        thread_was_new = True
+    else:
+        tid = int(thread_id)
+        thread = _thread_row(tid)
+        if thread is None:
+            raise ValueError(f"No such thread: {tid}")
+        if thread.get("closed_at"):
+            raise RuntimeError(f"Thread {tid} is closed — start a new coding task.")
+        thread_was_new = False
+
+    existing_binding = roundtable_repo_context(tid)
+    root = (working_directory or "").strip()
+    if not root:
+        root = (
+            existing_binding["working_directory"]
+            if existing_binding else str(Path.cwd())
+        )
+    grounding: dict = {
+        "working_directory": None,
+        "repo_bound": False,
+        "diff": None,
+        "warning": None,
+    }
+    try:
+        bound = roundtable_bind_repo(tid, root, permission_policy="readonly")
+        grounding["working_directory"] = bound["working_directory"]
+        grounding["repo_bound"] = True
+        if task_key == "review" and capture_working_diff and profile["capture_diff"]:
+            try:
+                grounding["diff"] = roundtable_bind_diff(tid, root, base=diff_base)
+            except (ValueError, RuntimeError) as exc:
+                grounding["warning"] = f"working diff not captured: {exc}"
+                roundtable_post(
+                    tid,
+                    "Repository grounding note: "
+                    f"{grounding['warning']}. Inspect the current repository "
+                    "with tools; do not treat an older working-diff artifact "
+                    "as the current change.",
+                    speaker="orchestrator",
+                )
+    except (ValueError, RuntimeError) as exc:
+        grounding["warning"] = f"repository not bound: {exc}"
+
+    roundtable_post(tid, prompt, speaker="user")
+    panel_prompt = roundtable_coding_panel_prompt(task_key, panel)
+    tool_context = _effective_tool_context(tid)
+    verification: Optional[dict] = None
+    panel_responses: dict[str, str] = {}
+    panel_errors: dict[str, str] = {}
+
+    use_structured_review = (
+        task_key == "review" and bool(grounding["diff"]) and bool(panel)
+    )
+    if use_structured_review:
+        structured = roundtable_ask_structured(
+            tid, panel, roundtable_coding_review_schema(),
+            prompt=panel_prompt, effort=effort,
+        )
+        panel_errors = structured.get("errors", {})
+        panel_responses = {
+            name: json.dumps(value, indent=2)
+            for name, value in structured.get("results", {}).items()
+        }
+        collected = roundtable_coding_review_findings(structured.get("results", {}))
+        findings = collected["findings"]
+        if verify_review and grounding["repo_bound"] and findings:
+            try:
+                converged = roundtable_converge(
+                    tid, findings, verifier=synthesizer, transport="auto",
+                )
+                for ledger_row, finding in zip(
+                    converged["ledger"], findings, strict=True,
+                ):
+                    ledger_row["reviewer"] = finding["reviewer"]
+                    ledger_row["category"] = finding["category"]
+                verification = {
+                    "status": "completed",
+                    "summary": converged["summary"],
+                    "ledger": converged["ledger"],
+                    "findings_total": collected["total"],
+                    "findings_omitted": collected["omitted"],
+                }
+                roundtable_post_verification_ledger(tid, verification)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "coding-task review verification failed: %s: %s",
+                    type(exc).__name__, exc,
+                )
+                verification = {
+                    "status": "skipped",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+        elif not verify_review:
+            verification = {"status": "skipped", "reason": "verification disabled"}
+        elif not grounding["repo_bound"]:
+            verification = {"status": "skipped", "reason": "no bound repository"}
+        else:
+            verification = {
+                "status": "completed",
+                "summary": {"confirmed": 0, "refuted": 0, "unresolved": 0},
+                "ledger": [],
+                "findings_total": collected["total"],
+                "findings_omitted": collected["omitted"],
+            }
+    else:
+        if panel:
+            panel_result = roundtable_ask_parallel(
+                tid, panel, prompt=panel_prompt, effort=effort,
+                web_search=web_search, tool_use_context=tool_context,
+            )
+            panel_responses = panel_result.get("responses", {})
+            panel_errors = panel_result.get("errors", {})
+        else:
+            roundtable_post(tid, panel_prompt, speaker="orchestrator")
+        if task_key == "review":
+            verification = {
+                "status": "skipped",
+                "reason": "no review artifact was available for structured findings",
+            }
+
+    synth_prompt = roundtable_coding_synthesis_prompt(
+        task_key,
+        [PARTICIPANTS[name]["label"] for name in panel],
+        synth_info["label"],
+        roundtable_has_artifacts(tid),
+        verification,
+    )
+    synthesis = roundtable_ask(
+        tid, synthesizer, prompt=synth_prompt, effort=effort,
+        web_search=web_search, tool_use_context=tool_context,
+    )
+    return {
+        "thread_id": tid,
+        "thread_was_new": thread_was_new,
+        "task": task_key,
+        "profile": {
+            "label": profile["label"],
+            "description": profile["description"],
+        },
+        "grounding": grounding,
+        "panel": panel,
+        "panel_responses": panel_responses,
+        "panel_errors": panel_errors,
+        "verification": verification,
+        "synthesizer": synthesizer,
+        "synthesis": synthesis,
+    }

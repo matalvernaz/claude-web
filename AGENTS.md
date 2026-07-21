@@ -135,6 +135,7 @@ SQLite at `$CLAUDE_WEB_STATE_DIR/state.db` (WAL mode) holds run metadata + event
 | `CLAUDE_WEB_LOG_LEVEL` | `INFO` | log level for the `claude-web` application logger |
 | `CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY` | 60 | per-user roundtable bucket capacity (1 token = 1 panellist or synth call) |
 | `CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC` | 1.0 | roundtable token refill rate per user |
+| `CLAUDE_ROUNDTABLE_REVIEW_MAX_FINDINGS` | 8 | maximum severity-sorted findings sent through grounded review verification |
 | `OIDC_ALLOWLIST_MODE` | `all` | `all` (default; user must be in every configured email/group list) or `any` (one match is enough) |
 
 ### State / cost files (under `$CLAUDE_WEB_STATE_DIR`, default `~/.claude-web/`)
@@ -149,12 +150,14 @@ Per-user creds: `$CLAUDE_WEB_PERSONAL_HOMES_DIR/<safe_sub>/<id>/`.
 
 ### Roundtable
 
-`/roundtable` is a multi-AI panel where Gemini Pro + GPT-5 answer in parallel and Claude Opus synthesises a single consolidated reply. Code-related questions can return unified diffs in the synth output that click-to-apply against the bound project. Two surfaces:
+Roundtable is a multi-AI coding panel where Gemini Pro + GPT-5 answer independently and Claude Opus synthesises a single consolidated reply. It has three surfaces over the same `roundtable/core.py` library and SQLite store:
 
-- **Assistant view** (`mode-assistant`, default): one input box + file picker + "Ask the panel" button. Each user turn fires `roundtable_ask_parallel` against two paid participants (default `gemini-pro` + `gpt-5`) then `roundtable_ask` against the synthesiser (`claude-opus`, free via subscription CLI when `CLAUDE_ROUNDTABLE_ANTHROPIC_TRANSPORT=cli`). Conversation persists in a roundtable thread.
+- **MCP**: `roundtable/mcp_server.py` exposes 25 operations. `roundtable_coding_task` is the primary coding entry point for the chat AI; it composes create → repo bind → task-specific panel → optional review verification → synthesis in one call. The lower-level tools remain available for manually driven debates. MCP tool availability does not force model use — the user should explicitly say "use the roundtable" when consultation is mandatory.
+- **Assistant view** (`mode-assistant`, default): task picker (`general`, `debug`, `review`, `plan`, `implement`, `test`, `explain`) + input + file picker. Every task assigns independent panel lenses and a task-specific synthesis contract. A selected project is persistently bound into roundtable core as read-only context in addition to claude-web's ownership mapping.
+- **Review workflow**: auto-captures `git diff` against the selected base, asks the panel for schema-valid findings, severity-sorts/de-duplicates/caps them, runs `roundtable_converge` against real cited `file:line` source, posts the confirmed/refuted/unresolved ledger, then synthesises. A clean/non-git tree falls back to permission-gated repo inspection and labels findings unverified instead of using a stale diff artifact.
 - **Advanced view** (`mode-advanced`): underlying thread browser + manual-driving panels (post / ask / ask_parallel / attach / close). Same body, different `mode-*` class.
 
-Optional editable dependency on the `roundtable` package — `pip install -e /home/matt/roundtable-mcp` (or wherever the operator put it). If the import fails the route renders a "not installed" panel. The wrapper at `roundtable/` in this repo is a thin shim re-exporting from the installed package.
+The canonical roundtable package is vendored under `roundtable/` in this repository. The app still guards its import and renders a disabled panel if its provider dependencies are unavailable, but there is no second `roundtable-mcp` checkout to keep in sync.
 
 - **Shared store**: `~/.claude-roundtable/state.db` (SQLite, WAL). Same store the standalone `roundtable-mcp` stdio server uses — threads created via Claude Code MCP tools are visible in the web UI and vice versa. No sync layer.
 
@@ -162,9 +165,9 @@ Optional editable dependency on the `roundtable` package — `pip install -e /ho
 
 - **Ownership / authorization**: `_require_roundtable_thread_access(thread_id, user, *, for_apply=False)` gates every per-thread route (read, post, ask, ask_parallel, attach, close, apply). Policy: a bound thread with a non-NULL `created_by` is private to that OIDC sub and any operator in `CLAUDE_WEB_ADMIN_EMAILS`; bound threads with NULL `created_by` (legacy rows) and unbound threads (MCP / CLI created) stay readable+postable by any authenticated user to preserve interop. **Apply is stricter**: it refuses unbound threads outright and demands a non-NULL `created_by` matching the caller — without that gate, any signed-in user could rewrite files in another user's bound project and ride the next build/test for RCE. Cross-user access returns 404 (not 403) so thread ids aren't enumerable.
 
-- **Rate limiting**: per-OIDC-sub token bucket via `_roundtable_rate_limit_check(user, weight=…)`. `ask` consumes 1, `ask_parallel` consumes one per participant, the assistant route consumes `len(panel) + 1`. Bucket sizing is `CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY` / `CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC`. Refused requests return HTTP 429 with a `Retry-After` header.
+- **Rate limiting**: per-OIDC-sub token bucket via `_roundtable_rate_limit_check(user, weight=…)`. `ask` consumes 1, `ask_parallel` consumes one per participant, the assistant route consumes `len(panel) + 1`, and review verification consumes one additional token per checked finding. Bucket sizing is `CLAUDE_WEB_ROUNDTABLE_RATE_CAPACITY` / `CLAUDE_WEB_ROUNDTABLE_RATE_REFILL_PER_SEC`. If the second-stage review charge is unavailable, synthesis continues with verification explicitly marked skipped.
 
-- **Streaming SSE** on `POST /api/roundtable/assistant`. Event order per turn: `created` → `attached` (per file) → `prompt_posted` → `panel_start` → `panel_done` (with per-panelist char counts) → `synth_start` → `done` (full payload incl. patches). The browser uses `fetch().body.getReader()` + a small SSE parser; aria-live announcements track each step for NVDA. Per-token streaming of the synth is a future improvement — would need streaming added to `roundtable.core`.
+- **Streaming SSE** on `POST /api/roundtable/assistant`. Event order per turn: `created` → `grounded` → `attached` (per file) → `prompt_posted` → `panel_start` → `panel_done` → optional `verify_start` / `verify_done` → `synth_start` → optional `synth_delta` → `done`. The detached producer survives tab close; reload rejoins by stream id and replays buffered events. Aria-live announcements track milestones without speaking token deltas.
 
 - **Markdown rendering on synth turns**: `marked.min.js` + `purify.min.js` are loaded on the roundtable page. AI output goes through `marked.parse()` → `DOMPurify.sanitize()` before insertion. Falls back to plain `<pre>` if either lib is missing.
 
@@ -175,7 +178,7 @@ Optional editable dependency on the `roundtable` package — `pip install -e /ho
 
 - **Env config**: `GEMINI_API_KEY`, `OPENAI_API_KEY` for the paid panel; `CLAUDE_ROUNDTABLE_ANTHROPIC_TRANSPORT=cli` to bill Claude participants through the subscription CLI (no `ANTHROPIC_API_KEY` needed); optional `CLAUDE_WEB_ROUNDTABLE_ASSISTANT_MAX_BYTES` (default 2 MiB per upload).
 
-- **Cost picture**: per "Ask the panel" turn = 1 Gemini Pro call + 1 GPT-5 call (paid) + 1 Claude Opus call (subscription, free in CLI transport mode). Typical 20-40s round-trip.
+- **Cost picture**: normal task = 1 Gemini Pro call + 1 GPT-5 call (paid) + 1 Claude Opus synthesis (subscription in CLI transport mode). Verified review adds up to `CLAUDE_ROUNDTABLE_REVIEW_MAX_FINDINGS` verifier calls; the default verifier is the selected Claude synthesiser with `transport=auto`.
 
 ### Codex provider (OpenAI)
 
@@ -236,7 +239,7 @@ This is a claude-web bug, not upstream Claude Code — the next-prompt picker af
 | `codex_provider.py` | OpenAI Codex provider: `codex app-server` JSON-RPC client (singleton), availability probe, notification→SSE translation, thread/read transcript reader; stdlib-only, no app.py imports |
 | `auth.py` | OIDC code+PKCE via authlib |
 | `setup_flow.py` | in-browser sign-in flows for the bundled CLI, keyed per-credential |
-| `roundtable/` | thin shim re-exporting the installed `roundtable` package (`pip install -e ../roundtable-mcp`); absent imports degrade `/roundtable` to a "not installed" panel |
+| `roundtable/` | canonical vendored roundtable core + FastMCP server; high-level coding workflows, providers, repo tools, structured review, convergence, storage |
 | `templates/{index,account,setup,personalities,roundtable}.html` | UI |
 | `static/{app,account,setup,personalities,roundtable}.js` | client JS |
 | `static/{style,setup,roundtable}.css` | styles |

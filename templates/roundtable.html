@@ -89,10 +89,10 @@
       >
         <h2 id="assistant-history-heading" class="sr-only">Conversation</h2>
         <p id="assistant-empty" class="assistant-empty">
-          Ask the panel a question or upload a file below. Two paid
-          participants will read independently; Claude Opus will read
-          their replies and synthesize one answer for you. Continue the
-          conversation to refine — the panel sees prior turns.
+          Choose a coding task and ask the panel below. With a project
+          selected, participants inspect the repository directly. Review
+          mode also captures the working diff and verifies concrete findings
+          against source before Claude Opus synthesizes one answer.
         </p>
       </section>
 
@@ -127,6 +127,18 @@
 
           <div class="assistant-turn-knobs">
             <p class="action-form-row">
+              <label for="assistant-task">Task</label>
+              <select id="assistant-task" aria-describedby="assistant-task-description">
+                {% for profile in coding_profiles %}
+                  <option value="{{ profile.key }}"
+                    data-description="{{ profile.description }}"
+                    {% if profile.key == 'general' %}selected{% endif %}>
+                    {{ profile.label }}
+                  </option>
+                {% endfor %}
+              </select>
+            </p>
+            <p class="action-form-row">
               <label for="override-effort">Effort</label>
               <select id="override-effort">
                 <option value="">Provider default</option>
@@ -142,6 +154,7 @@
               </label>
             </p>
           </div>
+          <p id="assistant-task-description" class="assistant-task-description"></p>
 
           <details class="assistant-advanced-knobs">
             <summary>Override panel</summary>
@@ -164,6 +177,29 @@
                 <option value="claude-fable">claude-fable (access-gated)</option>
               </select>
             </p>
+            <div id="review-options" class="assistant-review-options" hidden>
+              <p class="hint">
+                Review mode can capture the selected project's current diff
+                and verify schema-valid findings against the cited source.
+              </p>
+              <p class="action-form-row">
+                <label for="review-diff-base">Diff base</label>
+                <input type="text" id="review-diff-base" value="HEAD"
+                  autocomplete="off" spellcheck="false">
+              </p>
+              <p class="action-form-row">
+                <label for="capture-working-diff">
+                  <input type="checkbox" id="capture-working-diff" checked>
+                  Capture working diff
+                </label>
+              </p>
+              <p class="action-form-row">
+                <label for="verify-review">
+                  <input type="checkbox" id="verify-review" checked>
+                  Verify findings against source
+                </label>
+              </p>
+            </div>
           </details>
 
           <button type="submit" id="assistant-submit">Ask the panel</button>
