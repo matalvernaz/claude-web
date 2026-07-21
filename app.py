@@ -11252,24 +11252,30 @@ _OVERAGE_GATE_STOP = "Stop here"
 def _overage_should_gate(rli: Optional[dict]) -> bool:
     """True if continuing now would spend pay-as-you-go credits.
 
-    Fires when a plan window is approaching (``allowed_warning``) or at
-    (``rejected``) its limit *and* overage is available to absorb the overflow,
-    or when the reported window is already the ``overage`` bucket. Returns False
-    when there's plan headroom, or when overage is unavailable — in that case
-    the CLI stops on its own and there's nothing to gate.
+    Fires when a plan window is exhausted (``rejected``) and overage is
+    available to absorb the overflow, or when the CLI says requests are
+    actually billing to the overage bucket (``isUsingOverage``). Everything
+    else is headroom or FYI and must not gate: ``allowed_warning`` on a plan
+    window means the plan still has room, and the CLI emits ``overage``-type
+    events about the monthly cap's utilization even when nothing is drawing
+    on it (``isUsingOverage: false``). A window whose ``resetsAt`` has passed
+    reads as reset — the persisted cache outlives the window it describes.
+    When overage is unavailable the CLI stops on its own; nothing to gate.
 
     Reads the raw CLI dict (camelCase keys) so it works against both the
     persisted cache and a live RateLimitEvent's ``.raw``.
     """
     if not isinstance(rli, dict):
         return False
+    resets_at = rli.get("resetsAt")
+    if isinstance(resets_at, (int, float)) and resets_at <= time.time():
+        return False
     status = rli.get("status")
     rl_type = rli.get("rateLimitType")
-    overage_status = rli.get("overageStatus")
     if rl_type == "overage":
-        return status in ("allowed", "allowed_warning")
-    if rl_type in _PLAN_RATE_LIMIT_TYPES and status in ("allowed_warning", "rejected"):
-        return overage_status in ("allowed", "allowed_warning")
+        return bool(rli.get("isUsingOverage")) and status in ("allowed", "allowed_warning")
+    if rl_type in _PLAN_RATE_LIMIT_TYPES and status == "rejected":
+        return rli.get("overageStatus") in ("allowed", "allowed_warning")
     return False
 
 

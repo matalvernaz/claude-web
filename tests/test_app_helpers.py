@@ -1278,7 +1278,8 @@ async def test_api_usage_live_happy_path_never_returns_token(monkeypatch) -> Non
 
 # ─── Overage (pay-as-you-go) gate decision ─────────────────────────────────
 
-def _rli(status=None, rate_limit_type=None, overage_status=None) -> dict:
+def _rli(status=None, rate_limit_type=None, overage_status=None,
+         is_using_overage=None, resets_at=None) -> dict:
     """Build a raw rate-limit dict (camelCase keys, as the CLI reports them)."""
     d: dict = {}
     if status is not None:
@@ -1287,7 +1288,15 @@ def _rli(status=None, rate_limit_type=None, overage_status=None) -> dict:
         d["rateLimitType"] = rate_limit_type
     if overage_status is not None:
         d["overageStatus"] = overage_status
+    if is_using_overage is not None:
+        d["isUsingOverage"] = is_using_overage
+    if resets_at is not None:
+        d["resetsAt"] = resets_at
     return d
+
+
+_RESETS_FUTURE = 4102444800  # 2100-01-01
+_RESETS_PAST = 946684800  # 2000-01-01
 
 
 @pytest.mark.parametrize("rli,expected", [
@@ -1295,11 +1304,23 @@ def _rli(status=None, rate_limit_type=None, overage_status=None) -> dict:
     (_rli("rejected", "five_hour", "allowed"), True),
     (_rli("rejected", "seven_day", "allowed"), True),
     (_rli("rejected", "seven_day_opus", "allowed_warning"), True),
-    # Approaching the wall, overage available -> warn-early gate.
-    (_rli("allowed_warning", "five_hour", "allowed"), True),
-    # Already on the overage bucket -> definitely spending credits.
-    (_rli("allowed", "overage"), True),
-    (_rli("allowed_warning", "overage"), True),
+    (_rli("rejected", "five_hour", "allowed", resets_at=_RESETS_FUTURE), True),
+    # Approaching the wall is still plan headroom -> nothing bills yet, no gate.
+    (_rli("allowed_warning", "five_hour", "allowed"), False),
+    # Actually drawing on the overage bucket -> spending credits.
+    (_rli("allowed", "overage", is_using_overage=True), True),
+    (_rli("allowed_warning", "overage", is_using_overage=True), True),
+    # Overage-bucket FYI about the monthly cap while nothing bills to it ->
+    # no gate. Regression: this exact CLI event fired the card at 60% session
+    # usage (2026-07-21).
+    ({"status": "allowed_warning", "rateLimitType": "overage",
+      "utilization": 1.05, "isUsingOverage": False, "surpassedThreshold": 1,
+      "resetsAt": _RESETS_FUTURE}, False),
+    (_rli("allowed", "overage"), False),
+    (_rli("allowed_warning", "overage"), False),
+    # Window already reset since the cache was written -> stale, no gate.
+    (_rli("rejected", "five_hour", "allowed", resets_at=_RESETS_PAST), False),
+    (_rli("allowed", "overage", is_using_overage=True, resets_at=_RESETS_PAST), False),
     # Plan headroom -> no gate.
     (_rli("allowed", "five_hour", "allowed"), False),
     # Plan exhausted but overage unavailable -> the CLI stops on its own.
@@ -1307,6 +1328,7 @@ def _rli(status=None, rate_limit_type=None, overage_status=None) -> dict:
     (_rli("rejected", "five_hour", "rejected"), False),
     # Overage bucket itself rejected (disabled/exhausted) -> no spend possible.
     (_rli("rejected", "overage"), False),
+    (_rli("rejected", "overage", is_using_overage=True), False),
     # Unknown / missing -> conservative False.
     (None, False),
     ({}, False),
