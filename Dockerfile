@@ -4,20 +4,20 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# Node + the official Claude Code CLI (the SDK shells out to it).
+# Node + the official Claude Code and OpenAI Codex CLIs.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @anthropic-ai/claude-code \
+ && npm install -g @anthropic-ai/claude-code @openai/codex \
  && npm cache clean --force
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY app.py auth.py currency.py setup_flow.py ./
+COPY app.py auth.py codex_provider.py currency.py setup_flow.py ./
 COPY static ./static
 COPY templates ./templates
 
@@ -27,6 +27,7 @@ RUN useradd -u 1000 -m claude
 USER claude
 
 ENV CLAUDE_HOME=/home/claude/.claude \
+    CODEX_HOME=/home/claude/.codex \
     CLAUDE_WEB_STATE_DIR=/home/claude/.claude-web \
     CLAUDE_PROJECT_DIR=/workspace
 

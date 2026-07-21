@@ -8,6 +8,8 @@ plumbing, and the route-level validation that keeps the two providers'
 sessions from cross-contaminating.
 """
 import asyncio
+import os
+import shutil
 
 import pytest
 
@@ -196,6 +198,15 @@ def test_availability_via_auth_json(monkeypatch, tmp_path):
     assert codex_provider.availability()["available"] is True
 
 
+def test_personal_availability_does_not_inherit_service_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(codex_provider, "codex_binary", lambda: "/bin/true")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared")
+    assert codex_provider.availability(tmp_path)["available"] is True
+    assert codex_provider.availability(
+        tmp_path, allow_env_key=False,
+    )["available"] is False
+
+
 # ─── JSON-RPC dispatch plumbing ───────────────────────────────────────────────
 
 
@@ -229,6 +240,124 @@ async def test_dispatch_routes_thread_notifications():
                       "params": {"threadId": "t-unknown"}})
     server.unsubscribe("t1")
     assert "t1" not in server._thread_queues
+
+
+def test_dispatch_records_device_login_completion():
+    server = codex_provider.CodexAppServer()
+    server._dispatch({
+        "jsonrpc": "2.0",
+        "method": "account/login/completed",
+        "params": {"loginId": "login-1", "success": True},
+    })
+    assert server.login_result("login-1") == {
+        "loginId": "login-1", "success": True,
+    }
+
+
+async def test_app_server_pool_is_keyed_and_rejects_setting_mismatch(
+    monkeypatch, tmp_path,
+):
+    class _Proc:
+        returncode = None
+
+        def terminate(self):
+            self.returncode = -15
+
+    async def _fake_start(self):
+        self.proc = _Proc()
+
+    codex_provider.CodexAppServer.shutdown_all()
+    monkeypatch.setattr(codex_provider.CodexAppServer, "_start", _fake_start)
+    try:
+        home_a = tmp_path / "account-a"
+        first = await codex_provider.CodexAppServer.get(
+            "account:a", home=home_a, isolated_auth=True,
+        )
+        again = await codex_provider.CodexAppServer.get(
+            "account:a", home=home_a, isolated_auth=True,
+        )
+        second = await codex_provider.CodexAppServer.get(
+            "account:b", home=tmp_path / "account-b", isolated_auth=True,
+        )
+
+        assert again is first
+        assert second is not first
+        with pytest.raises(codex_provider.CodexError, match="different settings"):
+            await codex_provider.CodexAppServer.get(
+                "account:a", home=tmp_path / "wrong-home", isolated_auth=True,
+            )
+    finally:
+        codex_provider.CodexAppServer.shutdown_all()
+
+
+async def test_isolated_server_forces_file_chatgpt_auth_and_strips_keys(
+    monkeypatch, tmp_path,
+):
+    captured = {}
+    stopped = asyncio.Event()
+
+    class _Stream:
+        async def readline(self):
+            await stopped.wait()
+            return b""
+
+    class _Stdin:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, value):
+            self.writes.append(value)
+
+    class _Proc:
+        def __init__(self):
+            self.stdin = _Stdin()
+            self.stdout = _Stream()
+            self.stderr = _Stream()
+            self.returncode = None
+            self.pid = 1234
+
+        def terminate(self):
+            self.returncode = -15
+            stopped.set()
+
+    proc = _Proc()
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return proc
+
+    monkeypatch.setattr(codex_provider, "codex_binary", lambda: "/bin/codex")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-shared")
+    monkeypatch.setenv("CODEX_API_KEY", "codex-shared")
+    home = tmp_path / "slot-home"
+    server = codex_provider.CodexAppServer(
+        key="slot-test", home=home, isolated_auth=True,
+    )
+
+    async def _fake_request(method, params=None, timeout=None):
+        assert method == "initialize"
+        return {}
+
+    server.request = _fake_request
+    try:
+        await server._start()
+        assert captured["args"] == (
+            "/bin/codex",
+            "-c", 'cli_auth_credentials_store="file"',
+            "-c", 'forced_login_method="chatgpt"',
+            "-c", 'model_provider="openai"',
+            "app-server",
+        )
+        assert captured["env"]["CODEX_HOME"] == str(home)
+        assert "OPENAI_API_KEY" not in captured["env"]
+        assert "CODEX_API_KEY" not in captured["env"]
+    finally:
+        server.shutdown()
+        await asyncio.gather(
+            server._reader_task, server._stderr_task, return_exceptions=True,
+        )
 
 
 async def test_server_request_with_no_handler_declines():
@@ -295,7 +424,7 @@ def test_api_chat_rejects_unknown_provider(client):
 def test_api_chat_codex_unavailable_503(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": False, "reason": "codex CLI not installed"},
+        lambda *args, **kwargs: {"available": False, "reason": "codex CLI not installed"},
     )
     r = client.post("/api/chat", data={"message": "hi", "provider": "codex"})
     assert r.status_code == 503
@@ -305,7 +434,7 @@ def test_api_chat_codex_unavailable_503(client, monkeypatch):
 def test_api_chat_codex_rejects_plan_and_fork(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": True, "reason": None},
+        lambda *args, **kwargs: {"available": True, "reason": None},
     )
     for mode in ("plan", "dontAsk", "auto"):
         r = client.post("/api/chat", data={
@@ -332,7 +461,7 @@ def test_api_chat_provider_session_mismatch(client, monkeypatch):
     # Codex requested for a session id with no codex registry row.
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": True, "reason": None},
+        lambda *args, **kwargs: {"available": True, "reason": None},
     )
     r = client.post("/api/chat", data={
         "message": "hi", "provider": "codex", "session_id": "0" * 32,
@@ -343,7 +472,7 @@ def test_api_chat_provider_session_mismatch(client, monkeypatch):
 def test_api_providers_payload(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": False, "reason": "codex CLI not installed"},
+        lambda *args, **kwargs: {"available": False, "reason": "codex CLI not installed"},
     )
     r = client.get("/api/providers")
     assert r.status_code == 200
@@ -356,6 +485,8 @@ def test_api_providers_payload(client, monkeypatch):
     assert provs["codex"]["available"] is False
     assert provs["codex"]["capabilities"]["plan_mode"] is False
     assert provs["codex"]["capabilities"]["usage"] is False
+    assert provs["codex"]["capabilities"]["accounts"] is True
+    assert provs["codex"]["accounts"]["shared_label"]
     # The frontend hides selector options not in this list.
     assert provs["codex"]["capabilities"]["permission_modes"] == [
         "default", "acceptEdits", "bypassPermissions",
@@ -511,7 +642,7 @@ def test_codex_session_delete_removes_registry_row(client, monkeypatch):
             assert method == "thread/delete"
             return {}
 
-    async def _fake_get():
+    async def _fake_get(*args, **kwargs):
         return _FakeServer()
 
     monkeypatch.setattr(
@@ -525,6 +656,8 @@ def test_codex_session_history_payload(client, monkeypatch):
     import app as app_module
 
     app_module._record_codex_session("t-hist", None, "", "history", None)
+    opened_keys = []
+    closed_keys = []
 
     class _FakeServer:
         async def request(self, method, params=None, timeout=None):
@@ -536,23 +669,34 @@ def test_codex_session_history_payload(client, monkeypatch):
                 {"type": "agentMessage", "id": "m1", "text": "hey matt"},
             ]}]}}
 
-    async def _fake_get():
+    async def _fake_get(key, **kwargs):
+        opened_keys.append(key)
         return _FakeServer()
+
+    async def _fake_close_key(key):
+        closed_keys.append(key)
 
     monkeypatch.setattr(
         codex_provider.CodexAppServer, "get", staticmethod(_fake_get))
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key",
+        staticmethod(_fake_close_key),
+    )
     r = client.get("/api/sessions/t-hist")
     assert r.status_code == 200
     data = r.json()
     assert data["provider"] == "codex"
     assert data["messages"][0] == {"role": "user", "text": "hey codex"}
     assert data["messages"][1] == {"role": "assistant", "text": "hey matt"}
+    assert len(opened_keys) == 1
+    assert opened_keys[0].startswith("shared:read:")
+    assert closed_keys == opened_keys
 
 
 def test_codex_usage_endpoint_chatgpt_auth(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": True, "reason": None},
+        lambda *args, **kwargs: {"available": True, "reason": None},
     )
 
     class _FakeServer:
@@ -568,7 +712,7 @@ def test_codex_usage_endpoint_chatgpt_auth(client, monkeypatch):
                 "unavailable_reason": None,
             }
 
-    async def _fake_get():
+    async def _fake_get(*args, **kwargs):
         return _FakeServer()
 
     monkeypatch.setattr(
@@ -585,7 +729,7 @@ def test_codex_usage_endpoint_chatgpt_auth(client, monkeypatch):
 def test_codex_usage_endpoint_apikey_degrades(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": True, "reason": None},
+        lambda *args, **kwargs: {"available": True, "reason": None},
     )
 
     class _FakeServer:
@@ -596,7 +740,7 @@ def test_codex_usage_endpoint_apikey_degrades(client, monkeypatch):
                 "unavailable_reason": "chatgpt authentication required to read rate limits",
             }
 
-    async def _fake_get():
+    async def _fake_get(*args, **kwargs):
         return _FakeServer()
 
     monkeypatch.setattr(
@@ -613,7 +757,7 @@ def test_codex_usage_endpoint_apikey_degrades(client, monkeypatch):
 def test_codex_usage_endpoint_unavailable(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
-        lambda: {"available": False, "reason": "codex CLI not installed"},
+        lambda *args, **kwargs: {"available": False, "reason": "codex CLI not installed"},
     )
     r = client.get("/api/codex/usage")
     assert r.status_code == 200
@@ -642,3 +786,304 @@ async def test_codex_account_usage_folds_rpc_errors():
     assert out["rate_limits"] is None
     assert "chatgpt" in out["unavailable_reason"].lower()
     assert "account/usage/read" in calls  # still attempted
+
+
+def test_codex_credential_home_shares_only_rollouts_and_configuration(
+    client, monkeypatch, tmp_path,
+):
+    import app as app_module
+
+    shared = tmp_path / "shared-codex"
+    personal = tmp_path / "personal-codex"
+    (shared / "sessions").mkdir(parents=True)
+    (shared / "skills").mkdir()
+    (shared / "config.toml").write_text('model = "gpt-test"\n')
+    (shared / "state_5.sqlite").write_text("private index")
+    (shared / "auth.json").write_text("shared credential")
+    monkeypatch.setattr(app_module, "CODEX_PERSONAL_HOMES_DIR", personal)
+    monkeypatch.setattr(codex_provider, "codex_home", lambda: shared)
+
+    home = app_module._ensure_codex_credential_home("user-overlay", 41)
+
+    assert os.path.samefile(home / "sessions", shared / "sessions")
+    assert os.path.samefile(home / "skills", shared / "skills")
+    assert os.path.samefile(home / "config.toml", shared / "config.toml")
+    assert not (home / "state_5.sqlite").exists()
+    assert not (home / "auth.json").exists()
+
+
+def test_codex_device_login_api_marks_account_active(client, monkeypatch):
+    import app as app_module
+
+    created = client.post(
+        "/api/account/codex/credentials", json={"label": "Device Plan Test"},
+    )
+    assert created.status_code == 200
+    cred_id = created.json()["id"]
+    login_id = "device-login-test"
+
+    class _FakeServer:
+        async def request(self, method, params=None, timeout=None):
+            if method == "account/login/start":
+                assert params == {"type": "chatgptDeviceCode"}
+                return {
+                    "type": "chatgptDeviceCode",
+                    "loginId": login_id,
+                    "verificationUrl": "https://auth.openai.com/codex/device",
+                    "userCode": "ABCD-EFGH",
+                }
+            if method == "account/read":
+                return {
+                    "requiresOpenaiAuth": True,
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "plan@example.test",
+                        "planType": "plus",
+                    },
+                }
+            raise AssertionError(method)
+
+        def login_result(self, candidate):
+            assert candidate == login_id
+            return {"loginId": login_id, "success": True}
+
+    server = _FakeServer()
+
+    async def _fake_server_for_account(account):
+        assert account["isolated_auth"] is True
+        return server
+
+    monkeypatch.setattr(codex_provider, "codex_binary", lambda: "/bin/true")
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    try:
+        started = client.post(
+            f"/api/account/codex/credentials/{cred_id}/login/start",
+        )
+        assert started.status_code == 200
+        assert started.json() == {
+            "login_id": login_id,
+            "verification_url": "https://auth.openai.com/codex/device",
+            "user_code": "ABCD-EFGH",
+        }
+        home = app_module._codex_credential_home_path("anonymous", cred_id)
+        (home / "auth.json").write_text("{}")
+        status = client.get(
+            f"/api/account/codex/credentials/{cred_id}/status",
+            params={"login_id": login_id},
+        )
+        assert status.status_code == 200
+        assert status.json()["credential"]["configured"] is True
+        assert status.json()["flow"]["status"] == "done"
+        assert app_module._codex_user_active_slot("anonymous") == f"cred:{cred_id}"
+    finally:
+        app_module._set_codex_user_active("anonymous", "shared")
+        app_module._delete_codex_credential_row("anonymous", cred_id)
+        shutil.rmtree(
+            app_module._codex_credential_home_path("anonymous", cred_id),
+            ignore_errors=True,
+        )
+
+
+def test_codex_credential_routes_hide_other_users_rows(client):
+    import app as app_module
+
+    cred = app_module._create_codex_credential(
+        "different-oidc-sub", "Hidden OpenAI Account",
+    )
+    try:
+        response = client.get(
+            f"/api/account/codex/credentials/{cred['id']}/status",
+        )
+        assert response.status_code == 404
+    finally:
+        app_module._delete_codex_credential_row(
+            "different-oidc-sub", cred["id"],
+        )
+
+
+def test_account_page_renders_openai_device_code_controls(client):
+    response = client.get("/account")
+    assert response.status_code == 200
+    assert "OpenAI accounts" in response.text
+    assert 'id="codex-login-start"' in response.text
+    assert 'src="/static/codex-account.js' in response.text
+
+
+def test_codex_account_change_supersedes_run_without_changing_session(
+    client, monkeypatch,
+):
+    import app as app_module
+
+    cred = app_module._create_codex_credential(
+        "anonymous", "Same Chat Switch Test",
+    )
+    cred_id = cred["id"]
+    home = app_module._ensure_codex_credential_home("anonymous", cred_id)
+    (home / "auth.json").write_text("{}")
+    run = app_module.ActiveRun(
+        "run-codex-account-switch",
+        owner_sub="anonymous",
+        account_slot="shared",
+    )
+    run.provider = "codex"
+    run.session_id = "thread-codex-account-switch"
+    run.personality_id = app_module._resolve_personality_for_run(
+        {"sub": "anonymous"}, session_id=run.session_id,
+    )["id"]
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    app_module.ACTIVE_RUNS_BY_SESSION[run.session_id] = run
+    seen = {}
+
+    async def _fake_supersede(candidate, reason):
+        seen["run"] = candidate
+        seen["reason"] = reason
+
+    monkeypatch.setattr(
+        app_module, "_supersede_run_for_switch", _fake_supersede,
+    )
+    try:
+        response = client.post(
+            f"/api/chat/send/{run.run_id}",
+            data={
+                "message": "continue here",
+                "account_slot": f"cred:{cred_id}",
+            },
+        )
+        assert response.status_code == 409
+        assert response.json()["error"] == "account_changed"
+        assert seen == {"run": run, "reason": "account_changed"}
+        assert run.session_id == "thread-codex-account-switch"
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
+        app_module._delete_codex_credential_row("anonymous", cred_id)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+async def test_codex_account_handoff_waits_for_interrupted_turn_to_finish(client):
+    import app as app_module
+
+    events = []
+    run = app_module.ActiveRun(
+        "run-handoff-barrier", owner_sub="anonymous", account_slot="shared",
+    )
+    run.provider = "codex"
+    run.between_turns = False
+    run.codex_turn_done.clear()
+
+    class _Client:
+        async def interrupt(self):
+            events.append("interrupt")
+            assert run.accepting_input is False
+            loop = asyncio.get_running_loop()
+            loop.call_soon(events.append, "turn_completed")
+            loop.call_soon(run.codex_turn_done.set)
+
+    async def _driver():
+        try:
+            await asyncio.Future()
+        finally:
+            events.append("driver_closed")
+
+    run.client = _Client()
+    run.task = asyncio.create_task(_driver())
+    await asyncio.sleep(0)
+    await app_module._supersede_run_for_switch(run, "account_changed")
+
+    assert events == ["interrupt", "turn_completed", "driver_closed"]
+    assert run.superseded_reason == "account_changed"
+    assert run.task.cancelled()
+
+
+async def test_codex_driver_resumes_same_thread_in_fresh_run_server(
+    client, monkeypatch,
+):
+    import app as app_module
+
+    class _FakeServer:
+        def __init__(self):
+            self.calls = []
+            self.queue = asyncio.Queue()
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/resume":
+                return {"thread": {"id": "thread-handoff", "model": "gpt-test"}}
+            if method == "turn/start":
+                self.queue.put_nowait({
+                    "method": codex_provider.SERVER_EXITED_METHOD,
+                    "params": {},
+                })
+                return {}
+            if method == "thread/unsubscribe":
+                return {"status": "unsubscribed"}
+            raise AssertionError(method)
+
+        def subscribe(self, thread_id):
+            assert thread_id == "thread-handoff"
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            self.handler = handler
+
+        def unsubscribe(self, thread_id):
+            self.unsubscribed = thread_id
+
+    server = _FakeServer()
+
+    seen_server_keys = []
+    closed_server_keys = []
+
+    async def _fake_server_for_account(account, *, server_key=None):
+        seen_server_keys.append(server_key)
+        return server
+
+    async def _fake_close_key(server_key):
+        closed_server_keys.append(server_key)
+
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key", _fake_close_key,
+    )
+    run = app_module.ActiveRun(
+        "run-thread-handoff", owner_sub="anonymous", account_slot="cred:999",
+    )
+    run.provider = "codex"
+    run.project_key = "project-test"
+    await app_module._codex_driver(
+        run,
+        initial_text="continue",
+        initial_images=[],
+        resume_thread_id="thread-handoff",
+        model_id="gpt-test",
+        effort="",
+        cwd=app_module.DEFAULT_CWD,
+        personality_append="",
+        first_prompt_title="continue",
+        account={"server_key": "test"},
+    )
+
+    assert run.session_id == "thread-handoff"
+    assert server.calls[0] == (
+        "thread/resume",
+        {
+            "cwd": str(app_module.DEFAULT_CWD),
+            "approvalPolicy": codex_provider.APPROVAL_POLICY,
+            "sandbox": codex_provider.SANDBOX_MODE,
+            "model": "gpt-test",
+            "threadId": "thread-handoff",
+        },
+    )
+    assert server.calls[-1] == (
+        "thread/unsubscribe", {"threadId": "thread-handoff"},
+    )
+    assert server.unsubscribed == "thread-handoff"
+    assert seen_server_keys == ["test:run:run-thread-handoff"]
+    assert closed_server_keys == ["test:run:run-thread-handoff"]
+    app_module._state_db().execute(
+        "DELETE FROM codex_session WHERE thread_id = ?", ("thread-handoff",),
+    )

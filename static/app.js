@@ -14,6 +14,7 @@
   const modelSelect = document.getElementById("model-select");
   const providerSelect = document.getElementById("provider-select");
   const providerSelectLabel = document.getElementById("provider-select-label");
+  const accountSelect = document.getElementById("account-select");
   const permModeSelect = document.getElementById("permission-mode-select");
   const effortSelect = document.getElementById("effort-select");
   const effortSelectLabel = document.getElementById("effort-select-label");
@@ -610,6 +611,7 @@
   // own model list; the shared MODEL_* maps merge both lists because the
   // key spaces are disjoint (claude-* vs gpt-*).
   const PROVIDERS = { claude: null, codex: null };
+  let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
   }
@@ -630,6 +632,62 @@
       plan_mode: true, fork: true, rewind: true,
       permission_modes: true, accounts: true, usage: true,
     };
+  }
+
+  function ingestProvider(provider) {
+    if (!provider || !provider.key) return;
+    PROVIDERS[provider.key] = provider;
+    for (const m of provider.models || []) {
+      if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
+      MODEL_EFFORTS[m.key || ""] = m.efforts || [];
+      MODEL_BETAS[m.key || ""] = m.betas || [];
+      MODEL_ADVISOR[m.key || ""] = m.advisor || "";
+    }
+  }
+
+  function rebuildAccountOptions(provider, preferredSlot) {
+    if (!accountSelect) return;
+    const accounts = PROVIDERS[provider] && PROVIDERS[provider].accounts;
+    if (!accounts) return;
+    accountSelect.innerHTML = "";
+
+    const shared = document.createElement("option");
+    shared.value = "shared";
+    shared.textContent = accounts.shared_label || "Shared";
+    shared.disabled = accounts.shared_configured === false;
+    if (shared.disabled) shared.textContent += " (not signed in)";
+    accountSelect.appendChild(shared);
+
+    for (const cred of accounts.credentials || []) {
+      const option = document.createElement("option");
+      option.value = `cred:${cred.id}`;
+      option.textContent = cred.label || option.value;
+      option.disabled = !cred.configured;
+      if (option.disabled) option.textContent += " (not signed in)";
+      accountSelect.appendChild(option);
+    }
+
+    const desired = preferredSlot || accounts.active || "shared";
+    const desiredOption = [...accountSelect.options].find(
+      (option) => option.value === desired && !option.disabled,
+    );
+    const fallback = [...accountSelect.options].find((option) => !option.disabled);
+    if (desiredOption) accountSelect.value = desiredOption.value;
+    else if (fallback) accountSelect.value = fallback.value;
+    lastAccount = accountSelect.value;
+  }
+
+  async function refreshCodexProvider(accountSlot) {
+    const query = accountSlot
+      ? "?codex_account_slot=" + encodeURIComponent(accountSlot)
+      : "";
+    const response = await fetch("/api/providers" + query);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const codex = (payload.providers || []).find((provider) => provider.key === "codex");
+    if (!codex) throw new Error("Codex provider missing from response");
+    ingestProvider(codex);
+    return codex;
   }
 
   function rebuildModelOptions(provider) {
@@ -675,7 +733,7 @@
   }
 
   // Show/hide the Claude-only header controls and swap the model list.
-  function applyProviderUI(provider) {
+  function applyProviderUI(provider, preferredAccount) {
     const caps = providerCapabilities(provider);
     // permission_modes: true = every mode, array = that subset, falsy = none.
     const permModes = caps.permission_modes;
@@ -700,6 +758,7 @@
     }
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
+    rebuildAccountOptions(provider, preferredAccount);
     // The running header cost is Anthropic $-spend; hide it when the provider
     // can't populate it (Codex reports no per-turn cost). The Usage button
     // stays visible for every provider — the dialog itself branches on the
@@ -717,15 +776,7 @@
       if (r.ok) payload = await r.json();
     } catch (_) { /* provider combo just stays hidden */ }
     const provs = (payload && payload.providers) || [];
-    for (const p of provs) {
-      PROVIDERS[p.key] = p;
-      for (const m of p.models || []) {
-        if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
-        MODEL_EFFORTS[m.key || ""] = MODEL_EFFORTS[m.key || ""] || m.efforts || [];
-        if (!(m.key in MODEL_BETAS)) MODEL_BETAS[m.key || ""] = m.betas || [];
-        if (!(m.key in MODEL_ADVISOR)) MODEL_ADVISOR[m.key || ""] = m.advisor || "";
-      }
-    }
+    for (const p of provs) ingestProvider(p);
     const available = provs.filter((p) => p.available);
     if (!providerSelect || available.length < 2) return;
     providerSelect.innerHTML = "";
@@ -742,7 +793,7 @@
     }
     // A session pinned in the URL wins over the saved pick; loadSession
     // realigns the picker from the session payload's provider field.
-    if (currentProvider() !== "claude" && !sessionId) {
+    if (!sessionId) {
       applyProviderUI(currentProvider());
     }
     providerSelect.addEventListener("change", () => {
@@ -771,25 +822,24 @@
   // The select value is "shared" or "cred:<id>". Mirrors the personality
   // picker's per-session model: the slot is bound to the session via the
   // ``account_slot`` form field on every /api/chat send, so two tabs on two
-  // sessions can run under two different Claude accounts at once. The POST
+  // sessions can run under two different provider accounts at once. The POST
   // to /api/account/active here only sets the *default* for new chats — it
   // no longer drives resolution for live sessions, which is what used to
   // make a switch in one tab silently respawn every other tab onto the same
   // slot. Mid-conversation the switch takes effect on the next message: the
   // server sees account_slot differ from the run's slot, 409s
-  // account_changed, and the browser respawns the CLI under the new
-  // CLAUDE_CONFIG_DIR (the in-flight turn keeps the old slot — its
-  // subprocess loaded credentials at startup). Respawn-in-place, not fork:
-  // the conversation continues on the new account.
-  const accountSelect = document.getElementById("account-select");
+  // account_changed, and the browser respawns the provider driver under the
+  // selected credential. Both providers keep the visible conversation; Codex
+  // resumes the same rollout from the new account's app-server.
   if (accountSelect) {
-    let lastAccount = accountSelect.value;
     accountSelect.addEventListener("change", async () => {
       const target = accountSelect.value;
       if (target === lastAccount) return;
+      const provider = currentProvider();
       try {
         const fd = new FormData();
         fd.append("active", target);
+        fd.append("provider", provider);
         const r = await fetch("/api/account/active", { method: "POST", body: fd });
         if (!r.ok) {
           let detail = `HTTP ${r.status}`;
@@ -799,7 +849,19 @@
           } catch (_) {}
           throw new Error(detail);
         }
+        const accounts = await r.json();
+        if (PROVIDERS[provider]) PROVIDERS[provider].accounts = accounts;
         lastAccount = target;
+        if (provider === "codex") {
+          try {
+            await refreshCodexProvider(target);
+            applyProviderUI(provider, target);
+          } catch (_) {
+            // The account switch is already persisted. Keep the selected slot;
+            // the send endpoint validates the model if model-list refresh failed.
+            rebuildAccountOptions(provider, target);
+          }
+        }
         const label = accountSelect.options[accountSelect.selectedIndex]?.text || target;
         announce(`Account switched to ${label}. Takes effect on your next message.`);
       } catch (err) {
@@ -1118,7 +1180,10 @@
         && [...providerSelect.options].some((o) => o.value === sessProvider)) {
       providerSelect.value = sessProvider;
       safeSet(localStorage, PROVIDER_KEY, sessProvider);
-      applyProviderUI(sessProvider);
+      if (sessProvider === "codex" && data.account_slot) {
+        try { await refreshCodexProvider(data.account_slot); } catch (_) {}
+      }
+      applyProviderUI(sessProvider, data.account_slot || undefined);
     }
     // Use ?? not || so the loaded session's own (possibly empty) project
     // wins over the URL-pinned project — otherwise switching to an
@@ -2092,8 +2157,8 @@
       const provider = currentProvider();
       fd.append("provider", provider);
       if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
-      // Permission modes and account slots are Claude concepts; Codex runs
-      // always gate through approval prompts and use host-level auth.
+      // Permission-mode delivery remains provider-specific; account slots are
+      // shared UI semantics and both backends resolve them server-side.
       if (provider === "claude" && permModeSelect && permModeSelect.value) {
         fd.append("permission_mode", permModeSelect.value);
       }
@@ -2111,7 +2176,7 @@
       }
       // Picker value as session-scoped account override — same per-session
       // binding as personality, so two tabs run under two accounts at once.
-      if (provider === "claude" && accountSelect && accountSelect.value) {
+      if (accountSelect && accountSelect.value) {
         fd.append("account_slot", accountSelect.value);
       }
       for (const img of entry.images) {
@@ -4298,9 +4363,13 @@
     if (currentProvider() === "codex") {
       let data = null;
       try {
-        const url = "/api/codex/usage"
-          + (sessionId ? "?session_id=" + encodeURIComponent(sessionId) : "");
-        const r = await fetch(url);
+        const query = new URLSearchParams();
+        if (sessionId) query.set("session_id", sessionId);
+        if (accountSelect && accountSelect.value) {
+          query.set("account_slot", accountSelect.value);
+        }
+        const suffix = query.toString() ? "?" + query.toString() : "";
+        const r = await fetch("/api/codex/usage" + suffix);
         if (r.ok) data = await r.json();
         else data = { available: false, reason: "HTTP " + r.status };
       } catch (e) {

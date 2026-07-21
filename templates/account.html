@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Your Claude accounts — claude-web</title>
+  <title>Your AI accounts — claude-web</title>
   <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
   <link rel="stylesheet" href="/static/setup.css?v={{ asset_version('setup.css') }}">
 </head>
 <body>
   <header>
-    <h1>Your Claude accounts</h1>
+    <h1>Your AI accounts</h1>
     <div class="header-actions">
       <a href="/">Back to chat</a>
       {% if user and user.sub != 'anonymous' %}
@@ -20,13 +20,13 @@
 
   <main class="setup">
     <p class="setup-intro">
-      Each account you add is yours — only you can see, switch to, or delete
-      it. The shared <strong>{{ account.shared_label }}</strong> account is
-      managed by an admin and is available to everyone.
+      Each personal account you add is yours — only you can see, switch to,
+      or delete it. Shared accounts are managed by an admin and available to
+      everyone using this site.
     </p>
 
     <section aria-labelledby="creds-heading" class="setup-card">
-      <h2 id="creds-heading">Accounts</h2>
+      <h2 id="creds-heading">Claude accounts</h2>
       <ul id="cred-list" class="cred-list" aria-live="polite">
         <li class="cred-item cred-shared">
           <span class="cred-label">{{ account.shared_label }}</span>
@@ -144,8 +144,92 @@
         <p id="apikey-error" class="setup-error" role="alert" hidden></p>
       </details>
     </section>
+
+    <section aria-labelledby="codex-creds-heading" class="setup-card">
+      <h2 id="codex-creds-heading">OpenAI accounts</h2>
+      <p>
+        Add a ChatGPT subscription account for Codex. Each account has private
+        sign-in credentials; conversation history stays shared so switching
+        accounts can continue the current chat.
+      </p>
+      {% if not codex_account.cli_installed %}
+        <p class="setup-error" role="alert">
+          The Codex CLI is not installed on this server. Accounts can be
+          reserved, but sign-in requires the CLI.
+        </p>
+      {% endif %}
+      <ul id="codex-cred-list" class="cred-list" aria-live="polite">
+        <li class="cred-item cred-shared">
+          <span class="cred-label">{{ codex_account.shared_label }}</span>
+          <span class="cred-meta">
+            Shared with everyone —
+            {% if codex_account.shared_configured %}signed in{% else %}not signed in{% endif %}
+          </span>
+        </li>
+        {% for c in codex_account.credentials %}
+          <li class="cred-item" data-codex-cred-id="{{ c.id }}">
+            <span class="cred-label">{{ c.label }}</span>
+            <span class="cred-meta">
+              {% if c.configured %}Signed in with ChatGPT{% else %}Not signed in{% endif %}
+            </span>
+            <span class="cred-actions">
+              {% if not c.configured %}
+                <button type="button" class="codex-setup" data-codex-cred-id="{{ c.id }}">Sign in</button>
+              {% else %}
+                <button type="button" class="codex-signout" data-codex-cred-id="{{ c.id }}">Sign out</button>
+              {% endif %}
+              <button type="button" class="codex-rename" data-codex-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Rename</button>
+              <button type="button" class="codex-delete" data-codex-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Remove</button>
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+
+      <form id="codex-add-form">
+        <p>
+          <label for="codex-add-label">Add an OpenAI account</label><br>
+          <input type="text" id="codex-add-label" name="label" maxlength="80"
+            autocomplete="off" placeholder="e.g. Personal Plus" required>
+        </p>
+        <p><button type="submit" id="codex-add-submit">Add OpenAI account</button></p>
+      </form>
+      <p id="codex-add-error" class="setup-error" role="alert" hidden></p>
+      <p id="codex-add-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="codex-signin-section" aria-labelledby="codex-signin-heading" class="setup-card" hidden>
+      <h2 id="codex-signin-heading">Sign in to <span id="codex-signin-label"></span></h2>
+      <p>
+        This uses OpenAI's device-code flow for a ChatGPT subscription. Your
+        OpenAI password is entered only on OpenAI's site and is never sent to
+        claude-web.
+      </p>
+      <p>
+        <button type="button" id="codex-login-start">Start OpenAI sign-in</button>
+        <button type="button" id="codex-signin-close">Close</button>
+      </p>
+      <div id="codex-login-progress" hidden>
+        <p id="codex-login-status" role="status" aria-live="polite"></p>
+        <div id="codex-device-block" hidden>
+          <p>
+            <a id="codex-verification-url" href="#" target="_blank" rel="noopener noreferrer">Open the OpenAI sign-in page</a>
+            (opens in a new tab)
+          </p>
+          <p>
+            <label for="codex-device-code">One-time code</label><br>
+            <input type="text" id="codex-device-code" readonly autocomplete="off"
+              autocapitalize="off" spellcheck="false">
+            <button type="button" id="codex-copy-code">Copy code</button>
+          </p>
+          <p class="hint">Enter this code on the OpenAI page, then return here. This page detects completion automatically.</p>
+          <p><button type="button" id="codex-login-cancel">Cancel sign-in</button></p>
+        </div>
+        <p id="codex-login-error" class="setup-error" role="alert" hidden></p>
+      </div>
+    </section>
   </main>
 
   <script src="/static/account.js?v={{ asset_version('account.js') }}"></script>
+  <script src="/static/codex-account.js?v={{ asset_version('codex-account.js') }}"></script>
 </body>
 </html>

@@ -262,6 +262,16 @@ PERSONAL_HOMES_DIR = Path(os.getenv(
     "CLAUDE_WEB_PERSONAL_HOMES_DIR", str(Path.home() / ".claude-homes")
 )).resolve()
 SHARED_ACCOUNT_LABEL = os.getenv("CLAUDE_WEB_SHARED_ACCOUNT_LABEL", "Shared").strip() or "Shared"
+# Personal ChatGPT-plan credentials use one CODEX_HOME per slot. Rollout
+# sessions and user configuration are shared with the host Codex home; auth
+# and SQLite state stay private to each slot.
+CODEX_PERSONAL_HOMES_DIR = Path(os.getenv(
+    "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR", str(Path.home() / ".codex-homes")
+)).resolve()
+CODEX_SHARED_ACCOUNT_LABEL = (
+    os.getenv("CLAUDE_WEB_CODEX_SHARED_ACCOUNT_LABEL", "Shared OpenAI").strip()
+    or "Shared OpenAI"
+)
 # Branding overrides so a deployment can rename "Claude — homelab" without
 # patching templates. SITE_TITLE shows in <title> and the <h1>; if unset,
 # the original homelab branding is used.
@@ -449,7 +459,9 @@ VALID_PROVIDERS = ("claude", "codex")
 CODEX_PROVIDER_LABEL = "Codex (OpenAI)"
 
 
-async def _providers_payload() -> list[dict]:
+async def _providers_payload(
+    user: dict, codex_account_slot: Optional[str] = None,
+) -> list[dict]:
     """Provider list for the header combo, fetched by the browser after
     load (not embedded at render time: the Codex model list needs the
     app-server, and first spawn shouldn't block the page).
@@ -465,22 +477,30 @@ async def _providers_payload() -> list[dict]:
         "available": True,
         "reason": None,
         "models": _models_payload(),
+        "accounts": _account_payload(user),
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
             "permission_modes": True, "accounts": True, "usage": True,
         },
     }
-    codex_avail = codex_provider.availability()
+    codex_account = _resolve_codex_account_for_run(
+        user, override_slot=codex_account_slot,
+    )
+    codex_avail = codex_provider.availability(
+        codex_account.get("home"),
+        allow_env_key=not codex_account.get("isolated_auth", False),
+    )
     codex_entry = {
         "key": "codex",
         "label": CODEX_PROVIDER_LABEL,
         "available": bool(codex_avail["available"]),
         "reason": codex_avail["reason"],
         "models": [],
+        "accounts": _codex_account_payload(user),
         "capabilities": {
             "plan_mode": False, "fork": False, "rewind": False,
             "permission_modes": list(codex_provider.CODEX_PERMISSION_MODES),
-            "accounts": False,
+            "accounts": True,
             # The Usage dialog + header cost are Anthropic plan/cost data
             # (today's spend, plan rate limits, 30-day history) — none of it
             # applies to a codex conversation, and the app-server reports no
@@ -491,7 +511,7 @@ async def _providers_payload() -> list[dict]:
     }
     if codex_entry["available"]:
         try:
-            server = await codex_provider.CodexAppServer.get()
+            server = await _codex_server_for_account(codex_account)
             models = await server.models()
             codex_entry["models"] = [
                 {"key": m["key"], "label": m["label"], "context": None,
@@ -510,13 +530,13 @@ async def _providers_payload() -> list[dict]:
     return [claude_entry, codex_entry]
 
 
-def _codex_models_by_key() -> dict[str, dict]:
+def _codex_models_by_key(account: dict) -> dict[str, dict]:
     """Synchronous view of the Codex model-list cache for request
     validation. Empty until the first /api/providers fetch has run —
     api_chat treats an unknown-but-nonempty model key as invalid only
     when the cache is warm, and otherwise passes it through (the
     app-server rejects a genuinely bad id with a clear error)."""
-    inst = codex_provider.CodexAppServer._instance
+    inst = codex_provider.CodexAppServer.get_cached(account["server_key"])
     cache = inst._models_cache if inst is not None else None
     return {m["key"]: m for m in (cache or [])}
 
@@ -1607,6 +1627,24 @@ def _state_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_credential_sub ON user_credential(user_sub)"
         )
+        # OpenAI account slots parallel the Claude tables but remain separate:
+        # their homes, login protocol, and active defaults are provider-specific.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_codex_account (
+            user_sub TEXT PRIMARY KEY,
+            active TEXT NOT NULL DEFAULT 'shared',
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS codex_credential (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_sub TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(user_sub, label)
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_credential_sub "
+            "ON codex_credential(user_sub)"
+        )
         # Roundtable thread → project binding. The roundtable library itself
         # is project-agnostic (its SQLite store at ~/.claude-roundtable/ has
         # no notion of claude-web projects). This claude-web-side table maps
@@ -1676,12 +1714,9 @@ def _state_db() -> sqlite3.Connection:
         # Per-session active credential slot. Mirrors session_personality:
         # ``user_account.active`` (above) is only the DEFAULT for *new* chats;
         # an existing session binds its slot here so two chats can run under
-        # two different Claude accounts at once. The old design resolved the
-        # account purely from the user-global ``user_account`` row, which
-        # forced last-writer-wins across every tab — switching the account in
-        # one tab silently respawned every other tab onto the same slot.
-        # ``slot`` is the same free string the run carries: 'shared' or
-        # 'cred:<id>'.
+        # two different provider accounts at once. Claude and Codex have
+        # separate credential tables, while the owning session determines
+        # which table interprets the shared 'shared' / 'cred:<id>' slot shape.
         conn.execute("""CREATE TABLE IF NOT EXISTS session_account (
             session_id TEXT PRIMARY KEY,
             user_sub TEXT,
@@ -4064,6 +4099,129 @@ def _delete_credential(user_sub: str, cred_id: int) -> None:
         _set_user_active(user_sub, "shared")
 
 
+def _codex_user_active_slot(user_sub: Optional[str]) -> str:
+    if not user_sub:
+        return "shared"
+    try:
+        row = _state_db().execute(
+            "SELECT active FROM user_codex_account WHERE user_sub = ?",
+            (user_sub,),
+        ).fetchone()
+    except sqlite3.Error:
+        return "shared"
+    return row[0] if row else "shared"
+
+
+def _set_codex_user_active(user_sub: str, active: str) -> None:
+    try:
+        _state_db().execute(
+            """INSERT INTO user_codex_account(user_sub, active, updated_at)
+               VALUES(?, ?, ?)
+               ON CONFLICT(user_sub) DO UPDATE SET
+                   active=excluded.active,
+                   updated_at=excluded.updated_at""",
+            (user_sub, active, time.time()),
+        )
+    except sqlite3.Error as e:
+        log.warning("set_codex_user_active failed: %s", e)
+
+
+def _list_codex_credentials(user_sub: str) -> list[dict]:
+    if not user_sub:
+        return []
+    try:
+        rows = _state_db().execute(
+            "SELECT id, label, created_at FROM codex_credential "
+            "WHERE user_sub = ? ORDER BY id",
+            (user_sub,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [
+        {"id": row[0], "label": row[1], "created_at": row[2]}
+        for row in rows
+    ]
+
+
+def _get_codex_credential(user_sub: str, cred_id: int) -> Optional[dict]:
+    if not user_sub:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT id, label, created_at FROM codex_credential "
+            "WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "label": row[1], "created_at": row[2]}
+
+
+def _create_codex_credential(user_sub: str, label: str) -> dict:
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    if len(label) > 80:
+        raise HTTPException(400, "label too long (max 80 chars)")
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    try:
+        cur = _state_db().execute(
+            "INSERT INTO codex_credential(user_sub, label, created_at) "
+            "VALUES(?, ?, ?)",
+            (user_sub, label, time.time()),
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(
+            409, "you already have an OpenAI account with that label",
+        ) from e
+    except sqlite3.Error as e:
+        log.warning("create_codex_credential failed: %s", e)
+        raise HTTPException(500, "could not create OpenAI account") from e
+    return {"id": int(cur.lastrowid), "label": label}
+
+
+def _rename_codex_credential(user_sub: str, cred_id: int, label: str) -> dict:
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "label is required")
+    if len(label) > 80:
+        raise HTTPException(400, "label too long (max 80 chars)")
+    if not _get_codex_credential(user_sub, cred_id):
+        raise HTTPException(404, "no such OpenAI account")
+    try:
+        _state_db().execute(
+            "UPDATE codex_credential SET label = ? "
+            "WHERE user_sub = ? AND id = ?",
+            (label, user_sub, cred_id),
+        )
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(
+            409, "you already have an OpenAI account with that label",
+        ) from e
+    except sqlite3.Error as e:
+        log.warning("rename_codex_credential failed: %s", e)
+        raise HTTPException(500, "could not rename OpenAI account") from e
+    return {"id": cred_id, "label": label}
+
+
+def _delete_codex_credential_row(user_sub: str, cred_id: int) -> None:
+    if not _get_codex_credential(user_sub, cred_id):
+        raise HTTPException(404, "no such OpenAI account")
+    try:
+        _state_db().execute(
+            "DELETE FROM codex_credential WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
+        )
+    except sqlite3.Error as e:
+        log.warning("delete_codex_credential failed: %s", e)
+        raise HTTPException(500, "could not delete OpenAI account") from e
+    if _codex_user_active_slot(user_sub) == f"cred:{cred_id}":
+        _set_codex_user_active(user_sub, "shared")
+
+
 # ─── personality helpers ─────────────────────────────────────────────────────
 #
 # Personalities are system-prompt voices. Each user sees the built-in set
@@ -4510,6 +4668,154 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
             continue
         _link_or_copy(entry.absolute(), link)
     return home
+
+
+def _codex_credential_home_path(user_sub: str, cred_id: int) -> Path:
+    return CODEX_PERSONAL_HOMES_DIR / _safe_sub(user_sub) / str(cred_id)
+
+
+def _codex_server_key(user_sub: str, cred_id: int) -> str:
+    return f"cred:{_safe_sub(user_sub)}:{cred_id}"
+
+
+def _ensure_codex_credential_home(user_sub: str, cred_id: int) -> Path:
+    """Create a private Codex auth/state home with shared rollout history.
+
+    ``sessions/`` is the continuity boundary: another account's app-server
+    can load the same rollout by thread id. SQLite files are deliberately not
+    linked because opening one database through different symlink paths can
+    create separate WAL files and corrupt it.
+    """
+    home = _codex_credential_home_path(user_sub, cred_id)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not IS_WINDOWS:
+        with contextlib.suppress(OSError):
+            home.chmod(0o700)
+
+    shared_home = codex_provider.codex_home().resolve()
+    shared_sessions = shared_home / "sessions"
+    shared_sessions.mkdir(parents=True, exist_ok=True)
+    shared_entries = ("sessions", "config.toml", "skills", "rules", "prompts")
+    for name in shared_entries:
+        source = shared_home / name
+        if not source.exists() or source.is_symlink():
+            if source.is_symlink():
+                log.warning(
+                    "skipping symlinked Codex entry %s while creating account home",
+                    source,
+                )
+            continue
+        link = home / name
+        if link.exists() or link.is_symlink():
+            continue
+        _link_or_copy(source.absolute(), link)
+    return home
+
+
+def _codex_credential_is_configured(user_sub: str, cred_id: int) -> bool:
+    return (_codex_credential_home_path(user_sub, cred_id) / "auth.json").is_file()
+
+
+def _codex_account_slot_visible(
+    user_sub: Optional[str], slot: Optional[str],
+) -> bool:
+    if slot == "shared":
+        return True
+    cred_id = _parse_cred_active(slot or "")
+    return (
+        cred_id is not None
+        and bool(user_sub)
+        and _get_codex_credential(user_sub, cred_id) is not None
+    )
+
+
+def _effective_codex_active_slot(user_sub: Optional[str]) -> str:
+    active = _codex_user_active_slot(user_sub)
+    cred_id = _parse_cred_active(active)
+    if cred_id is not None and user_sub:
+        if (_get_codex_credential(user_sub, cred_id)
+                and _codex_credential_is_configured(user_sub, cred_id)):
+            return active
+    shared = codex_provider.availability()
+    if shared["available"]:
+        return "shared"
+    if user_sub:
+        for cred in _list_codex_credentials(user_sub):
+            if _codex_credential_is_configured(user_sub, cred["id"]):
+                return f"cred:{cred['id']}"
+    return "shared"
+
+
+def _codex_account_payload(user: dict) -> dict:
+    sub = (user or {}).get("sub")
+    creds = _list_codex_credentials(sub) if sub else []
+    for cred in creds:
+        cred["configured"] = _codex_credential_is_configured(sub, cred["id"])
+    shared = codex_provider.availability()
+    return {
+        "user_sub": sub,
+        "active": _effective_codex_active_slot(sub),
+        "shared_label": CODEX_SHARED_ACCOUNT_LABEL,
+        "shared_configured": bool(shared["available"]),
+        "credentials": creds,
+        "cli_installed": codex_provider.codex_binary() is not None,
+    }
+
+
+def _resolve_codex_account_for_run(
+    user: dict,
+    session_id: Optional[str] = None,
+    override_slot: Optional[str] = None,
+) -> dict:
+    """Resolve one OpenAI slot without allowing shared env auth to leak in."""
+    sub = (user or {}).get("sub")
+    candidates: list[str] = []
+    if override_slot is not None and _codex_account_slot_visible(sub, override_slot):
+        candidates.append(override_slot)
+    bound = _session_account_slot(session_id)
+    if bound is not None and _codex_account_slot_visible(sub, bound):
+        candidates.append(bound)
+    candidates.append(_effective_codex_active_slot(sub))
+
+    for active in candidates:
+        cred_id = _parse_cred_active(active)
+        if cred_id is not None and sub:
+            cred = _get_codex_credential(sub, cred_id)
+            if cred and _codex_credential_is_configured(sub, cred_id):
+                home = _ensure_codex_credential_home(sub, cred_id)
+                return {
+                    "slot": active,
+                    "label": cred["label"],
+                    "server_key": _codex_server_key(sub, cred_id),
+                    "home": home,
+                    "isolated_auth": True,
+                }
+        elif active == "shared" and codex_provider.availability()["available"]:
+            return {
+                "slot": "shared",
+                "label": CODEX_SHARED_ACCOUNT_LABEL,
+                "server_key": "shared",
+                "home": None,
+                "isolated_auth": False,
+            }
+
+    return {
+        "slot": "shared",
+        "label": CODEX_SHARED_ACCOUNT_LABEL,
+        "server_key": "shared",
+        "home": None,
+        "isolated_auth": False,
+    }
+
+
+async def _codex_server_for_account(
+    account: dict, *, server_key: Optional[str] = None,
+) -> codex_provider.CodexAppServer:
+    return await codex_provider.CodexAppServer.get(
+        server_key or account["server_key"],
+        home=account.get("home"),
+        isolated_auth=bool(account.get("isolated_auth")),
+    )
 
 
 _IDENTITY_ENV_MAX = 200
@@ -5512,6 +5818,8 @@ class ActiveRun:
         self.codex_model_id: Optional[str] = None
         self.codex_effort: Optional[str] = None
         self.codex_token_usage: Optional[dict] = None
+        self.codex_turn_done = asyncio.Event()
+        self.codex_turn_done.set()
 
     def emit(self, event: dict) -> None:
         # Tag with a monotonic per-run index so the browser can dedupe an
@@ -6010,11 +6318,9 @@ async def _install_restart_machinery() -> None:
 async def _mark_shutting_down() -> None:
     global SHUTTING_DOWN
     SHUTTING_DOWN = True
-    # Terminate the shared codex app-server child (best-effort; the systemd
-    # cgroup sweep catches it anyway on unit restart).
-    inst = codex_provider.CodexAppServer._instance
-    if inst is not None:
-        inst.shutdown()
+    # Terminate every pooled Codex app-server child (best-effort; the systemd
+    # cgroup sweep catches them anyway on unit restart).
+    codex_provider.CodexAppServer.shutdown_all()
 
 
 def _require_restart_admin(user: dict) -> None:
@@ -6116,6 +6422,9 @@ SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
 # real long tools and short enough that a wedge is noticed before the user
 # walks away thinking it's still working.
 MIDTURN_SILENCE_TIMEOUT_MS = 30 * 60 * 1000
+# Maximum time to let an interrupted Codex turn finish persisting before an
+# account handoff force-closes its run-specific app-server.
+CODEX_HANDOFF_TIMEOUT_SECONDS = 10.0
 
 # Hydrate from sqlite at module load so uvicorn's first request already sees
 # whatever state survived the last restart.
@@ -6500,12 +6809,19 @@ async def api_projects(user: dict = Depends(auth.require_user)):
 
 
 @app.get("/api/providers")
-async def api_providers(user: dict = Depends(auth.require_user)):
+async def api_providers(
+    codex_account_slot: str = "",
+    user: dict = Depends(auth.require_user),
+):
     """Provider list for the header combo. Fetched by the browser after
     page load; the first call with Codex signed in spawns the shared
     app-server to read its model list, so this can take a couple of
     seconds once per process lifetime."""
-    return {"providers": await _providers_payload()}
+    return {
+        "providers": await _providers_payload(
+            user, codex_account_slot=codex_account_slot or None,
+        )
+    }
 
 
 @app.get("/api/sessions")
@@ -6602,13 +6918,23 @@ async def api_sessions_search(
 
 async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
     """api_session response for a Codex thread: transcript via thread/read
-    on the shared app-server (codex's rollout store is the source of truth,
+    from a fresh app-server (codex's rollout store is the source of truth,
     like the CLI JSONL is for Claude sessions). A read failure degrades to
     an empty history rather than a 500 — the live_run attach still lets an
     in-flight conversation reconnect."""
     messages: list[dict] = []
+    account = _resolve_codex_account_for_run(user, session_id=sid)
+    read_server_key = (
+        f"{account['server_key']}:read:{uuid_mod.uuid4().hex}"
+    )
     try:
-        server = await codex_provider.CodexAppServer.get()
+        # thread/unsubscribe keeps a thread resident in app-server memory for
+        # up to 30 minutes. A disposable reader is therefore required after
+        # another account extends the same rollout; the account-control
+        # process could otherwise return its stale in-memory snapshot.
+        server = await _codex_server_for_account(
+            account, server_key=read_server_key,
+        )
         resp = await server.request(
             "thread/read", {"threadId": sid, "includeTurns": True},
         )
@@ -6617,6 +6943,11 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         )
     except Exception as e:
         log.warning("codex thread/read failed for %s: %s", sid, e)
+    finally:
+        try:
+            await codex_provider.CodexAppServer.close_key(read_server_key)
+        except Exception as e:
+            log.warning("codex thread reader close failed for %s: %s", sid, e)
     live = _existing_run_for_session(sid)
     live_run = None
     if live is not None and (not live.owner_sub or live.owner_sub == user.get("sub")):
@@ -6633,6 +6964,7 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         "messages": messages,
         "live_run": live_run,
         "provider": "codex",
+        "account_slot": account["slot"],
     }
 
 
@@ -6684,6 +7016,9 @@ async def api_session(
         "messages": messages,
         "live_run": live_run,
         "provider": "claude",
+        "account_slot": _resolve_account_for_run(
+            user, session_id=sid,
+        )["slot"],
     }
 
 
@@ -6731,7 +7066,8 @@ async def api_delete_session(
         # entry (our registry row) goes regardless so the delete is honoured
         # even when the app-server is unavailable.
         try:
-            server = await codex_provider.CodexAppServer.get()
+            account = _resolve_codex_account_for_run(user, session_id=sid)
+            server = await _codex_server_for_account(account)
             await server.request("thread/delete", {"threadId": sid})
         except Exception as e:
             log.warning("codex thread/delete failed for %s: %s", sid, e)
@@ -6906,6 +7242,7 @@ async def api_account_get(user: dict = Depends(auth.require_user)):
 @app.post("/api/account/active")
 async def api_account_set_active(
     active: str = Form(...),
+    provider: str = Form(default="claude"),
     user: dict = Depends(auth.require_user),
 ):
     """Switch the user's active credential slot.
@@ -6918,6 +7255,23 @@ async def api_account_set_active(
     sub = user.get("sub")
     if not sub:
         raise HTTPException(401, "no user identity")
+    if provider == "codex":
+        if active == "shared":
+            if not codex_provider.availability()["available"]:
+                raise HTTPException(400, "shared OpenAI account is not signed in")
+            _set_codex_user_active(sub, "shared")
+            return _codex_account_payload(user)
+        cred_id = _parse_cred_active(active)
+        if cred_id is None:
+            raise HTTPException(400, "invalid slot")
+        if not _get_codex_credential(sub, cred_id):
+            raise HTTPException(404, "no such OpenAI account")
+        if not _codex_credential_is_configured(sub, cred_id):
+            raise HTTPException(400, "OpenAI account is not signed in yet")
+        _set_codex_user_active(sub, active)
+        return _codex_account_payload(user)
+    if provider != "claude":
+        raise HTTPException(400, "unknown provider")
     if active == "shared":
         _set_user_active(sub, "shared")
         return _account_payload(user)
@@ -7210,6 +7564,266 @@ async def api_credentials_signout(
     return {"configured": _credential_is_configured(sub, cred_id)}
 
 
+# ─── per-user OpenAI subscription accounts ───────────────────────────────────
+
+
+def _require_owned_codex_credential(
+    user_sub: Optional[str], cred_id: int,
+) -> dict:
+    if not user_sub:
+        raise HTTPException(401, "no user identity")
+    cred = _get_codex_credential(user_sub, cred_id)
+    if not cred:
+        raise HTTPException(404, "no such OpenAI account")
+    return cred
+
+
+def _codex_credential_has_live_run(user_sub: str, cred_id: int) -> bool:
+    slot = f"cred:{cred_id}"
+    return any(
+        not run.done
+        and run.provider == "codex"
+        and run.owner_sub == user_sub
+        and run.account_slot == slot
+        for run in ACTIVE_RUNS.values()
+    )
+
+
+def _validate_codex_login_id(value: str) -> str:
+    login_id = (value or "").strip()
+    if not login_id or len(login_id) > 500:
+        raise HTTPException(400, "invalid login id")
+    return login_id
+
+
+_CODEX_CREDENTIAL_LOCKS: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _codex_credential_lock(user_sub: str, cred_id: int) -> asyncio.Lock:
+    key = _codex_server_key(user_sub, cred_id)
+    lock = _CODEX_CREDENTIAL_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CODEX_CREDENTIAL_LOCKS[key] = lock
+    return lock
+
+
+@app.get("/api/account/codex")
+async def api_codex_accounts_get(user: dict = Depends(auth.require_user)):
+    return _codex_account_payload(user)
+
+
+@app.post("/api/account/codex/credentials")
+async def api_codex_credentials_create(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    body = await request.json()
+    return _create_codex_credential(
+        user.get("sub"), body.get("label") or "",
+    )
+
+
+@app.patch("/api/account/codex/credentials/{cred_id}")
+async def api_codex_credentials_rename(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    body = await request.json()
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        _require_owned_codex_credential(sub, cred_id)
+        return _rename_codex_credential(sub, cred_id, body.get("label") or "")
+
+
+@app.delete("/api/account/codex/credentials/{cred_id}")
+async def api_codex_credentials_delete(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        _require_owned_codex_credential(sub, cred_id)
+        if _codex_credential_has_live_run(sub, cred_id):
+            raise HTTPException(
+                409, "this OpenAI account is in use by an active chat",
+            )
+        key = _codex_server_key(sub, cred_id)
+        await codex_provider.CodexAppServer.close_key(key)
+        _delete_codex_credential_row(sub, cred_id)
+        home = _codex_credential_home_path(sub, cred_id)
+        if home.exists():
+            shutil.rmtree(home, ignore_errors=True)
+        return _codex_account_payload(user)
+
+
+@app.post("/api/account/codex/credentials/{cred_id}/login/start")
+async def api_codex_credentials_login_start(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        _require_owned_codex_credential(sub, cred_id)
+        if codex_provider.codex_binary() is None:
+            raise HTTPException(503, "codex CLI not installed")
+        home = _ensure_codex_credential_home(sub, cred_id)
+        account = {
+            "server_key": _codex_server_key(sub, cred_id),
+            "home": home,
+            "isolated_auth": True,
+        }
+        try:
+            server = await _codex_server_for_account(account)
+            result = await server.request(
+                "account/login/start", {"type": "chatgptDeviceCode"},
+            )
+        except Exception as e:
+            raise HTTPException(502, f"could not start OpenAI sign-in: {e}") from e
+        if (result or {}).get("type") != "chatgptDeviceCode":
+            raise HTTPException(502, "Codex returned an unexpected login response")
+        login_id = result.get("loginId")
+        verification_url = result.get("verificationUrl")
+        user_code = result.get("userCode")
+        if not all(
+            isinstance(value, str) and value
+            for value in (login_id, verification_url, user_code)
+        ):
+            raise HTTPException(502, "Codex returned an incomplete login response")
+        parsed_verification_url = urlparse(verification_url)
+        verification_host = (parsed_verification_url.hostname or "").lower()
+        openai_host = any(
+            verification_host == domain or verification_host.endswith(f".{domain}")
+            for domain in ("openai.com", "chatgpt.com")
+        )
+        if parsed_verification_url.scheme != "https" or not openai_host:
+            raise HTTPException(502, "Codex returned an unsafe login URL")
+        return {
+            "login_id": login_id,
+            "verification_url": verification_url,
+            "user_code": user_code,
+        }
+
+
+@app.get("/api/account/codex/credentials/{cred_id}/status")
+async def api_codex_credentials_status(
+    cred_id: int,
+    login_id: str = "",
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        cred = _require_owned_codex_credential(sub, cred_id)
+        clean_login_id = _validate_codex_login_id(login_id) if login_id else ""
+        home = _ensure_codex_credential_home(sub, cred_id)
+        account_spec = {
+            "server_key": _codex_server_key(sub, cred_id),
+            "home": home,
+            "isolated_auth": True,
+        }
+        account_data = None
+        flow = None
+        try:
+            server = await _codex_server_for_account(account_spec)
+            response = await server.request("account/read", {})
+            account_data = (response or {}).get("account")
+            if clean_login_id:
+                completed = server.login_result(clean_login_id)
+                if completed is not None:
+                    flow = {
+                        "status": "done" if completed.get("success") else "failed",
+                        "error": completed.get("error"),
+                    }
+                else:
+                    flow = {"status": "waiting", "error": None}
+        except Exception as e:
+            if clean_login_id:
+                flow = {"status": "failed", "error": str(e)}
+        configured = bool(
+            isinstance(account_data, dict)
+            and account_data.get("type") == "chatgpt"
+            and (home / "auth.json").is_file()
+        )
+        if configured:
+            _set_codex_user_active(sub, f"cred:{cred_id}")
+            if flow is not None:
+                flow = {"status": "done", "error": None}
+        return {
+            "credential": {
+                "id": cred["id"],
+                "label": cred["label"],
+                "configured": configured,
+            },
+            "account": account_data,
+            "flow": flow,
+        }
+
+
+@app.post("/api/account/codex/credentials/{cred_id}/login/cancel")
+async def api_codex_credentials_login_cancel(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    body = await request.json()
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        _require_owned_codex_credential(sub, cred_id)
+        login_id = _validate_codex_login_id(body.get("login_id") or "")
+        home = _ensure_codex_credential_home(sub, cred_id)
+        server = await _codex_server_for_account({
+            "server_key": _codex_server_key(sub, cred_id),
+            "home": home,
+            "isolated_auth": True,
+        })
+        await server.request("account/login/cancel", {"loginId": login_id})
+        return {"ok": True}
+
+
+@app.post("/api/account/codex/credentials/{cred_id}/signout")
+async def api_codex_credentials_signout(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    async with _codex_credential_lock(sub, cred_id):
+        _require_owned_codex_credential(sub, cred_id)
+        if _codex_credential_has_live_run(sub, cred_id):
+            raise HTTPException(
+                409, "this OpenAI account is in use by an active chat",
+            )
+        key = _codex_server_key(sub, cred_id)
+        home = _ensure_codex_credential_home(sub, cred_id)
+        server = await _codex_server_for_account({
+            "server_key": key,
+            "home": home,
+            "isolated_auth": True,
+        })
+        with contextlib.suppress(Exception):
+            await server.request("account/logout", {})
+        await codex_provider.CodexAppServer.close_key(key)
+        with contextlib.suppress(FileNotFoundError):
+            (home / "auth.json").unlink()
+        if _codex_user_active_slot(sub) == f"cred:{cred_id}":
+            _set_codex_user_active(sub, "shared")
+        return {"configured": False}
+
+
 # ─── personality CRUD ─────────────────────────────────────────────────────────
 #
 # Each user sees built-in personalities (owner_sub NULL) plus their own rows
@@ -7286,6 +7900,48 @@ def _supersede_run(run: ActiveRun, reason: str) -> None:
     run.superseded_reason = reason
     if run.task and not run.task.done():
         run.task.cancel()
+
+
+async def _supersede_run_for_switch(run: ActiveRun, reason: str) -> None:
+    """Stop a run at a clean boundary before replacing its credential.
+
+    Codex account processes share rollout files. A mid-turn handoff must
+    interrupt the old writer and wait for its driver to release the loaded
+    thread before another process resumes it.
+    """
+    task = run.task
+    run.accepting_input = False
+    run.superseded_reason = reason
+    interrupted = False
+    if run.provider == "codex" and run.client is not None:
+        try:
+            async with run.client_write_lock:
+                if run.between_turns:
+                    interrupted = False
+                else:
+                    run.interrupting = True
+                    _resolve_pending_permissions(run, reason)
+                    await run.client.interrupt()
+                    interrupted = True
+        except Exception as e:
+            log.warning(
+                "codex interrupt before %s failed for run %s: %s",
+                reason, run.run_id, e,
+            )
+    if interrupted:
+        try:
+            await asyncio.wait_for(
+                run.codex_turn_done.wait(), timeout=CODEX_HANDOFF_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "codex turn did not finish within %.0fs before %s for run %s",
+                CODEX_HANDOFF_TIMEOUT_SECONDS, reason, run.run_id,
+            )
+    _supersede_run(run, reason)
+    if run.provider == "codex" and task is not None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 def _resolve_pending_permissions(run: ActiveRun, reason: str) -> int:
@@ -7706,12 +8362,13 @@ def _compose_auto_fire_message(events: list[dict]) -> str:
 
 
 # ─── Codex run driver ─────────────────────────────────────────────────────────
-# The Codex analog of the ClaudeSDKClient driver inside api_chat. One shared
-# `codex app-server` process serves every Codex run (the protocol is
-# thread-scoped); this driver owns one thread on it: start/resume the
-# thread, feed queued user input as turns, translate notifications into the
-# same SSE events the Claude path emits, and bridge approval requests into
-# _gate_tool_permission so the existing permission cards drive them.
+# The Codex analog of the ClaudeSDKClient driver inside api_chat. Each active
+# run owns a short-lived `codex app-server` process. The process boundary is
+# required for cross-account continuity because app-server keeps an
+# unsubscribed thread in memory for up to 30 minutes; a fresh process reloads
+# the rollout that another account may have extended. The driver feeds queued
+# user input as turns, translates notifications into the same SSE events the
+# Claude path emits, and bridges approval requests into _gate_tool_permission.
 
 
 class _CodexRunClient:
@@ -7731,7 +8388,6 @@ class _CodexRunClient:
             "threadId": self._run.session_id,
             "turnId": self._run.codex_turn_id,
         })
-
 
 def _codex_result_event(run: "ActiveRun", *, interrupted: bool,
                         failed: bool, error_message: str = "",
@@ -7777,6 +8433,7 @@ async def _codex_driver(
     cwd: Path,
     personality_append: str,
     first_prompt_title: str,
+    account: dict,
 ) -> None:
     """Own one Codex thread for the life of this run.
 
@@ -7792,6 +8449,7 @@ async def _codex_driver(
     # item's tool input from item/started so the approval card can show it.
     item_inputs: dict[str, dict] = {}
     partial_buf: list[str] = []
+    run_server_key = f"{account['server_key']}:run:{run.run_id}"
 
     def _flush_codex_partial() -> None:
         if partial_buf:
@@ -7836,7 +8494,9 @@ async def _codex_driver(
     notif_q: Optional[asyncio.Queue] = None
     try:
         try:
-            server = await codex_provider.CodexAppServer.get()
+            server = await _codex_server_for_account(
+                account, server_key=run_server_key,
+            )
             thread_params: dict[str, Any] = {
                 "cwd": str(cwd),
                 "approvalPolicy": codex_provider.approval_policy_for_mode(
@@ -7902,15 +8562,23 @@ async def _codex_driver(
                 params["model"] = run.codex_model_id
             if run.codex_effort:
                 params["effort"] = run.codex_effort
+            run.codex_turn_done.clear()
             try:
-                await server.request("turn/start", params)
+                async with run.client_write_lock:
+                    started = await server.request("turn/start", params)
+                    started_turn_id = (
+                        ((started or {}).get("turn") or {}).get("id")
+                    )
+                    if started_turn_id:
+                        run.codex_turn_id = started_turn_id
+                    run.between_turns = False
+                    run.interrupting = False
+                    item_inputs.clear()
             except Exception as e:
+                run.codex_turn_done.set()
                 run.emit({"type": "error",
                           "message": f"Codex turn failed to start: {e}"})
                 return False
-            run.between_turns = False
-            run.interrupting = False
-            item_inputs.clear()
             return True
 
         if not await _start_turn(initial_text, initial_images):
@@ -7918,22 +8586,30 @@ async def _codex_driver(
 
         turn_started_mono = time.monotonic()
         while True:
+            if not run.accepting_input and run.between_turns:
+                break
             # Race the notification stream against queued user input.
             # Between turns a popped message opens the next turn; mid-turn
             # it's delivered via turn/steer (codex's native mid-turn
             # injection), so the delivery ack fires promptly either way.
             notif_get = asyncio.create_task(notif_q.get())
-            user_get = asyncio.create_task(run.user_input_queue.get())
+            user_get = (
+                asyncio.create_task(run.user_input_queue.get())
+                if run.accepting_input else None
+            )
+            waiters = {notif_get}
+            if user_get is not None:
+                waiters.add(user_get)
             timeout = (SESSION_IDLE_TIMEOUT_MS if run.between_turns
                        else MIDTURN_SILENCE_TIMEOUT_MS) / 1000
             try:
                 done, _ = await asyncio.wait(
-                    {notif_get, user_get}, timeout=timeout,
+                    waiters, timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
                 for t in (notif_get, user_get):
-                    if not t.done():
+                    if t is not None and not t.done():
                         t.cancel()
             if not done:
                 if run.between_turns:
@@ -7947,11 +8623,25 @@ async def _codex_driver(
                     })
                 break
 
-            if user_get in done:
+            if user_get is not None and user_get in done:
                 item = user_get.result()
                 qid = item.get("queue_id")
                 ack = item.get("delivered")
-                if qid and qid in run.canceled_input_ids:
+                if not run.accepting_input:
+                    try:
+                        run.user_input_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        _emit_lost_input(
+                            run, item.get("text") or "",
+                            "The run switched accounts before this message "
+                            "could be delivered; send it again",
+                            queue_id=qid,
+                        )
+                        if ack is not None and not ack.done():
+                            ack.set_exception(_DeliveryAlreadyReported(
+                                "account handoff; lost_input already emitted"
+                            ))
+                elif qid and qid in run.canceled_input_ids:
                     run.canceled_input_ids.discard(qid)
                     if ack is not None and not ack.done():
                         ack.set_exception(_DeliveryAlreadyReported("recalled"))
@@ -7966,11 +8656,16 @@ async def _codex_driver(
                         turn_started_mono = time.monotonic()
                     else:
                         try:
-                            await server.request("turn/steer", {
-                                "threadId": thread_id,
-                                "input": [{"type": "text",
-                                           "text": item.get("text") or ""}],
-                            })
+                            async with run.client_write_lock:
+                                if not run.accepting_input:
+                                    run.user_input_queue.put_nowait(item)
+                                    delivered_ok = False
+                                else:
+                                    await server.request("turn/steer", {
+                                        "threadId": thread_id,
+                                        "input": [{"type": "text",
+                                                   "text": item.get("text") or ""}],
+                                    })
                         except Exception as e:
                             log.warning("codex steer failed: %s", e)
                             delivered_ok = False
@@ -8039,6 +8734,7 @@ async def _codex_driver(
                     run.interrupting = False
                     run.codex_turn_id = None
                     run.between_turns = True
+                    run.codex_turn_done.set()
                     run.turn_started_at = time.monotonic()
                     _persist_run_meta(run)
                     _record_codex_session(thread_id, run.owner_sub,
@@ -8061,11 +8757,24 @@ async def _codex_driver(
                        "conversation can be resumed with a new message.",
         })
     finally:
-        # Mirror the Claude driver: finish() only. The run stays in
-        # ACTIVE_RUNS (done=True) so reconnecting clients can replay it;
-        # _gc_runs reaps it later.
+        run.codex_turn_done.set()
+        # The run stays in ACTIVE_RUNS (done=True) so reconnecting clients can
+        # replay it; _gc_runs reaps it later. Always terminate this run's
+        # app-server so a later account switch reloads the shared rollout.
         if server is not None and thread_id:
             server.unsubscribe(thread_id)
+            try:
+                await server.request(
+                    "thread/unsubscribe", {"threadId": thread_id}, timeout=5.0,
+                )
+            except Exception as e:
+                log.warning("codex thread/unsubscribe failed for %s: %s", thread_id, e)
+        try:
+            # Also clears the keyed spawn lock when startup failed before an
+            # instance entered the pool.
+            await codex_provider.CodexAppServer.close_key(run_server_key)
+        except Exception as e:
+            log.warning("codex run server close failed for %s: %s", run.run_id, e)
         run.client = None
         run.finish()
         _persist_run_meta(run)
@@ -8141,8 +8850,18 @@ async def api_chat(
         raise HTTPException(400, "unknown codex session")
     elif provider == "claude" and _codex_sess is not None:
         raise HTTPException(400, "session belongs to the codex provider")
+    account: Optional[dict] = None
+    codex_models: dict[str, dict] = {}
     if provider == "codex":
-        _codex_avail = codex_provider.availability()
+        account = _resolve_codex_account_for_run(
+            user,
+            session_id=session_id or None,
+            override_slot=account_slot or None,
+        )
+        _codex_avail = codex_provider.availability(
+            account.get("home"),
+            allow_env_key=not account.get("isolated_auth", False),
+        )
         if not _codex_avail["available"]:
             return JSONResponse(
                 {"error": "codex_not_configured",
@@ -8185,16 +8904,25 @@ async def api_chat(
         # the app-server rejects a bad id with a clear error — but plan
         # mode and forking are Claude concepts with no Codex analog, so
         # those fail fast here regardless.
-        _codex_models = _codex_models_by_key()
-        if model and _codex_models and model not in _codex_models:
-            raise HTTPException(400, "unknown model")
-        selected_model = _codex_models.get(model, {}) if model else {}
         if (permission_mode
                 and permission_mode not in codex_provider.CODEX_PERMISSION_MODES):
             raise HTTPException(
                 400, f"{permission_mode} mode is not available with Codex")
         if fork:
             raise HTTPException(400, "forking is not available with Codex")
+        try:
+            codex_server = await _codex_server_for_account(account)
+            codex_models = {
+                item["key"]: item for item in await codex_server.models()
+            }
+        except Exception as e:
+            return JSONResponse(
+                {"error": "codex_not_configured", "detail": str(e)},
+                status_code=503,
+            )
+        if model and codex_models and model not in codex_models:
+            raise HTTPException(400, "unknown model")
+        selected_model = codex_models.get(model, {}) if model else {}
         if (effort and selected_model
                 and effort not in (selected_model.get("efforts") or [])):
             raise HTTPException(400, "model does not support this effort level")
@@ -8233,18 +8961,13 @@ async def api_chat(
         # HTTPException from a bad active slot, etc.) still releases the
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
-        account = _resolve_account_for_run(
-            user,
-            session_id=session_id or None,
-            override_slot=account_slot or None,
-        )
-        if provider == "codex":
-            # Codex auth is host-level (auth.json / OPENAI_API_KEY); the
-            # per-user Claude credential slots don't apply. Pinning the slot
-            # to "shared" also keeps the account-toggle respawn comparison
-            # below (and in /api/chat/send) inert for Codex runs — toggling
-            # a Claude credential must not tear down a Codex conversation.
-            account = {"slot": "shared", "env": {}, "label": SHARED_ACCOUNT_LABEL}
+        if provider != "codex":
+            account = _resolve_account_for_run(
+                user,
+                session_id=session_id or None,
+                override_slot=account_slot or None,
+            )
+        assert account is not None
         personality_for_run = _resolve_personality_for_run(
             user,
             session_id=session_id or None,
@@ -8287,12 +9010,9 @@ async def api_chat(
             # resumes the same transcript; fork_session below gives it a
             # fresh session id, so both branches stay navigable.
             existing = None
-        # Flag set when we supersede an in-flight run because the user toggled
-        # credentials or personality between turns. The spawn below uses it to
-        # pass ``fork_session=True`` to the SDK so the post-swap turns get a
-        # fresh session id — the pre-swap transcript stays bound to its
-        # original credentials/personality, the post-swap conversation lives
-        # at the new id, and both are independently navigable in the sidebar.
+        # Flag set when we supersede an in-flight Claude run because the user
+        # toggled credentials or personality between turns. The Claude spawn
+        # below forks; Codex resumes the same thread id in a fresh app-server.
         swap_respawn = False
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
@@ -8306,7 +9026,7 @@ async def api_chat(
                 session_id, existing.run_id, existing.account_slot, account["slot"],
             )
             _require_owner(existing, user)
-            _supersede_run(existing, "account_changed")
+            await _supersede_run_for_switch(existing, "account_changed")
             existing = None
             swap_respawn = True
         if existing is not None and existing.personality_id != active_personality_id:
@@ -8320,7 +9040,7 @@ async def api_chat(
                 existing.personality_id, active_personality_id,
             )
             _require_owner(existing, user)
-            _supersede_run(existing, "personality_changed")
+            await _supersede_run_for_switch(existing, "personality_changed")
             existing = None
             swap_respawn = True
         if existing is not None:
@@ -8473,6 +9193,7 @@ async def api_chat(
             cwd=cwd,
             personality_append=personality_for_run["append"],
             first_prompt_title=message.strip().splitlines()[0][:80] if message.strip() else "",
+            account=account,
         ))
         run.task.add_done_callback(_log_task_exception)
         return _stream_run_response(run)
@@ -9519,20 +10240,25 @@ async def api_chat_send(
         session_id=run.session_id,
         override_personality_id=personality_id,
     )
-    account = _resolve_account_for_run(
-        user,
-        session_id=run.session_id,
-        override_slot=account_slot or None,
-    )
+    if run.provider == "codex":
+        account = _resolve_codex_account_for_run(
+            user,
+            session_id=run.session_id,
+            override_slot=account_slot or None,
+        )
+    else:
+        account = _resolve_account_for_run(
+            user,
+            session_id=run.session_id,
+            override_slot=account_slot or None,
+        )
     if run.personality_id != personality_for_run["id"]:
-        _supersede_run(run, "personality_changed")
+        await _supersede_run_for_switch(run, "personality_changed")
         return JSONResponse(
             {"ok": False, "error": "personality_changed"}, status_code=409,
         )
-    # Claude credential slots don't apply to Codex runs (host-level OpenAI
-    # auth); toggling one must not tear down a Codex conversation.
-    if run.provider != "codex" and run.account_slot != account["slot"]:
-        _supersede_run(run, "account_changed")
+    if run.account_slot != account["slot"]:
+        await _supersede_run_for_switch(run, "account_changed")
         return JSONResponse(
             {"ok": False, "error": "account_changed"}, status_code=409,
         )
@@ -9913,7 +10639,10 @@ async def api_chat_set_model(
     if run.provider == "codex":
         # Codex takes the model per turn (turn/start), so a mid-chat switch
         # is just a field write — the next turn picks it up, no client call.
-        codex_models = _codex_models_by_key()
+        codex_account = _resolve_codex_account_for_run(
+            user, session_id=run.session_id, override_slot=run.account_slot,
+        )
+        codex_models = _codex_models_by_key(codex_account)
         if model and codex_models and model not in codex_models:
             raise HTTPException(400, f"unknown model {model!r}")
         entry = codex_models.get(model, {}) if model else {}
@@ -11194,7 +11923,9 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
 
 @app.get("/api/codex/usage")
 async def api_codex_usage(
-    session_id: str = "", user: dict = Depends(auth.require_user),
+    session_id: str = "",
+    account_slot: str = "",
+    user: dict = Depends(auth.require_user),
 ):
     """Codex account usage for the Usage dialog's codex view.
 
@@ -11203,17 +11934,27 @@ async def api_codex_usage(
     folds in the live conversation's cumulative token totals so an API-key
     login — where no account data is available — still sees something
     concrete."""
-    avail = codex_provider.availability()
+    clean_session_id = _safe_id(session_id) if session_id else ""
+    account = _resolve_codex_account_for_run(
+        user,
+        session_id=clean_session_id or None,
+        override_slot=account_slot or None,
+    )
+    avail = codex_provider.availability(
+        account.get("home"),
+        allow_env_key=not account.get("isolated_auth", False),
+    )
     if not avail["available"]:
         return {"available": False, "reason": avail["reason"]}
     payload: dict = {"available": True}
     try:
-        server = await codex_provider.CodexAppServer.get()
+        server = await _codex_server_for_account(account)
         payload.update(await server.account_usage())
     except Exception as e:  # noqa: BLE001 — surface the reason, don't 500 the dialog
         return {"available": False, "reason": str(e)}
-    if session_id:
-        run = _existing_run_for_session(_safe_id(session_id))
+    payload["account_slot"] = account["slot"]
+    if clean_session_id:
+        run = _existing_run_for_session(clean_session_id)
         if (run is not None and run.provider == "codex"
                 and (not run.owner_sub or run.owner_sub == user.get("sub"))):
             payload["conversation_tokens"] = codex_provider.usage_tokens(
@@ -11223,7 +11964,7 @@ async def api_codex_usage(
 
 @app.get("/account")
 async def account_page(request: Request, user: dict = Depends(auth.require_user)):
-    """Per-user credential management — add/remove/rename Claude accounts.
+    """Per-user credential management for Claude and OpenAI accounts.
 
     Unlike /setup (which configures the shared in-container CLI and is admin-
     gated), this page is reachable by any signed-in user; each user only
@@ -11233,6 +11974,7 @@ async def account_page(request: Request, user: dict = Depends(auth.require_user)
         request, "account.html", {
             "user": user,
             "account": _account_payload(user),
+            "codex_account": _codex_account_payload(user),
             "site_title": SITE_TITLE,
             "shared_reauth_allowed": _shared_reauth_allowed(user),
         },

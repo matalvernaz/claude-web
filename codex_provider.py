@@ -7,13 +7,14 @@ approval prompts, interrupt, resume.
 
 Design notes:
 
-- One shared app-server process serves every Codex conversation. The
-  protocol is thread-scoped (every notification/server-request carries a
-  ``threadId``), so a singleton multiplexes cleanly — this mirrors how the
-  VS Code extension uses it, and keeps auth/model-list state in one place.
-  If the process dies, pending requests fail, per-thread subscribers get a
-  synthetic ``_codex/server_exited`` notification, and the next use
-  respawns it (conversations resume via ``thread/resume``).
+- The keyed process pool supports one account-control server per OpenAI slot
+  and one short-lived server per active chat. A run-specific process matters
+  for account handoff: ``thread/unsubscribe`` leaves a thread cached for up to
+  30 minutes, while a fresh process must reload the shared rollout and see
+  turns another account appended. Per-slot ``CODEX_HOME`` directories isolate
+  ``auth.json`` and local SQLite indexes while app.py shares the rollout
+  ``sessions/`` directory. If a process dies, pending requests fail and live
+  subscribers get a synthetic ``_codex/server_exited`` notification.
 
 - This module is deliberately free of app.py imports (pure stdlib) so it
   can't create an import cycle. The run driver in app.py owns everything
@@ -36,6 +37,7 @@ Design notes:
 
 import asyncio
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -104,24 +106,35 @@ def codex_binary() -> Optional[str]:
     return str(fallback) if fallback.exists() else None
 
 
-def _codex_home() -> Path:
+def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
 
 
-def availability() -> dict:
+def availability(
+    home: Optional[Path] = None, *, allow_env_key: bool = True,
+) -> dict:
     """Cheap, subprocess-free probe used to decide whether the provider
     combo box offers Codex at all. auth.json (written by `codex login`)
-    or an OPENAI_API_KEY in the service env both count as signed in."""
+    or an OPENAI_API_KEY in the service env both count as signed in.
+
+    Personal credential homes pass ``allow_env_key=False`` so a shared
+    service-level API key cannot silently mask a missing per-user login.
+    """
     binary = codex_binary()
     if not binary:
         return {"available": False, "reason": "codex CLI not installed"}
-    authed = (_codex_home() / "auth.json").exists() or bool(
-        os.environ.get("OPENAI_API_KEY")
+    selected_home = Path(home) if home is not None else codex_home()
+    authed = (selected_home / "auth.json").is_file() or (
+        allow_env_key and bool(os.environ.get("OPENAI_API_KEY"))
     )
     if not authed:
         return {
             "available": False,
-            "reason": "not signed in (run `codex login` or set OPENAI_API_KEY)",
+            "reason": (
+                "not signed in with ChatGPT"
+                if not allow_env_key
+                else "not signed in (run `codex login` or set OPENAI_API_KEY)"
+            ),
         }
     return {"available": True, "reason": None}
 
@@ -143,7 +156,7 @@ class CodexRPCError(CodexError):
 
 
 class CodexAppServer:
-    """Singleton asyncio JSON-RPC client for one `codex app-server` process.
+    """Async JSON-RPC client pooled by account-control or run-specific key.
 
     Line-delimited JSON-RPC 2.0 over stdio. Three inbound message kinds:
     responses (matched to pending request futures), server→client requests
@@ -151,10 +164,22 @@ class CodexAppServer:
     (routed to the per-thread subscriber queue).
     """
 
+    # ``_instance`` remains the shared-slot alias for callers/tests that only
+    # need a cache probe. New code should use ``get_cached(key)``.
     _instance: Optional["CodexAppServer"] = None
-    _instance_lock: Optional[asyncio.Lock] = None
+    _instances: dict[str, "CodexAppServer"] = {}
+    _instance_locks: dict[str, asyncio.Lock] = {}
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        key: str = "shared",
+        home: Optional[Path] = None,
+        isolated_auth: bool = False,
+    ) -> None:
+        self.key = key
+        self.home = Path(home) if home is not None else None
+        self.isolated_auth = isolated_auth
         self.proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -169,24 +194,75 @@ class CodexAppServer:
         )
         self._models_cache: Optional[list[dict]] = None
         self._models_lock = asyncio.Lock()
+        self._login_results: dict[str, dict] = {}
         self.started_at: Optional[float] = None
 
     # -- lifecycle -------------------------------------------------------------
 
     @classmethod
-    async def get(cls) -> "CodexAppServer":
-        """Return the live singleton, spawning it on first use or after a
-        crash. Serialized so concurrent first requests spawn one process."""
-        if cls._instance_lock is None:
-            cls._instance_lock = asyncio.Lock()
-        async with cls._instance_lock:
-            inst = cls._instance
+    async def get(
+        cls,
+        key: str = "shared",
+        *,
+        home: Optional[Path] = None,
+        isolated_auth: bool = False,
+    ) -> "CodexAppServer":
+        """Return the live process for ``key``, spawning it once as needed."""
+        lock = cls._instance_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            inst = cls._instances.get(key)
             if inst is not None and inst.alive:
+                requested_home = Path(home) if home is not None else None
+                if inst.home != requested_home or inst.isolated_auth != isolated_auth:
+                    raise CodexError(f"codex app-server key {key!r} reused with different settings")
                 return inst
-            inst = cls()
+            inst = cls(key=key, home=home, isolated_auth=isolated_auth)
             await inst._start()
-            cls._instance = inst
+            cls._instances[key] = inst
+            if key == "shared":
+                cls._instance = inst
             return inst
+
+    @classmethod
+    def get_cached(cls, key: str = "shared") -> Optional["CodexAppServer"]:
+        inst = cls._instances.get(key)
+        return inst if inst is not None and inst.alive else None
+
+    @classmethod
+    def shutdown_key(cls, key: str) -> None:
+        inst = cls._instances.pop(key, None)
+        cls._instance_locks.pop(key, None)
+        if inst is not None:
+            inst.shutdown()
+        if key == "shared":
+            cls._instance = None
+
+    @classmethod
+    async def close_key(cls, key: str) -> None:
+        """Stop one pooled process and wait until it can no longer write."""
+        inst = cls._instances.pop(key, None)
+        cls._instance_locks.pop(key, None)
+        if key == "shared":
+            cls._instance = None
+        if inst is None:
+            return
+        proc = inst.proc
+        inst.shutdown()
+        if proc is None:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+    @classmethod
+    def shutdown_all(cls) -> None:
+        for inst in list(cls._instances.values()):
+            inst.shutdown()
+        cls._instances.clear()
+        cls._instance_locks.clear()
+        cls._instance = None
 
     @property
     def alive(self) -> bool:
@@ -196,14 +272,33 @@ class CodexAppServer:
         binary = codex_binary()
         if not binary:
             raise CodexError("codex CLI not installed")
+        command = [binary]
+        child_env = os.environ.copy()
+        if self.home is not None:
+            self.home.mkdir(parents=True, exist_ok=True)
+            child_env["CODEX_HOME"] = str(self.home)
+        if self.isolated_auth:
+            # A service-level key must never override a user's ChatGPT-plan
+            # credential. The CLI writes/refreshes auth.json in this slot's
+            # CODEX_HOME because the credential store is forced to ``file``;
+            # forcing the built-in OpenAI provider also blocks a shared
+            # config.toml custom provider from changing the billing path.
+            for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"):
+                child_env.pop(name, None)
+            command.extend([
+                "-c", 'cli_auth_credentials_store="file"',
+                "-c", 'forced_login_method="chatgpt"',
+                "-c", 'model_provider="openai"',
+            ])
+        command.append("app-server")
         self.proc = await asyncio.create_subprocess_exec(
-            binary,
-            "app-server",
+            *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=STDOUT_LIMIT_BYTES,
             cwd=str(Path.home()),
+            env=child_env,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
@@ -224,11 +319,12 @@ class CodexAppServer:
             self.shutdown()
             raise
         self._send({"jsonrpc": "2.0", "method": "initialized"})
-        log.info("codex app-server started (pid=%s)", self.proc.pid)
+        log.info("codex app-server started (key=%s pid=%s)", self.key, self.proc.pid)
 
     def shutdown(self) -> None:
         if self.proc is not None and self.proc.returncode is None:
-            self.proc.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.terminate()
         self._fail_all_pending(CodexError("codex app-server shut down"))
 
     # -- wire ------------------------------------------------------------------
@@ -253,7 +349,9 @@ class CodexAppServer:
             )
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
-            raise CodexError(f"{method} timed out after {timeout:.0f}s")
+            raise CodexError(
+                f"{method} timed out after {timeout:.0f}s"
+            ) from None
         finally:
             self._pending.pop(rid, None)
 
@@ -292,6 +390,10 @@ class CodexAppServer:
             return
         method = msg.get("method") or ""
         params = msg.get("params") or {}
+        if method == "account/login/completed":
+            login_id = params.get("loginId")
+            if isinstance(login_id, str) and login_id:
+                self._login_results[login_id] = dict(params)
         thread_id = params.get("threadId") or (
             (params.get("thread") or {}).get("id")
         )
@@ -338,7 +440,9 @@ class CodexAppServer:
         )
         for q in self._thread_queues.values():
             q.put_nowait({"method": SERVER_EXITED_METHOD, "params": {}})
-        if CodexAppServer._instance is self:
+        if CodexAppServer._instances.get(self.key) is self:
+            CodexAppServer._instances.pop(self.key, None)
+        if self.key == "shared" and CodexAppServer._instance is self:
             CodexAppServer._instance = None
 
     def _fail_all_pending(self, exc: Exception) -> None:
@@ -365,6 +469,10 @@ class CodexAppServer:
         self._request_handlers[thread_id] = handler
 
     # -- convenience ---------------------------------------------------------
+
+    def login_result(self, login_id: str) -> Optional[dict]:
+        result = self._login_results.get(login_id)
+        return dict(result) if result is not None else None
 
     async def models(self) -> list[dict]:
         """model/list, cached for the life of this server process."""

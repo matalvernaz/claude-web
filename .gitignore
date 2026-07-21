@@ -10,7 +10,10 @@ __pycache__/
 .claude-web/
 workspace/
 claude-home/
+claude-homes/
 claude-web-state/
+codex-home/
+codex-homes/
 
 # PyInstaller build output (claude_web.spec). Native bundles for each
 # platform are produced in CI on tag push and attached to the release;

@@ -18,6 +18,9 @@ services:
       - ./claude-home:/home/claude/.claude
       # claude-web's own state: usage log, persisted runs/events, uploads.
       - ./claude-web-state:/home/claude/.claude-web
+      # Shared Codex configuration, rollout history, and optional host-level
+      # OpenAI login.
+      - ./codex-home:/home/claude/.codex
       # Per-user personal-account credentials. Each signed-in user can add
       # their own labeled Claude accounts via the /account page; each one
       # gets a subdirectory here keyed by user-sub and credential id, with
@@ -26,6 +29,10 @@ services:
       # shared across slot toggles. Omit this mount if you don't need
       # per-user accounts.
       - ./claude-homes:/home/claude/.claude-homes
+      # Per-user ChatGPT-plan credentials and private Codex indexes. Each
+      # account links sessions/ back to codex-home so account changes resume
+      # the same thread instead of splitting the chat.
+      - ./codex-homes:/home/claude/.codex-homes
     # Bind to localhost only — your reverse proxy (Traefik / nginx / Caddy /
     # oauth2-proxy) terminates TLS and forwards to this port. If you're not
     # behind a proxy, drop "127.0.0.1:" to expose the port directly (and set

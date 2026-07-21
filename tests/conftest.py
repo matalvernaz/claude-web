@@ -35,12 +35,19 @@ for var in (
     "CLAUDE_WEB_PER_USER_SESSIONS",
     "CLAUDE_WEB_PROJECT_DIRS",
     "ANTHROPIC_API_KEY",
+    "CODEX_HOME",
+    "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
+    "OPENAI_API_KEY",
 ):
     os.environ.pop(var, None)
 os.environ["AUTH_MODE"] = "none"
 os.environ["CLAUDE_HOME"] = os.path.join(_TEST_TMP, "claude-home")
 os.environ["CLAUDE_WEB_STATE_DIR"] = os.path.join(_TEST_TMP, "claude-web-state")
 os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(_TEST_TMP, "project")
+os.environ["CODEX_HOME"] = os.path.join(_TEST_TMP, "codex-home")
+os.environ["CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR"] = os.path.join(
+    _TEST_TMP, "codex-personal-homes",
+)
 os.environ["CLAUDE_WEB_ENABLE_SETUP"] = "true"
 # Loosen CSRF so tests using the bare TestClient don't all need to set Origin.
 os.environ["CLAUDE_WEB_CSRF_STRICT"] = "false"
@@ -52,6 +59,7 @@ for d in (
     os.environ["CLAUDE_HOME"],
     os.environ["CLAUDE_WEB_STATE_DIR"],
     os.environ["CLAUDE_PROJECT_DIR"],
+    os.environ["CODEX_HOME"],
 ):
     os.makedirs(d, exist_ok=True)
 

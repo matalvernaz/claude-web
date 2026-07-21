@@ -7,7 +7,7 @@ A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) 
 - Reads sessions directly from `~/.claude/projects/<project>/*.jsonl`, so the UI and the host-shell `claude` CLI share state — start a chat in one, resume it in the other.
 - OIDC sign-in (Keycloak, Authentik, Authelia, Auth0, Google, …) with optional email- or group-based allowlists.
 - One container, one `.env` file, no separate database.
-- Optional second AI provider: install the OpenAI `codex` CLI and sign it in (`codex login`, or set `OPENAI_API_KEY`) and a provider picker appears next to the model picker. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, and mid-chat model switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
+- Optional second AI provider: install the OpenAI `codex` CLI and sign in either the shared host slot or personal ChatGPT subscription accounts from `/account`. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, mid-chat model switching, and same-chat account switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
 
 > ## Trust model — read this first
 >
@@ -25,7 +25,7 @@ cd claude-web
 cp .env.example .env
 # edit .env: set SESSION_SECRET (random) and the OIDC_* values for your IdP
 cp docker-compose.example.yml docker-compose.yml
-mkdir -p workspace claude-home claude-web-state
+mkdir -p workspace claude-home claude-web-state codex-home claude-homes codex-homes
 docker compose up -d
 ```
 
@@ -40,7 +40,7 @@ If you'd rather sign in from a shell from the start: `docker compose exec claude
 
 ## Running from source (no Docker)
 
-Tested on Python 3.11+. You need Node.js for the bundled `@anthropic-ai/claude-code` CLI (the SDK shells out to it).
+Tested on Python 3.11+. You need Node.js for the Claude Code CLI; install the Codex CLI too when using OpenAI accounts.
 
 ```bash
 git clone https://github.com/matalvernaz/claude-web.git
@@ -48,7 +48,7 @@ cd claude-web
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-npm install -g @anthropic-ai/claude-code      # provides the `claude` binary
+npm install -g @anthropic-ai/claude-code @openai/codex
 cp .env.example .env                          # edit values
 set -a; source .env; set +a
 uvicorn app:app --host 127.0.0.1 --port 3001
@@ -66,7 +66,7 @@ cd claude-web
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-npm install -g @anthropic-ai/claude-code        # provides claude.cmd
+npm install -g @anthropic-ai/claude-code @openai/codex
 Copy-Item .env.example .env                     # edit values
 Get-Content .env | ForEach-Object {
     if ($_ -match '^\s*([^#=]+?)\s*=\s*(.*)$') { Set-Item "env:$($matches[1])" $matches[2] }
@@ -167,25 +167,28 @@ The schema is stable — keys are always set, only their values are empty when t
 
 `AUTH_MODE=none` + `PER_USER_SESSIONS=true` is refused at startup (every visitor would share `sub="anonymous"`, breaking isolation entirely).
 
-### Per-user accounts
+### Per-user Claude and OpenAI accounts
 
-By default every signed-in user authenticates as the deployment-wide *shared* Claude account whose credentials sit in `$CLAUDE_HOME/.credentials.json`. Optionally, each user can register their own *personal* Claude account and flip between the two from a `<select>` in the header.
+`/account` lets every signed-in user add, label, sign in to, switch, and remove their own Claude and OpenAI accounts. Rows and filesystem homes are scoped to the caller's OIDC subject; a guessed credential id owned by another user returns 404.
+
+Claude defaults to the deployment-wide shared account in `$CLAUDE_HOME/.credentials.json`. Personal Claude homes mirror `CLAUDE_HOME`, with only the credential files kept private. The transcript JSONL is therefore the same file under every slot, so a credential change can resume the current conversation.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `CLAUDE_WEB_PERSONAL_HOMES_DIR` | `$HOME/.claude-homes` | Where per-user personal `CLAUDE_CONFIG_DIR` directories are created. Bind-mount this in your compose so personal credentials survive container rebuilds (`./claude-homes:/home/claude/.claude-homes`). |
 | `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` | `Shared` | Display name for the shared slot in the UI. Set this per deployment, e.g. `Office`, `Team`, `Workspace`. |
 
-Per-user homes are mostly symlinks back to `CLAUDE_HOME`, with only `.credentials.json` as a real per-user file. That means `projects/`, `sessions/`, `settings.json`, `skills/`, `commands/`, etc. all stay shared — the chat transcript JSONL for a session is the same file regardless of which slot is active, so toggling between accounts mid-conversation does not break or split the user's history.
+OpenAI has a separate slot set. The shared slot uses `$CODEX_HOME/auth.json` or `OPENAI_API_KEY`; personal slots use Codex's ChatGPT device-code flow and support subscription plans such as Plus and Pro.
 
-To register a personal account for a user (admin task — needs shell access to the host):
+| Variable | Default | Notes |
+|---|---|---|
+| `CODEX_HOME` | `$HOME/.codex` | Shared Codex configuration, rollout history, and optional host-level login. Bind-mount this in a container (`./codex-home:/home/claude/.codex`). |
+| `CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR` | `$HOME/.codex-homes` | Private per-user `auth.json` and Codex SQLite indexes. Bind-mount this too (`./codex-homes:/home/claude/.codex-homes`). |
+| `CLAUDE_WEB_CODEX_SHARED_ACCOUNT_LABEL` | `Shared OpenAI` | Display name for the host-level OpenAI slot. |
 
-```bash
-# Run on whatever host the claude-web container lives on.
-./scripts/add-personal --sub <oidc-sub> [--label "<display name>"]
-```
+Codex personal homes link only `sessions/` and user configuration such as `config.toml` and `skills/` back to `CODEX_HOME`. Authentication and SQLite files remain private. On an account change, claude-web interrupts any old writer, terminates that chat's app-server process, and resumes the same thread id under the new account in a fresh process. This avoids both a split chat and the corruption risk of opening one SQLite database through multiple symlink paths.
 
-This drops the user into an interactive `claude /login` against their personal directory, then flips `has_personal=1` so the toggle becomes available in their UI. The user can find their `<oidc-sub>` by signing in and reading `GET /api/account` (or any field of their session — the `sub` is the OIDC subject identifier from your IdP).
+The ownership filter is not an OS security boundary. All model processes still run as the same Unix user with the configured Codex sandbox posture; use separate containers or Unix users for mutually untrusted people.
 
 ### Setup-flow lock
 
