@@ -93,6 +93,14 @@ SERVER_EXITED_METHOD = "_codex/server_exited"
 TOOL_COMMAND = "Bash"
 TOOL_PATCH = "ApplyPatch"
 TOOL_WEB_SEARCH = "WebSearch"
+TOOL_IMAGE_GEN = "GenerateImage"
+TOOL_IMAGE_VIEW = "ViewImage"
+TOOL_SUBAGENT = "Subagent"
+TOOL_COLLAB = "CollabAgent"
+
+# Transcript note for a context compaction, emitted both for spontaneous
+# contextCompaction items and the driver's /compact command.
+COMPACTED_NOTE = "*Context compacted — older conversation summarized.*"
 
 
 def codex_binary() -> Optional[str]:
@@ -311,7 +319,12 @@ class CodexAppServer:
                         "name": "claude-web",
                         "title": "claude-web",
                         "version": "1.0",
-                    }
+                    },
+                    # Opt into experimental protocol surface. Required for
+                    # item/tool/requestUserInput (rendered as a question card
+                    # by the driver); everything else it unlocks is additive
+                    # and unknown notifications are dropped by design.
+                    "capabilities": {"experimentalApi": True},
                 },
                 timeout=REQUEST_TIMEOUT_S,
             )
@@ -683,6 +696,81 @@ def item_events(item: dict, *, completed: bool, session_id: Optional[str],
             })
         return [{"type": "todos_update", "todos": todos}]
 
+    if itype == "plan":
+        # Proposed-plan text (plan-mode style prose, not todo steps — those
+        # arrive via turn/plan/updated). Only the completed item is
+        # authoritative; deltas may not concatenate to it.
+        if not completed or not item.get("text"):
+            return []
+        return [_assistant_event(
+            [{"type": "text", "text": str(item["text"])}], session_id,
+        )]
+
+    if itype == "contextCompaction":
+        # Auto-compaction mid-conversation; /compact-triggered runs are
+        # deduped against this by the driver's thread/compacted fallback.
+        if not completed:
+            return []
+        return [_assistant_event(
+            [{"type": "text", "text": COMPACTED_NOTE}], session_id,
+        )]
+
+    if itype == "imageGeneration":
+        if not completed:
+            return [_assistant_event([{
+                "type": "tool_use", "id": item_id, "name": TOOL_IMAGE_GEN,
+                "input": {"prompt": item.get("revisedPrompt") or ""},
+            }], session_id)]
+        failed = item.get("status") == "failed"
+        out = item.get("savedPath") or item.get("result") or "done"
+        return [_tool_result_event(item_id, str(out), failed, preview_cap)]
+
+    if itype == "imageView":
+        if not completed:
+            return [_assistant_event([{
+                "type": "tool_use", "id": item_id, "name": TOOL_IMAGE_VIEW,
+                "input": {"path": str(item.get("path") or "")},
+            }], session_id)]
+        return [_tool_result_event(item_id, "viewed", False, preview_cap)]
+
+    if itype == "subAgentActivity":
+        if not completed:
+            return [_assistant_event([{
+                "type": "tool_use", "id": item_id, "name": TOOL_SUBAGENT,
+                "input": {"agent": str(item.get("agentPath") or ""),
+                          "kind": str(item.get("kind") or "")},
+            }], session_id)]
+        return [_tool_result_event(item_id, "done", False, preview_cap)]
+
+    if itype == "collabAgentToolCall":
+        if not completed:
+            inp: dict = {"tool": str(item.get("tool") or "")}
+            if item.get("prompt"):
+                inp["prompt"] = str(item["prompt"])
+            return [_assistant_event([{
+                "type": "tool_use", "id": item_id, "name": TOOL_COLLAB,
+                "input": inp,
+            }], session_id)]
+        failed = item.get("status") == "failed"
+        return [_tool_result_event(
+            item_id, str(item.get("status") or "done"), failed, preview_cap,
+        )]
+
+    if itype in ("enteredReviewMode", "exitedReviewMode"):
+        # `review` is the target description on enter and the reviewer's
+        # findings on exit — the exit text is the payload users care about.
+        if not completed:
+            return []
+        text = str(item.get("review") or "")
+        if itype == "enteredReviewMode":
+            text = f"*Entered review mode{': ' + text if text else ''}*"
+        elif not text:
+            text = "*Exited review mode*"
+        return [_assistant_event([{"type": "text", "text": text}], session_id)]
+
+    if itype in ("sleep", "hookPrompt"):
+        return []  # timing/hook internals; nothing user-facing to render
+
     if itype == "error":
         return [{"type": "error",
                  "message": item.get("message") or "Codex reported an error."}]
@@ -691,6 +779,77 @@ def item_events(item: dict, *, completed: bool, session_id: Optional[str],
         return []  # our own input echoed back; user_prompt already emitted
 
     return []
+
+
+def plan_todos(plan: Any) -> list[dict]:
+    """turn/plan/updated steps → the frontend's todos_update list (the
+    shape TodoWrite produces on the Claude path)."""
+    status_map = {"inProgress": "in_progress"}
+    todos = []
+    for s in plan or []:
+        if not isinstance(s, dict):
+            continue
+        step = str(s.get("step") or "")
+        status = str(s.get("status") or "pending")
+        todos.append({
+            "content": step,
+            "activeForm": step,
+            "status": status_map.get(status, status),
+        })
+    return todos
+
+
+def question_cards(params: dict) -> list[dict]:
+    """item/tool/requestUserInput questions → the question_request card list
+    the frontend already renders for AskUserQuestion. codex questions are
+    single-select; option-less ones fall through to the card's free-text
+    "Other" row. isSecret rides along so the browser can mask the input."""
+    cards = []
+    for q in (params or {}).get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        options = [
+            {"label": str(o.get("label") or ""),
+             "description": str(o.get("description") or "")}
+            for o in (q.get("options") or []) if isinstance(o, dict)
+        ]
+        cards.append({
+            "question": str(q.get("question") or ""),
+            "header": str(q.get("header") or ""),
+            "options": options,
+            "multiSelect": False,
+            "isSecret": bool(q.get("isSecret")),
+        })
+    return cards
+
+
+def question_answers(params: dict, payload: Any) -> dict:
+    """Browser answer payload → requestUserInput wire response.
+
+    The card posts answers keyed by question text (the AskUserQuestion
+    convention); codex wants them keyed by question id, each as
+    {"answers": [strings]}. Unanswered questions are simply absent —
+    an empty mapping is the "no answers" outcome codex expects for
+    skip/timeout/interrupt."""
+    by_text = (payload or {}).get("answers") if isinstance(payload, dict) else None
+    if not isinstance(by_text, dict):
+        by_text = {}
+    answers: dict[str, dict] = {}
+    for q in (params or {}).get("questions") or []:
+        if not isinstance(q, dict):
+            continue
+        qid = q.get("id")
+        if not qid:
+            continue
+        val = by_text.get(q.get("question") or "")
+        if val is None:
+            val = by_text.get(q.get("header") or "")
+        if val is None:
+            continue
+        vals = [str(v) for v in (val if isinstance(val, list) else [val]) if str(v)]
+        if vals:
+            answers[str(qid)] = {"answers": vals}
+    return {"answers": answers}
 
 
 def usage_tokens(token_usage: dict) -> dict:

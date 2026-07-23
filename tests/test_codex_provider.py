@@ -8,6 +8,7 @@ plumbing, and the route-level validation that keeps the two providers'
 sessions from cross-contaminating.
 """
 import asyncio
+import json
 import os
 import shutil
 from pathlib import Path
@@ -138,6 +139,130 @@ def test_todo_list_maps_to_todos_update():
         {"content": "step one", "activeForm": "step one", "status": "completed"},
         {"content": "step two", "activeForm": "step two", "status": "pending"},
     ]}]
+
+
+def test_plan_item_completed_becomes_text():
+    assert codex_provider.item_events(
+        {"type": "plan", "id": "p1", "text": "1. do X\n2. do Y"},
+        completed=False, session_id="t1", preview_cap=CAP,
+    ) == []
+    evs = codex_provider.item_events(
+        {"type": "plan", "id": "p1", "text": "1. do X\n2. do Y"},
+        completed=True, session_id="t1", preview_cap=CAP,
+    )
+    assert evs[0]["message"]["content"][0] == {
+        "type": "text", "text": "1. do X\n2. do Y",
+    }
+
+
+def test_context_compaction_item_emits_note():
+    assert codex_provider.item_events(
+        {"type": "contextCompaction", "id": "cc1"},
+        completed=False, session_id="t1", preview_cap=CAP,
+    ) == []
+    evs = codex_provider.item_events(
+        {"type": "contextCompaction", "id": "cc1"},
+        completed=True, session_id="t1", preview_cap=CAP,
+    )
+    assert evs[0]["message"]["content"][0]["text"] == codex_provider.COMPACTED_NOTE
+
+
+def test_image_generation_lifecycle():
+    started = codex_provider.item_events(
+        {"type": "imageGeneration", "id": "img1", "revisedPrompt": "a cat"},
+        completed=False, session_id="t1", preview_cap=CAP,
+    )
+    blk = started[0]["message"]["content"][0]
+    assert blk["name"] == codex_provider.TOOL_IMAGE_GEN
+    assert blk["input"] == {"prompt": "a cat"}
+    done = codex_provider.item_events(
+        {"type": "imageGeneration", "id": "img1", "status": "completed",
+         "savedPath": "/tmp/cat.png", "result": "ok"},
+        completed=True, session_id="t1", preview_cap=CAP,
+    )
+    res = done[0]["message"]["content"][0]
+    assert res["type"] == "tool_result"
+    assert res["content"] == "/tmp/cat.png"
+    assert res["is_error"] is False
+
+
+def test_review_mode_items_become_text():
+    entered = codex_provider.item_events(
+        {"type": "enteredReviewMode", "id": "rv1", "review": "uncommitted changes"},
+        completed=True, session_id="t1", preview_cap=CAP,
+    )
+    assert "review mode" in entered[0]["message"]["content"][0]["text"]
+    exited = codex_provider.item_events(
+        {"type": "exitedReviewMode", "id": "rv2", "review": "Found 2 issues: …"},
+        completed=True, session_id="t1", preview_cap=CAP,
+    )
+    assert exited[0]["message"]["content"][0]["text"] == "Found 2 issues: …"
+
+
+def test_sleep_and_hook_prompt_render_nothing():
+    for itype in ("sleep", "hookPrompt"):
+        for completed in (False, True):
+            assert codex_provider.item_events(
+                {"type": itype, "id": "x1"},
+                completed=completed, session_id="t1", preview_cap=CAP,
+            ) == []
+
+
+def test_plan_todos_maps_turn_plan_steps():
+    assert codex_provider.plan_todos([
+        {"step": "read files", "status": "completed"},
+        {"step": "edit app", "status": "inProgress"},
+        {"step": "run tests", "status": "pending"},
+        "junk",
+    ]) == [
+        {"content": "read files", "activeForm": "read files", "status": "completed"},
+        {"content": "edit app", "activeForm": "edit app", "status": "in_progress"},
+        {"content": "run tests", "activeForm": "run tests", "status": "pending"},
+    ]
+    assert codex_provider.plan_todos(None) == []
+
+
+# ─── requestUserInput question translation ────────────────────────────────────
+
+
+def test_question_cards_shape():
+    cards = codex_provider.question_cards({"questions": [
+        {"id": "q1", "header": "Auth", "question": "Which auth method?",
+         "options": [{"label": "OAuth", "description": "browser flow"},
+                     {"label": "API key", "description": ""}]},
+        {"id": "q2", "header": "Token", "question": "Paste the token",
+         "isSecret": True},
+    ]})
+    assert cards == [
+        {"question": "Which auth method?", "header": "Auth",
+         "options": [{"label": "OAuth", "description": "browser flow"},
+                     {"label": "API key", "description": ""}],
+         "multiSelect": False, "isSecret": False},
+        {"question": "Paste the token", "header": "Token", "options": [],
+         "multiSelect": False, "isSecret": True},
+    ]
+    assert codex_provider.question_cards({}) == []
+
+
+def test_question_answers_keyed_by_id():
+    params = {"questions": [
+        {"id": "q1", "header": "Auth", "question": "Which auth method?"},
+        {"id": "q2", "header": "Token", "question": "Paste the token"},
+        {"id": "q3", "header": "Skip", "question": "Unanswered one"},
+    ]}
+    out = codex_provider.question_answers(params, {"answers": {
+        "Which auth method?": "OAuth",
+        # Header-keyed fallback (frontend keys by question text, falling
+        # back to header when the question string is empty).
+        "Token": ["tok-123", "tok-456"],
+    }})
+    assert out == {"answers": {
+        "q1": {"answers": ["OAuth"]},
+        "q2": {"answers": ["tok-123", "tok-456"]},
+    }}
+    # Skip / timeout / junk payloads collapse to the empty mapping.
+    assert codex_provider.question_answers(params, None) == {"answers": {}}
+    assert codex_provider.question_answers(params, {"answers": "x"}) == {"answers": {}}
 
 
 def test_error_item_and_user_message_echo():
@@ -351,11 +476,14 @@ async def test_isolated_server_forces_file_chatgpt_auth_and_strips_keys(
 
     async def _fake_request(method, params=None, timeout=None):
         assert method == "initialize"
+        captured["initialize"] = params
         return {}
 
     server.request = _fake_request
     try:
         await server._start()
+        # Experimental surface (item/tool/requestUserInput) is opt-in.
+        assert captured["initialize"]["capabilities"] == {"experimentalApi": True}
         assert captured["args"] == (
             "/bin/codex",
             "-c", 'cli_auth_credentials_store="file"',
@@ -444,7 +572,7 @@ def test_api_chat_codex_unavailable_503(client, monkeypatch):
     assert r.json()["error"] == "codex_not_configured"
 
 
-def test_api_chat_codex_rejects_plan_and_fork(client, monkeypatch):
+def test_api_chat_codex_rejects_claude_only_modes(client, monkeypatch):
     monkeypatch.setattr(
         codex_provider, "availability",
         lambda *args, **kwargs: {"available": True, "reason": None},
@@ -455,11 +583,35 @@ def test_api_chat_codex_rejects_plan_and_fork(client, monkeypatch):
         })
         assert r.status_code == 400
         assert f"{mode} mode" in r.text
+
+
+def test_api_chat_codex_fork_gate(client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setattr(
+        codex_provider, "availability",
+        lambda *args, **kwargs: {"available": True, "reason": None},
+    )
+    # Nothing to fork from without a session id.
     r = client.post("/api/chat", data={
         "message": "hi", "provider": "codex", "fork": "true",
     })
     assert r.status_code == 400
     assert "fork" in r.text.lower()
+    # With a registered codex session the fork passes validation; the 503
+    # (from the stubbed server spawn) proves it got past the fork gate.
+    app_module._record_codex_session("t-forkme", None, "", "x", None)
+
+    async def _no_server(account, server_key=None):
+        raise RuntimeError("no app-server in tests")
+
+    monkeypatch.setattr(app_module, "_codex_server_for_account", _no_server)
+    r = client.post("/api/chat", data={
+        "message": "hi", "provider": "codex", "fork": "true",
+        "session_id": "t-forkme",
+    })
+    assert r.status_code == 503
+    assert r.json()["error"] == "codex_not_configured"
 
 
 def test_api_chat_provider_session_mismatch(client, monkeypatch):
@@ -497,6 +649,10 @@ def test_api_providers_payload(client, monkeypatch):
     assert provs["claude"]["capabilities"]["usage"] is True
     assert provs["codex"]["available"] is False
     assert provs["codex"]["capabilities"]["plan_mode"] is False
+    # Conversation forking rides codex's native thread/fork; file rewind
+    # stays Claude-only (checkpoints live in the bundled CLI).
+    assert provs["codex"]["capabilities"]["fork"] is True
+    assert provs["codex"]["capabilities"]["rewind"] is False
     assert provs["codex"]["capabilities"]["usage"] is False
     assert provs["codex"]["capabilities"]["accounts"] is True
     assert provs["codex"]["accounts"]["shared_label"]
@@ -1100,3 +1256,307 @@ async def test_codex_driver_resumes_same_thread_in_fresh_run_server(
     app_module._state_db().execute(
         "DELETE FROM codex_session WHERE thread_id = ?", ("thread-handoff",),
     )
+
+
+async def test_codex_driver_fork_branches_to_new_thread(client, monkeypatch):
+    import app as app_module
+
+    class _FakeServer:
+        def __init__(self):
+            self.calls = []
+            self.queue = asyncio.Queue()
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/fork":
+                return {"thread": {"id": "t-forked", "model": "gpt-test"}}
+            if method == "turn/start":
+                self.queue.put_nowait({
+                    "method": codex_provider.SERVER_EXITED_METHOD,
+                    "params": {},
+                })
+                return {}
+            if method == "thread/unsubscribe":
+                return {}
+            raise AssertionError(method)
+
+        def subscribe(self, thread_id):
+            assert thread_id == "t-forked"
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            pass
+
+        def unsubscribe(self, thread_id):
+            pass
+
+    server = _FakeServer()
+
+    async def _fake_server_for_account(account, *, server_key=None):
+        return server
+
+    async def _fake_close_key(server_key):
+        pass
+
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key", _fake_close_key,
+    )
+    run = app_module.ActiveRun("run-fork-test", owner_sub="anonymous")
+    run.provider = "codex"
+    run.project_key = "project-test"
+    await app_module._codex_driver(
+        run,
+        initial_text="branch here",
+        initial_images=[],
+        resume_thread_id="t-src",
+        model_id="gpt-test",
+        effort="",
+        cwd=app_module.DEFAULT_CWD,
+        personality_append="",
+        first_prompt_title="branch here",
+        account={"server_key": "test"},
+        fork=True,
+    )
+
+    method, params = server.calls[0]
+    assert method == "thread/fork"
+    assert params["threadId"] == "t-src"
+    # The fork's own (new) thread id is what the run indexes and registers.
+    assert run.session_id == "t-forked"
+    assert app_module._codex_session_row("t-forked") is not None
+    assert "thread/resume" not in [m for m, _ in server.calls]
+    app_module._state_db().execute(
+        "DELETE FROM codex_session WHERE thread_id = ?", ("t-forked",),
+    )
+
+
+async def test_codex_driver_compact_command(client, monkeypatch):
+    import app as app_module
+
+    class _FakeServer:
+        def __init__(self):
+            self.calls = []
+            self.queue = asyncio.Queue()
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/resume":
+                return {"thread": {"id": "t-compact", "model": "gpt-test"}}
+            if method == "thread/compact/start":
+                self.queue.put_nowait({
+                    "method": "thread/compacted",
+                    "params": {"threadId": "t-compact"},
+                })
+                self.queue.put_nowait({
+                    "method": codex_provider.SERVER_EXITED_METHOD,
+                    "params": {},
+                })
+                return {}
+            if method == "thread/unsubscribe":
+                return {}
+            raise AssertionError(method)
+
+        def subscribe(self, thread_id):
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            pass
+
+        def unsubscribe(self, thread_id):
+            pass
+
+    server = _FakeServer()
+
+    async def _fake_server_for_account(account, *, server_key=None):
+        return server
+
+    async def _fake_close_key(server_key):
+        pass
+
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key", _fake_close_key,
+    )
+    run = app_module.ActiveRun("run-compact-test", owner_sub="anonymous")
+    run.provider = "codex"
+    run.project_key = "project-test"
+    await app_module._codex_driver(
+        run,
+        initial_text="/compact",
+        initial_images=[],
+        resume_thread_id="t-compact",
+        model_id="gpt-test",
+        effort="",
+        cwd=app_module.DEFAULT_CWD,
+        personality_append="",
+        first_prompt_title="/compact",
+        account={"server_key": "test"},
+    )
+
+    methods = [m for m, _ in server.calls]
+    assert "thread/compact/start" in methods
+    assert "turn/start" not in methods
+    notes = [
+        blk.get("text")
+        for ev in run.events if ev.get("type") == "assistant"
+        for blk in (ev.get("message") or {}).get("content") or []
+        if blk.get("type") == "text"
+    ]
+    assert codex_provider.COMPACTED_NOTE in notes
+    app_module._state_db().execute(
+        "DELETE FROM codex_session WHERE thread_id = ?", ("t-compact",),
+    )
+
+
+async def test_codex_driver_turn_plan_updated_emits_todos(client, monkeypatch):
+    import app as app_module
+
+    class _FakeServer:
+        def __init__(self):
+            self.calls = []
+            self.queue = asyncio.Queue()
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/start":
+                return {"thread": {"id": "t-plan", "model": "gpt-test"}}
+            if method == "turn/start":
+                self.queue.put_nowait({
+                    "method": "turn/plan/updated",
+                    "params": {"threadId": "t-plan", "plan": [
+                        {"step": "look around", "status": "inProgress"},
+                    ]},
+                })
+                self.queue.put_nowait({
+                    "method": codex_provider.SERVER_EXITED_METHOD,
+                    "params": {},
+                })
+                return {}
+            if method == "thread/unsubscribe":
+                return {}
+            raise AssertionError(method)
+
+        def subscribe(self, thread_id):
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            pass
+
+        def unsubscribe(self, thread_id):
+            pass
+
+    server = _FakeServer()
+
+    async def _fake_server_for_account(account, *, server_key=None):
+        return server
+
+    async def _fake_close_key(server_key):
+        pass
+
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key", _fake_close_key,
+    )
+    run = app_module.ActiveRun("run-plan-test", owner_sub="anonymous")
+    run.provider = "codex"
+    run.project_key = "project-test"
+    await app_module._codex_driver(
+        run,
+        initial_text="plan something",
+        initial_images=[],
+        resume_thread_id=None,
+        model_id="gpt-test",
+        effort="",
+        cwd=app_module.DEFAULT_CWD,
+        personality_append="",
+        first_prompt_title="plan something",
+        account={"server_key": "test"},
+    )
+
+    todo_events = [ev for ev in run.events if ev.get("type") == "todos_update"]
+    assert todo_events and todo_events[0]["todos"] == [
+        {"content": "look around", "activeForm": "look around",
+         "status": "in_progress"},
+    ]
+    app_module._state_db().execute(
+        "DELETE FROM codex_session WHERE thread_id = ?", ("t-plan",),
+    )
+
+
+async def test_codex_question_decision_round_trip(client):
+    import app as app_module
+
+    run = app_module.ActiveRun("run-question-test", owner_sub="anonymous")
+    params = {"questions": [
+        {"id": "q1", "header": "Pick", "question": "Pick one",
+         "options": [{"label": "A", "description": ""},
+                     {"label": "B", "description": ""}]},
+    ]}
+    task = asyncio.create_task(
+        app_module._codex_question_decision(run, params),
+    )
+    pending_id = None
+    for _ in range(200):
+        await asyncio.sleep(0)
+        for rid, entry in app_module.PENDING.items():
+            if entry.get("run_id") == "run-question-test":
+                pending_id = rid
+                break
+        if pending_id:
+            break
+    assert pending_id, "question never reached PENDING"
+    ask = [ev for ev in run.events if ev.get("type") == "question_request"]
+    assert ask and ask[0]["provider"] == "codex"
+    assert ask[0]["questions"][0]["options"][1]["label"] == "B"
+    app_module.PENDING[pending_id]["future"].set_result({
+        "decision": "answer", "payload": {"answers": {"Pick one": "B"}},
+    })
+    assert await task == {"answers": {"q1": {"answers": ["B"]}}}
+    resolved = [ev for ev in run.events if ev.get("type") == "permission_resolved"]
+    assert resolved and resolved[0]["decision"] == "answer"
+
+
+def test_sessions_search_includes_codex(client):
+    import app as app_module
+
+    tid = "00000000-1111-2222-3333-444444444444"
+    home = Path(os.environ["CODEX_HOME"])
+    day = home / "sessions" / "2026" / "07" / "22"
+    day.mkdir(parents=True, exist_ok=True)
+    rollout = day / f"rollout-2026-07-22T00-00-00-{tid}.jsonl"
+    rows = [
+        {"type": "session_meta", "payload": {"id": tid}},
+        # Instruction wrapper — must be skipped like Claude's isMeta rows.
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text",
+                         "text": "<user_instructions>hidden wrapper</user_instructions>"}]}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text",
+                         "text": "the flux capacitor hums nicely"}]}},
+    ]
+    rollout.write_text("\n".join(json.dumps(r) for r in rows))
+    app_module._record_codex_session(tid, None, "", "Codex chat", None)
+    try:
+        r = client.get("/api/sessions/search", params={"q": "flux capacitor"})
+        assert r.status_code == 200
+        hits = [h for h in r.json()["hits"] if h["id"] == tid]
+        assert hits and hits[0]["provider"] == "codex"
+        assert hits[0]["title"] == "Codex chat"
+        assert "flux capacitor" in hits[0]["snippet"]
+        # The wrapper text is invisible to search.
+        r = client.get("/api/sessions/search", params={"q": "hidden wrapper"})
+        assert not [h for h in r.json()["hits"] if h["id"] == tid]
+    finally:
+        rollout.unlink()
+        app_module._state_db().execute(
+            "DELETE FROM codex_session WHERE thread_id = ?", (tid,),
+        )

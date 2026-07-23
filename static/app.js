@@ -2949,7 +2949,7 @@
       markVisibleActivity();
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
-      announce("Claude is asking you a question.");
+      announce(`${obj.provider === "codex" ? "Codex" : "Claude"} is asking you a question.`);
       playCue("permission");
       renderQuestionCard(obj);
       enqueuePermRequest("question", obj);
@@ -4085,7 +4085,7 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = "Claude is asking";
+    heading.textContent = req.provider === "codex" ? "Codex is asking" : "Claude is asking";
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
 
@@ -4129,7 +4129,9 @@
       otherLabel.setAttribute("for", otherInput.id);
       otherLabel.textContent = "Other:";
       const otherText = document.createElement("input");
-      otherText.type = "text";
+      // Secret questions (codex requestUserInput isSecret) mask the free-text
+      // answer; their options-based answers stay visible like any radio.
+      otherText.type = q.isSecret ? "password" : "text";
       otherText.className = "question-other-text";
       otherText.setAttribute("aria-label", `Other answer for: ${q.question || q.header || "question"}`);
       otherText.addEventListener("input", () => { if (otherText.value) otherInput.checked = true; });
@@ -4200,8 +4202,14 @@
         // `answer` payload while the UI claims "Question skipped".
         if (entries.length) {
           await postDecision(req.id, "answer", { answers });
+          // Never echo a secret answer back into the transcript summary.
+          const secretByText = {};
+          fieldMeta.forEach((fm) => {
+            const t = fm.q.question || fm.q.header;
+            if (t && fm.q.isSecret) secretByText[t] = true;
+          });
           replaceCardWithSummary(card,
-            `Answered — ${entries.map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`).join("; ")}`);
+            `Answered — ${entries.map(([k, v]) => `${k}: ${secretByText[k] ? "•••" : (Array.isArray(v) ? v.join(", ") : v)}`).join("; ")}`);
         } else {
           await postDecision(req.id, "dismiss", null);
           replaceCardWithSummary(card, "Question skipped");

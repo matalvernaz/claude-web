@@ -498,7 +498,10 @@ async def _providers_payload(
         "models": [],
         "accounts": _codex_account_payload(user),
         "capabilities": {
-            "plan_mode": False, "fork": False, "rewind": False,
+            # rewind stays off: claude-web rewind restores files from CLI
+            # checkpoints, which codex has no analog for (thread/fork with
+            # lastTurnId rewinds *conversation*, a different feature).
+            "plan_mode": False, "fork": True, "rewind": False,
             "permission_modes": list(codex_provider.CODEX_PERMISSION_MODES),
             "accounts": True,
             # The Usage dialog + header cost are Anthropic plan/cost data
@@ -1552,6 +1555,59 @@ async def _codex_gate_decision(run, tool_name: str, tool_input: dict[str, Any]) 
         if d == "allow_session":
             return "acceptForSession"
         return "decline"
+
+
+async def _codex_question_decision(run, params: dict) -> dict:
+    """codex item/tool/requestUserInput → the AskUserQuestion card flow.
+
+    Mirrors the Claude QUESTION_TOOL path: emit question_request, await the
+    browser's answer, echo permission_resolved for replay. Skip, timeout and
+    interrupt all collapse to the empty answers mapping — codex's native
+    "did not answer" outcome — so the turn proceeds rather than stalling.
+    ``autoResolutionMs`` (codex answering itself after a deadline) shortens
+    our wait; a reply after codex self-resolves would be ignored anyway."""
+    questions = codex_provider.question_cards(params)
+    if not questions or run.interrupting:
+        return {"answers": {}}
+    timeout = PERMISSION_TIMEOUT_SECONDS
+    auto_ms = params.get("autoResolutionMs")
+    if isinstance(auto_ms, (int, float)) and auto_ms > 0:
+        timeout = max(5, min(timeout, int(auto_ms / 1000)))
+    request_id = str(uuid_mod.uuid4())
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
+    try:
+        run.emit({
+            "type": "question_request",
+            "id": request_id,
+            "questions": questions,
+            "timeout_seconds": timeout,
+            "provider": "codex",
+        })
+        try:
+            decision = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            run.emit({
+                "type": "permission_timeout", "id": request_id,
+                "tool": QUESTION_TOOL, "timeout_seconds": timeout,
+            })
+            return {"answers": {}}
+    finally:
+        PENDING.pop(request_id, None)
+    run.emit({
+        "type": "permission_resolved",
+        "id": request_id,
+        "tool": QUESTION_TOOL,
+        "decision": decision.get("decision"),
+    })
+    if decision.get("interrupted"):
+        return {"answers": {}}
+    answers = codex_provider.question_answers(params, decision.get("payload"))
+    log.info(
+        "codex question answered=%s run=%s owner=%s",
+        bool(answers.get("answers")), run.run_id, run.owner_sub or "?",
+    )
+    return answers
 
 
 # ─── State persistence (sqlite-backed run + event store) ─────────────────────
@@ -6856,20 +6912,124 @@ def _scan_sessions_for_query(
             idx = low.find(query)
             if idx < 0:
                 continue
-            start = max(0, idx - 40)
-            end = min(len(text), idx + len(query) + SEARCH_SNIPPET_CHARS - 40)
-            snippet = text[start:end].replace("\n", " ").strip()
-            if start > 0:
-                snippet = "…" + snippet
-            if end < len(text):
-                snippet = snippet + "…"
             hits.append({
                 "id": path.stem,
                 "project": key,
                 "title": session_title_from(path) or path.stem[:8],
                 "mtime": mtime,
-                "snippet": snippet,
+                "snippet": _search_snippet(text, idx, len(query)),
                 "role": kind,
+            })
+            break
+        if len(hits) >= MAX_SEARCH_RESULTS:
+            break
+    return hits
+
+
+def _search_snippet(text: str, idx: int, query_len: int) -> str:
+    """Context window around a match at ``idx``, ellipsised at cut edges."""
+    start = max(0, idx - 40)
+    end = min(len(text), idx + query_len + SEARCH_SNIPPET_CHARS - 40)
+    snippet = text[start:end].replace("\n", " ").strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
+# Rollout texts that are wrappers injected by codex itself, not conversation
+# — the moral equivalent of Claude's isMeta rows.
+_CODEX_META_PREFIXES = (
+    "<user_instructions>", "<environment_context>", "<permissions",
+    "<turn_aborted",
+)
+
+
+def _codex_rollout_paths() -> dict[str, Path]:
+    """thread_id → rollout path for every codex session on disk.
+
+    Rollout filenames end in the thread uuid:
+    ``sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`` under the
+    shared CODEX_HOME (per-account homes symlink back to it)."""
+    root = codex_provider.codex_home() / "sessions"
+    out: dict[str, Path] = {}
+    if not root.is_dir():
+        return out
+    for path in root.rglob("rollout-*.jsonl"):
+        stem = path.stem
+        if len(stem) > 36:
+            out[stem[-36:]] = path
+    return out
+
+
+def _codex_search_candidates(user: dict) -> list[tuple[int, Path, str, str, str]]:
+    """Visible codex sessions joined to their rollout files, newest-first
+    (mtime, path, project_key, title, thread_id). Visibility mirrors
+    _codex_sessions_for_list: ownerless rows are visible to all."""
+    try:
+        rows = _state_db().execute(
+            "SELECT thread_id, owner_sub, project_key, title, updated_at "
+            "FROM codex_session ORDER BY updated_at DESC",
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    if not rows:
+        return []
+    paths = _codex_rollout_paths()
+    sub = (user or {}).get("sub")
+    out: list[tuple[int, Path, str, str, str]] = []
+    for thread_id, owner_sub, project_key, title, updated_at in rows:
+        if PER_USER_SESSIONS and user is not None and owner_sub and owner_sub != sub:
+            continue
+        path = paths.get(thread_id)
+        if path is None:
+            continue
+        out.append((int(updated_at), path, project_key or "",
+                    (title or "").strip(), thread_id))
+    return out
+
+
+def _scan_codex_sessions_for_query(
+    query: str, candidates: list[tuple[int, Path, str, str, str]],
+) -> list[dict]:
+    """Codex twin of _scan_sessions_for_query, over rollout JSONL files.
+
+    Conversation text lives in response_item/message payloads (roles user /
+    assistant, content parts carrying ``text``); codex's instruction and
+    environment wrappers are skipped the way isMeta rows are for Claude.
+    Pure file I/O, safe for a worker thread."""
+    hits: list[dict] = []
+    for mtime, path, key, title, thread_id in candidates:
+        for obj in _iter_jsonl(path):
+            if obj.get("type") != "response_item":
+                continue
+            payload = obj.get("payload") or {}
+            if payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            parts = [
+                c.get("text") or ""
+                for c in (payload.get("content") or [])
+                if isinstance(c, dict)
+            ]
+            text = "\n".join(p for p in parts if p)
+            if not text or text.lstrip().startswith(_CODEX_META_PREFIXES):
+                continue
+            low = text.lower()
+            idx = low.find(query)
+            if idx < 0:
+                continue
+            hits.append({
+                "id": thread_id,
+                "project": key,
+                "title": title or thread_id[:8],
+                "mtime": mtime,
+                "snippet": _search_snippet(text, idx, len(query)),
+                "role": role,
+                "provider": "codex",
             })
             break
         if len(hits) >= MAX_SEARCH_RESULTS:
@@ -6882,7 +7042,8 @@ async def api_sessions_search(
     q: str = "",
     user: dict = Depends(auth.require_user),
 ):
-    """Substring search across every configured project's session transcripts.
+    """Substring search across every configured project's session transcripts,
+    plus registered codex threads (scanned from their rollout files).
 
     Line-by-line, case-insensitive, capped at MAX_SEARCH_RESULTS hits. The
     frontend always shows titles for matched sessions even when the hit was
@@ -6912,7 +7073,15 @@ async def api_sessions_search(
             candidates.append((mtime, path, key))
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    hits = await asyncio.to_thread(_scan_sessions_for_query, query, candidates)
+    codex_candidates = _codex_search_candidates(user)
+
+    def _scan_both() -> list[dict]:
+        found = _scan_sessions_for_query(query, candidates)
+        found.extend(_scan_codex_sessions_for_query(query, codex_candidates))
+        found.sort(key=lambda h: h["mtime"], reverse=True)
+        return found[:MAX_SEARCH_RESULTS]
+
+    hits = await asyncio.to_thread(_scan_both)
     return {"query": q, "hits": hits}
 
 
@@ -8434,6 +8603,7 @@ async def _codex_driver(
     personality_append: str,
     first_prompt_title: str,
     account: dict,
+    fork: bool = False,
 ) -> None:
     """Own one Codex thread for the life of this run.
 
@@ -8449,6 +8619,10 @@ async def _codex_driver(
     # item's tool input from item/started so the approval card can show it.
     item_inputs: dict[str, dict] = {}
     partial_buf: list[str] = []
+    # True between a user /compact and its confirmation, so the
+    # thread/compacted fallback note doesn't double up with a
+    # contextCompaction item from the same compaction.
+    compact_pending = False
     run_server_key = f"{account['server_key']}:run:{run.run_id}"
 
     def _flush_codex_partial() -> None:
@@ -8480,11 +8654,13 @@ async def _codex_driver(
             if not tool_input:
                 tool_input = {"files": ["(unknown)"]}
         elif method == "item/tool/requestUserInput":
-            # Experimental TUI-side prompt. Answer "no answers" so the tool
-            # proceeds like the Claude question-timeout path does, instead
-            # of stalling the turn on a card the UI can't render yet.
-            return {"answers": {}}
+            return await _codex_question_decision(run, params)
         else:
+            # Includes item/permissions/requestApproval: its response wants a
+            # structured GrantedPermissionProfile, not accept/decline, so a
+            # yes/no card can't answer it honestly. With the sandbox pinned to
+            # danger-full-access it shouldn't fire; declining is the safe
+            # no-op if it ever does.
             log.warning("codex approval %s unhandled — declining", method)
             return {"decision": "decline"}
         return {"decision": await _codex_gate_decision(run, tool, tool_input)}
@@ -8507,7 +8683,12 @@ async def _codex_driver(
                 thread_params["model"] = model_id
             if personality_append:
                 thread_params["developerInstructions"] = personality_append
-            if resume_thread_id:
+            if resume_thread_id and fork:
+                # thread/fork loads the source rollout and branches it into a
+                # brand-new thread id; the source conversation is untouched.
+                thread_params["threadId"] = resume_thread_id
+                resp = await server.request("thread/fork", thread_params)
+            elif resume_thread_id:
                 thread_params["threadId"] = resume_thread_id
                 resp = await server.request("thread/resume", thread_params)
             else:
@@ -8519,7 +8700,9 @@ async def _codex_driver(
             })
             return
         thread = (resp or {}).get("thread") or {}
-        thread_id = thread.get("id") or resume_thread_id
+        # A fork must never fall back to the source id — two runs would then
+        # append to the same thread, the exact split the fork asked to avoid.
+        thread_id = thread.get("id") or (None if fork else resume_thread_id)
         if not thread_id:
             run.emit({"type": "error",
                       "message": "Codex did not report a thread id."})
@@ -8545,6 +8728,21 @@ async def _codex_driver(
         async def _start_turn(text: str, image_blocks: list[dict]) -> bool:
             """turn/start with the run's current model/effort. Returns
             False when the request itself failed (turn never opened)."""
+            nonlocal compact_pending
+            if text.strip() == "/compact" and not image_blocks:
+                # The composer's builtin /compact maps to codex's native
+                # compaction instead of reaching the model as literal text.
+                # No turn bookkeeping: if codex runs it as a turn, the
+                # normal turn/started..turn/completed events handle it.
+                try:
+                    await server.request(
+                        "thread/compact/start", {"threadId": thread_id},
+                    )
+                    compact_pending = True
+                except Exception as e:
+                    run.emit({"type": "error",
+                              "message": f"Codex compaction failed: {e}"})
+                return True
             input_items: list[dict] = []
             if text:
                 input_items.append({"type": "text", "text": text})
@@ -8707,6 +8905,10 @@ async def _codex_driver(
                     completed = method == "item/completed"
                     if completed and item.get("type") == "agentMessage":
                         _flush_codex_partial()
+                    if completed and item.get("type") == "contextCompaction":
+                        # item_events emits the note; suppress the
+                        # thread/compacted fallback for this compaction.
+                        compact_pending = False
                     if not completed and isinstance(item.get("id"), str):
                         if item.get("type") == "fileChange":
                             item_inputs[item["id"]] = codex_provider.patch_input(item)
@@ -8715,6 +8917,24 @@ async def _codex_driver(
                         preview_cap=TOOL_RESULT_PREVIEW * 4,
                     ):
                         run.emit(ev)
+                elif method == "turn/plan/updated":
+                    run.emit({
+                        "type": "todos_update",
+                        "todos": codex_provider.plan_todos(params.get("plan")),
+                    })
+                elif method == "thread/compacted":
+                    # Fallback note for a user /compact whose stream carried
+                    # no contextCompaction item.
+                    if compact_pending:
+                        compact_pending = False
+                        run.emit({
+                            "type": "assistant",
+                            "message": {"content": [{
+                                "type": "text",
+                                "text": codex_provider.COMPACTED_NOTE,
+                            }]},
+                            "session_id": thread_id,
+                        })
                 elif method == "thread/tokenUsage/updated":
                     run.codex_token_usage = params.get("tokenUsage") or {}
                 elif method in ("turn/completed", "turn/failed"):
@@ -8744,9 +8964,12 @@ async def _codex_driver(
                     msg_text = params.get("message") or params.get("error") or ""
                     if msg_text:
                         run.emit({"type": "error", "message": str(msg_text)})
-                # Remaining notification types (status changes, deltas for
-                # reasoning summaries, plan updates) are presentation-only
-                # duplicates of the item events above — dropped on purpose.
+                # Remaining notification types (status changes, reasoning
+                # deltas) are dropped on purpose. Reasoning deltas in
+                # particular: claude-web doesn't render thinking (see
+                # _handle_partial_stream_event), so streaming them as
+                # partial_text would show codex thinking where Claude's is
+                # deliberately hidden.
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -8902,14 +9125,14 @@ async def api_chat(
         # Codex model keys are the app-server's ids, cached after the first
         # /api/providers fetch. A cold cache passes unknown keys through —
         # the app-server rejects a bad id with a clear error — but plan
-        # mode and forking are Claude concepts with no Codex analog, so
-        # those fail fast here regardless.
+        # mode is a Claude concept with no Codex analog, so it fails fast
+        # here regardless. Forking maps to codex's native thread/fork.
         if (permission_mode
                 and permission_mode not in codex_provider.CODEX_PERMISSION_MODES):
             raise HTTPException(
                 400, f"{permission_mode} mode is not available with Codex")
-        if fork:
-            raise HTTPException(400, "forking is not available with Codex")
+        if fork and not session_id:
+            raise HTTPException(400, "fork requires a session to fork from")
         try:
             codex_server = await _codex_server_for_account(account)
             codex_models = {
@@ -9194,6 +9417,7 @@ async def api_chat(
             personality_append=personality_for_run["append"],
             first_prompt_title=message.strip().splitlines()[0][:80] if message.strip() else "",
             account=account,
+            fork=fork,
         ))
         run.task.add_done_callback(_log_task_exception)
         return _stream_run_response(run)
