@@ -24,7 +24,9 @@ CAP = 800
 
 
 def test_frontend_sends_permission_mode_for_codex():
-    source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS
+    )
     send_one = source.index("async function sendOne")
     start = source.index("const provider = currentProvider();", send_one)
     end = source.index("if (effortSelect", start)

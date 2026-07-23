@@ -144,7 +144,9 @@ def test_review_sse_captures_diff_and_emits_verified_ledger(
 
 
 def test_frontend_posts_task_and_explicit_review_booleans():
-    source = (Path(__file__).parents[1] / "static" / "roundtable.js").read_text()
+    source = (Path(__file__).parents[1] / "static" / "roundtable.js").read_text(
+        encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS
+    )
     assert 'formData.append("task", taskSelect.value)' in source
     assert '"capture_working_diff", captureWorkingDiff.checked ? "true" : "false"' in source
     assert 'formData.append("verify_review", verifyReview.checked ? "true" : "false")' in source

@@ -38,6 +38,7 @@ for var in (
     "CODEX_HOME",
     "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
     "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
 ):
     os.environ.pop(var, None)
 os.environ["AUTH_MODE"] = "none"
@@ -55,6 +56,14 @@ os.environ["CLAUDE_WEB_CSRF_STRICT"] = "false"
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.
 os.environ["CLAUDE_ROUNDTABLE_STATE_DIR"] = os.path.join(_TEST_TMP, "roundtable-state")
+# app.py decides /roundtable availability at import: roundtable_core collapses
+# to None unless providers_configured() sees a provider key or a claude binary
+# on PATH. CI runners have neither, so without this the roundtable web tests
+# lose their monkeypatch target (None has no attribute ...) and the page
+# renders without the assistant panel. A fake key keeps the decision
+# deterministic on every machine — no live calls, the tests stub the provider
+# layer.
+os.environ["GEMINI_API_KEY"] = "test-not-a-real-key"
 for d in (
     os.environ["CLAUDE_HOME"],
     os.environ["CLAUDE_WEB_STATE_DIR"],
