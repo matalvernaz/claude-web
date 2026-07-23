@@ -154,7 +154,6 @@ def test_next_backup_path_never_overwrites(tmp_path) -> None:
 
 def test_roundtable_usage_totals(tmp_path, monkeypatch) -> None:
     """roundtable_usage aggregates persisted per-turn rows by participant."""
-    import importlib
     import roundtable.core as core
     # Point the core DB at a temp file and reset the cached connection.
     monkeypatch.setattr(core, "DB_PATH", tmp_path / "rt.db")

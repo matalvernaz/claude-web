@@ -7,6 +7,8 @@ live APIs to verify; this exercises everything that doesn't.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import roundtable.core as core
 
 
@@ -120,7 +122,6 @@ def test_permission_callback_fault_denies(tmp_path):
 # gated executor, feed results back, terminate on a text turn. They mock the
 # SDK response shapes, so they catch loop-control bugs (infinite loop, missing
 # termination, dropped result) but NOT a wrong live wire format.
-from types import SimpleNamespace
 
 
 def test_openai_tool_loop_executes_then_finishes(tmp_path, monkeypatch):

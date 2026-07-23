@@ -73,7 +73,7 @@ for d in (
     os.makedirs(d, exist_ok=True)
 
 
-import pytest
+import pytest  # noqa: E402 — the env block above must run before any app import
 
 
 @pytest.fixture(scope="session", autouse=True)

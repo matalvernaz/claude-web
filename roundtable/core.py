@@ -2156,7 +2156,7 @@ def _call_anthropic_router(
 
 
 def roundtable_create(
-    topic: str, participants: list[str] = [], house_rules: str = "",
+    topic: str, participants: Optional[list[str]] = None, house_rules: str = "",
     context: str = "",
 ) -> dict:
     """Create a new roundtable thread.
@@ -2183,6 +2183,7 @@ def roundtable_create(
     Returns ``{"thread_id", "topic", "participants", "house_rules"}`` plus
     ``context_bytes``/``context_truncated`` when a context pack was set.
     """
+    participants = participants or []
     unknown = [p for p in participants if p not in PARTICIPANTS]
     if unknown:
         raise ValueError(

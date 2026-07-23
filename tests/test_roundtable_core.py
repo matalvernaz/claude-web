@@ -296,7 +296,9 @@ def test_bind_github_clones_strips_git_and_binds_readonly(tmp_path):
 
 def test_bind_github_bad_repo_raises_and_leaves_no_binding(tmp_path):
     tid = core.roundtable_create("gh fail")["thread_id"]
-    with pytest.raises(Exception):
+    # ValueError from URL validation or RuntimeError from the failed clone —
+    # both are "bind refused", which is what the no-binding assertion needs.
+    with pytest.raises((ValueError, RuntimeError)):
         core.roundtable_bind_github(tid, f"file://{tmp_path}/nope")
     assert core.roundtable_repo_context(tid) is None
 
