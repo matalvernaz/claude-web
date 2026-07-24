@@ -101,6 +101,8 @@ Tests in `tests/test_app_helpers.py` (`test_identity_env_for_*`, `test_resolve_a
 
 `usage.jsonl` rows carry `account_slot` (`'shared'` or `'personal'`) and `owner_sub`. `/api/usage` reports shared spend aggregated across all users (one bill) and personal spend filtered to just the requesting user. Pre-tagging rows are treated as shared.
 
+The Claude Usage dialog also reads live plan data from Anthropic's OAuth API. Team and Enterprise seats get a **Request more usage** action (also reachable through the client-side `/usage-credits` shortcut). `POST /api/usage/request` keeps the selected slot's OAuth token server-side, checks Anthropic's `limit_increase` eligibility plus existing `pending`/`dismissed` admin requests, then creates one organization admin request. Organization-wide credit exhaustion/caps and unlimited allocations are not requestable, matching Claude Code's own `/usage-credits` behavior.
+
 ### Multi-user / ownership filter
 
 `CLAUDE_WEB_PER_USER_SESSIONS=true` scopes session listing/loading/deleting/exporting to whoever first chatted in them. **This is an ownership filter, not a security boundary** — that's called out explicitly in the README.

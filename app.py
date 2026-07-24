@@ -68,6 +68,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
 import codex_provider
+import conversation_replay
 import currency
 import setup_flow
 
@@ -249,6 +250,15 @@ UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 # matching the README's "share state" promise. Default off so a single-user
 # homelab keeps working as before.
 PER_USER_SESSIONS = os.getenv("CLAUDE_WEB_PER_USER_SESSIONS", "").lower() in ("1", "true", "yes")
+# Mid-chat provider switching (Claude ⇄ Codex). Default OFF: the one edit that
+# changes existing behaviour (relaxing the provider-mismatch reject in
+# api_chat) stays dark until deliberately enabled. See
+# DESIGN-multiprovider-switch.md.
+PROVIDER_SWITCH_ENABLED = os.getenv("CLAUDE_WEB_PROVIDER_SWITCH", "").lower() in ("1", "true", "yes")
+_PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+# Screen-reader boundary announced on a switch. Kept as one constant so the
+# wording is a one-line change (UX default: an explicit announced boundary).
+PROVIDER_SWITCH_NOTICE = "Switched to {to}. Prior conversation carried over."
 
 # Per-user "personal account" support. Each logged-in user can register their
 # own Claude credentials and toggle between the shared (default) account and
@@ -388,9 +398,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 # turn (see _looks_like_model_rejection) instead of a silent reply.
 #
 # `efforts` lists the values accepted for the SDK's `effort` option (the
-# CLI's --effort flag). Opus 4.8 and Fable 5 accept the full set; earlier
-# models aren't known to accept it, so those entries stay empty rather than
-# risk a 400.
+# CLI's --effort flag). Opus 5, Opus 4.8, and Fable 5 accept the full set;
+# earlier models aren't known to accept it, so those entries stay empty
+# rather than risk a 400.
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 KNOWN_MODELS = [
     {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": [],
@@ -415,6 +425,8 @@ KNOWN_MODELS = [
     {"key": "fableplan-advisor", "model": "claude-opus-4-8",
      "plan_model": "claude-fable-5", "advisor_model": "claude-fable-5",
      "label": "Fableplan + Fable 5 advisor", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
@@ -1810,10 +1822,120 @@ def _state_db() -> sqlite3.Connection:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )""")
+        # ── Mid-chat provider switching (Claude ⇄ Codex) ──────────────────
+        # Provider-neutral conversation model layered over the two native
+        # session stores (Claude on-disk JSONL; the codex_session registry
+        # above). Authoritative for ordering / UI / ownership / switching /
+        # export ONLY — native transcripts stay authoritative for
+        # resumability, compaction, tool continuation and file checkpoints.
+        # Slice 0 shadow-writes these with zero behaviour change; switching
+        # reads them in Slice 1. See DESIGN-multiprovider-switch.md.
+        conn.execute("""CREATE TABLE IF NOT EXISTS conversation (
+            conversation_id TEXT PRIMARY KEY,
+            owner_sub TEXT,
+            project_key TEXT NOT NULL,
+            title TEXT,
+            last_seq INTEGER NOT NULL DEFAULT 0,
+            capture_state TEXT NOT NULL DEFAULT 'live_complete',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_owner "
+            "ON conversation(owner_sub, updated_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_project "
+            "ON conversation(project_key, updated_at DESC)"
+        )
+        # 0..1 live native binding per (conversation, provider). Superseded
+        # rows survive as aliases so a cross-provider fork doesn't break old
+        # URLs referencing the prior native id. The partial unique index
+        # enforces at most one provisional/active binding per provider while
+        # letting superseded/deleted rows accumulate.
+        conn.execute("""CREATE TABLE IF NOT EXISTS conversation_binding (
+            binding_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+            native_session_id TEXT,
+            project_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'provisional',
+            synced_through_seq INTEGER NOT NULL DEFAULT 0,
+            adapter_version INTEGER NOT NULL DEFAULT 1,
+            provider_version TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_native "
+            "ON conversation_binding(provider, project_key, native_session_id) "
+            "WHERE native_session_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_live "
+            "ON conversation_binding(conversation_id, provider) "
+            "WHERE status IN ('provisional','active')"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_binding_conversation "
+            "ON conversation_binding(conversation_id, provider, created_at)"
+        )
+        # Append-only canonical event log. Captured at RAW PROVIDER INGRESS —
+        # before the 800-char (TOOL_RESULT_PREVIEW*4) live tool-result slice at
+        # app.py ~11528 / codex_provider.py ~580 — NOT at ActiveRun.emit, which
+        # is downstream of that slice and would poison the store with truncated
+        # results. normalized_json is the provider-neutral shape; raw_json is
+        # the untruncated provider payload kept for later re-projection. seq is
+        # allocated atomically via COALESCE(MAX(seq))+1 in a single statement.
+        conn.execute("""CREATE TABLE IF NOT EXISTS conversation_event (
+            conversation_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            source_key TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            binding_id TEXT,
+            run_id TEXT,
+            run_event_idx INTEGER,
+            native_turn_id TEXT,
+            event_type TEXT NOT NULL,
+            visibility TEXT NOT NULL DEFAULT 'transcript',
+            replayable INTEGER NOT NULL DEFAULT 0,
+            normalized_json TEXT NOT NULL,
+            raw_json TEXT,
+            original_bytes INTEGER NOT NULL DEFAULT 0,
+            stored_bytes INTEGER NOT NULL DEFAULT 0,
+            payload_sha256 TEXT NOT NULL DEFAULT '',
+            truncated INTEGER NOT NULL DEFAULT 0,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(conversation_id, seq)
+        )""")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_cevent_source "
+            "ON conversation_event(conversation_id, source_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cevent_run "
+            "ON conversation_event(run_id, run_event_idx)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cevent_replayable "
+            "ON conversation_event(conversation_id, replayable, seq)"
+        )
         _migrate_user_account_legacy(conn)
+        _migrate_runs_add_conversation(conn)
         _seed_personalities(conn)
         _STATE_DB = conn
     return _STATE_DB
+
+
+def _migrate_runs_add_conversation(conn: sqlite3.Connection) -> None:
+    """Add provider/conversation_id/binding_id to the runs table (Slice 0 of
+    mid-chat provider switching). Additive; no-op once the columns exist.
+    Column names are a fixed literal allowlist — safe to interpolate."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    for col in ("provider", "conversation_id", "binding_id"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
 
 
 def _migrate_user_account_legacy(conn: sqlite3.Connection) -> None:
@@ -5053,24 +5175,560 @@ def _user_can_see_session(session_id: str, user: dict) -> bool:
     return owner == (user or {}).get("sub")
 
 
+# ── Canonical conversation model (mid-chat provider switching, Slice 0) ──────
+# Provider-neutral layer over the two native session stores. These helpers
+# shadow-write the conversation / conversation_binding / conversation_event
+# tables. Every write is best-effort: on failure it logs, marks the
+# conversation incomplete where it can, and NEVER raises into the run — a broken
+# canonical store must not take down a live provider turn; it only bars that
+# conversation from Slice-1 switching. See DESIGN-multiprovider-switch.md.
+
+# Byte cap for a single stored raw canonical payload. Bounds the new
+# retention/disk surface; an oversized payload is stored truncated with
+# truncated=1 and its original size recorded so a re-projection knows it's
+# partial.
+CANONICAL_PAYLOAD_CAP = 256 * 1024
+
+
+def _binding_ids_for_native(
+    provider: str, project_key: str, native_id: str
+) -> Optional[tuple[str, str]]:
+    """(binding_id, conversation_id) for an established native session, or None."""
+    if not native_id:
+        return None
+    row = _state_db().execute(
+        "SELECT binding_id, conversation_id FROM conversation_binding "
+        "WHERE provider=? AND project_key=? AND native_session_id=? LIMIT 1",
+        (provider, project_key, native_id),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _conv_ensure_for_native(
+    provider: str, project_key: str, native_id: str,
+    owner_sub: Optional[str], title: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Idempotently ensure a conversation + active binding for an already
+    established native session. Returns (conversation_id, binding_id) or None.
+    Keyed on the binding's native id, so repeated calls (sidebar list, reopen)
+    resolve to the same conversation. Used to lazily wrap sessions predating
+    these tables — their history can't be reconstructed at full fidelity, so the
+    conversation is marked legacy_partial."""
+    try:
+        existing = _binding_ids_for_native(provider, project_key, native_id)
+        if existing is not None:
+            return (existing[1], existing[0])
+        now = time.time()
+        cid = "conv_" + uuid_mod.uuid4().hex
+        bid = "bind_" + uuid_mod.uuid4().hex
+        db = _state_db()
+        db.execute(
+            "INSERT INTO conversation(conversation_id, owner_sub, project_key, "
+            "title, last_seq, capture_state, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, 0, 'legacy_partial', ?, ?)",
+            (cid, owner_sub, project_key, title, now, now),
+        )
+        db.execute(
+            "INSERT INTO conversation_binding(binding_id, conversation_id, "
+            "provider, native_session_id, project_key, status, "
+            "synced_through_seq, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, 'active', 0, ?, ?)",
+            (bid, cid, provider, native_id, project_key, now, now),
+        )
+        return (cid, bid)
+    except sqlite3.IntegrityError:
+        # Lost a race to create the same native binding — read the winner back.
+        existing = _binding_ids_for_native(provider, project_key, native_id)
+        return (existing[1], existing[0]) if existing else None
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "conv_ensure_for_native failed native=%s: %s", native_id, e)
+        return None
+
+
+def _conv_create_with_binding(
+    provider: str, project_key: str, owner_sub: Optional[str],
+    title: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Create a conversation + provisional binding for a run whose native id
+    isn't known yet (a brand-new chat). The binding is activated later, once the
+    provider reports its session/thread id, via _conv_activate_binding. Returns
+    (conversation_id, binding_id) or None on error."""
+    try:
+        now = time.time()
+        cid = "conv_" + uuid_mod.uuid4().hex
+        bid = "bind_" + uuid_mod.uuid4().hex
+        db = _state_db()
+        db.execute(
+            "INSERT INTO conversation(conversation_id, owner_sub, project_key, "
+            "title, last_seq, capture_state, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, 0, 'live_complete', ?, ?)",
+            (cid, owner_sub, project_key, title, now, now),
+        )
+        db.execute(
+            "INSERT INTO conversation_binding(binding_id, conversation_id, "
+            "provider, native_session_id, project_key, status, "
+            "synced_through_seq, created_at, updated_at) "
+            "VALUES(?, ?, ?, NULL, ?, 'provisional', 0, ?, ?)",
+            (bid, cid, provider, project_key, now, now),
+        )
+        return (cid, bid)
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "conv_create_with_binding failed: %s", e)
+        return None
+
+
+def _conv_activate_binding(
+    binding_id: str, native_id: str, provider_version: Optional[str] = None,
+) -> None:
+    """Attach the native session/thread id to a provisional binding and mark it
+    active, once the provider reports it. Idempotent; if another binding already
+    owns this native id (a lazy wrap won the race) the UNIQUE index rejects the
+    update and we leave the provisional row for later cleanup."""
+    if not binding_id or not native_id:
+        return
+    try:
+        _state_db().execute(
+            "UPDATE conversation_binding SET native_session_id=?, "
+            "status='active', provider_version=COALESCE(?, provider_version), "
+            "updated_at=? WHERE binding_id=? AND status IN ('provisional','active')",
+            (native_id, provider_version, time.time(), binding_id),
+        )
+    except sqlite3.IntegrityError:
+        logging.getLogger("claude-web").info(
+            "activate_binding: native=%s already bound elsewhere", native_id)
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "activate_binding failed binding=%s: %s", binding_id, e)
+
+
+def _conv_mark_incomplete(conversation_id: str, reason: str) -> None:
+    if not conversation_id:
+        return
+    try:
+        _state_db().execute(
+            "UPDATE conversation SET capture_state='incomplete', updated_at=? "
+            "WHERE conversation_id=? AND capture_state!='incomplete'",
+            (time.time(), conversation_id),
+        )
+        logging.getLogger("claude-web").warning(
+            "conversation %s marked incomplete: %s", conversation_id, reason)
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("mark_incomplete failed: %s", e)
+
+
+def _conv_append_event(
+    conversation_id: str, source_key: str, provider: str, event_type: str,
+    normalized: dict, *, raw: Optional[Any] = None,
+    binding_id: Optional[str] = None, run_id: Optional[str] = None,
+    run_event_idx: Optional[int] = None, native_turn_id: Optional[str] = None,
+    visibility: str = "transcript", replayable: bool = False,
+) -> Optional[int]:
+    """Append one canonical event and return its seq (or None on error/dedup).
+
+    seq is allocated atomically inside the INSERT via a COALESCE(MAX(seq))+1
+    subquery — SQLite serializes writers under the WAL write lock, so a
+    switch/reconnect race can't hand two runs the same seq. Deduplicated on
+    (conversation_id, source_key): a repeated provider notification (e.g. a
+    duplicate codex item/completed) is a no-op that returns the existing seq.
+    raw is the UNTRUNCATED provider payload (captured at ingress); it's stored
+    up to CANONICAL_PAYLOAD_CAP with a sha256 + original-size record.
+
+    Best-effort: any failure logs, marks the conversation incomplete, and
+    returns None WITHOUT raising."""
+    if not conversation_id:
+        return None
+    try:
+        norm_json = json.dumps(normalized, default=str)
+    except (TypeError, ValueError):
+        norm_json = json.dumps({"_type": event_type, "_unserializable": True})
+    raw_json: Optional[str] = None
+    original_bytes = stored_bytes = truncated = 0
+    sha = ""
+    if raw is not None:
+        try:
+            raw_full = raw if isinstance(raw, str) else json.dumps(raw, default=str)
+        except (TypeError, ValueError):
+            raw_full = str(raw)
+        rb = raw_full.encode("utf-8", "replace")
+        original_bytes = len(rb)
+        sha = hashlib.sha256(rb).hexdigest()
+        if original_bytes > CANONICAL_PAYLOAD_CAP:
+            raw_json = rb[:CANONICAL_PAYLOAD_CAP].decode("utf-8", "ignore")
+            truncated = 1
+        else:
+            raw_json = raw_full
+        stored_bytes = len(raw_json.encode("utf-8", "replace"))
+    now = time.time()
+    try:
+        db = _state_db()
+        cur = db.execute(
+            "INSERT OR IGNORE INTO conversation_event("
+            "conversation_id, seq, source_key, provider, binding_id, run_id, "
+            "run_event_idx, native_turn_id, event_type, visibility, replayable, "
+            "normalized_json, raw_json, original_bytes, stored_bytes, "
+            "payload_sha256, truncated, schema_version, created_at) VALUES(?, "
+            "(SELECT COALESCE(MAX(seq),0)+1 FROM conversation_event "
+            "WHERE conversation_id=?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, 1, ?)",
+            (conversation_id, conversation_id, source_key, provider, binding_id,
+             run_id, run_event_idx, native_turn_id, event_type, visibility,
+             1 if replayable else 0, norm_json, raw_json, original_bytes,
+             stored_bytes, sha, truncated, now),
+        )
+        if cur.rowcount == 0:
+            row = db.execute(
+                "SELECT seq FROM conversation_event "
+                "WHERE conversation_id=? AND source_key=?",
+                (conversation_id, source_key),
+            ).fetchone()
+            return int(row[0]) if row else None
+        db.execute(
+            "UPDATE conversation SET last_seq=(SELECT MAX(seq) FROM "
+            "conversation_event WHERE conversation_id=?), updated_at=? "
+            "WHERE conversation_id=?",
+            (conversation_id, now, conversation_id),
+        )
+        row = db.execute(
+            "SELECT seq FROM conversation_event "
+            "WHERE conversation_id=? AND source_key=?",
+            (conversation_id, source_key),
+        ).fetchone()
+        return int(row[0]) if row else None
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "conv_append_event failed conv=%s key=%s: %s",
+            conversation_id, source_key, e)
+        _conv_mark_incomplete(conversation_id, f"append failed: {e}")
+        return None
+
+
+def _conversation_binding_by_native(
+    provider: str, native_id: str,
+) -> Optional[tuple[str, str, str]]:
+    """(conversation_id, binding_id, project_key) for a native session id, or
+    None. Native ids are globally unique, so this resolves the source of a
+    provider switch without needing the project_key up front."""
+    if not native_id:
+        return None
+    row = _state_db().execute(
+        "SELECT conversation_id, binding_id, project_key FROM conversation_binding "
+        "WHERE provider=? AND native_session_id=? ORDER BY updated_at DESC LIMIT 1",
+        (provider, native_id),
+    ).fetchone()
+    return (row[0], row[1], row[2]) if row else None
+
+
+def _conversation_meta(conversation_id: str) -> Optional[tuple[Optional[str], str]]:
+    """(owner_sub, capture_state) for a conversation, or None."""
+    row = _state_db().execute(
+        "SELECT owner_sub, capture_state FROM conversation WHERE conversation_id=?",
+        (conversation_id,),
+    ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def _native_binding_superseded(provider: str, native_id: str) -> bool:
+    """True if the newest binding for this native session id is superseded —
+    i.e. the conversation continued on another provider. Used to guard
+    workspace-mutating ops (rewind) that would discard the other provider's work."""
+    if not native_id:
+        return False
+    row = _state_db().execute(
+        "SELECT status FROM conversation_binding WHERE provider=? "
+        "AND native_session_id=? ORDER BY updated_at DESC LIMIT 1",
+        (provider, native_id),
+    ).fetchone()
+    return bool(row) and row[0] == "superseded"
+
+
+def _conv_supersede_binding(conversation_id: str, provider: str) -> None:
+    """Retire the live binding for a provider in a conversation (kept as an
+    alias row). Called before a switch mints a fresh target binding."""
+    try:
+        _state_db().execute(
+            "UPDATE conversation_binding SET status='superseded', updated_at=? "
+            "WHERE conversation_id=? AND provider=? "
+            "AND status IN ('provisional','active')",
+            (time.time(), conversation_id, provider),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("supersede_binding failed: %s", e)
+
+
+def _conv_new_binding(
+    conversation_id: str, provider: str, project_key: str,
+) -> Optional[str]:
+    """Create a fresh provisional binding inside an EXISTING conversation (the
+    switch case — the conversation already exists, we're adding the target
+    provider to it). Returns binding_id or None."""
+    try:
+        now = time.time()
+        bid = "bind_" + uuid_mod.uuid4().hex
+        _state_db().execute(
+            "INSERT INTO conversation_binding(binding_id, conversation_id, "
+            "provider, native_session_id, project_key, status, "
+            "synced_through_seq, created_at, updated_at) "
+            "VALUES(?, ?, ?, NULL, ?, 'provisional', 0, ?, ?)",
+            (bid, conversation_id, provider, project_key, now, now),
+        )
+        return bid
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning("conv_new_binding failed: %s", e)
+        return None
+
+
+def _write_forged_session(cwd: Path, session_id: str, lines: list[str]) -> bool:
+    """Write a forged transcript (JSONL lines) into the CLI's session dir so
+    `resume=<session_id>` loads it as prior history. Returns success."""
+    try:
+        d = _sessions_dir(cwd)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{session_id}.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+        return True
+    except OSError as e:
+        logging.getLogger("claude-web").warning(
+            "write_forged_session failed sid=%s: %s", session_id, e)
+        return False
+
+
+def _wire_provider_switch(
+    run: "ActiveRun", switch_source: tuple[str, str], target_provider: str,
+    cwd: Path, *, model_key: Optional[str] = None, claude_forge_ok: bool = True,
+) -> tuple[str, Optional[str]]:
+    """Seed a cross-provider switch. Returns a typed outcome:
+
+      ("claude", new_sid) — forged Claude transcript written; resume new_sid.
+      ("claude_text", None) — Claude target, but forged-resume isn't verified on
+                            this CLI version: handoff rides the first message to
+                            a fresh session (run.switch_handoff), sid_in stays None.
+      ("codex", None)     — handoff stashed on run.switch_handoff for the driver.
+      ("reject", reason)  — the caller must abort the switch (HTTP 409).
+
+    Order matters: every precondition is checked and the destination is fully
+    prepared BEFORE any state mutation (binding supersede/create,
+    run.conversation_id) or the provider_switched announcement — so a failed
+    forge or a rejected precondition can't leave a retired source binding and a
+    context-free target claiming a successful handoff."""
+    source_provider, source_native = switch_source
+    src = _conversation_binding_by_native(source_provider, source_native)
+    if src is None:
+        return ("reject", "source conversation was never captured")
+    source_conv_id, _src_bid, src_project = src
+    meta = _conversation_meta(source_conv_id)
+    owner_sub = meta[0] if meta else None
+    capture_state = meta[1] if meta else "incomplete"
+    # Authorize: carrying a conversation across providers exposes its whole
+    # transcript to the target, so in per-user mode only the owner may.
+    if PER_USER_SESSIONS and owner_sub and owner_sub != run.owner_sub:
+        return ("reject", "not your conversation")
+    # Fail closed on partial capture — never announce carryover we can't back.
+    if capture_state != "live_complete":
+        return ("reject",
+                f"conversation history is {capture_state}; can't carry it over")
+    # Same project only — never seed a target in a different workspace.
+    if src_project and src_project != run.project_key:
+        return ("reject", "source conversation belongs to a different project")
+    events = _load_conversation_events(source_conv_id)
+    handoff, omitted = conversation_replay.render_handoff_text(events, source_provider)
+    # Prepare destination BEFORE mutating any state. Forge an on-disk transcript
+    # only when this CLI version is verified to ingest one; otherwise fall back
+    # to injecting the handoff as the first real message to a fresh session
+    # (the same shape Codex uses), so a version bump can never silently drop the
+    # carried context.
+    use_forge = target_provider == "claude" and claude_forge_ok
+    new_sid: Optional[str] = None
+    if use_forge:
+        new_sid = str(uuid_mod.uuid4())
+        lines = conversation_replay.build_claude_resume_jsonl(
+            handoff, new_sid, str(cwd), version=_claude_cli_version(),
+            model=(model_key or "claude-opus-4-8"))
+        if not _write_forged_session(cwd, new_sid, lines):
+            return ("reject", "could not prepare the Claude session")
+    # Commit: join the conversation, mint the target binding, announce last.
+    run.conversation_id = source_conv_id
+    _conv_supersede_binding(source_conv_id, target_provider)
+    nb = _conv_new_binding(source_conv_id, target_provider, run.project_key)
+    if nb:
+        run.binding_id = nb
+    if not use_forge:
+        run.switch_handoff = handoff
+    run.emit({
+        "type": "provider_switched",
+        "from": source_provider,
+        "to": target_provider,
+        "carried_turns": len(events),
+        "omitted": omitted,
+        "notice": PROVIDER_SWITCH_NOTICE.format(
+            to=_PROVIDER_LABELS.get(target_provider, target_provider)),
+    })
+    if use_forge:
+        return ("claude", new_sid)
+    return ("codex", None) if target_provider == "codex" else ("claude_text", None)
+
+
+# Bump when build_claude_resume_jsonl's envelope changes, to invalidate the
+# cached forge-capability probe below.
+CLAUDE_FORGE_ADAPTER_VERSION = 1
+_CLAUDE_CLI_VERSION: Optional[str] = None
+_FORGE_PROBE_CACHE: dict[str, bool] = {}
+
+
+def _claude_cli_version() -> str:
+    """Installed `claude` CLI semver (cached), or 'unknown'. Used to stamp
+    forged transcripts with the RUNNING version (the on-disk format is internal
+    and drifts between releases) and to key the forge-capability probe."""
+    global _CLAUDE_CLI_VERSION
+    if _CLAUDE_CLI_VERSION is None:
+        _CLAUDE_CLI_VERSION = "unknown"
+        binary = shutil.which("claude")
+        if binary:
+            try:
+                out = subprocess.run(
+                    [binary, "--version"], capture_output=True, text=True, timeout=10)
+                m = re.search(r"\d+\.\d+\.\d+", out.stdout or "")
+                if m:
+                    _CLAUDE_CLI_VERSION = m.group(0)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return _CLAUDE_CLI_VERSION
+
+
+def _run_forge_probe() -> bool:
+    """Blocking: does THIS claude CLI ingest a fabricated resume transcript?
+    Forges a nonce exchange, resumes it in print mode on a throwaway cwd, and
+    checks the nonce comes back. A switch into Claude only uses the forged-resume
+    path when this passes; otherwise it injects the handoff as the first message.
+    Any error → False (fall back), never raises."""
+    binary = shutil.which("claude")
+    if not binary:
+        return False
+    nonce = "PROBE-" + uuid_mod.uuid4().hex[:10]
+    sid = str(uuid_mod.uuid4())
+    cwd = Path(tempfile.mkdtemp(prefix="cw-forgeprobe-"))
+    try:
+        lines = conversation_replay.build_claude_resume_jsonl(
+            f"USER: Remember this token exactly: {nonce}\nASSISTANT: Noted — {nonce}.",
+            sid, str(cwd), version=_claude_cli_version())
+        if not _write_forged_session(cwd, sid, lines):
+            return False
+        out = subprocess.run(
+            [binary, "-p", "Reply with ONLY the token I told you to remember.",
+             "--resume", sid, "--model", "claude-haiku-4-5-20251001"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=120)
+        return nonce in (out.stdout or "")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        # Remove the temp cwd AND the CLI's per-cwd session dir — resume writes
+        # extra session files there beyond the forged one.
+        shutil.rmtree(cwd, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            shutil.rmtree(_sessions_dir(cwd))
+
+
+async def _claude_forge_capable() -> bool:
+    """Cached (per process, keyed by CLI + adapter version) forge-capability.
+    Runs _run_forge_probe in a worker thread so the event loop isn't blocked —
+    one probe per version, paid on the first switch into Claude."""
+    key = f"{_claude_cli_version()}:{CLAUDE_FORGE_ADAPTER_VERSION}"
+    cached = _FORGE_PROBE_CACHE.get(key)
+    if cached is None:
+        try:
+            cached = await asyncio.to_thread(_run_forge_probe)
+        except Exception as e:  # noqa: BLE001 — probe must never break a switch
+            logging.getLogger("claude-web").warning("forge probe errored: %s", e)
+            cached = False
+        _FORGE_PROBE_CACHE[key] = cached
+        logging.getLogger("claude-web").info(
+            "claude forged-resume probe %s: %s", key,
+            "supported" if cached else "unsupported — will inject handoff instead")
+    return cached
+
+
+def _load_conversation_events(
+    conversation_id: str, *, transcript_only: bool = True,
+) -> list[dict]:
+    """Ordered canonical events for a conversation, shaped for
+    conversation_replay: each dict carries seq, provider, event_type, parsed
+    normalized, and the raw (untruncated) payload string. transcript_only drops
+    control/internal rows. Empty on error — a projection over nothing degrades
+    to an empty (still-framed) handoff rather than raising."""
+    if not conversation_id:
+        return []
+    try:
+        query = (
+            "SELECT seq, provider, event_type, normalized_json, raw_json "
+            "FROM conversation_event WHERE conversation_id=? "
+        )
+        if transcript_only:
+            query += "AND visibility='transcript' "
+        query += "ORDER BY seq"
+        rows = _state_db().execute(query, (conversation_id,)).fetchall()
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "load_conversation_events failed conv=%s: %s", conversation_id, e)
+        return []
+    out: list[dict] = []
+    for seq, provider, etype, norm_json, raw_json in rows:
+        try:
+            normalized = json.loads(norm_json) if norm_json else {}
+        except (ValueError, TypeError):
+            normalized = {}
+        out.append({
+            "seq": seq, "provider": provider, "event_type": etype,
+            "normalized": normalized, "raw": raw_json,
+        })
+    return out
+
+
+def _capture_canonical(
+    run: "ActiveRun", provider: str, source_key: str, event_type: str,
+    normalized: dict, *, raw: Optional[Any] = None, replayable: bool = False,
+    visibility: str = "transcript", native_turn_id: Optional[str] = None,
+) -> None:
+    """Thin wrapper over _conv_append_event for the live capture sites: no-op
+    unless the run carries a conversation; tags the row with the run's
+    binding/run ids. source_key MUST key on a stable native id (tool_use_id,
+    message uuid, codex item id) — never the run id — so a resume that re-echoes
+    an event dedups instead of double-writing into the canonical log."""
+    cid = getattr(run, "conversation_id", None)
+    if not cid:
+        return
+    _conv_append_event(
+        cid, source_key, provider, event_type, normalized, raw=raw,
+        binding_id=run.binding_id, run_id=run.run_id,
+        native_turn_id=native_turn_id, visibility=visibility,
+        replayable=replayable,
+    )
+
+
 def _persist_run_meta(run: "ActiveRun") -> None:
-    """Upsert the runs row. COALESCE preserves session_id/project_key once set
-    so a later emit() that doesn't carry them can't blank them out."""
+    """Upsert the runs row. COALESCE preserves session_id/project_key/provider/
+    conversation linkage once set so a later emit() that doesn't carry them
+    can't blank them out."""
     try:
         _state_db().execute(
             """
             INSERT INTO runs(run_id, owner_sub, session_id, project_key,
-                             created_at, finished_at, last_activity)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+                             created_at, finished_at, last_activity,
+                             provider, conversation_id, binding_id)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 session_id=COALESCE(excluded.session_id, runs.session_id),
                 project_key=COALESCE(excluded.project_key, runs.project_key),
                 finished_at=excluded.finished_at,
-                last_activity=excluded.last_activity
+                last_activity=excluded.last_activity,
+                provider=COALESCE(excluded.provider, runs.provider),
+                conversation_id=COALESCE(excluded.conversation_id, runs.conversation_id),
+                binding_id=COALESCE(excluded.binding_id, runs.binding_id)
             """,
             (
                 run.run_id, run.owner_sub, run.session_id, run.project_key,
                 run.created_at, run.finished_at, run.last_activity,
+                run.provider, run.conversation_id, run.binding_id,
             ),
         )
     except sqlite3.Error as e:
@@ -5266,7 +5924,8 @@ def _restore_persisted_runs() -> None:
     try:
         rows = _state_db().execute(
             "SELECT run_id, owner_sub, session_id, project_key, created_at,"
-            " finished_at, last_activity FROM runs ORDER BY created_at"
+            " finished_at, last_activity, provider, conversation_id, binding_id"
+            " FROM runs ORDER BY created_at"
         ).fetchall()
     except sqlite3.Error as e:
         logging.getLogger("claude-web").warning("restore_persisted_runs read failed: %s", e)
@@ -5275,12 +5934,16 @@ def _restore_persisted_runs() -> None:
     log = logging.getLogger("claude-web")
     restored = 0
     interrupted = 0
-    for run_id, owner_sub, session_id, project_key, created_at, finished_at, last_activity in rows:
+    for (run_id, owner_sub, session_id, project_key, created_at, finished_at,
+         last_activity, provider, conversation_id, binding_id) in rows:
         run = ActiveRun(run_id, owner_sub=owner_sub)
         run.created_at = created_at or now
         run.last_activity = last_activity or now
         run.session_id = session_id
         run.project_key = project_key
+        run.provider = provider or "claude"
+        run.conversation_id = conversation_id
+        run.binding_id = binding_id
         try:
             evt_rows = _state_db().execute(
                 "SELECT payload FROM events WHERE run_id = ? ORDER BY idx", (run_id,),
@@ -5390,6 +6053,33 @@ ENABLE_IN_PROCESS_MCP = os.getenv("CLAUDE_WEB_ENABLE_IN_PROCESS_MCP", "false").l
     "1", "true", "yes",
 )
 
+# The CLI's server-side --advisor beta disables itself for any conversation
+# whose history contains tool_use/tool_result blocks — i.e. every real Claude
+# Code session, from its first tool call — and latches "temporarily disabled"
+# for the rest of the conversation. Verified 2026-07-22: plain-text consults
+# (to 900KB) and thinking-only histories succeed; a single tool_use block trips
+# it. Fable itself stays servable throughout. When this flag is on, the advisor
+# combos skip --advisor and expose an in-process `advisor` tool that renders the
+# live transcript to plain text (no tool_use blocks) and consults Fable
+# directly — the exact request shape the beta accepts.
+INPROCESS_ADVISOR = os.getenv("CLAUDE_WEB_INPROCESS_ADVISOR", "false").lower() in (
+    "1", "true", "yes",
+)
+# Flattened transcript is capped well under the plain-text ceiling the direct
+# Fable call tolerates (900KB verified good); older turns past the cap are
+# dropped and the elision is flagged so the reviewer knows it lacks the head.
+_ADVISOR_TRANSCRIPT_CHAR_CAP = 600_000
+_ADVISOR_TIMEOUT_S = 240
+_ADVISOR_SYSTEM_PROMPT = (
+    "You are a senior engineering reviewer consulted mid-task by another AI "
+    "coding agent. You are shown the transcript of that agent's session with "
+    "its user so far; tool calls and their results are summarised as plain "
+    "text. Give direct, high-signal feedback to the agent: challenge wrong "
+    "assumptions, flag risky or incomplete approaches, name missed steps, and "
+    "recommend the next concrete move. Be concise and specific. Address the "
+    "agent, not the user, and respond in prose — do not restate the transcript."
+)
+
 
 def _list_cli_mcp_servers(timeout_seconds: float = 15.0) -> dict[str, Any]:
     """Shell out to ``claude mcp list`` and parse the human-readable output.
@@ -5480,13 +6170,141 @@ def _register_in_process_mcp_servers() -> None:
     _IN_PROCESS_MCP_SERVERS = {"claude_web": server}
 
 
-def _in_process_mcp_servers_for_run() -> dict[str, Any]:
-    """Return the dict of in-process MCP servers to merge into options.
+def _flatten_transcript_for_advisor(msgs: list[dict]) -> str:
+    """Render session_transcript() output as plain prose for the Fable consult.
 
-    Idempotent: registration happens on the first call. Returns an empty
-    dict when the feature is disabled so callers can spread-merge without
-    a None check.
+    Emits text only — no tool_use/tool_result content blocks — because those
+    blocks are exactly what makes the server-side advisor bail. Tool activity
+    survives as one-line summaries so the reviewer still sees what happened.
     """
+    lines: list[str] = []
+    for m in msgs:
+        role = m.get("role")
+        if role == "user":
+            txt = m.get("text", "")
+            imgs = m.get("image_count") or 0
+            if txt or imgs:
+                suffix = f" [+{imgs} image(s)]" if imgs else ""
+                lines.append(f"## User\n{txt}{suffix}")
+        elif role == "assistant":
+            txt = m.get("text", "")
+            if txt:
+                lines.append(f"## Agent\n{txt}")
+        elif role == "tool_use":
+            lines.append(f"[agent ran {m.get('name', '?')}: {m.get('summary', '')}]")
+        elif role == "tool_result":
+            tag = "error" if m.get("is_error") else "result"
+            lines.append(f"[tool {tag}: {m.get('text', '')}]")
+    body = "\n\n".join(lines)
+    if len(body) > _ADVISOR_TRANSCRIPT_CHAR_CAP:
+        # Keep the tail — the recent turns are what needs reviewing — and flag
+        # the cut so the reviewer knows it isn't seeing the start.
+        body = (
+            "[earlier conversation elided to fit the reviewer's context]\n\n"
+            + body[-_ADVISOR_TRANSCRIPT_CHAR_CAP:]
+        )
+    return body
+
+
+def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor_model: str):
+    """Per-run in-process MCP server exposing an `advisor` tool bound to this run.
+
+    Closes over the run so the tool can read the run's own live transcript and
+    reuse its credential slot: SDK tool handlers are dispatched with the call
+    arguments only, so the run context can't arrive any other way. Returns None
+    if the SDK is too old to build an in-process server.
+    """
+    try:
+        from claude_agent_sdk import create_sdk_mcp_server, tool, query as _sdk_query
+    except ImportError as e:
+        log.warning("in-process advisor unavailable (SDK too old?): %s", e)
+        return None
+
+    @tool(
+        "advisor",
+        "Consult a stronger reviewer that sees this whole conversation. Your "
+        "full transcript is forwarded automatically — no required arguments. "
+        "Use it before committing to an approach, when stuck, or before "
+        "declaring a task done. Optionally pass `focus` to steer the review.",
+        {"focus": str},
+    )
+    async def advisor(args: dict) -> dict:
+        focus = (args or {}).get("focus") or ""
+        try:
+            msgs = session_transcript(run.session_id or "", run.project_key or "")
+        except Exception as e:  # transcript read is best-effort
+            log.warning("advisor transcript read failed run=%s: %s", run.run_id, e)
+            msgs = []
+        transcript = _flatten_transcript_for_advisor(msgs)
+        parts = [
+            "Transcript of the session so far:\n\n" + transcript
+            if transcript
+            else "(The session transcript is not available yet.)"
+        ]
+        if focus:
+            parts.append(f"The agent asks you to focus on: {focus}")
+        parts.append("Give your review now.")
+        prompt = "\n\n---\n\n".join(parts)
+
+        # A bare reviewer: no skills, no project settings, no MCP/advisor of its
+        # own (no recursion), and plan mode so it can never execute a tool
+        # against the user's real home/credentials — it only returns prose.
+        fable_opts = ClaudeAgentOptions(
+            model=advisor_model,
+            cwd=str(cwd) if cwd else None,
+            system_prompt=_ADVISOR_SYSTEM_PROMPT,
+            setting_sources=[],
+            mcp_servers={},
+            permission_mode="plan",
+            env=account.get("env") or {},
+            cli_path=shutil.which("claude"),
+        )
+        chunks: list[str] = []
+
+        async def _consult() -> None:
+            async for msg in _sdk_query(prompt=prompt, options=fable_opts):
+                if isinstance(msg, AssistantMessage):
+                    for blk in msg.content:
+                        if isinstance(blk, TextBlock):
+                            chunks.append(blk.text)
+
+        try:
+            await asyncio.wait_for(_consult(), timeout=_ADVISOR_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return {"content": [{"type": "text",
+                "text": "The advisor timed out. Proceed on your own judgment."}]}
+        except Exception as e:
+            log.warning("advisor consult failed run=%s: %s", run.run_id, e)
+            return {"content": [{"type": "text",
+                "text": f"The advisor is unavailable right now ({type(e).__name__}). "
+                        "Proceed on your own judgment."}]}
+        text = "".join(chunks).strip() or "The advisor returned no response."
+        return {"content": [{"type": "text", "text": text}]}
+
+    return create_sdk_mcp_server(name="claude_web", version="1.0.0", tools=[advisor])
+
+
+def _in_process_mcp_servers_for_run(
+    run: "Optional[ActiveRun]" = None,
+    selected_model: Optional[dict] = None,
+    account: Optional[dict] = None,
+    cwd: Any = None,
+) -> dict[str, Any]:
+    """Return the dict of in-process MCP servers to merge into a run's options.
+
+    For advisor-combo runs with INPROCESS_ADVISOR on, returns a per-run
+    ``claude_web`` server carrying the transcript-forwarding ``advisor`` tool
+    (the caller also skips the ``--advisor`` CLI flag so the two don't collide).
+    Otherwise falls back to the opt-in ping-only stub. Callable with no args
+    (the /api/mcp status page) — then it only ever yields the stub.
+    """
+    if (INPROCESS_ADVISOR and run is not None and selected_model
+            and selected_model.get("advisor_model")):
+        server = _build_advisor_mcp_server(
+            run, account or {}, cwd, selected_model["advisor_model"],
+        )
+        if server is not None:
+            return {"claude_web": server}
     if not ENABLE_IN_PROCESS_MCP:
         return {}
     if not _IN_PROCESS_MCP_SERVERS:
@@ -5864,6 +6682,16 @@ class ActiveRun:
         # the life of the conversation; api_chat dispatches on it and the
         # control endpoints branch where Codex semantics differ.
         self.provider: str = "claude"
+        # Canonical conversation linkage (mid-chat provider switching, Slice 0).
+        # Set once in api_chat before the driver spawns; the binding is
+        # provisional until the provider reports its native id, then activated.
+        # None on runs created before the conversation layer wraps them.
+        self.conversation_id: Optional[str] = None
+        self.binding_id: Optional[str] = None
+        # Set on a cross-provider switch with a Codex target: the bounded
+        # handoff the driver injects as the first message. Claude targets get
+        # their handoff via a forged resume transcript instead.
+        self.switch_handoff: Optional[str] = None
         # Codex-only state. thread_id doubles as the session id; turn_id is
         # the in-flight turn (turn/interrupt needs both). effort/model are
         # the values the next turn/start will send (per-turn on Codex, so a
@@ -5900,6 +6728,10 @@ class ActiveRun:
                 if old and ACTIVE_RUNS_BY_SESSION.get(old) is self:
                     ACTIVE_RUNS_BY_SESSION.pop(old, None)
                 ACTIVE_RUNS_BY_SESSION[sid] = self
+                # Activate the provisional canonical binding now that the SDK
+                # has reported the native session id (Slice 0).
+                if self.binding_id:
+                    _conv_activate_binding(self.binding_id, sid)
                 meta_changed = True
                 # First-write-wins claim so PER_USER_SESSIONS mode knows who
                 # owns this transcript. Idempotent; no-op when disabled.
@@ -6735,6 +7567,15 @@ async def _confirm_and_emit_user_prompt(
         "file_count": file_count,
         "queue_id": queue_id,
     })
+    # Canonical capture (Slice 0): the user turn, captured at delivery rather
+    # than from a CLI echo so it's provider-agnostic. Keyed on queue_id (unique
+    # per submission) → idempotent.
+    if queue_id:
+        _capture_canonical(
+            run, run.provider, f"userprompt:queued:{queue_id}", "user_prompt",
+            {"role": "user", "text": text, "image_count": image_count,
+             "file_count": file_count}, raw=text, replayable=True,
+        )
 
 
 async def _inject_user_input(
@@ -8113,6 +8954,49 @@ async def _supersede_run_for_switch(run: ActiveRun, reason: str) -> None:
             await task
 
 
+async def _stop_source_run_for_switch(
+    conversation_id: str, source_native: str, user: dict,
+) -> None:
+    """Barrier run before a provider switch starts the target: stop EVERY live
+    run on the source conversation at a clean boundary — the source-native run
+    plus any target run a racing switch already started — so the conversation
+    has exactly one live run (the new target) afterward and two providers never
+    drive one workspace.
+
+    Rejects (409) if any is mid-turn, has queued input, or has a pending
+    permission/question card — the user must let it settle first. Authorizes
+    each against its owner. No-op when nothing is live (an old conversation
+    being reopened + switched). Caller holds the conversation lock, so this is
+    atomic against a second concurrent switch of the same chat."""
+    live: list[ActiveRun] = []
+    seen: set[str] = set()
+    first = _existing_run_for_session(source_native)
+    if first is not None and not first.done:
+        live.append(first)
+        seen.add(first.run_id)
+    for run in list(ACTIVE_RUNS.values()):
+        if (run.run_id not in seen
+                and getattr(run, "conversation_id", None) == conversation_id
+                and _run_is_live(run)):
+            live.append(run)
+            seen.add(run.run_id)
+    # Authorize + reject-if-busy across ALL before stopping any, so a partial
+    # stop can't leave the conversation half-switched.
+    for run in live:
+        _require_owner(run, user)
+        if (not run.between_turns
+                or not run.user_input_queue.empty()
+                or run._deferred_user_item is not None
+                or any(e.get("run_id") == run.run_id for e in PENDING.values())):
+            raise HTTPException(
+                409,
+                "the current turn is still active on this conversation — let it "
+                "finish (or stop it) before switching provider",
+            )
+    for run in live:
+        await _supersede_run_for_switch(run, "provider switch")
+
+
 def _resolve_pending_permissions(run: ActiveRun, reason: str) -> int:
     """Resolve every pending permission/question/plan prompt for ``run`` with
     a deny, so its awaiting ``can_use_tool`` coroutine returns instead of
@@ -8917,6 +9801,19 @@ async def _codex_driver(
                         preview_cap=TOOL_RESULT_PREVIEW * 4,
                     ):
                         run.emit(ev)
+                    # Canonical capture (Slice 0): the raw, untruncated codex
+                    # item on completion, keyed on item id (dedups duplicate
+                    # item/completed notifications). item_events above truncates
+                    # for the UI; this keeps full fidelity for a later switch.
+                    if completed and isinstance(item.get("id"), str):
+                        _itype = item.get("type") or "item"
+                        _capture_canonical(
+                            run, "codex", f"codex:item:{item['id']}", _itype,
+                            {"type": _itype, "id": item["id"]}, raw=item,
+                            replayable=_itype in (
+                                "agentMessage", "commandExecution", "fileChange"),
+                            native_turn_id=run.codex_turn_id,
+                        )
                 elif method == "turn/plan/updated":
                     run.emit({
                         "type": "todos_update",
@@ -9067,12 +9964,29 @@ async def api_chat(
     if provider and provider not in VALID_PROVIDERS:
         raise HTTPException(400, "unknown provider")
     _codex_sess = _codex_session_row(session_id) if session_id else None
+    # A provider that differs from the session's is normally a client bug and
+    # rejected. With PROVIDER_SWITCH_ENABLED it instead means "switch this
+    # conversation to the other provider": we remember the source, then clear
+    # session_id so the target gets a FRESH native session seeded with a
+    # handoff (forged transcript for Claude / injected first message for Codex)
+    # rather than resume-and-forking the wrong backend's transcript.
+    switch_source: Optional[tuple[str, str]] = None
     if not provider:
         provider = "codex" if _codex_sess else "claude"
     elif provider == "codex" and session_id and _codex_sess is None:
-        raise HTTPException(400, "unknown codex session")
+        if PROVIDER_SWITCH_ENABLED and _conversation_binding_by_native(
+                "claude", session_id):
+            switch_source = ("claude", session_id)
+            session_id = ""
+        else:
+            raise HTTPException(400, "unknown codex session")
     elif provider == "claude" and _codex_sess is not None:
-        raise HTTPException(400, "session belongs to the codex provider")
+        if PROVIDER_SWITCH_ENABLED:
+            switch_source = ("codex", session_id)
+            session_id = ""
+            _codex_sess = None
+        else:
+            raise HTTPException(400, "session belongs to the codex provider")
     account: Optional[dict] = None
     codex_models: dict[str, dict] = {}
     if provider == "codex":
@@ -9172,6 +10086,24 @@ async def api_chat(
     # ensures two near-simultaneous POSTs with the same session_id can't both
     # miss _existing_run_for_session and spawn duplicate runs (only relevant
     # for resumed sessions; a fresh session_id="" is unique per request).
+    # On a provider switch, session_id was cleared at the gate, so serialize on
+    # the SOURCE conversation instead: this both stops the source run at a clean
+    # boundary before the target starts (no two providers on one workspace) and
+    # prevents two concurrent switches of the same chat. sess_lock is None on a
+    # switch (session_id empty), so there is never a two-lock ordering hazard.
+    switch_lock = None
+    if switch_source:
+        _src = _conversation_binding_by_native(switch_source[0], switch_source[1])
+        if _src is None:
+            raise HTTPException(
+                409, "can't switch provider: source conversation was never captured")
+        switch_lock = _session_lock("conv:" + _src[0])
+        await switch_lock.acquire()
+        try:
+            await _stop_source_run_for_switch(_src[0], switch_source[1], user)
+        except BaseException:
+            switch_lock.release()
+            raise
     sess_lock = _session_lock(session_id) if session_id else None
     if sess_lock:
         await sess_lock.acquire()
@@ -9360,6 +10292,38 @@ async def api_chat(
         run.permission_mode = _init_permission_mode
         run.model = model or None
         run.project_key = _sanitize_project_key(cwd)
+        # Canonical conversation linkage (Slice 0, shadow-only — nothing reads
+        # these tables yet). Resuming an already-wrapped native session reuses
+        # its conversation; a fork or a brand-new chat gets a fresh conversation
+        # whose provisional binding activates when the provider first reports
+        # its native id (Claude init event / codex thread record).
+        if switch_source:
+            # Cross-provider switch: join the source conversation and seed the
+            # destination. Claude targets forge a resume transcript only when
+            # this CLI version is probed to ingest one; otherwise (and for
+            # Codex) the handoff rides the first message. A rejected
+            # precondition aborts before any state was mutated.
+            _forge_ok = await _claude_forge_capable() if provider == "claude" else True
+            _sw_kind, _sw_val = _wire_provider_switch(
+                run, switch_source, provider, cwd, model_key=(model or None),
+                claude_forge_ok=_forge_ok)
+            if _sw_kind == "reject":
+                raise HTTPException(409, f"can't switch provider: {_sw_val}")
+            if _sw_kind == "claude":  # forged resume — target resumes new_sid
+                sid_in = _sw_val
+                session_id = _sw_val
+            # "claude_text" / "codex": fresh session, handoff rides the first
+            # message via run.switch_handoff; sid_in stays None.
+        elif sid_in and not fork:
+            _wrapped = _conv_ensure_for_native(
+                provider, run.project_key, sid_in, run.owner_sub)
+            if _wrapped:
+                run.conversation_id, run.binding_id = _wrapped
+        if run.conversation_id is None:
+            _created = _conv_create_with_binding(
+                provider, run.project_key, run.owner_sub)
+            if _created:
+                run.conversation_id, run.binding_id = _created
         # Multi-user ownership check before any upload work.
         if session_id and PER_USER_SESSIONS:
             owner = _session_owner(session_id)
@@ -9390,6 +10354,8 @@ async def api_chat(
     finally:
         if sess_lock:
             sess_lock.release()
+        if switch_lock:
+            switch_lock.release()
     effective_message = _file_attachment_prefix(file_metas) + message
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
@@ -9401,14 +10367,31 @@ async def api_chat(
         "image_count": len(image_blocks),
         "file_count": len(file_metas),
     })
+    # Canonical capture (Slice 0): the initial user turn of this run, captured
+    # at submission (provider-agnostic). Keyed on run_id (one per run) → idempotent.
+    _capture_canonical(
+        run, provider, f"userprompt:initial:{run_id}", "user_prompt",
+        {"role": "user", "text": message, "image_count": len(image_blocks),
+         "file_count": len(file_metas)}, raw=message, replayable=True,
+    )
 
     if provider == "codex":
         # The Codex driver owns everything from here (thread lifecycle,
         # event translation, approvals); the rest of this handler is the
         # Claude SDK path.
+        # On a switch into Codex, lead the first turn with the bounded handoff
+        # (already framed as an untrusted read-only record) then the user's
+        # actual message in a clearly separated block.
+        _codex_initial = effective_message
+        if run.switch_handoff:
+            _codex_initial = (
+                run.switch_handoff
+                + "\n\n---\n\nThe user's new message follows:\n\n"
+                + effective_message
+            )
         run.task = asyncio.create_task(_codex_driver(
             run,
-            initial_text=effective_message,
+            initial_text=_codex_initial,
             initial_images=image_blocks,
             resume_thread_id=sid_in,
             model_id=(selected_model.get("model") or model or ""),
@@ -9428,6 +10411,12 @@ async def api_chat(
         # answerable from the journal without grepping the SSE event store.
         # Includes run_id + owner_sub for cross-correlation with errors.
         owner = run.owner_sub or "?"
+        # claude-web's own in-process advisor is a read-only, plan-mode Fable
+        # consult with no side effects, standing in for the seamless
+        # server-side --advisor tool — auto-allow so a consult never prompts.
+        if INPROCESS_ADVISOR and tool_name == "mcp__claude_web__advisor":
+            log.info("perm advisor-auto tool=%s run=%s owner=%s", tool_name, run.run_id, owner)
+            return PermissionResultAllow()
         if tool_name in SAFE_TOOLS:
             log.info(
                 "perm safe-auto %s tool=%s run=%s owner=%s", tool_name,
@@ -9611,8 +10600,11 @@ async def api_chat(
         skills=_resolve_skills_for_run(),
         # Merge claude-web's in-process MCP servers (when enabled) on top of
         # whatever the CLI discovers from its own mcp.json. strict_mcp_config
-        # stays False so the CLI's configured servers continue to load.
-        mcp_servers=_in_process_mcp_servers_for_run(),
+        # stays False so the CLI's configured servers continue to load. Run
+        # context lets an advisor combo get its per-run in-process advisor tool.
+        mcp_servers=_in_process_mcp_servers_for_run(
+            run=run, selected_model=selected_model, account=account, cwd=cwd,
+        ),
         # Partial deltas become transient partial_text SSE frames (typing
         # feel); the durable transcript still comes from whole messages.
         include_partial_messages=True,
@@ -9635,7 +10627,11 @@ async def api_chat(
         options_kwargs["model"] = sdk_model
     run.live_sdk_model = sdk_model or None
     advisor_model = selected_model.get("advisor_model") or ""
-    if advisor_model:
+    if advisor_model and not INPROCESS_ADVISOR:
+        # Server-side --advisor beta. Only when the in-process replacement is
+        # off: the beta disables itself once the transcript carries tool_use
+        # blocks (every agentic session), so INPROCESS_ADVISOR routes advisor
+        # consults to our own in-process tool instead (_build_advisor_mcp_server).
         # Undocumented but verified CLI flag; reaches the CLI via extra_args
         # because the SDK has no first-class option for it yet.
         options_kwargs["extra_args"] = {"advisor": advisor_model}
@@ -9796,8 +10792,17 @@ async def api_chat(
                         if not await _gate_overage(run):
                             _emit_overage_declined(run, {"text": message})
                             return
+                    _claude_initial = effective_message
+                    if run.switch_handoff:
+                        # Switch into Claude on a version without forged-resume:
+                        # lead with the bounded handoff, then the user's message.
+                        _claude_initial = (
+                            run.switch_handoff
+                            + "\n\n---\n\nThe user's new message follows:\n\n"
+                            + effective_message
+                        )
                     async with run.client_write_lock:
-                        await _send_to_client(client, effective_message, image_blocks)
+                        await _send_to_client(client, _claude_initial, image_blocks)
                         run.client = client
 
                     # `run.between_turns` flips to True on each ResultMessage and
@@ -10592,6 +11597,14 @@ async def api_chat_rewind(
         raise HTTPException(501, "file checkpointing is disabled "
                                  "(CLAUDE_WEB_FILE_CHECKPOINTS=false)")
     session_id = _safe_id(session_id)
+    # If this conversation was switched to another provider, the Claude
+    # checkpoints predate that provider's edits — rewinding here could silently
+    # discard them. Refuse. (Inert unless provider switching is enabled.)
+    if PROVIDER_SWITCH_ENABLED and _native_binding_superseded("claude", session_id):
+        raise HTTPException(
+            409, "this conversation continued on another provider; rewinding "
+                 "could discard the other provider's edits",
+        )
     run = _existing_run_for_session(session_id)
     if run is None or run.done:
         raise HTTPException(
@@ -11339,6 +12352,18 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "message": {"content": message_blocks},
             "session_id": msg.session_id,
         })
+        # Canonical capture (Slice 0): the assistant turn, keyed on the SDK's
+        # stable message uuid so a resume that re-echoes it dedups. Thinking
+        # blocks are excluded from the replayable projection (hidden reasoning
+        # must not become trusted conversational state on a cross-provider
+        # switch); the full blocks incl. thinking are kept in raw.
+        if run is not None and (msg.uuid or msg.message_id):
+            _replay_blocks = [b for b in message_blocks if b.get("type") != "thinking"]
+            _capture_canonical(
+                run, "claude", f"claude:assistant:{msg.uuid or msg.message_id}",
+                "assistant", {"role": "assistant", "content": _replay_blocks},
+                raw={"content": message_blocks}, replayable=True,
+            )
         return out
     if isinstance(msg, UserMessage):
         # Tool results coming back from Claude's tool runs.
@@ -11359,6 +12384,18 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                     "is_error": bool(blk.is_error),
                     "content": text[:TOOL_RESULT_PREVIEW * 4],
                 })
+                # Canonical capture (Slice 0): the UNtruncated tool result,
+                # keyed on tool_use_id (idempotent across resumes). `text` here
+                # is the full joined content — captured before the 800-char
+                # slice above that would otherwise poison the source of truth.
+                if run is not None:
+                    _capture_canonical(
+                        run, "claude", f"claude:tool_result:{blk.tool_use_id}",
+                        "tool_result",
+                        {"tool_use_id": blk.tool_use_id,
+                         "is_error": bool(blk.is_error)},
+                        raw=text, replayable=True,
+                    )
                 # Finish a TaskCreate: the CLI's tool result carries the
                 # assigned id ("Task #1 created successfully: <subject>").
                 # Migrate the pending entry into the live ledger and emit a
@@ -11992,6 +13029,8 @@ async def api_usage_history(
 ANTHROPIC_OAUTH_API = "https://api.anthropic.com/api/oauth"
 ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 LIVE_USAGE_TIMEOUT_SECONDS = 10.0
+_USAGE_ADMIN_REQUEST_TYPE = "limit_increase"
+_TEAM_ORGANIZATION_TYPES = frozenset({"claude_team", "claude_enterprise"})
 
 # Labels for the fixed rate-limit buckets in /api/oauth/usage `limits[]`;
 # model-scoped weekly buckets are labelled from their scope instead.
@@ -12110,7 +13149,210 @@ def _shape_live_usage(profile: Optional[dict], usage: Optional[dict]) -> dict:
             "disabled_reason": extra.get("disabled_reason"),
             "utilization": extra.get("utilization"),
         }
+        if "monthly_limit" in extra:
+            out["extra_usage"]["monthly_limit"] = extra["monthly_limit"]
     return out
+
+
+def _anthropic_error_message(data: Any) -> Optional[str]:
+    """Extract a short user-facing message from an Anthropic error body."""
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        message = error["message"].strip()
+        if message:
+            return message[:500]
+    for key in ("message", "detail"):
+        message = data.get(key)
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:500]
+    return None
+
+
+async def _anthropic_admin_request_json(
+    client: httpx.AsyncClient,
+    token: str,
+    method: str,
+    path: str,
+    *,
+    params: Optional[list[tuple[str, str]]] = None,
+    json_body: Optional[dict] = None,
+) -> tuple[Any, Optional[str], Optional[str]]:
+    """Call one organization admin-request endpoint without exposing OAuth data.
+
+    Returns ``(data, error_code, error_message)``. The message is accepted only
+    from Anthropic's structured error fields and capped before it can reach the
+    browser.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+    }
+    kwargs: dict[str, Any] = {"headers": headers}
+    if params is not None:
+        kwargs["params"] = params
+    if json_body is not None:
+        kwargs["json"] = json_body
+    try:
+        response = await client.request(
+            method, f"{ANTHROPIC_OAUTH_API}/{path.lstrip('/')}", **kwargs,
+        )
+    except httpx.HTTPError:
+        return None, "anthropic_unreachable", None
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if response.status_code == 401:
+        return None, "token_rejected", _anthropic_error_message(data)
+    if not 200 <= response.status_code < 300:
+        return (
+            None,
+            f"anthropic_http_{response.status_code}",
+            _anthropic_error_message(data),
+        )
+    return data, None, None
+
+
+async def _request_anthropic_usage_credits(
+    token: str,
+    profile: dict,
+    usage: Optional[dict],
+) -> dict:
+    """Request a Team/Enterprise usage-limit increase from its Anthropic admin.
+
+    Mirrors Claude Code's ``/usage-credits`` flow: refuse states an admin must
+    fix directly, check eligibility, suppress duplicate pending/dismissed
+    requests, then create one ``limit_increase`` request.
+    """
+    organization = profile.get("organization") or {}
+    if organization.get("organization_type") not in _TEAM_ORGANIZATION_TYPES:
+        return {
+            "status": "unavailable",
+            "message": (
+                "Admin usage requests are available only for Claude Team "
+                "and Enterprise accounts."
+            ),
+        }
+
+    extra = (usage or {}).get("extra_usage") or {}
+    disabled_reason = extra.get("disabled_reason")
+    if disabled_reason == "out_of_credits":
+        return {
+            "status": "unavailable",
+            "message": (
+                "Your organization is out of usage credits. Contact your "
+                "admin to add more."
+            ),
+        }
+    if disabled_reason in {"org_level_disabled_until", "org_spend_cap_reached"}:
+        return {
+            "status": "unavailable",
+            "message": (
+                "Your organization's usage credit cap is reached for this "
+                "period. Contact your admin to raise it."
+            ),
+        }
+    if (
+        extra.get("is_enabled")
+        and "monthly_limit" in extra
+        and extra.get("monthly_limit") is None
+    ):
+        return {
+            "status": "unavailable",
+            "message": (
+                "Your organization already has unlimited usage credits. "
+                "No request needed."
+            ),
+        }
+
+    organization_uuid = organization.get("uuid")
+    try:
+        organization_uuid = str(uuid_mod.UUID(str(organization_uuid)))
+    except (ValueError, TypeError, AttributeError):
+        return {
+            "status": "error",
+            "message": "Anthropic did not return a valid organization identifier.",
+        }
+    base_path = f"organizations/{organization_uuid}/admin_requests"
+
+    async with httpx.AsyncClient(timeout=LIVE_USAGE_TIMEOUT_SECONDS) as client:
+        eligibility, eligibility_error, _ = await _anthropic_admin_request_json(
+            client,
+            token,
+            "GET",
+            f"{base_path}/eligibility",
+            params=[("request_type", _USAGE_ADMIN_REQUEST_TYPE)],
+        )
+        if eligibility_error:
+            log.warning(
+                "usage-credit eligibility check failed: %s", eligibility_error,
+            )
+        elif (
+            isinstance(eligibility, dict)
+            and eligibility.get("is_allowed") is False
+        ):
+            return {
+                "status": "unavailable",
+                "message": "Contact your admin to manage usage credit settings.",
+            }
+
+        existing, existing_error, _ = await _anthropic_admin_request_json(
+            client,
+            token,
+            "GET",
+            f"{base_path}/me",
+            params=[
+                ("request_type", _USAGE_ADMIN_REQUEST_TYPE),
+                ("statuses", "pending"),
+                ("statuses", "dismissed"),
+            ],
+        )
+        if existing_error:
+            log.warning(
+                "usage-credit existing-request check failed: %s", existing_error,
+            )
+        elif isinstance(existing, list) and existing:
+            return {
+                "status": "already_requested",
+                "message": (
+                    "You've already sent a usage credit request to your admin."
+                ),
+            }
+
+        _, create_error, create_message = await _anthropic_admin_request_json(
+            client,
+            token,
+            "POST",
+            base_path,
+            json_body={
+                "request_type": _USAGE_ADMIN_REQUEST_TYPE,
+                "details": None,
+            },
+        )
+    if create_error:
+        if create_error == "token_rejected":
+            message = (
+                "Anthropic session token is expired or revoked. Send one "
+                "message on this account to refresh it, then try again."
+            )
+        elif create_error == "anthropic_unreachable":
+            message = "Could not reach Anthropic's API."
+        else:
+            message = (
+                create_message
+                or "Contact your admin to manage usage credit settings."
+            )
+        return {"status": "error", "message": message}
+
+    if extra.get("is_enabled"):
+        message = (
+            "Request sent to your admin to increase your usage credit limit."
+        )
+    else:
+        message = "Request sent to your admin to turn on usage credits."
+    return {"status": "sent", "message": message}
 
 
 @app.get("/api/usage/live")
@@ -12149,6 +13391,52 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
         "error": err,
         "fetched_at": int(time.time()),
     }
+
+
+@app.post("/api/usage/request")
+async def api_usage_request(
+    slot: str = Form(default="shared"),
+    user: dict = Depends(auth.require_user),
+):
+    """Ask the selected Claude account's Anthropic admin for more usage."""
+    sub = user.get("sub")
+    if not _account_slot_visible(sub, slot):
+        raise HTTPException(status_code=404, detail="unknown account slot")
+    cred_id = _parse_cred_active(slot)
+    home = _credential_home_path(sub, cred_id) if cred_id is not None else None
+    info = await asyncio.to_thread(setup_flow.whoami, home)
+    if info.get("mode") != "oauth":
+        raise HTTPException(
+            status_code=400,
+            detail="usage requests require Claude subscription credentials",
+        )
+    token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    if not token:
+        raise HTTPException(status_code=409, detail="Claude OAuth token is missing")
+    if expires_at is not None and expires_at / 1000 <= time.time():
+        raise HTTPException(status_code=409, detail="Claude OAuth token is expired")
+
+    profile, usage, error = await _fetch_anthropic_live_usage(token)
+    if not profile:
+        if error == "token_rejected":
+            message = (
+                "Anthropic session token is expired or revoked. Send one "
+                "message on this account to refresh it, then try again."
+            )
+        elif error == "anthropic_unreachable":
+            message = "Could not reach Anthropic's API."
+        else:
+            message = "Could not load your Claude organization from Anthropic."
+        return {"status": "error", "message": message}
+
+    result = await _request_anthropic_usage_credits(token, profile, usage)
+    if result.get("status") == "sent":
+        log.info(
+            "usage-credit request sent slot=%s owner=%s",
+            slot,
+            sub or "?",
+        )
+    return result
 
 
 @app.get("/api/codex/usage")

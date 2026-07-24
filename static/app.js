@@ -4601,6 +4601,45 @@
     claude_enterprise: "Enterprise plan",
   };
 
+  async function requestClaudeUsage(slot, button, statusEl) {
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "Requesting…";
+    statusEl.textContent = "";
+    try {
+      const fd = new FormData();
+      fd.append("slot", slot || "shared");
+      const response = await fetch("/api/usage/request", {
+        method: "POST",
+        body: fd,
+      });
+      const data = await response.json().catch(() => ({}));
+      const message = typeof data.message === "string"
+        ? data.message
+        : typeof data.detail === "string"
+          ? data.detail
+          : `Could not request more usage (HTTP ${response.status}).`;
+      statusEl.textContent = message;
+      const settled = response.ok
+        && (data.status === "sent" || data.status === "already_requested");
+      if (settled) {
+        button.textContent = data.status === "sent"
+          ? "Request sent"
+          : "Request already sent";
+      } else {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+      announce(message);
+    } catch (_) {
+      const message = "Could not reach claude-web to request more usage.";
+      statusEl.textContent = message;
+      button.disabled = false;
+      button.textContent = originalLabel;
+      announce(message);
+    }
+  }
+
   // Fill the #usage-live placeholder with live plan data from Anthropic
   // (/api/usage/live). Ends with a single announce() so a screen reader
   // hears the numbers without hunting for the section that appeared above
@@ -4627,7 +4666,7 @@
     if (live.error === "anthropic_unreachable") {
       return fail("Could not reach Anthropic's API.");
     }
-    if (live.error && !(live.limits && live.limits.length)) {
+    if (live.error && !(live.limits && live.limits.length) && !live.organization) {
       return fail("Anthropic returned an error (" + live.error + ").");
     }
 
@@ -4670,13 +4709,39 @@
         msg = "Extra usage is enabled" + (x.utilization != null ? ` — ${x.utilization}% of this month's cap used` : "") + ".";
       } else if (x.disabled_reason === "out_of_credits") {
         msg = "Extra usage: out of credits — hitting a cap hard-stops until the window resets.";
+      } else if (x.disabled_reason === "org_level_disabled_until"
+          || x.disabled_reason === "org_spend_cap_reached") {
+        msg = "Extra usage: the organization's credit cap is reached for this period.";
       } else {
         msg = "Extra usage is off — hitting a cap hard-stops until the window resets.";
       }
       html += `<p class="usage-note">${htmlEscape(msg)}</p>`;
     }
 
+    const extra = live.extra_usage || {};
+    const teamAccount = org.organization_type === "claude_team"
+      || org.organization_type === "claude_enterprise";
+    const adminMustActDirectly = extra.disabled_reason === "out_of_credits"
+      || extra.disabled_reason === "org_level_disabled_until"
+      || extra.disabled_reason === "org_spend_cap_reached";
+    const unlimited = extra.is_enabled
+      && Object.prototype.hasOwnProperty.call(extra, "monthly_limit")
+      && extra.monthly_limit == null;
+    if (teamAccount && !adminMustActDirectly && !unlimited) {
+      html += `<div class="usage-request">
+        <button type="button" class="usage-request-button">Request more usage</button>
+        <span class="usage-request-status" role="status" aria-live="polite"></span>
+      </div>`;
+    }
+
     target.innerHTML = html;
+    const requestButton = target.querySelector(".usage-request-button");
+    const requestStatus = target.querySelector(".usage-request-status");
+    if (requestButton && requestStatus) {
+      requestButton.addEventListener("click", () => {
+        requestClaudeUsage(live.slot || "shared", requestButton, requestStatus);
+      });
+    }
     announce("Live plan usage for " + (slotLabel || "account") + ": "
       + (spoken.length ? spoken.join(", ") : "no limit data"));
   }
@@ -5400,6 +5465,7 @@
     new: { description: "Start a new chat", run: () => newChatBtn.click() },
     cost: { description: "Open the usage dialog", run: () => document.getElementById("show-usage").click() },
     usage: { description: "Open the usage dialog", run: () => document.getElementById("show-usage").click() },
+    "usage-credits": { description: "Request more Claude usage from your organization admin", run: () => document.getElementById("show-usage").click() },
     stop: { description: "Stop the current turn", run: () => { if (!stopBtn.hidden) stopBtn.click(); } },
     help: { description: "Show what slash commands work in claude-web", run: () => showSlashHelp() },
     model: { description: "Switch model: /model <id> (e.g. /model claude-sonnet-4-6)", run: (arg) => switchModel(arg) },

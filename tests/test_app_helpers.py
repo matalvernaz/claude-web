@@ -1183,7 +1183,8 @@ def test_shape_live_usage_maps_limits_and_scoped_model() -> None:
         ],
         "extra_usage": {"is_enabled": False,
                         "disabled_reason": "out_of_credits",
-                        "utilization": None},
+                        "utilization": None,
+                        "monthly_limit": 75},
     }
     out = app_module._shape_live_usage(profile, usage)
     assert [lim["label"] for lim in out["limits"]] == [
@@ -1194,6 +1195,7 @@ def test_shape_live_usage_maps_limits_and_scoped_model() -> None:
     assert out["organization"]["rate_limit_tier"] == "default_claude_max_5x"
     assert out["account"]["email"] == "a@b.c"
     assert out["extra_usage"]["disabled_reason"] == "out_of_credits"
+    assert out["extra_usage"]["monthly_limit"] == 75
 
 
 def test_shape_live_usage_tolerates_missing_halves() -> None:
@@ -1273,6 +1275,199 @@ async def test_api_usage_live_happy_path_never_returns_token(monkeypatch) -> Non
     assert out["account"]["email"] == "x@y.z"
     assert out["limits"][0]["label"] == "Session (5-hour window)"
     assert "sekrit-token" not in json.dumps(out)
+
+
+async def test_request_anthropic_usage_credits_posts_limit_increase(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    async def fake_request(client, token, method, path, **kwargs):
+        calls.append((token, method, path, kwargs))
+        if path.endswith("/eligibility"):
+            return {"is_allowed": True}, None, None
+        if path.endswith("/me"):
+            return [], None, None
+        return {"uuid": "request-id"}, None, None
+
+    monkeypatch.setattr(
+        app_module, "_anthropic_admin_request_json", fake_request,
+    )
+    profile = {
+        "organization": {
+            "uuid": "12345678-1234-5678-1234-567812345678",
+            "organization_type": "claude_team",
+        },
+    }
+    usage = {
+        "extra_usage": {"is_enabled": True, "monthly_limit": 50},
+    }
+
+    out = await app_module._request_anthropic_usage_credits(
+        "sekrit-token", profile, usage,
+    )
+
+    assert out == {
+        "status": "sent",
+        "message": (
+            "Request sent to your admin to increase your usage credit limit."
+        ),
+    }
+    assert [call[1] for call in calls] == ["GET", "GET", "POST"]
+    assert calls[1][3]["params"] == [
+        ("request_type", "limit_increase"),
+        ("statuses", "pending"),
+        ("statuses", "dismissed"),
+    ]
+    assert calls[2][3]["json_body"] == {
+        "request_type": "limit_increase",
+        "details": None,
+    }
+
+
+async def test_request_anthropic_usage_credits_suppresses_duplicate(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    async def fake_request(client, token, method, path, **kwargs):
+        calls.append((method, path))
+        if path.endswith("/eligibility"):
+            return {"is_allowed": True}, None, None
+        return [{"status": "dismissed"}], None, None
+
+    monkeypatch.setattr(
+        app_module, "_anthropic_admin_request_json", fake_request,
+    )
+    profile = {
+        "organization": {
+            "uuid": "12345678-1234-5678-1234-567812345678",
+            "organization_type": "claude_enterprise",
+        },
+    }
+
+    out = await app_module._request_anthropic_usage_credits(
+        "token", profile, {"extra_usage": {}},
+    )
+
+    assert out["status"] == "already_requested"
+    assert [method for method, _ in calls] == ["GET", "GET"]
+
+
+async def test_request_anthropic_usage_credits_respects_eligibility(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    async def fake_request(client, token, method, path, **kwargs):
+        calls.append((method, path))
+        return {"is_allowed": False}, None, None
+
+    monkeypatch.setattr(
+        app_module, "_anthropic_admin_request_json", fake_request,
+    )
+    profile = {
+        "organization": {
+            "uuid": "12345678-1234-5678-1234-567812345678",
+            "organization_type": "claude_team",
+        },
+    }
+
+    out = await app_module._request_anthropic_usage_credits(
+        "token", profile, {"extra_usage": {}},
+    )
+
+    assert out == {
+        "status": "unavailable",
+        "message": "Contact your admin to manage usage credit settings.",
+    }
+    assert len(calls) == 1
+
+
+async def test_request_anthropic_usage_credits_stops_when_org_out(
+    monkeypatch,
+) -> None:
+    async def must_not_request(*args, **kwargs):
+        raise AssertionError("must not create an admin request")
+
+    monkeypatch.setattr(
+        app_module, "_anthropic_admin_request_json", must_not_request,
+    )
+    profile = {
+        "organization": {
+            "uuid": "12345678-1234-5678-1234-567812345678",
+            "organization_type": "claude_team",
+        },
+    }
+
+    out = await app_module._request_anthropic_usage_credits(
+        "token",
+        profile,
+        {"extra_usage": {"disabled_reason": "out_of_credits"}},
+    )
+
+    assert out["status"] == "unavailable"
+    assert out["message"] == (
+        "Your organization is out of usage credits. Contact your admin to add more."
+    )
+
+
+async def test_api_usage_request_uses_selected_oauth_slot(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_module.setup_flow, "whoami", lambda home=None: {"mode": "oauth"},
+    )
+    monkeypatch.setattr(
+        app_module, "_read_oauth_token", lambda home: ("sekrit-token", None),
+    )
+
+    async def fake_fetch(token):
+        assert token == "sekrit-token"
+        return (
+            {"organization": {"organization_type": "claude_team"}},
+            {"extra_usage": {}},
+            None,
+        )
+
+    async def fake_request(token, profile, usage):
+        assert token == "sekrit-token"
+        assert profile["organization"]["organization_type"] == "claude_team"
+        assert usage == {"extra_usage": {}}
+        return {"status": "sent", "message": "Request sent."}
+
+    monkeypatch.setattr(
+        app_module, "_fetch_anthropic_live_usage", fake_fetch,
+    )
+    monkeypatch.setattr(
+        app_module, "_request_anthropic_usage_credits", fake_request,
+    )
+
+    out = await app_module.api_usage_request(
+        slot="shared", user={"sub": "usage-request-user"},
+    )
+
+    assert out == {"status": "sent", "message": "Request sent."}
+    assert "sekrit-token" not in json.dumps(out)
+
+
+async def test_api_usage_request_unknown_slot_is_404() -> None:
+    with pytest.raises(HTTPException) as exc:
+        await app_module.api_usage_request(
+            slot="cred:424242",
+            user={"sub": "usage-request-404"},
+        )
+    assert exc.value.status_code == 404
+
+
+async def test_api_usage_request_rejects_api_key_slot(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app_module.setup_flow, "whoami", lambda home=None: {"mode": "api_key"},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await app_module.api_usage_request(
+            slot="shared",
+            user={"sub": "usage-request-api-key"},
+        )
+    assert exc.value.status_code == 400
 
 
 # ─── Overage (pay-as-you-go) gate decision ─────────────────────────────────
