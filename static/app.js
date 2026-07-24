@@ -611,6 +611,10 @@
   // own model list; the shared MODEL_* maps merge both lists because the
   // key spaces are disjoint (claude-* vs gpt-*).
   const PROVIDERS = { claude: null, codex: null };
+  // Set from /api/providers (CLAUDE_WEB_PROVIDER_SWITCH server-side). Gates the
+  // mid-chat provider switch: off → changing provider on a live chat starts a
+  // new chat (the original behavior); on → it carries the conversation over.
+  let providerSwitchEnabled = false;
   let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
@@ -776,6 +780,7 @@
       if (r.ok) payload = await r.json();
     } catch (_) { /* provider combo just stays hidden */ }
     const provs = (payload && payload.providers) || [];
+    providerSwitchEnabled = !!(payload && payload.provider_switch);
     for (const p of provs) ingestProvider(p);
     const available = provs.filter((p) => p.available);
     if (!providerSelect || available.length < 2) return;
@@ -800,14 +805,22 @@
       const provider = currentProvider();
       safeSet(localStorage, PROVIDER_KEY, provider);
       const label = [...providerSelect.options].find((o) => o.value === provider);
-      if (sessionId) {
-        // Provider is fixed per conversation — leaving one means leaving
-        // the chat. Reuse the New-chat reset so every piece of per-run
-        // state is dropped consistently.
+      const name = label ? label.textContent : provider;
+      if (sessionId && providerSwitchEnabled) {
+        // Carry this conversation across providers. Keep the session id: the
+        // next send posts the new provider WITH it, the server supersedes the
+        // old binding, seeds the destination with a handoff, and confirms via
+        // a provider_switched event. The switch lands on that send, not now —
+        // say so, so a screen-reader user knows the next message is the boundary.
+        announce(`${name} takes over on your next message, carrying this conversation over.`);
+      } else if (sessionId) {
+        // Switch disabled: provider is fixed per conversation, so leaving one
+        // starts a new chat (the server refuses cross-provider resumes). Reuse
+        // the New-chat reset so every piece of per-run state is dropped consistently.
         newChatBtn.click();
-        announce(`Switched to ${label ? label.textContent : provider}. Started a new chat.`);
+        announce(`Switched to ${name}. Started a new chat.`);
       } else {
-        announce(`Switched to ${label ? label.textContent : provider}.`);
+        announce(`Switched to ${name}.`);
       }
       applyProviderUI(provider);
     });
@@ -2189,15 +2202,17 @@
       }
       const r = await fetch("/api/chat", { method: "POST", body: fd, signal: myAbort.signal });
       if (!r.ok) {
-        let code = "";
-        try { code = (await r.json()).error || ""; } catch (_) { /* non-JSON body */ }
+        let code = "", detail = "";
+        try { const b = await r.json(); code = b.error || ""; detail = b.detail || ""; } catch (_) { /* non-JSON body */ }
         if (code === "restart_pending") {
           throw new Error("Server restart in progress — wait a few seconds and resend.");
         }
         if (code === "queue_full") {
           throw new Error(assistantLabel() + "'s input queue for this session is full — wait for the current turn and resend.");
         }
-        throw new Error("HTTP " + r.status);
+        // Surface the server's reason (e.g. a 409 "can't switch provider: …")
+        // so a screen-reader user hears why instead of a bare status code.
+        throw new Error(detail || ("HTTP " + r.status));
       }
       await drainStream(r, gen);
       ok = true;
@@ -3003,6 +3018,19 @@
         syncEffortVisibility();
       }
       announce(`Model switched to ${obj.label || "default"} for the rest of this conversation.`);
+      markVisibleActivity();
+    } else if (obj.type === "provider_switched") {
+      // The server carried this conversation into the other provider: the old
+      // binding is superseded and a fresh native session was seeded with the
+      // prior turns (forged transcript for Claude, injected first message for
+      // Codex). That session's own system:init event adopts the new id above;
+      // here we realign the picker to the destination and announce the boundary
+      // for NVDA. The notice text comes from the server.
+      if (providerSelect && obj.to &&
+          [...providerSelect.options].some((o) => o.value === obj.to)) {
+        providerSelect.value = obj.to;
+      }
+      announce(obj.notice || "Switched provider. Prior conversation carried over.");
       markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // Backend dropped us as a slow subscriber — fetch a fresh stream from

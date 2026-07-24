@@ -7717,7 +7717,12 @@ async def api_providers(
     return {
         "providers": await _providers_payload(
             user, codex_account_slot=codex_account_slot or None,
-        )
+        ),
+        # Lets the browser choose the mid-chat provider-change behavior:
+        # switch-in-place (carry the conversation over) vs. start a new chat.
+        # Sending a cross-provider (provider, session_id) with the flag off
+        # 400s server-side, so the frontend must know before it posts.
+        "provider_switch": PROVIDER_SWITCH_ENABLED,
     }
 
 

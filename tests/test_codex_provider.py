@@ -664,6 +664,23 @@ def test_api_providers_payload(client, monkeypatch):
     ]
 
 
+def test_api_providers_reports_switch_flag(client, monkeypatch):
+    """The browser reads provider_switch to decide whether a mid-chat provider
+    change carries the conversation over or starts a new chat — posting a
+    cross-provider (provider, session_id) with the flag off 400s, so the
+    frontend must learn the flag state from this endpoint."""
+    import app as app_module
+
+    monkeypatch.setattr(
+        codex_provider, "availability",
+        lambda *a, **k: {"available": False, "reason": "codex CLI not installed"},
+    )
+    monkeypatch.setattr(app_module, "PROVIDER_SWITCH_ENABLED", False)
+    assert client.get("/api/providers").json()["provider_switch"] is False
+    monkeypatch.setattr(app_module, "PROVIDER_SWITCH_ENABLED", True)
+    assert client.get("/api/providers").json()["provider_switch"] is True
+
+
 async def test_codex_gate_decision_maps_to_wire_values(client, monkeypatch):
     """The codex approval gate offers allow-session (unlike Bash on the
     Claude path) and answers in codex's vocabulary."""
