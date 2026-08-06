@@ -4408,6 +4408,11 @@
         }
         const suffix = query.toString() ? "?" + query.toString() : "";
         const r = await fetch("/api/codex/usage" + suffix);
+        if (r.status === 401 || r.status === 403) {
+          usageBody.textContent = "Session expired — redirecting to sign-in.";
+          handleStreamError(new Error("HTTP " + r.status));
+          return;
+        }
         if (r.ok) data = await r.json();
         else data = { available: false, reason: "HTTP " + r.status };
       } catch (e) {
