@@ -12,12 +12,14 @@ Supports two modes via the AUTH_MODE env var:
     opt in -- there is no implicit fallback.
 
 Sessions are signed cookies via Starlette's SessionMiddleware. SESSION_SECRET
-must be set in oidc mode.
+must be set in oidc mode. SESSION_MAX_AGE_SECONDS is a rolling idle window,
+not a countdown from sign-in — see touch_session.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional
 from urllib.parse import urlencode, urlparse
 
@@ -34,6 +36,18 @@ AUTH_MODE = os.getenv("AUTH_MODE", "oidc").strip().lower()
 # Default 24h. The signed cookie carries this max-age and Starlette refuses
 # expired payloads, so a stale cookie can't be replayed past the limit.
 SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE_SECONDS", "86400"))
+
+# Rolling window. itsdangerous validates max-age against the time the payload
+# was *signed*, and SessionMiddleware only re-signs when the session is
+# modified — reads mark it accessed, not modified. Login being the only writer,
+# the cookie would otherwise expire SESSION_MAX_AGE after sign-in no matter how
+# actively the app was used, logging the user out mid-session on a fixed clock.
+# Re-stamping on request makes the window an idle timeout measured from last
+# use. The interval keeps Set-Cookie off the vast majority of responses rather
+# than re-signing on every one; the cost is that the recorded stamp trails
+# actual last use by up to one interval, shortening the effective idle
+# tolerance by that much.
+SESSION_REFRESH_INTERVAL = max(3600, SESSION_MAX_AGE // 24)
 
 
 def _split_csv(value: str) -> set[str]:
@@ -193,10 +207,30 @@ def current_user(request: Request) -> Optional[dict]:
     return request.session.get("user")
 
 
+def touch_session(request: Request) -> None:
+    """Extend the session cookie's lifetime, at most once per refresh interval.
+
+    Writing to the session is what makes SessionMiddleware re-sign and re-send
+    the cookie; the stored stamp is only there to rate-limit that write. A
+    stamp that is missing (a cookie predating this behaviour) or in the future
+    (clock step) is replaced rather than trusted, so neither case can pin the
+    session to its original signing time.
+    """
+    now = int(time.time())
+    stamped = request.session.get("stamped_at")
+    age = now - stamped if isinstance(stamped, int) else None
+    if age is None or not (0 <= age < SESSION_REFRESH_INTERVAL):
+        request.session["stamped_at"] = now
+
+
 def require_user(request: Request) -> dict:
     """FastAPI dependency: 401/redirect if not logged in."""
     user = current_user(request)
     if user is not None:
+        # AUTH_MODE=none installs no SessionMiddleware, so there is no
+        # session to touch and request.session would raise.
+        if AUTH_MODE != "none":
+            touch_session(request)
         return user
 
     accept = request.headers.get("accept", "")

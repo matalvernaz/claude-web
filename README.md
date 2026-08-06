@@ -116,7 +116,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 |---|---|---|---|
 | `AUTH_MODE` | yes | `oidc` | `oidc` or `none`. `none` skips auth entirely — only safe behind a trusted proxy or for localhost dev. |
 | `SESSION_SECRET` | when `oidc` | — | Random string for cookie signing. `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
-| `SESSION_MAX_AGE_SECONDS` | no | `86400` | How long the signed session cookie is valid. |
+| `SESSION_MAX_AGE_SECONDS` | no | `86400` | How long a login survives with no activity. Rolling — measured from the last request, so active use never logs you out. No server-side store, so a leaked cookie stays valid this long. |
 | `SESSION_COOKIE_INSECURE` | no | `false` | Set `true` only when serving plain HTTP (e.g. localhost dev). |
 | `OIDC_ISSUER_URL` | when `oidc` | — | Base URL your IdP advertises in `/.well-known/openid-configuration`. |
 | `OIDC_CLIENT_ID` | when `oidc` | — | OIDC client id. |

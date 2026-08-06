@@ -1,7 +1,14 @@
-"""Auth helper tests: safe_next open-redirect protection + origin derivation."""
+"""Auth tests: safe_next open-redirect protection, origin derivation,
+allowlist gating, and the rolling session window."""
 from __future__ import annotations
 
+import time
+from types import SimpleNamespace
+
 import pytest
+from fastapi import Depends, FastAPI, Request
+from fastapi.testclient import TestClient
+from starlette.middleware.sessions import SessionMiddleware
 
 import auth
 
@@ -101,3 +108,108 @@ def test_verified_requirement_can_be_disabled(monkeypatch) -> None:
 def test_non_allowlisted_email_rejected_even_if_verified(monkeypatch) -> None:
     user = {"email": "nope@y.com", "email_verified": True}
     assert _allowed(monkeypatch, user) is False
+
+
+# ─── Rolling session window ──────────────────────────────────────────────────
+# The cookie's max-age is validated against its signing time and Starlette only
+# re-signs a *modified* session, so without touch_session a login would expire
+# on a fixed clock no matter how much the app was used.
+
+def _fake_request(session: dict):
+    """Minimal stand-in exposing just the .session mapping touch_session uses."""
+    return SimpleNamespace(session=session)
+
+
+def test_touch_session_stamps_a_fresh_session() -> None:
+    session: dict = {"user": {"sub": "abc"}}
+    auth.touch_session(_fake_request(session))
+    assert isinstance(session["stamped_at"], int)
+
+
+def test_touch_session_is_rate_limited_within_the_interval(monkeypatch) -> None:
+    """A second call soon after must not rewrite the stamp.
+
+    Rewriting on every request would put Set-Cookie on every response,
+    including each SSE stream and poll.
+    """
+    now = int(time.time())
+    session = {"user": {"sub": "abc"}, "stamped_at": now}
+    monkeypatch.setattr(auth.time, "time", lambda: now + 5)
+    auth.touch_session(_fake_request(session))
+    assert session["stamped_at"] == now
+
+
+def test_touch_session_restamps_after_the_interval(monkeypatch) -> None:
+    now = int(time.time())
+    session = {"user": {"sub": "abc"}, "stamped_at": now}
+    later = now + auth.SESSION_REFRESH_INTERVAL + 1
+    monkeypatch.setattr(auth.time, "time", lambda: later)
+    auth.touch_session(_fake_request(session))
+    assert session["stamped_at"] == later
+
+
+def test_touch_session_replaces_a_missing_stamp() -> None:
+    """Cookies issued before this behaviour existed carry no stamp.
+
+    They must be adopted into the rolling window rather than left pinned to
+    their original signing time.
+    """
+    session = {"user": {"sub": "abc"}}
+    auth.touch_session(_fake_request(session))
+    assert "stamped_at" in session
+
+
+def test_touch_session_replaces_a_future_stamp(monkeypatch) -> None:
+    """A stamp ahead of now (clock step) must not suppress refreshes forever."""
+    now = int(time.time())
+    session = {"user": {"sub": "abc"}, "stamped_at": now + 999_999}
+    monkeypatch.setattr(auth.time, "time", lambda: now)
+    auth.touch_session(_fake_request(session))
+    assert session["stamped_at"] == now
+
+
+def test_touch_session_replaces_a_non_integer_stamp() -> None:
+    session = {"user": {"sub": "abc"}, "stamped_at": "not-a-number"}
+    auth.touch_session(_fake_request(session))
+    assert isinstance(session["stamped_at"], int)
+
+
+def test_refresh_interval_is_shorter_than_the_window() -> None:
+    """Otherwise the stamp could go stale before it is ever refreshed."""
+    assert auth.SESSION_REFRESH_INTERVAL < auth.SESSION_MAX_AGE
+
+
+def test_authenticated_request_reissues_the_session_cookie(monkeypatch) -> None:
+    """End-to-end: the response actually carries a refreshed Set-Cookie.
+
+    This is the behaviour the unit tests above only imply — before
+    touch_session, an authenticated read emitted `Vary: Cookie` and no
+    Set-Cookie, which is what made the window count down from sign-in.
+    """
+    monkeypatch.setattr(auth, "AUTH_MODE", "oidc")
+    mini = FastAPI()
+    mini.add_middleware(
+        SessionMiddleware, secret_key="test-secret", max_age=auth.SESSION_MAX_AGE,
+    )
+
+    @mini.get("/whoami")
+    async def _whoami(user: dict = Depends(auth.require_user)):
+        return {"sub": user["sub"]}
+
+    c = TestClient(mini)
+    # Seed a logged-in session the way /auth/callback does.
+    @mini.get("/seed")
+    async def _seed(request: Request):
+        request.session["user"] = {"sub": "abc"}
+        return {"ok": True}
+
+    assert c.get("/seed").status_code == 200
+    first = c.get("/whoami")
+    assert first.status_code == 200
+    # The seeded cookie already carries a stamp from the /whoami call above,
+    # so jump past the interval to force a visible refresh.
+    later = int(time.time()) + auth.SESSION_REFRESH_INTERVAL + 1
+    monkeypatch.setattr(auth.time, "time", lambda: later)
+    second = c.get("/whoami")
+    assert second.status_code == 200
+    assert "set-cookie" in {k.lower() for k in second.headers}
