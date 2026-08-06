@@ -402,23 +402,45 @@ STATIC_DIR = Path(__file__).parent / "static"
 # earlier models aren't known to accept it, so those entries stay empty
 # rather than risk a 400.
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+# Order matters: this list drives the header picker (server-rendered options
+# in index.html AND the JS rebuild in app.js, both via _models_payload()).
+# Every switchable model comes first, then the spawn-only block last. Under a
+# screen reader a collapsed <select> fires "change" on each option arrowed
+# through, and switchKey() (app.js) reverts a mid-chat switch to a spawn-only
+# entry — so a non-switchable entry sitting between two switchable ones bounces
+# the selection back and traps AT/keyboard users before they reach the model
+# they wanted. Keeping the spawn-only entries contiguous at the bottom removes
+# every such crossing for the common models.
 KNOWN_MODELS = [
     {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     # Split-model entry: "plan_model" runs while the run is in plan mode,
     # "model" the rest of the time (the CLI's opusplan pattern, pointed at
-    # Fable). _sync_plan_model drives the swap on plan enter/approve.
+    # Fable). _sync_plan_model drives the swap on plan enter/approve. Switchable
+    # mid-chat (no betas/advisor), so it stays in the top block.
     {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
      "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
+     "efforts": EFFORT_LEVELS},
+    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
+     "efforts": []},
+    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": [],
+     "efforts": []},
+    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
+     "efforts": []},
+    # ─── Spawn-only block (kept last; see the module comment above) ───────────
+    # Request betas / an advisor attachment only apply at spawn, so switchKey()
+    # refuses a mid-chat switch across any of these and reverts the picker.
+    {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
+     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": []},
     # Advisor entries: "advisor_model" attaches the CLI's hidden server-side
     # advisor tool at spawn (--advisor, verified on 2.1.198) — the main model
     # consults it on demand and only those consults bill at advisor rates.
-    # Spawn-only: no control request can attach/detach it live, so the
-    # browser refuses mid-chat switches across differing advisors the same
-    # way it does for betas (see switchKey() in app.js).
     {"key": "opus-fable-advisor", "model": "claude-opus-4-8",
      "advisor_model": "claude-fable-5", "label": "Opus 4.8 + Fable 5 advisor",
      "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
