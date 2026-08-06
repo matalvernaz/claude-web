@@ -615,6 +615,10 @@
   // mid-chat provider switch: off → changing provider on a live chat starts a
   // new chat (the original behavior); on → it carries the conversation over.
   let providerSwitchEnabled = false;
+  // Provider that owns the active native session. This deliberately differs
+  // from currentProvider() while a picker change is waiting to land on the
+  // next message.
+  let sessionProvider = null;
   let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
@@ -1189,6 +1193,7 @@
     // present (it can't know the session's provider yet).
     await providersReady;
     const sessProvider = data.provider === "codex" ? "codex" : "claude";
+    sessionProvider = sessProvider;
     if (providerSelect
         && [...providerSelect.options].some((o) => o.value === sessProvider)) {
       providerSelect.value = sessProvider;
@@ -1603,6 +1608,7 @@
 
   newChatBtn.addEventListener("click", () => {
     sessionId = "";
+    sessionProvider = null;
     // Clear the URL-pinned project so the picker takes over again. Without
     // this, a chat opened from a session URL stayed glued to that project
     // even after the user picked a different one and clicked New chat.
@@ -1977,6 +1983,21 @@
     // currentRunId has been nulled, and the queue re-bind needs the id of
     // the run the entries were typed into.
     const rid = currentRunId;
+    // A provider is fixed to its live native process. Route the first message
+    // after a picker change through /api/chat, where the cross-provider
+    // handoff is prepared, instead of injecting it into the old provider's
+    // still-open stdin via /api/chat/send/{run_id}.
+    if (providerSwitchEnabled && sessionId && sessionProvider
+        && currentProvider() !== sessionProvider) {
+      queueRebindFromRunId = rid;
+      const oldAbort = currentAbort;
+      currentAbort = null;
+      currentRunId = null;
+      safeRemove(sessionStorage, RUN_KEY);
+      if (oldAbort) { try { oldAbort.abort(); } catch (_) {} }
+      const sent = await sendOne(entry);
+      return { ok: sent, mode: sent ? "fresh" : "failed" };
+    }
     setStreaming(true);
     startGerunds();
     announce("Sent. " + assistantLabel() + " is responding.");
@@ -2005,6 +2026,7 @@
       if (accountSelect && accountSelect.value) {
         fd.append("account_slot", accountSelect.value);
       }
+      fd.append("provider", currentProvider());
       for (const img of entry.images) {
         fd.append("images", img.file, sendName(img.file));
       }
@@ -2034,7 +2056,7 @@
       }
       if (!r.ok) {
         // Any other non-2xx — 404 (run gone), 409 (run superseded by a
-        // personality/account swap mid-conversation), 5xx (driver
+        // personality/account swap or a provider handoff), 5xx (driver
         // crashed), network blip through the proxy — means the existing
         // stream can't carry this message. Abort the old SSE reader so
         // its events don't bleed into the new run's transcript, then open
@@ -2057,7 +2079,8 @@
         // the new run's run_started).
         queueRebindFromRunId = rid;
         const benign409 = supersededReason === "personality_changed" ||
-                          supersededReason === "account_changed";
+                          supersededReason === "account_changed" ||
+                          supersededReason === "provider_changed";
         if (r.status !== 404 && !benign409) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
@@ -2729,6 +2752,7 @@
       }
       if (obj.project) sessionProject = obj.project;
       if (obj.model) lastSeenModel = obj.model;
+      if (obj.provider) sessionProvider = obj.provider;
     } else if (obj.type === "user_prompt") {
       // Single source of truth for "the user's message in the transcript":
       // the server echoes the prompt as an event so both live and resumed
@@ -3030,6 +3054,7 @@
           [...providerSelect.options].some((o) => o.value === obj.to)) {
         providerSelect.value = obj.to;
       }
+      if (obj.to) sessionProvider = obj.to;
       announce(obj.notice || "Switched provider. Prior conversation carried over.");
       markVisibleActivity();
     } else if (obj.type === "_overflow") {

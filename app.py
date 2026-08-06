@@ -11562,6 +11562,7 @@ async def api_chat_send(
     request: Request,
     run_id: str,
     message: str = Form(...),
+    provider: str = Form(default=""),
     personality_id: Optional[int] = Form(default=None),
     account_slot: str = Form(default=""),
     queue_id: str = Form(default=""),
@@ -11576,9 +11577,9 @@ async def api_chat_send(
     waiting on our own end-of-turn boundary.
     Returns 202 Accepted; the existing stream emits the new events.
 
-    Refuses with 409 if the run has been superseded (personality or
-    account swap mid-conversation) so the browser falls back to
-    /api/chat, which respawns under the current state.
+    Refuses with 409 if the run has been superseded (personality/account
+    swap) or the client selected a different provider, so the browser falls
+    back to /api/chat and performs the appropriate respawn or handoff.
     """
     _safe_id(run_id)
     if RESTART_STATE["pending"]:
@@ -11603,6 +11604,21 @@ async def api_chat_send(
                 "error": run.superseded_reason or "run_superseded",
             },
             status_code=409,
+        )
+    requested_provider = (provider or run.provider).strip().lower()
+    if requested_provider not in VALID_PROVIDERS:
+        raise HTTPException(400, "unknown provider")
+    if requested_provider != run.provider:
+        if not PROVIDER_SWITCH_ENABLED:
+            return JSONResponse(
+                {"ok": False, "error": "provider_switch_disabled"},
+                status_code=409,
+            )
+        # Leave the source run intact here. The browser retries through
+        # /api/chat, whose conversation lock verifies the source is idle and
+        # stops it before preparing the target-provider handoff.
+        return JSONResponse(
+            {"ok": False, "error": "provider_changed"}, status_code=409,
         )
     # Defense-in-depth: re-resolve the personality bound to this run's
     # session (or the client's explicit ``personality_id`` override) and

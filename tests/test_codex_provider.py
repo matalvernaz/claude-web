@@ -1150,6 +1150,31 @@ def test_codex_account_change_supersedes_run_without_changing_session(
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_provider_change_rejects_live_run_before_input(client, monkeypatch):
+    import app as app_module
+
+    run = app_module.ActiveRun(
+        "run-provider-switch", owner_sub="anonymous", account_slot="shared",
+    )
+    run.provider = "claude"
+    run.session_id = "session-provider-switch"
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    app_module.ACTIVE_RUNS_BY_SESSION[run.session_id] = run
+    monkeypatch.setattr(app_module, "PROVIDER_SWITCH_ENABLED", True)
+    try:
+        response = client.post(
+            f"/api/chat/send/{run.run_id}",
+            data={"message": "hand this over", "provider": "codex"},
+        )
+        assert response.status_code == 409
+        assert response.json()["error"] == "provider_changed"
+        assert run.accepting_input is True
+        assert run.session_id == "session-provider-switch"
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop(run.session_id, None)
+
+
 async def test_codex_account_handoff_waits_for_interrupted_turn_to_finish(client):
     import app as app_module
 
