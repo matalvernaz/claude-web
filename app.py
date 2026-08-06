@@ -448,18 +448,6 @@ KNOWN_MODELS = [
      "plan_model": "claude-fable-5", "advisor_model": "claude-fable-5",
      "label": "Fableplan + Fable 5 advisor", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
-    {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
-    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
-    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
-     "efforts": []},
-    {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
-     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": []},
-    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": [],
-     "efforts": []},
-    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
-     "efforts": []},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
 
