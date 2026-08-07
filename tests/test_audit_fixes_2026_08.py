@@ -315,8 +315,14 @@ def test_compact_keep_last_over_length_compacts_nothing(tmp_path) -> None:
     tid = core.roundtable_create("compact-guard")["thread_id"]
     for i in range(4):
         core.roundtable_post(tid, f"message {i}")
+    # Pin the summariser to a provider the suite always has. The default is
+    # claude-opus, and roundtable_compact resolves the participant before it
+    # reaches the guard under test, so on a runner with no ANTHROPIC_API_KEY and
+    # no claude binary the resolve raised first and the test failed for an
+    # unrelated reason. conftest sets a fake GEMINI_API_KEY, and the ValueError
+    # below fires before any provider call, so this stays hermetic.
     with pytest.raises(ValueError, match="not worth a summariser turn"):
-        core.roundtable_compact(tid, keep_last=10)
+        core.roundtable_compact(tid, keep_last=10, summarizer="gemini-flash")
 
 
 def test_read_line_window_reaches_past_the_read_cap(tmp_path) -> None:
