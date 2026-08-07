@@ -17,7 +17,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY app.py auth.py codex_provider.py currency.py setup_flow.py ./
+# Glob rather than a file list: the list silently omitted conversation_replay.py
+# when it was added, and the image crash-looped on ModuleNotFoundError at startup
+# because nothing in the build imports app.py. Every top-level .py here is a first-party
+# app module; tests/ and scripts/ are directories and stay out either way.
+COPY *.py ./
 COPY static ./static
 COPY templates ./templates
 
