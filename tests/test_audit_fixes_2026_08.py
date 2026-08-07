@@ -8,6 +8,7 @@ the Codex app-server pool, and roundtable grounding/verification.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -16,6 +17,8 @@ import pytest
 import app as app_module
 import codex_provider
 import roundtable.core as core
+
+_IS_WINDOWS = os.name == "nt"
 
 
 # ─── child process environment ───────────────────────────────────────────
@@ -199,11 +202,23 @@ def test_codex_input_items_carries_images(tmp_path, monkeypatch) -> None:
     items = app_module._codex_input_items("hello", blocks, "run-abc")
     assert items[0] == {"type": "text", "text": "hello"}
     assert items[1]["type"] == "localImage"
+    # Under uploads/<run_id>/, which _purge_old_uploads already reaps, rather
+    # than the shared temp dir where they accumulated forever.
     written = tmp_path / "run-abc"
     assert written.is_dir()
-    # 0600, not the shared temp dir's default 0644.
-    only = next(written.iterdir())
-    assert oct(only.stat().st_mode & 0o777) == "0o600"
+    assert next(written.iterdir()).is_file()
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="POSIX file modes don't apply on NTFS")
+def test_codex_image_written_mode_600(tmp_path, monkeypatch) -> None:
+    """A multi-user host must not be able to read whatever the operator pasted
+    into a chat; the old path wrote world-readable files into the shared temp
+    dir."""
+    monkeypatch.setattr(app_module, "UPLOADS_ROOT", tmp_path)
+    blk = [{"source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]
+    paths = app_module._codex_image_paths(blk, "run-mode")
+    assert paths
+    assert oct(Path(paths[0]).stat().st_mode & 0o777) == "0o600"
 
 
 def test_codex_image_paths_no_index_collision(tmp_path, monkeypatch) -> None:
