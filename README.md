@@ -221,7 +221,14 @@ The ownership filter is not an OS security boundary. All model processes still r
 | Variable | Default | Notes |
 |---|---|---|
 | `CLAUDE_WEB_CSRF_STRICT` | `true` | Reject mutating requests without a matching `Origin` or `Referer` header. Set `false` only for command-line testing. |
-| `CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE` | `1000` | Bound on in-memory SSE event queue per subscriber; slow clients are dropped (with `_overflow`) instead of growing memory. |
+| `CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE` | `1000` | Bound on in-memory SSE event queue per subscriber. A replay longer than this overflows and the client resumes from the `next_index` the marker carries. |
+| `CLAUDE_WEB_CHILD_ENV_SCRUB` | *(empty)* | Extra env var names to strip from every spawned child, comma-separated. This app's own secrets (`SESSION_SECRET`, `OIDC_CLIENT_SECRET`, `OIDC_CLIENT_ID`, `CLAUDE_WEB_PUSHOVER_*`) are always stripped. Provider keys are not, by default — MCP servers registered without their own `env` inherit them from the child. |
+
+A spawned agent runs shell commands, so treat anything in the server's
+environment as readable by the model and by anything it executes.
+`SESSION_SECRET` is the only input to the auth-cookie signer, so it is stripped
+unconditionally; if you add secrets of your own to the service environment, add
+their names to `CLAUDE_WEB_CHILD_ENV_SCRUB`.
 
 ### Retention / GC
 
@@ -229,6 +236,7 @@ The ownership filter is not an OS security boundary. All model processes still r
 |---|---|---|
 | `CLAUDE_WEB_PERSIST_RETENTION` | `86400` (24h) | Run/event store rows older than this are pruned. |
 | `CLAUDE_WEB_UPLOAD_RETENTION` | `604800` (7d) | Per-run upload directories older than this are deleted. |
+| `CLAUDE_WEB_CONVERSATION_RETENTION` | `2592000` (30d) | Canonical conversation log (`conversation*` tables) older than this is pruned. Deliberately much longer than the run store: this is what a mid-chat provider switch replays. A conversation with a live run is never pruned. |
 | `CLAUDE_WEB_PERMISSION_TIMEOUT` | `900` (15m) | Pending permission requests deny themselves after this. |
 | `CLAUDE_WEB_MAX_AUTO_FIRES` | `3` | How many synth-message turns can chain off background tool notifications before the driver waits for a human. |
 

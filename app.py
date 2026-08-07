@@ -355,9 +355,66 @@ UPLOAD_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_UPLOAD_RETENTION", str(7 * 
 # multi-day reporting while staying small.
 USAGE_RETENTION_SECONDS = int(os.getenv("CLAUDE_WEB_USAGE_RETENTION", str(30 * 86400)))
 
+# The canonical conversation log (conversation / conversation_binding /
+# conversation_event) is what a mid-chat provider switch replays, so it has to
+# outlive PERSIST_RETENTION_SECONDS by a wide margin — switching provider on a
+# conversation last touched weeks ago is a normal thing to do. It is also by far
+# the largest table in state.db, so it does need *a* bound.
+CONVERSATION_RETENTION_SECONDS = int(
+    os.getenv("CLAUDE_WEB_CONVERSATION_RETENTION", str(30 * 86400))
+)
+
 # Pending permission requests deny themselves after this if the browser never
 # answers (closed tab, lost network). Without this the SDK turn pins forever.
 PERMISSION_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_WEB_PERMISSION_TIMEOUT", "900"))
+
+# Secrets this app owns that must never reach a spawned child. systemd loads
+# .env into the server process and the agent SDK *merges* options.env over the
+# inherited environment (it cannot remove a name), so a child would otherwise
+# see all of them: one `env` in any turn is enough. SESSION_SECRET is the whole
+# ballgame — it is the only input to the auth-cookie signer, so whoever reads it
+# can mint a session for any user.
+#
+# Third-party provider keys (OPENAI_API_KEY, GEMINI_API_KEY, ...) are
+# deliberately absent: MCP servers registered without an explicit `env` block
+# inherit them from the child, and scrubbing by default would break those
+# installs. Add them via CLAUDE_WEB_CHILD_ENV_SCRUB once your MCP registrations
+# pass their own keys.
+_CHILD_ENV_SCRUB_DEFAULT = (
+    "SESSION_SECRET",
+    "OIDC_CLIENT_SECRET",
+    "OIDC_CLIENT_ID",
+    "CLAUDE_WEB_PUSHOVER_TOKEN",
+    "CLAUDE_WEB_PUSHOVER_USER",
+)
+CHILD_ENV_SCRUB: tuple[str, ...] = tuple(dict.fromkeys(
+    list(_CHILD_ENV_SCRUB_DEFAULT)
+    + [
+        name.strip()
+        for name in os.getenv("CLAUDE_WEB_CHILD_ENV_SCRUB", "").split(",")
+        if name.strip()
+    ]
+))
+
+
+def _scrubbed_child_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Child environment overlay with this app's own secrets blanked.
+
+    Only names actually present in the parent environment are included, so the
+    overlay stays minimal. An empty value is how the SDK expresses "unset" —
+    every consumer of these names treats blank as absent. A caller-supplied
+    ``env`` wins, so an explicit override is still honoured.
+    """
+    scrubbed = {name: "" for name in CHILD_ENV_SCRUB if os.environ.get(name)}
+    if env:
+        scrubbed.update(env)
+    return scrubbed
+
+
+# The codex app-server child builds a full replacement environment, so it can
+# delete these outright rather than blank them. Share the resolved list so the
+# CLAUDE_WEB_CHILD_ENV_SCRUB knob covers both providers.
+codex_provider.SCRUB_ENV_NAMES = list(CHILD_ENV_SCRUB)
 
 # Cap how many synth-message turns can chain off background tool notifications
 # before we stop and wait for the human. Prevents a notification-emitting tool
@@ -5962,6 +6019,52 @@ def _purge_old_persisted(now: float) -> None:
         logging.getLogger("claude-web").warning("purge_old_persisted failed: %s", e)
 
 
+def _purge_old_conversations(now: float) -> None:
+    """Drop canonical conversation rows past CONVERSATION_RETENTION_SECONDS.
+
+    The canonical log records every assistant message, tool result and user
+    prompt with payloads up to CANONICAL_PAYLOAD_CAP, so it outgrows the run
+    event store by more than an order of magnitude — it was the dominant
+    consumer of state.db before this existed, and monotonic, because the
+    _purge_old_persisted sweep only ever covered ``events`` and ``runs``.
+
+    Retention is deliberately much longer than PERSIST_RETENTION_SECONDS: this
+    log is what a provider switch replays, and a user can reasonably switch
+    provider on a conversation they last touched weeks ago. A conversation with
+    a live run is never purged, however old its last event.
+    """
+    cutoff = now - CONVERSATION_RETENTION_SECONDS
+    live_conv = [
+        r.conversation_id for r in ACTIVE_RUNS.values()
+        if not r.done and r.conversation_id
+    ]
+    keep_clause = ""
+    params: list[Any] = [cutoff]
+    if live_conv:
+        placeholders = ",".join("?" * len(live_conv))
+        keep_clause = f" AND conversation_id NOT IN ({placeholders})"
+        params.extend(live_conv)
+    doomed = (
+        "SELECT conversation_id FROM conversation "
+        f"WHERE updated_at < ?{keep_clause}"
+    )
+    try:
+        db = _state_db()
+        for table in ("conversation_event", "conversation_binding"):
+            db.execute(
+                f"DELETE FROM {table} WHERE conversation_id IN ({doomed})",
+                tuple(params),
+            )
+        db.execute(
+            f"DELETE FROM conversation WHERE conversation_id IN ({doomed})",
+            tuple(params),
+        )
+    except sqlite3.Error as e:
+        logging.getLogger("claude-web").warning(
+            "purge_old_conversations failed: %s", e,
+        )
+
+
 _LAST_UPLOAD_PURGE = 0.0
 _UPLOAD_PURGE_INTERVAL_SECONDS = 600  # don't rescan the dir on every request
 _LAST_DB_PURGE = 0.0
@@ -6064,6 +6167,7 @@ def _restore_persisted_runs() -> None:
     """
     now = time.time()
     _purge_old_persisted(now)
+    _purge_old_conversations(now)
     try:
         rows = _state_db().execute(
             "SELECT run_id, owner_sub, session_id, project_key, created_at,"
@@ -6399,10 +6503,18 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
             setting_sources=[],
             mcp_servers={},
             permission_mode="plan",
-            env=account.get("env") or {},
+            env=_scrubbed_child_env(account.get("env")),
             cli_path=shutil.which("claude"),
         )
         chunks: list[str] = []
+        # The installed SDK builds its error text from `errors` alone, falling
+        # back to str(subtype). An API failure arrives as is_error=True with
+        # subtype "success" and the real cause in api_error_status/result, so the
+        # exception message alone reads as the nonsense "Claude Code returned an
+        # error result: success". Keep the ResultMessage so the log and the
+        # model-facing message can name the actual failure (e.g. HTTP 429, spend
+        # limit reached).
+        outcome: dict[str, Any] = {}
 
         async def _consult() -> None:
             async for msg in _sdk_query(prompt=prompt, options=fable_opts):
@@ -6410,6 +6522,18 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
                     for blk in msg.content:
                         if isinstance(blk, TextBlock):
                             chunks.append(blk.text)
+                elif isinstance(msg, ResultMessage):
+                    outcome["status"] = msg.api_error_status
+                    outcome["result"] = msg.result
+                    outcome["is_error"] = msg.is_error
+
+        def _failure_detail() -> str:
+            bits = []
+            if outcome.get("status"):
+                bits.append(f"HTTP {outcome['status']}")
+            if outcome.get("result"):
+                bits.append(str(outcome["result"])[:300])
+            return " — ".join(bits)
 
         try:
             await asyncio.wait_for(_consult(), timeout=_ADVISOR_TIMEOUT_S)
@@ -6417,11 +6541,31 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
             return {"content": [{"type": "text",
                 "text": "The advisor timed out. Proceed on your own judgment."}]}
         except Exception as e:
-            log.warning("advisor consult failed run=%s: %s", run.run_id, e)
+            detail = _failure_detail()
+            log.warning(
+                "advisor consult failed run=%s: %s%s",
+                run.run_id, e, f" [{detail}]" if detail else "",
+            )
             return {"content": [{"type": "text",
-                "text": f"The advisor is unavailable right now ({type(e).__name__}). "
-                        "Proceed on your own judgment."}]}
-        text = "".join(chunks).strip() or "The advisor returned no response."
+                "text": "The advisor is unavailable right now"
+                        + (f": {detail}" if detail else f" ({type(e).__name__})")
+                        + ". Proceed on your own judgment."}]}
+        text = "".join(chunks).strip()
+        if not text:
+            # A failed turn can end without raising (is_error on the
+            # ResultMessage, no text blocks). Reporting "no response" there hides
+            # a billing or rate-limit wall behind what looks like a quiet model.
+            detail = _failure_detail() if outcome.get("is_error") else ""
+            if detail:
+                log.warning(
+                    "advisor consult returned an error run=%s: %s",
+                    run.run_id, detail,
+                )
+            text = (
+                f"The advisor is unavailable right now: {detail}. "
+                "Proceed on your own judgment."
+                if detail else "The advisor returned no response."
+            )
         return {"content": [{"type": "text", "text": text}]}
 
     return create_sdk_mcp_server(name="claude_web", version="1.0.0", tools=[advisor])
@@ -6643,6 +6787,34 @@ def _resolve_skills_for_run() -> Any:
 
 
 # ─── Active run tracking ─────────────────────────────────────────────────────
+
+
+def _force_terminal(q: asyncio.Queue, marker: dict) -> None:
+    """Put a terminal marker (_overflow / _done) into a subscriber queue,
+    evicting the oldest buffered event to make room if needed.
+
+    Without the evict-first step, a full queue silently drops the marker and
+    the SSE consumer drains its partial backlog then waits forever for events
+    that will never arrive — the browser shows a spinner that never resolves
+    and holds the connection open. Losing one buffered event to make room is
+    always the better trade: the client re-fetches from the persisted store,
+    whereas a lost terminal is unrecoverable.
+    """
+    try:
+        q.put_nowait(marker)
+        return
+    except asyncio.QueueFull:
+        pass
+    try:
+        q.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
+    try:
+        q.put_nowait(marker)
+    except asyncio.QueueFull:
+        # Should be impossible after a get on a maxsize>0 queue, but stay
+        # defensive — losing _done beats raising here.
+        pass
 
 
 class ActiveRun:
@@ -6986,45 +7158,36 @@ class ActiveRun:
         Queue depth is capped at MAX_SUBSCRIBER_QUEUE; a slow subscriber
         that falls behind during live tail will be dropped and emit() sends
         _overflow so the client reconnects via /api/chat/stream/<run_id>.
+
+        The backlog is pushed synchronously, before any consumer runs, so a run
+        holding more than MAX_SUBSCRIBER_QUEUE events (EVENTS_MEM_CAP_HIGH
+        allows ten times as many) always overflows partway through its own
+        replay. That is expected and recoverable: the _overflow marker carries
+        ``next_index``, the idx of the first event that did NOT fit, so the
+        client resumes from exactly there and each round makes forward
+        progress.
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=MAX_SUBSCRIBER_QUEUE)
 
         def _put_terminal(marker: dict) -> None:
-            """Force a terminal marker (_overflow / _done) into the queue,
-            making room by evicting the oldest buffered event if needed.
-
-            Without the evict-first step, a queue that just hit QueueFull
-            on a backlog event would silently drop the terminal marker too —
-            the consumer drains the partial backlog and then hangs forever
-            waiting for events that will never arrive.
-            """
-            try:
-                q.put_nowait(marker)
-                return
-            except asyncio.QueueFull:
-                pass
-            try:
-                q.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                q.put_nowait(marker)
-            except asyncio.QueueFull:
-                # Should be impossible after a get on a maxsize>0 queue,
-                # but stay defensive — losing _done is preferable to a
-                # crash here.
-                pass
+            _force_terminal(q, marker)
 
         def _put_or_overflow(evt: dict) -> bool:
-            """Append evt; on QueueFull, signal overflow (forced) and stop.
-            Returns False if the consumer should fetch via the persisted
-            store."""
-            try:
-                q.put_nowait(evt)
-                return True
-            except asyncio.QueueFull:
-                _put_terminal({"type": "_overflow"})
+            """Append evt; on overflow, signal it and stop.
+
+            Returns False if the consumer should reconnect for the remainder.
+            The last queue slot is reserved for the terminal marker: letting
+            _force_terminal evict to make room would drop the OLDEST queued
+            event, punching a permanent hole at the head of the replay window
+            that no reconnect could refill.
+            """
+            if q.qsize() >= max(1, MAX_SUBSCRIBER_QUEUE - 1):
+                _put_terminal({
+                    "type": "_overflow", "next_index": evt.get("_idx"),
+                })
                 return False
+            q.put_nowait(evt)
+            return True
 
         # Range partition: anything below the oldest kept event goes via
         # sqlite, the remainder via self.events. Two edge cases:
@@ -7108,10 +7271,10 @@ class ActiveRun:
                 ))
         self.done = True
         for q in list(self.subscribers):
-            try:
-                q.put_nowait({"type": "_done"})
-            except asyncio.QueueFull:
-                pass
+            # Forced, not best-effort: a subscriber whose queue filled on a
+            # partial_text burst (emit_transient drops silently by design)
+            # would otherwise never learn the run ended.
+            _force_terminal(q, {"type": "_done"})
         self.subscribers.clear()
         # Drop the session-id mapping so a follow-up POST doesn't pin against
         # a finished run. The run object stays in ACTIVE_RUNS until _gc_runs
@@ -7354,12 +7517,30 @@ async def _mark_shutting_down() -> None:
     codex_provider.CodexAppServer.shutdown_all()
 
 
-def _require_restart_admin(user: dict) -> None:
-    """Empty ADMIN_EMAILS = single-operator install: any signed-in user."""
-    if not ADMIN_EMAILS:
+def _require_global_config_admin(user: dict, what: str) -> None:
+    """Gate a mutation whose blast radius is the whole instance, not one user.
+
+    Empty ADMIN_EMAILS means a single-operator install, where every signed-in
+    user is the operator and the open default is intended. That default must not
+    survive into PER_USER_SESSIONS, where users are separate tenants and an
+    instance-wide write reaches into everyone else's runs. A multi-user instance
+    with no admin list therefore stays locked — no email is in the empty set —
+    rather than handing every tenant a shared switch. Same shape as
+    _require_setup_access.
+    """
+    if not (PER_USER_SESSIONS or ADMIN_EMAILS):
         return
     if (user.get("email") or "").lower() not in ADMIN_EMAILS:
-        raise HTTPException(403, "admin only")
+        log.info(
+            "%s reject %s: not in CLAUDE_WEB_ADMIN_EMAILS",
+            what, user.get("email") or user.get("sub") or "?",
+        )
+        raise HTTPException(403, f"admin access required for {what}")
+
+
+def _require_restart_admin(user: dict) -> None:
+    """A restart SIGTERMs every user's in-flight CLI, so it is instance-wide."""
+    _require_global_config_admin(user, "restart")
 
 
 @app.post("/api/admin/restart")
@@ -7487,6 +7668,7 @@ def _gc_runs() -> None:
     if now - _LAST_DB_PURGE >= _DB_PURGE_INTERVAL_SECONDS:
         _LAST_DB_PURGE = now
         _purge_old_persisted(now)
+        _purge_old_conversations(now)
 
 
 def _run_is_live(run: Optional[ActiveRun]) -> bool:
@@ -7572,6 +7754,14 @@ async def _send_to_client(client, text: str, blocks: list[dict]) -> None:
 USER_INPUT_DELIVERY_TIMEOUT = float(
     os.getenv("CLAUDE_WEB_USER_INPUT_DELIVERY_TIMEOUT", "1800"),
 )
+
+
+class CodexSteerUnavailable(RuntimeError):
+    """No live Codex turn to steer a mid-turn message into.
+
+    Distinct from an app-server rejection so the driver's failure message can
+    say which of the two happened.
+    """
 
 
 class _DeliveryAlreadyReported(RuntimeError):
@@ -9228,7 +9418,13 @@ async def api_skill_toggle(
     allow-list of remaining enabled names; the bundled CLI never loads the
     SKILL.md so the model can't discover or invoke it. Re-enabling drops
     the row from ``disabled_skill``.
+
+    ``disabled_skill`` has no owner column and ``_resolve_skills_for_run``
+    reads it for every user's spawn, so this write is instance-wide. That is
+    fine for a single-operator install but is a cross-tenant write once users
+    are separated, hence the same admin gate the other global mutations use.
     """
+    _require_global_config_admin(user, "skill toggle")
     name = _safe_skill_name(name)
     # Guard: don't let the user hide a name that isn't actually installed
     # (would just clutter the table forever — there's no UI to remove it).
@@ -9775,11 +9971,7 @@ async def _codex_driver(
                     run.emit({"type": "error",
                               "message": f"Codex compaction failed: {e}"})
                 return True
-            input_items: list[dict] = []
-            if text:
-                input_items.append({"type": "text", "text": text})
-            for path in _codex_image_paths(image_blocks, run.run_id):
-                input_items.append({"type": "localImage", "path": path})
+            input_items = _codex_input_items(text, image_blocks, run.run_id)
             params: dict[str, Any] = {
                 "threadId": thread_id,
                 "input": input_items,
@@ -9890,11 +10082,30 @@ async def _codex_driver(
                                 if not run.accepting_input:
                                     run.user_input_queue.put_nowait(item)
                                     delivered_ok = False
+                                elif not run.codex_turn_id:
+                                    # between_turns and codex_turn_id are always
+                                    # assigned together with no await between,
+                                    # so this only happens when turn/start
+                                    # answered without a turn id. Nothing to
+                                    # steer; report it rather than requeueing,
+                                    # which would spin (accepting_input is still
+                                    # True, so the loop re-gets it immediately).
+                                    raise CodexSteerUnavailable(
+                                        "no active Codex turn to steer"
+                                    )
                                 else:
+                                    # expectedTurnId is REQUIRED by
+                                    # TurnSteerParams — omitting it makes the
+                                    # app-server reject every mid-turn message
+                                    # with -32600 missing field.
                                     await server.request("turn/steer", {
                                         "threadId": thread_id,
-                                        "input": [{"type": "text",
-                                                   "text": item.get("text") or ""}],
+                                        "expectedTurnId": run.codex_turn_id,
+                                        "input": _codex_input_items(
+                                            item.get("text") or "",
+                                            item.get("image_blocks") or [],
+                                            run.run_id,
+                                        ),
                                     })
                         except Exception as e:
                             log.warning("codex steer failed: %s", e)
@@ -10048,20 +10259,58 @@ async def _codex_driver(
         _persist_run_meta(run)
 
 
+def _codex_input_items(
+    text: str, image_blocks: list[dict], run_id: str,
+) -> list[dict]:
+    """Build the codex ``input`` array shared by turn/start and turn/steer.
+
+    Kept in one place because the two paths drifting is exactly how mid-turn
+    image attachments came to be silently dropped: steer built a text-only
+    array while the UI still echoed the attachment count.
+    """
+    items: list[dict] = []
+    if text:
+        items.append({"type": "text", "text": text})
+    for path in _codex_image_paths(image_blocks, run_id):
+        items.append({"type": "localImage", "path": path})
+    return items
+
+
 def _codex_image_paths(image_blocks: list[dict], run_id: str) -> list[str]:
-    """Materialize uploaded base64 image blocks as temp files for codex's
-    localImage input items (the app-server takes paths, not payloads)."""
+    """Materialize uploaded base64 image blocks as files for codex's
+    localImage input items (the app-server takes paths, not payloads).
+
+    Written under uploads/<run_id>/ rather than the shared temp dir for two
+    reasons: _purge_old_uploads already reaps that directory, and mode 0600
+    keeps a multi-user host from reading whatever the operator pasted into a
+    chat. The per-call random prefix stops a later turn's image 0 from
+    overwriting an earlier one.
+    """
     exts = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
             "image/webp": ".webp"}
+    blocks = image_blocks or []
+    if not blocks:
+        return []
+    target_dir = UPLOADS_ROOT / run_id
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("codex image dir create failed: %s", e)
+        return []
+    nonce = uuid_mod.uuid4().hex[:8]
     paths: list[str] = []
-    for i, blk in enumerate(image_blocks or []):
+    for i, blk in enumerate(blocks):
         src = (blk or {}).get("source") or {}
         if src.get("type") != "base64" or not src.get("data"):
             continue
         ext = exts.get(src.get("media_type") or "", ".png")
-        p = Path(tempfile.gettempdir()) / f"claude-web-codex-{run_id}-{i}{ext}"
+        p = target_dir / f"codex-{nonce}-{i}{ext}"
         try:
-            p.write_bytes(base64.b64decode(src["data"]))
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, base64.b64decode(src["data"]))
+            finally:
+                os.close(fd)
             paths.append(str(p))
         except (OSError, ValueError) as e:
             log.warning("codex image materialize failed: %s", e)
@@ -10798,13 +11047,13 @@ async def api_chat(
         options_kwargs["fallback_model"] = FALLBACK_MODEL
     if MAX_BUDGET_USD > 0:
         options_kwargs["max_budget_usd"] = MAX_BUDGET_USD
-    if account["env"]:
-        # Identity (CLAUDE_WEB_USER_*) is always present so SessionStart
-        # hooks can address the user by name; CLAUDE_CONFIG_DIR/
-        # ANTHROPIC_API_KEY are added when the user has activated a personal
-        # credential slot. The SDK merges this dict over inherited env, so
-        # PATH/HOME/etc. survive.
-        options_kwargs["env"] = account["env"]
+    # Identity (CLAUDE_WEB_USER_*) is always present so SessionStart
+    # hooks can address the user by name; CLAUDE_CONFIG_DIR/
+    # ANTHROPIC_API_KEY are added when the user has activated a personal
+    # credential slot. The SDK merges this dict over inherited env, so
+    # PATH/HOME/etc. survive. Set unconditionally: even a shared-slot run with
+    # no account env needs the CHILD_ENV_SCRUB overlay.
+    options_kwargs["env"] = _scrubbed_child_env(account["env"])
     if swap_respawn or fork:
         # Personality / credential toggles cancelled an in-flight run (or
         # the user explicitly asked to branch via the fork field). Fork

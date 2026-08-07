@@ -1468,6 +1468,22 @@ class _StreamFailedBeforeOutput(RuntimeError):
     the fallback won't double up."""
 
 
+def _cli_child_env() -> dict[str, str]:
+    """Environment for a ``claude`` CLI child on the subscription transport.
+
+    The CLI prefers an inherited ``ANTHROPIC_API_KEY`` over OAuth, so a host
+    that exports one bills per-token behind the operator's back — and fails
+    every turn outright when that key's account has no credits, reported as the
+    near-meaningless ``is_error=true subtype=success``. Reaching the CLI at all
+    means subscription intent (``auto``/``cli``), so blank the key; the CLI
+    treats empty as unset and falls back to OAuth. Mirrors the SDK path in
+    ``_call_anthropic_sdk_with_tools``.
+    """
+    env = os.environ.copy()
+    env["ANTHROPIC_API_KEY"] = ""
+    return env
+
+
 def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") -> str:
     """Run the claude CLI in stream-json mode, emitting visible text deltas.
 
@@ -1486,7 +1502,7 @@ def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") ->
     # few for the error tail.
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True,
+        stderr=subprocess.STDOUT, text=True, env=_cli_child_env(),
     )
     parts: list[str] = []
     noise_tail: list[str] = []  # recent non-JSON lines, for the error message
@@ -1636,6 +1652,7 @@ def _call_anthropic_cli(
             text=True,
             capture_output=True,
             timeout=PROVIDER_TIMEOUT_SEC,
+            env=_cli_child_env(),
         )
         if proc.returncode != 0:
             # Surface BOTH streams. claude-ha writes account-switching
@@ -1791,24 +1808,18 @@ def _readonly_permission_callback(
     return "allow" if tool_name in _READONLY_TOOLS else "deny"
 
 
-def _deny_all_permission_callback(
-    participant_label: str, tool_name: str, tool_input: dict,
-) -> PermissionDecision:
-    return "deny"
-
-
 def _policy_callback(policy: str) -> Optional[PermissionCallback]:
     """Map a stored string policy to a built-in permission callback.
 
-    ``readonly`` and ``deny`` resolve to self-contained callbacks. ``ask``
-    needs an interactive (e.g. browser) callback supplied by the caller —
-    there is no built-in for it, so this returns None and the resolver
-    falls back to the no-tools path rather than silently auto-allowing.
+    ``readonly`` resolves to a self-contained callback. ``ask`` needs an
+    interactive (e.g. browser) callback supplied by the caller — there is no
+    built-in for it, so this returns None and the resolver falls back to the
+    no-tools path rather than silently auto-allowing. ``deny`` never reaches
+    here: the resolver short-circuits it to "no tools" so that no
+    caller-supplied callback can re-enable them.
     """
     if policy == "readonly":
         return _readonly_permission_callback
-    if policy == "deny":
-        return _deny_all_permission_callback
     return None  # "ask" — must be supplied externally
 
 
@@ -1821,8 +1832,8 @@ def _effective_tool_context(
     webapp passing its own interactive callback). Otherwise we look up the
     thread's stored binding and synthesize a context whose callback comes
     from the string policy. Returns None (no tools) when there is no
-    binding, or when the policy is ``ask`` but no interactive callback was
-    supplied — never auto-allow a gated policy.
+    binding, when the policy is ``deny``, or when the policy is ``ask`` but no
+    interactive callback was supplied — never auto-allow a gated policy.
     """
     if explicit is not None and explicit.working_directory is not None:
         return explicit
@@ -1830,6 +1841,13 @@ def _effective_tool_context(
     if binding is None:
         return explicit
     policy = binding["permission_policy"]
+    if policy == "deny":
+        # A deny binding means "no tools on this thread", so it must not be
+        # satisfiable by a caller-supplied callback. Left to fall through, deny
+        # ended up the *weakest* setting: the clamp below only fires for
+        # readonly, so allowed_tools stayed None and the SDK path read that as
+        # "no cap" — the full claude_code preset, Bash and Write included.
+        return None
     callback = (
         explicit.permission_callback
         if explicit is not None and explicit.permission_callback is not None
@@ -3064,6 +3082,15 @@ class _RepoTools:
             return f"[permission denied for {name}]"
         try:
             if name == "Read":
+                # An explicit line makes this a bounded window read (used by
+                # verification, which must reach any depth into a file). The
+                # declared Read schema has no `line`, so panellists get the
+                # plain capped read.
+                if "line" in args:
+                    return self.read_line_window(
+                        args.get("path"), int(args.get("line") or 0),
+                        int(args.get("context") or 40),
+                    )
                 return self._read(args.get("path"))
             if name == "Grep":
                 return self._grep(args.get("pattern"), args.get("path"))
@@ -3082,6 +3109,44 @@ class _RepoTools:
         if len(text) > _TOOL_READ_MAX_BYTES:
             text = text[:_TOOL_READ_MAX_BYTES] + "\n[… truncated]"
         return text
+
+    def read_line_window(self, rel: str, line: int, context: int) -> str:
+        """Line-numbered window around ``line``, at any depth into the file.
+
+        Separate from ``_read`` because that one caps at _TOOL_READ_MAX_BYTES to
+        bound what a panellist can pull into a prompt. Verification needs the
+        opposite property: the cited line must be reachable however large the
+        file is. Slicing a capped read silently returned an *empty* excerpt for
+        anything past the cap, and a verifier told to judge only from the code
+        shown then ruled real defects refuted. Streams line by line, so memory
+        stays proportional to the window, not the file.
+
+        Same jail as every other tool here. Returns a ``[...]`` marker on
+        failure, matching the convention the callers already branch on.
+        """
+        p = self._resolve(rel)
+        if p is None or not p.is_file():
+            return f"[no such file: {rel}]"
+        lo = max(1, line - context) if line > 0 else 1
+        hi = (line + context) if line > 0 else (2 * context + 1)
+        out: list[str] = []
+        try:
+            with p.open(encoding="utf-8", errors="replace") as fh:
+                for n, text in enumerate(fh, start=1):
+                    if n > hi:
+                        break
+                    if n >= lo:
+                        out.append(f"{n}: {text.rstrip(chr(10))}")
+        except OSError as exc:
+            return f"[Read error: {type(exc).__name__}: {exc}]"
+        if not out:
+            # The file is shorter than the cited line: the citation itself is
+            # wrong. Say so explicitly rather than handing back nothing.
+            return (
+                f"[{rel} has fewer than {line} lines — the cited location "
+                f"does not exist]"
+            )
+        return "\n".join(out)
 
     def _grep(self, pattern: str, rel: Optional[str]) -> str:
         if not pattern:
@@ -3180,6 +3245,15 @@ def _call_gemini_with_tools(
         ),
         "http_options": genai_types.HttpOptions(timeout=int(PROVIDER_TIMEOUT_SEC * 1000)),
     }
+    if web_search:
+        # Gemini rejects a built-in tool (google_search) alongside function
+        # declarations unless this is set, with
+        # `400 INVALID_ARGUMENT ... Please enable
+        # tool_config.include_server_side_tool_invocations`. Only the tools path
+        # combines the two, which is why plain _call_gemini never hits this.
+        config["tool_config"] = genai_types.ToolConfig(
+            include_server_side_tool_invocations=True,
+        )
     if effort and _gemini_uses_thinking_level(model):
         config["thinking_config"] = genai_types.ThinkingConfig(thinking_level=effort)
     elif effort in _GEMINI_BUDGETS:
@@ -3232,10 +3306,15 @@ def _call_gemini_with_tools(
                 parts=[genai_types.Part(text=_TOOL_BUDGET_FINAL_INSTRUCTION)],
             ))
             final_config = dict(config)
+            # Replacing tool_config wholesale would drop the
+            # include_server_side_tool_invocations flag set above, so a
+            # web_search turn would hit the same 400 it was set to avoid — on
+            # the very last call, after twelve rounds of work.
             final_config["tool_config"] = genai_types.ToolConfig(
                 function_calling_config=genai_types.FunctionCallingConfig(
                     mode="NONE",
                 ),
+                include_server_side_tool_invocations=web_search or None,
             )
             last = _provider_call(
                 f"gemini-tools/{model}/final",
@@ -4181,21 +4260,6 @@ _CONVERGE_SYSTEM_PROMPT = (
 )
 
 
-def _excerpt_around(text: str, line: int) -> str:
-    """Return a line-numbered window of ``text`` centred on ``line`` (1-based).
-
-    A non-positive ``line`` means "not line-specific" — return the head of the
-    content (already byte-capped by the reader) instead of a centred window.
-    """
-    lines = text.splitlines()
-    if line and line > 0:
-        lo = max(0, line - 1 - _CONVERGE_WINDOW_LINES)
-        hi = min(len(lines), line - 1 + _CONVERGE_WINDOW_LINES + 1)
-    else:
-        lo, hi = 0, min(len(lines), 2 * _CONVERGE_WINDOW_LINES + 1)
-    return "\n".join(f"{lo + i + 1}: {s}" for i, s in enumerate(lines[lo:hi]))
-
-
 def _parse_verdict(text: str) -> str:
     """Map a verifier reply to one of _VALID_VERDICTS; default unresolved.
 
@@ -4315,19 +4379,22 @@ def roundtable_converge(
             "severity": (f.get("severity") or "").strip(),
             "verifier": info["label"],
         }
-        raw = repo_tools.execute("Read", {"path": path}) if path else "[no file cited]"
-        if any(raw.startswith(p) for p in (
+        excerpt = repo_tools.execute("Read", {
+            "path": path, "line": line, "context": _CONVERGE_WINDOW_LINES,
+        }) if path else "[no file cited]"
+        if any(excerpt.startswith(p) for p in (
             "[no such file", "[permission denied", "[Read error", "[no file cited",
-        )):
-            # Cited location can't be read — can't confirm or refute it.
-            ledger.append({**row, "verdict": "unresolved", "evidence": raw})
+        )) or excerpt.endswith("does not exist]"):
+            # Cited location can't be read, or isn't there — can't confirm or
+            # refute it, and it never reaches the model.
+            ledger.append({**row, "verdict": "unresolved", "evidence": excerpt})
             continue
         user_msg = (
             f"CLAIM: {row['claim']}\n"
             f"LOCATION: {path}:{line}\n"
             f"SEVERITY: {row['severity'] or 'unspecified'}\n"
             f"REVIEWER'S PROOF: {row['proof'] or '(none given)'}\n\n"
-            f"ACTUAL CODE at {path} (line-numbered):\n{_excerpt_around(raw, line)}"
+            f"ACTUAL CODE at {path} (line-numbered):\n{excerpt}"
         )
         reply = _judge_finding(info, transport, user_msg)
         ledger.append({**row, "verdict": _parse_verdict(reply), "evidence": reply})
@@ -4405,7 +4472,16 @@ def roundtable_compact(
     info = _resolve_participant(summarizer)
 
     effective = _effective_messages(thread_id)
-    cut = effective[: len(effective) - keep_last] if keep_last else list(effective)
+    # max(0, ...) matters: a bare len-keep_last goes negative once keep_last
+    # exceeds the message count, and Python reads that as "all but the last N",
+    # so asking to keep more than exists compacted the *head* of the thread.
+    # With the default keep_last=10 that hit every thread under ten messages,
+    # and _effective_messages then serves the summary in place of those turns
+    # permanently.
+    cut = (
+        effective[: max(0, len(effective) - keep_last)] if keep_last
+        else list(effective)
+    )
     prev = _compaction_row(thread_id)
     if prev is not None:
         # Drop nothing that's already covered: the synthetic summary message
@@ -5124,8 +5200,14 @@ def roundtable_coding_review_findings(results: dict) -> dict:
 def roundtable_coding_synthesis_prompt(
     task: str, panel_labels: list[str], synthesizer_label: str,
     has_artifacts: bool, verification: Optional[dict] = None,
+    panel_errors: Optional[dict[str, str]] = None,
 ) -> str:
-    """Build the final synthesis contract shared by MCP and web workflows."""
+    """Build the final synthesis contract shared by MCP and web workflows.
+
+    ``panel_errors`` is named so the synthesizer knows the panel was thinner
+    than advertised; without it a run where most panellists errored reads as
+    full agreement among the survivors.
+    """
     key, profile = _coding_task_profile(task)
     panel_list = ", ".join(panel_labels) if panel_labels else "no independent panel"
     base = (
@@ -5158,6 +5240,13 @@ def roundtable_coding_synthesis_prompt(
                 "\n\nGrounded finding verification did not complete "
                 f"({reason}). Do not present panel claims as verified facts."
             )
+    if panel_errors:
+        base += (
+            "\n\nThese panellists failed and contributed nothing: "
+            + "; ".join(f"{name} ({err})" for name, err in panel_errors.items())
+            + ". Weigh the surviving responses accordingly — agreement among "
+            "fewer reviewers is weaker evidence, not stronger."
+        )
     if has_artifacts and key in {"debug", "review", "implement", "test", "general"}:
         base += (
             "\n\nIf and only if the requested outcome is a code change and the "
@@ -5348,6 +5437,16 @@ def roundtable_coding_task(
             verification = {"status": "skipped", "reason": "verification disabled"}
         elif not grounding["repo_bound"]:
             verification = {"status": "skipped", "reason": "no bound repository"}
+        elif panel_errors and not panel_responses:
+            # Every panellist failed, so there was nothing to verify. Reporting
+            # "completed / 0 findings" here reads as a clean review to anything
+            # branching on status, which is the opposite of what happened.
+            verification = {
+                "status": "failed",
+                "reason": "no panellist returned findings: " + "; ".join(
+                    f"{name}: {err}" for name, err in panel_errors.items()
+                ),
+            }
         else:
             verification = {
                 "status": "completed",
@@ -5378,6 +5477,7 @@ def roundtable_coding_task(
         synth_info["label"],
         roundtable_has_artifacts(tid),
         verification,
+        panel_errors,
     )
     synthesis = roundtable_ask(
         tid, synthesizer, prompt=synth_prompt, effort=effort,

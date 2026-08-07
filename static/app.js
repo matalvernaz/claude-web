@@ -196,15 +196,29 @@
   // 10ms wasn't enough), then holds long enough to be spoken before the next.
   const announceQueue = [];
   let announceTimer = null;
-  function announce(text) {
+  // `urgent` messages jump the queue and survive the backpressure trim. The
+  // queue serialises at up to 5s per entry and caps at 8, so a burst (a
+  // reconnect replay, a parallel-tool flurry) could delay a "permission needed"
+  // by tens of seconds or drop it outright — and an unheard permission prompt
+  // blocks the turn indefinitely, since there is no other non-visual signal.
+  function announce(text, opts) {
     if (!announcer || !text) return;
-    announceQueue.push(String(text));
-    if (announceQueue.length > 8) announceQueue.shift();  // backpressure guard
+    const entry = { text: String(text), urgent: !!(opts && opts.urgent) };
+    if (entry.urgent) announceQueue.unshift(entry);
+    else announceQueue.push(entry);
+    // Over budget: drop the OLDEST non-urgent entry. Stale chatter is what
+    // should go, and an approval prompt waiting its turn must never be the
+    // casualty. All-urgent queues are kept whole.
+    while (announceQueue.length > 8) {
+      const i = announceQueue.findIndex((e) => !e.urgent);
+      if (i === -1) break;
+      announceQueue.splice(i, 1);
+    }
     if (!announceTimer) pumpAnnounce();
   }
   function pumpAnnounce() {
     if (!announceQueue.length) { announceTimer = null; return; }
-    const text = announceQueue.shift();
+    const text = announceQueue.shift().text;
     announcer.textContent = "";
     announceTimer = setTimeout(() => {
       announcer.textContent = text;
@@ -214,6 +228,38 @@
       const dwell = Math.min(5000, 800 + text.split(/\s+/).length * 160);
       announceTimer = setTimeout(pumpAnnounce, dwell);
     }, 120);
+  }
+
+  // Run `handler(value)` only once the user has SETTLED on a <select> option,
+  // not on every option they pass through.
+  //
+  // A collapsed <select> fires `change` for each option arrowed over, and
+  // arrowing is how a screen-reader user reads the list. Wiring a destructive
+  // action straight to `change` therefore fires it once per option on the way
+  // to the wanted one — starting a new chat, respawning the CLI, or loosening a
+  // live run's permission mode each time. Committing on blur or Enter makes
+  // browsing free and the commit deliberate. `describe` announces the option
+  // under the cursor so arrowing still reads.
+  function onCommittedChange(el, handler, describe) {
+    if (!el) return;
+    let pending = null;
+    const commit = () => {
+      if (pending === null) return;
+      const value = pending;
+      pending = null;
+      handler(value);
+    };
+    el.addEventListener("change", () => {
+      pending = el.value;
+      if (describe) announce(describe(el));
+    });
+    el.addEventListener("blur", commit);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit();
+      }
+    });
   }
 
   // --- Event sounds ----------------------------------------------------
@@ -552,8 +598,7 @@
         + (permModeSelect.value === "bypassPermissions" ? " Approval prompts are off." : ""),
       );
     }
-    permModeSelect.addEventListener("change", async () => {
-      const mode = permModeSelect.value;
+    onCommittedChange(permModeSelect, async (mode) => {
       safeSet(localStorage, PERM_MODE_KEY, mode);
       if (!sessionId) {
         announce(`Permission mode set to ${permModeLabel(mode)} for your next chat.`);
@@ -573,7 +618,7 @@
         announce("Couldn't change permission mode: network error.");
         console.warn("permission-mode change error", e);
       }
-    });
+    }, (el) => `${permModeLabel(el.value)}. Press Enter to apply.`);
   }
 
   function permModeLabel(mode) {
@@ -788,6 +833,17 @@
     for (const p of provs) ingestProvider(p);
     const available = provs.filter((p) => p.available);
     if (!providerSelect || available.length < 2) return;
+    // The markup can't know whether the switch is enabled — that's server-side
+    // — and `title` is what a screen reader reads as this control's
+    // description. Left static it told the user switching starts a new chat,
+    // which is the opposite of what the switch path does, so the one feature
+    // built to make a mid-chat change safe read as the thing to avoid.
+    providerSelect.title = providerSwitchEnabled
+      ? "Which AI runs this conversation. More providers appear here once their"
+        + " CLI is installed and signed in. Switching mid-chat carries this"
+        + " conversation over to the new provider on your next message."
+      : "Which AI runs this conversation. More providers appear here once their"
+        + " CLI is installed and signed in. Switching provider starts a new chat.";
     providerSelect.innerHTML = "";
     for (const p of available) {
       const o = document.createElement("option");
@@ -849,8 +905,7 @@
   // selected credential. Both providers keep the visible conversation; Codex
   // resumes the same rollout from the new account's app-server.
   if (accountSelect) {
-    accountSelect.addEventListener("change", async () => {
-      const target = accountSelect.value;
+    onCommittedChange(accountSelect, async (target) => {
       if (target === lastAccount) return;
       const provider = currentProvider();
       try {
@@ -885,6 +940,9 @@
         accountSelect.value = lastAccount;
         announce(`Could not switch account: ${err.message}`);
       }
+    }, (el) => {
+      const label = el.options[el.selectedIndex]?.text || el.value;
+      return `${label}. Press Enter to switch account.`;
     });
   }
 
@@ -914,10 +972,10 @@
 
   if (personalitySelect) {
     let lastPersonality = personalitySelect.value;
-    personalitySelect.addEventListener("change", async () => {
-      const target = personalitySelect.value;
+    onCommittedChange(personalitySelect, async (target) => {
       if (target === lastPersonality) return;
-      const label = personalitySelect.options[personalitySelect.selectedIndex]?.text || target;
+      const label = [...personalitySelect.options]
+        .find((o) => o.value === target)?.text || target;
       const hasLiveChat = !!(sessionId || currentRunId);
       const applyMode = applyToCurrent && applyToCurrent.checked;
       try {
@@ -959,6 +1017,11 @@
         personalitySelect.value = lastPersonality;
         announce(`Could not switch personality: ${err.message}`);
       }
+    }, (el) => {
+      const label = el.options[el.selectedIndex]?.text || el.value;
+      const willFork = !!(sessionId || currentRunId)
+        && !(applyToCurrent && applyToCurrent.checked);
+      return `${label}. Press Enter to ${willFork ? "start a fresh chat in this voice" : "apply"}.`;
     });
   }
 
@@ -2785,7 +2848,13 @@
       // re-announce — the account is part of the key so a mid-chat account
       // switch can't swallow the new account's first warning, and the
       // announcement names the account so it's clear whose limit it is.
-      const key = (obj.account_slot || "") + ":" + obj.status + ":" + (obj.rate_limit_type || "");
+      // resets_at is in the key because it identifies the *window*: without it
+      // the key never changed for the life of the page, so with a 90-day
+      // rolling cookie a tab left open announced the first warning and then
+      // silently swallowed every later window's. There is no other non-visual
+      // channel for this — #status is aria-hidden.
+      const key = (obj.account_slot || "") + ":" + obj.status + ":"
+        + (obj.rate_limit_type || "") + ":" + (obj.resets_at || "");
       if ((obj.status === "allowed_warning" || obj.status === "rejected")
           && key !== handleSSEEvent._lastRateLimitKey) {
         handleSSEEvent._lastRateLimitKey = key;
@@ -2981,21 +3050,24 @@
       announce(label + ".");
     } else if (obj.type === "permission_request") {
       ctx.currentAssistantBody = null;
-      announce(`Permission needed for ${obj.tool}.`);
+      announce(`Permission needed for ${obj.tool}.`, { urgent: true });
       playCue("permission");
       renderPermissionCard(obj);
       enqueuePermRequest("permission", obj);
       markVisibleActivity();
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
-      announce(`${obj.provider === "codex" ? "Codex" : "Claude"} is asking you a question.`);
+      announce(
+        `${obj.provider === "codex" ? "Codex" : "Claude"} is asking you a question.`,
+        { urgent: true },
+      );
       playCue("permission");
       renderQuestionCard(obj);
       enqueuePermRequest("question", obj);
       markVisibleActivity();
     } else if (obj.type === "plan_review") {
       ctx.currentAssistantBody = null;
-      announce("Claude has a plan for you to review.");
+      announce("Claude has a plan for you to review.", { urgent: true });
       playCue("permission");
       renderPlanCard(obj);
       enqueuePermRequest("plan", obj);
@@ -3058,16 +3130,22 @@
       announce(obj.notice || "Switched provider. Prior conversation carried over.");
       markVisibleActivity();
     } else if (obj.type === "_overflow") {
-      // Backend dropped us as a slow subscriber — fetch a fresh stream from
-      // the start so we don't miss anything. tryResume's reconnect path
-      // replays from index 0 via the persisted store, but we MUST clear
-      // this run's dedup watermark first — otherwise the high-water mark
-      // from before the overflow drops every replayed event as a duplicate
-      // and the transcript stays blank.
+      // The server's per-subscriber queue filled. When it tells us which idx
+      // didn't fit, resume from exactly there: keep the dedup watermark and
+      // the rendered transcript, so each round moves forward and a run longer
+      // than the queue cap loads over successive rounds. Clearing the
+      // watermark and refetching from 0 (the only option when next_index is
+      // absent) re-overflows at the same point on a long run, which is an
+      // endless loop — the first recovery delay is 0ms.
       if (currentRunId) {
-        announce("Stream backlog overflowed; reconnecting from start.");
         const rid = currentRunId;
-        renderedIdxByRun.delete(rid);
+        if (typeof obj.next_index === "number") {
+          renderedIdxByRun.set(rid, obj.next_index - 1);
+          announce("Loading more of this conversation.");
+        } else {
+          announce("Stream backlog overflowed; reconnecting from start.");
+          renderedIdxByRun.delete(rid);
+        }
         // Bump the generation BEFORE aborting so the abort rejection in the
         // in-flight sendOne sees gen !== streamGeneration and stays silent —
         // otherwise its catch runs announce("Stopped.") which cancels the
@@ -3930,15 +4008,25 @@
       if (focusBtn) focusBtn.focus();
     }
 
-    // Esc denies. Enter is intentionally NOT bound to "allow once" — that
-    // would over-ride the focused-button default, so a user with focus on
-    // the Deny button (the default for Bash/Write) would still approve by
-    // pressing Enter. Native button activation handles Enter/Space on the
-    // focused button correctly.
+    // Esc leaves the card PENDING, the same meaning it has on the approval
+    // dialog ("decide later"). It used to deny outright, so one key meant
+    // "dismiss this" on the modal and "refuse the tool" here — and a user who
+    // pressed Esc to leave the card, then waited for a turn that had already
+    // been refused, got no feedback at all. Denying is irreversible; the
+    // recoverable reading is the right default, and the buttons remain the only
+    // way to actually decide.
+    //
+    // Enter is intentionally NOT bound to "allow once" — that would over-ride
+    // the focused-button default, so a user with focus on the Deny button (the
+    // default for Bash/Write) would still approve by pressing Enter. Native
+    // button activation handles Enter/Space on the focused button correctly.
     card.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        decide(req.id, "deny", card);
+        announce(
+          `Still waiting for your decision on ${card.dataset.tool || "this tool"}.`
+          + " Use the Allow or Deny buttons.",
+        );
       }
     });
   }
@@ -4000,6 +4088,17 @@
   // over the first line of the diff body.
   const PERM_LABELS = { allow: "Allowed", allow_session: "Allowed (session)", deny: "Denied" };
 
+  // The node that replaces a resolved card isn't focusable, so the focused
+  // button leaving the document sends focus to <body> and resets the screen
+  // reader's virtual cursor to the top of the page. Park focus on the summary:
+  // it sits exactly where the card was, so the reading position survives and
+  // the announcement lands in context.
+  function restoreFocusAfterCard(summary) {
+    if (!summary) return;
+    summary.tabIndex = -1;
+    try { summary.focus(); } catch (_) {}
+  }
+
   function resolvePermCardDom(card, decision, opts) {
     opts = opts || {};
     card.dataset.state = "resolved";
@@ -4021,8 +4120,10 @@
     const verb = opts.provisional ? "Handled elsewhere" : (PERM_LABELS[decision] || decision);
     if (opts.provisional) summary.dataset.provisional = "1";
     summary.textContent = `${verb} — ${suffix}`;
+    const hadFocus = card.contains(document.activeElement);
     card.replaceWith(summary);
     removeFromPermQueue(card.dataset.requestId);
+    if (hadFocus && !permDialog?.open) restoreFocusAfterCard(summary);
     return summary;
   }
 
@@ -4074,6 +4175,11 @@
       }
       if (!r.ok) throw new Error("HTTP " + r.status);
       resolvePermCardDom(card, decision);
+      // Announce the SUCCESS too, not just the failures below. #status is
+      // aria-hidden and resolvePermCardDom replaces the card with a summary
+      // node, so without this a screen-reader user presses Allow and gets
+      // total silence — no way to tell a landed decision from a dropped one.
+      announce(`${PERM_LABELS[decision] || decision}. ${assistantLabel()} is continuing.`);
       return true;
     } catch (err) {
       // Only re-enable if no terminal state arrived during the in-flight
@@ -4111,6 +4217,11 @@
     const summary = document.createElement("article");
     summary.className = "msg permission-resolved";
     summary.textContent = text;
+    // Whether focus is inside the card decides where it can go afterwards:
+    // replaceWith() drops the focused button out of the document, which sends
+    // focus to <body> and resets the screen reader's virtual cursor to the top
+    // of the page. Check before the swap, restore after.
+    const hadFocus = card.contains(document.activeElement);
     if (dockedCard === card && dockedPlaceholder) {
       // Card is hosted in the approval dialog: the summary belongs at the
       // card's original transcript spot, and the dialog advances.
@@ -4122,6 +4233,8 @@
       card.replaceWith(summary);
     }
     removeFromPermQueue(card.dataset.requestId);
+    announce(text);
+    if (hadFocus && !permDialog?.open) restoreFocusAfterCard(summary);
   }
 
   // AskUserQuestion → accessible form. Each question is a <fieldset>/<legend>

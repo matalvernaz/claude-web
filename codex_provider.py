@@ -86,6 +86,19 @@ STDERR_RING_LINES = 100
 # only when the server respawns.
 SERVER_EXITED_METHOD = "_codex/server_exited"
 
+# Names removed from the app-server child's environment before spawn. The
+# child inherits the web app's environment, which on a systemd install carries
+# every secret from .env — the auth-cookie signing key included. The hosting
+# app overwrites this list at import to keep one source of truth; the defaults
+# stand alone so this module remains usable on its own.
+SCRUB_ENV_NAMES: list[str] = [
+    "SESSION_SECRET",
+    "OIDC_CLIENT_SECRET",
+    "OIDC_CLIENT_ID",
+    "CLAUDE_WEB_PUSHOVER_TOKEN",
+    "CLAUDE_WEB_PUSHOVER_USER",
+]
+
 # Tool names the approval bridge presents to the existing permission UI.
 # "Bash" deliberately reuses the Claude tool name so the frontend's command
 # rendering and the server's NO_SESSION_ALLOWLIST_TOOLS coarse-signature
@@ -177,6 +190,9 @@ class CodexAppServer:
     _instance: Optional["CodexAppServer"] = None
     _instances: dict[str, "CodexAppServer"] = {}
     _instance_locks: dict[str, asyncio.Lock] = {}
+    # Callers currently inside (or queued for) each key's lock. Counted so the
+    # lock entry survives until the last one leaves — see _key_lock.
+    _lock_users: dict[str, int] = {}
 
     def __init__(
         self,
@@ -197,6 +213,9 @@ class CodexAppServer:
         ] = {}
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        # Set by shutdown() so _on_exit can tell a deliberate teardown from a
+        # reader that died on its own with the child still running.
+        self._shutting_down = False
         self.stderr_tail: collections.deque = collections.deque(
             maxlen=STDERR_RING_LINES
         )
@@ -208,6 +227,35 @@ class CodexAppServer:
     # -- lifecycle -------------------------------------------------------------
 
     @classmethod
+    @contextlib.asynccontextmanager
+    async def _key_lock(cls, key: str):
+        """Serialize spawn and teardown for one pool key.
+
+        Interest is counted *before* awaiting, so the lock entry cannot be
+        dropped while another caller still holds or awaits it. Popping it early
+        was a real bug: a teardown that removed the lock let the next caller
+        create a second Lock for the same key while a spawn still held the
+        first, so both could spawn and one process ended up referenced by
+        nothing. Refcounting also keeps the dict from growing a permanent entry
+        per disposable ``:read:<uuid>`` key.
+        """
+        lock = cls._instance_locks.get(key)
+        if lock is None:
+            lock = cls._instance_locks[key] = asyncio.Lock()
+        cls._lock_users[key] = cls._lock_users.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = cls._lock_users.get(key, 1) - 1
+            if remaining > 0:
+                cls._lock_users[key] = remaining
+            else:
+                cls._lock_users.pop(key, None)
+                if cls._instance_locks.get(key) is lock:
+                    cls._instance_locks.pop(key, None)
+
+    @classmethod
     async def get(
         cls,
         key: str = "shared",
@@ -216,8 +264,7 @@ class CodexAppServer:
         isolated_auth: bool = False,
     ) -> "CodexAppServer":
         """Return the live process for ``key``, spawning it once as needed."""
-        lock = cls._instance_locks.setdefault(key, asyncio.Lock())
-        async with lock:
+        async with cls._key_lock(key):
             inst = cls._instances.get(key)
             if inst is not None and inst.alive:
                 requested_home = Path(home) if home is not None else None
@@ -237,39 +284,38 @@ class CodexAppServer:
         return inst if inst is not None and inst.alive else None
 
     @classmethod
-    def shutdown_key(cls, key: str) -> None:
-        inst = cls._instances.pop(key, None)
-        cls._instance_locks.pop(key, None)
-        if inst is not None:
-            inst.shutdown()
-        if key == "shared":
-            cls._instance = None
-
-    @classmethod
     async def close_key(cls, key: str) -> None:
-        """Stop one pooled process and wait until it can no longer write."""
-        inst = cls._instances.pop(key, None)
-        cls._instance_locks.pop(key, None)
-        if key == "shared":
-            cls._instance = None
-        if inst is None:
-            return
-        proc = inst.proc
-        inst.shutdown()
-        if proc is None:
-            return
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        """Stop one pooled process and wait until it can no longer write.
+
+        Held under the same per-key lock as ``get`` so a spawn in flight cannot
+        publish its instance after this returns — otherwise a caller told the
+        slot was closed (credential delete, signout) would leave a live server
+        pooled against a home that no longer exists.
+        """
+        async with cls._key_lock(key):
+            inst = cls._instances.pop(key, None)
+            if key == "shared":
+                cls._instance = None
+            if inst is None:
+                return
+            proc = inst.proc
+            inst.shutdown()
+            if proc is None:
+                return
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
 
     @classmethod
     def shutdown_all(cls) -> None:
+        """Best-effort teardown of every pooled process (process shutdown)."""
         for inst in list(cls._instances.values()):
             inst.shutdown()
         cls._instances.clear()
         cls._instance_locks.clear()
+        cls._lock_users.clear()
         cls._instance = None
 
     @property
@@ -282,6 +328,8 @@ class CodexAppServer:
             raise CodexError("codex CLI not installed")
         command = [binary]
         child_env = os.environ.copy()
+        for name in SCRUB_ENV_NAMES:
+            child_env.pop(name, None)
         if self.home is not None:
             self.home.mkdir(parents=True, exist_ok=True)
             child_env["CODEX_HOME"] = str(self.home)
@@ -335,9 +383,20 @@ class CodexAppServer:
         log.info("codex app-server started (key=%s pid=%s)", self.key, self.proc.pid)
 
     def shutdown(self) -> None:
+        """Request termination and stop the reader tasks.
+
+        Synchronous, so it can only SIGTERM — ``close_key`` escalates to kill
+        after a bounded wait. Cancelling the reader tasks matters on the
+        ``_start`` failure path, where the instance is never published to the
+        pool and these tasks would otherwise outlive every reference to it.
+        """
+        self._shutting_down = True
         if self.proc is not None and self.proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self.proc.terminate()
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None and not task.done():
+                task.cancel()
         self._fail_all_pending(CodexError("codex app-server shut down"))
 
     # -- wire ------------------------------------------------------------------
@@ -372,7 +431,16 @@ class CodexAppServer:
         assert self.proc is not None and self.proc.stdout is not None
         try:
             while True:
-                line = await self.proc.stdout.readline()
+                try:
+                    line = await self.proc.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError) as e:
+                    # A line past STDOUT_LIMIT_BYTES. readline() discards it
+                    # before raising, so the next read resumes on a message
+                    # boundary — keep going rather than killing a live
+                    # conversation over one frame. The request whose response
+                    # was lost falls to its own timeout.
+                    log.warning("codex app-server stdout unreadable: %s", e)
+                    continue
                 if not line:
                     break
                 try:
@@ -380,17 +448,43 @@ class CodexAppServer:
                 except ValueError:
                     log.warning("codex app-server sent non-JSON: %r", line[:200])
                     continue
+                if not isinstance(msg, dict):
+                    # Valid JSON but not an object (a bare array/scalar). The
+                    # dispatcher assumes mapping access, so skip rather than
+                    # let an AttributeError kill the loop.
+                    log.warning(
+                        "codex app-server sent non-object JSON: %r", line[:200],
+                    )
+                    continue
                 self._dispatch(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let an unexpected dispatch error strand the child: without
+            # this the loop exits, nobody drains stdout, and the process wedges
+            # on its next write.
+            log.exception("codex app-server read loop failed")
         finally:
             self._on_exit()
 
     async def _stderr_loop(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
-        while True:
-            line = await self.proc.stderr.readline()
-            if not line:
-                break
-            self.stderr_tail.append(line.decode(errors="replace").rstrip())
+        try:
+            while True:
+                try:
+                    line = await self.proc.stderr.readline()
+                except (ValueError, asyncio.LimitOverrunError) as e:
+                    # Stop tailing but keep draining, or the child blocks on
+                    # write once the pipe buffer fills.
+                    log.warning("codex app-server stderr unreadable: %s", e)
+                    continue
+                if not line:
+                    break
+                self.stderr_tail.append(line.decode(errors="replace").rstrip())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("codex app-server stderr loop failed")
 
     def _dispatch(self, msg: dict) -> None:
         if "id" in msg and ("result" in msg or "error" in msg):
@@ -448,6 +542,16 @@ class CodexAppServer:
     def _on_exit(self) -> None:
         code = self.proc.returncode if self.proc else None
         log.warning("codex app-server exited (code=%s)", code)
+        if code is None and self.proc is not None and not self._shutting_down:
+            # The reader stopped while the child is still running (a failed
+            # dispatch, a cancelled task). Nobody drains stdout after this, so
+            # the child would wedge on its next write and — because the pool
+            # entry is dropped below — become unreachable for close_key() and
+            # shutdown_all(), surviving even a unit restart. Terminate it here,
+            # which is the only remaining reference.
+            log.warning("codex app-server reader stopped while alive; terminating")
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.terminate()
         self._fail_all_pending(
             CodexError(f"codex app-server exited (code={code})")
         )
