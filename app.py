@@ -12539,6 +12539,30 @@ def _maybe_record_checkpoint(run: "ActiveRun", msg) -> None:
         del run.checkpoints[:100]
 
 
+# The CLI wraps a local command's output in these markers when it echoes it
+# back as a bare UserMessage (e.g. set_model's control request is followed by
+# "<local-command-stdout>Set model to claude-fable-5</local-command-stdout>").
+_LOCAL_COMMAND_OUTPUT_MARKERS = ("<local-command-stdout>", "<local-command-stderr>")
+
+
+def _is_local_command_echo(msg) -> bool:
+    """True for the CLI's local-command output echo.
+
+    These arrive as bare UserMessages (string content, or a lone TextBlock)
+    and are pure bookkeeping: no assistant work follows one, so it must not
+    be read as a turn opening.
+    """
+    if not isinstance(msg, UserMessage):
+        return False
+    content = msg.content
+    if isinstance(content, list):
+        if len(content) != 1 or not isinstance(content[0], TextBlock):
+            return False
+        content = content[0].text
+    return (isinstance(content, str)
+            and content.lstrip().startswith(_LOCAL_COMMAND_OUTPUT_MARKERS))
+
+
 def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
     """Advance ``run.between_turns`` for one consumed SDK message.
 
@@ -12571,7 +12595,15 @@ def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
             and not evts
         )
         run.expect_interrupt_echo = False
-        if not is_interrupt_echo:
+        # A local command's stdout echo (set_model, and any future control
+        # verb the CLI answers this way) is the same trap as the interrupt
+        # marker: a bare between-turns UserMessage that opens no turn. Hit
+        # 2026-08-11 — a mid-chat Opus 5 → Fable 5 switch echoed "Set model
+        # to claude-fable-5", between_turns flipped to False with nothing
+        # running, and the next queued send sat undelivered until the
+        # mid-turn silence cap tore the run down.
+        is_command_echo = not evts and _is_local_command_echo(msg)
+        if not (is_interrupt_echo or is_command_echo):
             # Active LLM turn / tool dance. We're not between-turns again
             # until the next Result.
             if run.between_turns:

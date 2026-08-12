@@ -86,6 +86,31 @@ def test_interrupt_echo_still_records_checkpoint(run) -> None:
     assert run.checkpoints and run.checkpoints[-1]["uuid"] == "u-marker"
 
 
+SET_MODEL_ECHO = (
+    "<local-command-stdout>Set model to claude-fable-5</local-command-stdout>"
+)
+
+
+def test_local_command_echo_keeps_run_idle(run) -> None:
+    """set_model echoes its stdout as a bare string-content UserMessage with
+    no armed flag. Reading it as a turn start stranded the next queued send
+    (2026-08-11: mid-chat Opus 5 → Fable 5 switch hung the conversation)."""
+    run.between_turns = True
+    echo = UserMessage(content=SET_MODEL_ECHO, uuid="u-cmd")
+    evts = _translate(echo, run)
+    assert evts == []  # string-content UserMessage produces no events
+    app_module._apply_turn_state(run, echo, evts)
+    assert run.between_turns is True
+
+
+def test_local_command_echo_textblock_shape_keeps_run_idle(run) -> None:
+    """Same echo if a future CLI wraps it in a TextBlock instead of a str."""
+    run.between_turns = True
+    echo = UserMessage(content=[TextBlock(text=SET_MODEL_ECHO)], uuid="u-cmd2")
+    app_module._apply_turn_state(run, echo, _translate(echo, run))
+    assert run.between_turns is True
+
+
 def test_bare_user_message_without_flag_starts_turn(run) -> None:
     """A ScheduleWakeup firing inside the CLI opens a turn with a bare user
     echo; without the armed flag it must still count as turn activity."""
