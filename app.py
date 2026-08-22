@@ -505,6 +505,13 @@ KNOWN_MODELS = [
      "plan_model": "claude-fable-5", "advisor_model": "claude-fable-5",
      "label": "Fableplan + Fable 5 advisor", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    # Officially valid pairing per the advisor tool's model-compatibility
+    # table (the advisor must be at least as capable as the executor; Opus 5
+    # accepts Mythos 5 / Fable 5 / Opus 5). Probed working on CLI 2.1.240
+    # with tool_use in the history, 2026-08-22.
+    {"key": "opus5-fable-advisor", "model": "claude-opus-5",
+     "advisor_model": "claude-fable-5", "label": "Opus 5 + Fable 5 advisor",
+     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
 
@@ -7488,6 +7495,8 @@ async def _periodic_gc_loop() -> None:
 async def _install_restart_machinery() -> None:
     asyncio.create_task(_restart_watcher_loop())
     asyncio.create_task(_periodic_gc_loop())
+    if CLI_AUTOUPDATE:
+        asyncio.create_task(_cli_autoupdate_loop())
     # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
     # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
     # can drive both without an OIDC session cookie.
@@ -7592,6 +7601,150 @@ def _notify_turn_complete(run: "ActiveRun") -> None:
         f"in {where} (session …{(run.session_id or run.run_id)[-8:]})"
     )
     asyncio.create_task(asyncio.to_thread(_send_pushover_sync, SITE_TITLE, message))
+
+
+# ─── CLI auto-update ──────────────────────────────────────────────────────────
+# Every claude spawn on this install is headless (SDK stream-json), and Claude
+# Code's built-in auto-updater only runs in interactive TUI sessions — so the
+# CLI silently rots until someone remembers `claude update` (2.1.218 sat stale
+# for a month while upstream fixed the Fable advisor). Both spawn sites resolve
+# cli_path=shutil.which("claude") per spawn and the native installer swaps a
+# symlink between versioned files, so an update reaches every NEW run with no
+# service restart; in-flight runs keep the version file they already hold open.
+CLI_AUTOUPDATE = os.getenv("CLAUDE_WEB_CLI_AUTOUPDATE", "true").lower() in (
+    "1", "true", "yes",
+)
+CLI_UPDATE_INTERVAL_SECONDS = int(
+    os.getenv("CLAUDE_WEB_CLI_UPDATE_INTERVAL", "21600") or 21600)
+# First pass waits for startup to settle (state.db restore, session relinks)
+# before spending network/CPU on the installer.
+_CLI_UPDATE_BOOT_DELAY_SECONDS = 90.0
+_CLI_UPDATE_TIMEOUT_SECONDS = 600.0
+_CLI_UPDATE_DETAIL_TAIL = 1000
+# The timer loop and POST /api/admin/update-cli share one lock so two
+# `claude update` runs never race the installer's symlink swap.
+_CLI_UPDATE_LOCK = asyncio.Lock()
+CLI_UPDATE_STATE: dict[str, Any] = {
+    "status": "never",         # never | current | updated | error | timeout | no_cli
+    "version": None,           # `claude --version` after the last check
+    "previous_version": None,  # what the last version-changing check replaced
+    "checked_at": None,        # unix ts of the last completed check
+    "updated_at": None,        # unix ts of the last check that changed versions
+    "source": None,            # "timer" or "api:<email>"
+    "detail": "",              # tail of installer output (or the error)
+}
+
+
+async def _cli_version_line(cli: str) -> str:
+    """First line of ``<cli> --version``, or '' when it can't be read."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli, "--version",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return ""
+    text = (out or b"").decode("utf-8", "replace").strip()
+    return text.splitlines()[0].strip() if text else ""
+
+
+async def _run_cli_update(source: str) -> dict:
+    """Run ``claude update`` once (single-flight) and record the outcome.
+
+    Returns a snapshot of CLI_UPDATE_STATE rather than raising: the timer
+    loop and the admin endpoint both want a status dict, not an exception.
+    A version change is detected by diffing ``--version`` around the run, so
+    a nonzero installer exit with a swapped symlink still counts as updated.
+    """
+    cli = shutil.which("claude")
+    if not cli:
+        CLI_UPDATE_STATE.update(
+            status="no_cli", detail="no `claude` binary on PATH",
+            checked_at=time.time(), source=source,
+        )
+        return dict(CLI_UPDATE_STATE)
+    async with _CLI_UPDATE_LOCK:
+        before = await _cli_version_line(cli)
+        status, detail = "error", ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli, "update",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                out, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=_CLI_UPDATE_TIMEOUT_SECONDS)
+                detail = (out or b"").decode(
+                    "utf-8", "replace").strip()[-_CLI_UPDATE_DETAIL_TAIL:]
+                status = "current" if proc.returncode == 0 else "error"
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                status = "timeout"
+                detail = (f"`claude update` exceeded "
+                          f"{_CLI_UPDATE_TIMEOUT_SECONDS:.0f}s")
+        except OSError as e:
+            detail = str(e)
+        after = await _cli_version_line(cli)
+        if after and before and after != before:
+            status = "updated"
+            CLI_UPDATE_STATE.update(
+                updated_at=time.time(), previous_version=before)
+            log.info("claude CLI updated %s -> %s (via %s)",
+                     before, after, source)
+            if PUSHOVER_TOKEN and PUSHOVER_USER:
+                asyncio.create_task(asyncio.to_thread(
+                    _send_pushover_sync, SITE_TITLE,
+                    f"Claude CLI updated: {before} -> {after}"))
+        elif status != "current":
+            log.warning("claude CLI update %s (via %s): %s",
+                        status, source, detail)
+        CLI_UPDATE_STATE.update(
+            status=status, version=after or before or None,
+            checked_at=time.time(), source=source, detail=detail,
+        )
+        return dict(CLI_UPDATE_STATE)
+
+
+async def _cli_autoupdate_loop() -> None:
+    """``claude update`` on a timer — the headless analogue of the TUI's
+    auto-updater. New runs pick the fresh binary up immediately; runs already
+    in flight are untouched."""
+    await asyncio.sleep(_CLI_UPDATE_BOOT_DELAY_SECONDS)
+    while True:
+        try:
+            await _run_cli_update("timer")
+        except Exception:
+            log.exception("cli autoupdate pass failed")
+        await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
+
+
+def _require_cli_update_admin(user: dict) -> None:
+    """A CLI update swaps the binary every user's next run spawns, so it is
+    instance-wide."""
+    _require_global_config_admin(user, "cli update")
+
+
+@app.get("/api/admin/update-cli")
+async def api_cli_update_status(user: dict = Depends(auth.require_user)):
+    _require_cli_update_admin(user)
+    return dict(CLI_UPDATE_STATE)
+
+
+@app.post("/api/admin/update-cli")
+async def api_cli_update(user: dict = Depends(auth.require_user)):
+    _require_cli_update_admin(user)
+    return await _run_cli_update(
+        f"api:{user.get('email') or user.get('sub') or '?'}")
+
+
 # Per-session locks for /api/chat. The SDK only sets run.session_id once it
 # receives the init SystemMessage, so without this two near-simultaneous POSTs
 # for the same resumed session_id (multi-tab / fast double-submit) both miss
@@ -8926,15 +9079,24 @@ def _require_owned_codex_credential(
     return cred
 
 
-def _codex_credential_has_live_run(user_sub: str, cred_id: int) -> bool:
+def _codex_credential_live_runs(
+    user_sub: str, cred_id: int,
+) -> list[ActiveRun]:
     slot = f"cred:{cred_id}"
-    return any(
+    return [
+        run
+        for run in ACTIVE_RUNS.values()
+        if (
         not run.done
         and run.provider == "codex"
         and run.owner_sub == user_sub
         and run.account_slot == slot
-        for run in ACTIVE_RUNS.values()
-    )
+        )
+    ]
+
+
+def _codex_credential_has_live_run(user_sub: str, cred_id: int) -> bool:
+    return bool(_codex_credential_live_runs(user_sub, cred_id))
 
 
 def _validate_codex_login_id(value: str) -> str:
@@ -9151,10 +9313,8 @@ async def api_codex_credentials_signout(
         raise HTTPException(401, "no user identity")
     async with _codex_credential_lock(sub, cred_id):
         _require_owned_codex_credential(sub, cred_id)
-        if _codex_credential_has_live_run(sub, cred_id):
-            raise HTTPException(
-                409, "this OpenAI account is in use by an active chat",
-            )
+        for run in _codex_credential_live_runs(sub, cred_id):
+            await _supersede_run_for_switch(run, "account_changed")
         key = _codex_server_key(sub, cred_id)
         home = _ensure_codex_credential_home(sub, cred_id)
         server = await _codex_server_for_account({
@@ -9162,8 +9322,10 @@ async def api_codex_credentials_signout(
             "home": home,
             "isolated_auth": True,
         })
-        with contextlib.suppress(Exception):
-            await server.request("account/logout", {})
+        try:
+            await server.request("account/logout")
+        except Exception as e:
+            log.warning("OpenAI account logout failed for credential %s: %s", cred_id, e)
         await codex_provider.CodexAppServer.close_key(key)
         with contextlib.suppress(FileNotFoundError):
             (home / "auth.json").unlink()

@@ -9,6 +9,7 @@ from tests.test_fableplan import _FakeClient, _stub_run
 
 OPUS_ADVISOR = app_module.MODELS_BY_KEY.get("opus-fable-advisor") or {}
 COMBO = app_module.MODELS_BY_KEY.get("fableplan-advisor") or {}
+OPUS5_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable-advisor") or {}
 
 
 def test_advisor_entries_exist() -> None:
@@ -23,10 +24,19 @@ def test_advisor_entries_exist() -> None:
     assert COMBO["advisor_model"] == "claude-fable-5"
 
 
+def test_opus5_advisor_entry_exists() -> None:
+    assert OPUS5_ADVISOR, "opus5-fable-advisor missing from KNOWN_MODELS"
+    assert OPUS5_ADVISOR["model"] == "claude-opus-5"
+    assert OPUS5_ADVISOR["advisor_model"] == "claude-fable-5"
+    assert "plan_model" not in OPUS5_ADVISOR
+    assert OPUS5_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+
+
 def test_models_payload_carries_advisor() -> None:
     payload = {m["key"]: m for m in app_module._models_payload()}
     assert payload["opus-fable-advisor"]["advisor"] == "claude-fable-5"
     assert payload["fableplan-advisor"]["advisor"] == "claude-fable-5"
+    assert payload["opus5-fable-advisor"]["advisor"] == "claude-fable-5"
     # Ordinary entries expose an empty advisor so switchKey() compares "" to
     # "" rather than undefined to a model id.
     assert payload[""]["advisor"] == ""

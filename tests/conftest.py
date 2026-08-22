@@ -53,6 +53,9 @@ os.environ["CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR"] = os.path.join(
 os.environ["CLAUDE_WEB_ENABLE_SETUP"] = "true"
 # Loosen CSRF so tests using the bare TestClient don't all need to set Origin.
 os.environ["CLAUDE_WEB_CSRF_STRICT"] = "false"
+# Keep TestClient startup from spawning the real `claude update` timer loop;
+# the CLI-update tests call _run_cli_update directly against a fake binary.
+os.environ["CLAUDE_WEB_CLI_AUTOUPDATE"] = "false"
 # roundtable.core derives DB_PATH from this at import; point it at a temp dir
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.
