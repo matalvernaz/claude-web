@@ -1030,6 +1030,13 @@
     return projectSelect ? projectSelect.value : "";
   }
 
+  // Declared here rather than with the rest of the sidebar-search state further
+  // down: refreshSessions() reads it during the boot refresh immediately below,
+  // which runs before that block is evaluated, and a `let` still in its
+  // temporal dead zone throws instead of reading as undefined. That threw away
+  // the boot refresh entirely, silently.
+  let searchActive = false;
+
   // Always refresh the sidebar from /api/sessions on load — the server-rendered
   // list can be stale if the HTML was cached or another tab created sessions.
   refreshSessions();
@@ -1149,16 +1156,113 @@
   // screens, closed on narrow ones.
   const toggleBtn = document.getElementById("toggle-sessions");
   const SIDEBAR_KEY = "claude-web.sidebar";
+  const NARROW = window.matchMedia("(max-width: 720px)");
   function applySidebar(collapsed) {
     document.body.classList.toggle("sidebar-collapsed", collapsed);
+    if (NARROW.matches) return;
     toggleBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
   }
   const saved = safeGet(localStorage, SIDEBAR_KEY);
-  applySidebar(saved === "1" || (saved === null && window.matchMedia("(max-width: 720px)").matches));
+  // A narrow screen always starts with the panel out of the layout, because
+  // there it's a sheet: restoring a saved desktop "open" would drop the user
+  // straight into a modal on load. The stored preference is left alone so the
+  // next wide load still honours it.
+  applySidebar(NARROW.matches || saved === "1");
+
+  // ── Mobile sheets ─────────────────────────────────────────────────────────
+  // On a phone the sessions panel and the header controls appear as modal
+  // <dialog> sheets rather than inline regions, for the same reason the
+  // approval modal does: showModal() makes the rest of the page inert, so a
+  // mobile screen reader's swipe order collapses to heading -> content -> Done
+  // instead of wandering off into the transcript behind the overlay.
+  //
+  // The live node MOVES into the sheet and back out on close. Rendering a
+  // second copy would mean duplicate ids and two halves of one control's
+  // state (a typed session filter, a picked model).
+  function makeSheet(dialogId, bodyId, node) {
+    const dialog = document.getElementById(dialogId);
+    const body = document.getElementById(bodyId);
+    if (!dialog || !body || !node) return null;
+    let home = null;
+    // One "close" listener covers every exit path — Esc, the Done button's
+    // method="dialog" submit, and a programmatic close() on rotation.
+    dialog.addEventListener("close", () => {
+      if (!home) return;
+      home.parent.insertBefore(node, home.next);
+      home = null;
+    });
+    return {
+      dialog,
+      isOpen: () => dialog.open,
+      close: () => dialog.close(),
+      open() {
+        if (dialog.open) return;
+        home = { parent: node.parentNode, next: node.nextSibling };
+        body.appendChild(node);
+        dialog.showModal();
+      },
+    };
+  }
+
+  const sessionsSheet = makeSheet(
+    "sessions-sheet", "sessions-sheet-body",
+    document.getElementById("sessions-panel"),
+  );
+  const menuSheet = makeSheet(
+    "menu-sheet", "menu-sheet-body",
+    document.getElementById("header-controls"),
+  );
+  const menuBtn = document.getElementById("header-menu-toggle");
+
+  function syncSessionsTrigger() {
+    // Narrow: the button opens a dialog, so aria-expanded (the state of a
+    // region that is still on the page) would be a lie. Wide: the reverse.
+    if (NARROW.matches) {
+      toggleBtn.setAttribute("aria-haspopup", "dialog");
+      toggleBtn.removeAttribute("aria-expanded");
+      toggleBtn.removeAttribute("aria-controls");
+    } else {
+      toggleBtn.removeAttribute("aria-haspopup");
+      toggleBtn.setAttribute("aria-controls", "sessions-panel");
+      toggleBtn.setAttribute(
+        "aria-expanded",
+        document.body.classList.contains("sidebar-collapsed") ? "false" : "true",
+      );
+    }
+  }
+  syncSessionsTrigger();
+
   toggleBtn.addEventListener("click", () => {
+    if (NARROW.matches && sessionsSheet) {
+      sessionsSheet.open();
+      return;
+    }
     const willCollapse = !document.body.classList.contains("sidebar-collapsed");
     applySidebar(willCollapse);
     safeSet(localStorage, SIDEBAR_KEY, willCollapse ? "1" : "0");
+  });
+  if (menuBtn && menuSheet) {
+    menuBtn.addEventListener("click", () => menuSheet.open());
+  }
+  // The "Skip to sessions" link targets a node that is display:none on a phone,
+  // where the panel lives in a sheet. Open the sheet instead of sending focus
+  // nowhere.
+  const skipToSessions = document.querySelector('.skip[href="#sessions-heading"]');
+  if (skipToSessions && sessionsSheet) {
+    skipToSessions.addEventListener("click", (e) => {
+      if (!NARROW.matches) return;
+      e.preventDefault();
+      sessionsSheet.open();
+    });
+  }
+  // Rotating to a wide viewport with a sheet open would leave the header
+  // missing its controls, so close on the transition and hand back to the
+  // inline layout.
+  NARROW.addEventListener("change", () => {
+    if (sessionsSheet && sessionsSheet.isOpen()) sessionsSheet.close();
+    if (menuSheet && menuSheet.isOpen()) menuSheet.close();
+    applySidebar(NARROW.matches || saved === "1");
+    syncSessionsTrigger();
   });
 
   // Enter to send, Shift+Enter for newline. A submit while a turn is still
@@ -5287,7 +5391,7 @@
   // ─── Sidebar search: short queries filter titles locally; longer ones
   //     hit /api/sessions/search to grep across every session transcript.
   const sessionSearchEl = document.getElementById("session-search");
-  let searchActive = false;
+  // searchActive is declared above the boot refresh; see the note there.
   let searchTimer = null;
   let searchToken = 0;
 
