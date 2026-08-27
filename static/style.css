@@ -8,6 +8,7 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
+html { -webkit-text-size-adjust: 100%; }
 body {
   font-family: system-ui, -apple-system, sans-serif;
   font-size: 16px;
@@ -520,7 +521,6 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 #status { color: #aaa; font-size: 0.9rem; }
 @media (max-width: 720px) {
   .layout { grid-template-columns: 1fr; }
-  aside { display: none; }
 }
 
 /* ─── Header selects (model / project) ────────────────────────────────── */
@@ -1033,4 +1033,137 @@ body.app-shell {
 .header-actions .header-link,
 .header-select select {
   min-height: var(--tap-min-height);
+}
+
+/* ─── Header groups ───────────────────────────────────────────────────────── */
+/* The bar is what stays on screen at every width; everything else moves into
+   the Settings sheet on a narrow viewport. Both groups are flex rows so the
+   wide layout renders as it did when they were one flat row. */
+.header-bar,
+.header-controls {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.header-controls { flex: 1 1 auto; min-width: 0; }
+.header-menu-toggle { display: none; }
+
+/* ─── Sheets (mobile Chats / Settings) ────────────────────────────────────── */
+/* Native <dialog> + showModal(), matching the approval modal: it makes the
+   rest of the page inert, so a mobile screen reader's swipe order collapses to
+   heading -> content -> Done instead of wandering into the transcript behind
+   the overlay. The live nodes are MOVED in and back out rather than copied —
+   two copies would mean duplicate ids and split control state. */
+.sheet {
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  max-width: 32rem;
+  width: 92%;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.sheet::backdrop { background: rgba(0,0,0,0.6); }
+.sheet h2 { margin: 0 0 0.75rem 0; font-size: 1rem; }
+.sheet-actions { margin-top: 1rem; }
+.sheet-body { overscroll-behavior: contain; }
+
+/* Kill the 300ms double-tap-to-zoom delay on anything tappable. */
+button,
+select,
+.header-link,
+.header-toggle,
+#session-list li a { touch-action: manipulation; }
+/* Stop a scroll that runs out of transcript from rubber-banding the shell. */
+#transcript,
+nav#sessions-panel { overscroll-behavior: contain; }
+
+/* ─── Phone layout ────────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  :root {
+    /* Same reasoning as the standalone hook: no zoom-on-focus, real touch
+       targets. A phone in a browser tab should feel like the installed app. */
+    --control-font-size: 1rem;
+    --tap-min-height: 44px;
+  }
+  header { padding-bottom: 0.5rem; }
+  h1 { font-size: 1rem; }
+  .header-bar { flex: 1 1 auto; }
+  .header-menu-toggle { display: inline-flex; align-items: center; }
+  /* Reachable only through the Settings sheet, so display:none rather than a
+     visual hide — a screen reader must not find phantom controls out here. */
+  .header-controls { display: none; }
+
+  .sheet {
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    padding: calc(1rem + var(--safe-top)) calc(1rem + var(--safe-right))
+             calc(1rem + var(--safe-bottom)) calc(1rem + var(--safe-left));
+  }
+  .sheet[open] { display: flex; flex-direction: column; }
+  .sheet-body { flex: 1; min-height: 0; overflow-y: auto; }
+  .sheet-actions { flex: 0 0 auto; }
+  .sheet-actions button { width: 100%; min-height: var(--tap-min-height); }
+
+  /* Settings sheet: one full-width row per control, like a settings screen. */
+  #menu-sheet .header-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.9rem;
+  }
+  #menu-sheet .header-select {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.2rem;
+    width: 100%;
+  }
+  /* The wide header labels these visually by position; a stacked sheet needs
+     the text. The selects keep their aria-label, so this changes nothing for a
+     screen reader. */
+  #menu-sheet .header-select .sr-only {
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    clip: auto;
+    overflow: visible;
+    font-size: 0.8rem;
+    color: #aaa;
+  }
+  #menu-sheet .header-select select,
+  #menu-sheet .header-link,
+  #menu-sheet button { width: 100%; min-height: var(--tap-min-height); }
+  #menu-sheet .header-link { justify-content: center; }
+  #menu-sheet .header-toggle { min-height: var(--tap-min-height); }
+  #menu-sheet .header-cost { text-align: center; }
+
+  /* Chats sheet: the panel drops its sidebar chrome and fills the sheet. */
+  #sessions-sheet nav#sessions-panel {
+    display: block;
+    border-right: 0;
+    background: transparent;
+    overflow-y: visible;
+    padding: 0;
+  }
+  /* A 4px gap between "open this chat" and "delete this chat" is the real
+     defect here, not the button size — touch exploration lands between them. */
+  #session-list li { gap: 0.6rem; margin-bottom: 0.3rem; }
+  #session-list li a { min-height: var(--tap-min-height); display: flex; flex-direction: column; justify-content: center; }
+  .session-delete,
+  .session-export { min-width: var(--tap-min-height); min-height: var(--tap-min-height); justify-content: center; }
+
+  /* Composer: thumb-sized controls, and the send row stays one line. */
+  .row button,
+  .image-btn { min-height: var(--tap-min-height); }
+  #prompt { min-height: 5.5rem; }
 }
