@@ -97,7 +97,7 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.75rem 1rem;
+  padding: calc(0.75rem + var(--safe-top)) calc(1rem + var(--safe-right)) 0.75rem calc(1rem + var(--safe-left));
   border-bottom: 1px solid var(--border);
 }
 h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
@@ -105,6 +105,8 @@ h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
 .header-actions button { background: transparent; color: var(--fg); border: 1px solid var(--border); }
 .header-actions button:hover, .header-actions button:focus { border-color: var(--accent); outline: none; }
 .header-link {
+  display: inline-flex;
+  align-items: center;
   font-size: 0.9rem;
   padding: 0.25rem 0.5rem;
   border: 1px solid var(--border);
@@ -134,7 +136,8 @@ h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
 .layout {
   display: grid;
   grid-template-columns: 16rem 1fr;
-  height: calc(100vh - 3.25rem);
+  flex: 1;
+  min-height: 0;
 }
 body.sidebar-collapsed .layout { grid-template-columns: 1fr; }
 body.sidebar-collapsed aside { display: none; }
@@ -210,7 +213,7 @@ body.sidebar-collapsed nav#sessions-panel { display: none; }
   border-radius: 4px;
   padding: 0.3rem 0.5rem;
   font: inherit;
-  font-size: 0.85rem;
+  font-size: var(--control-font-size);
   margin: 0 0 0.5rem 0;
 }
 #session-search:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
@@ -475,7 +478,7 @@ body[data-plan-mode="1"]::before {
 #usage-body .usage-request-status { color: #aaa; font-size: 0.8rem; }
 form#chat-form {
   border-top: 1px solid var(--border);
-  padding: 0.75rem 1rem;
+  padding: 0.75rem calc(1rem + var(--safe-right)) calc(0.75rem + var(--safe-bottom)) calc(1rem + var(--safe-left));
   background: var(--bg-alt);
 }
 form label {
@@ -528,7 +531,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   border-radius: 4px;
   padding: 0.25rem 0.4rem;
   font: inherit;
-  font-size: 0.85rem;
+  font-size: var(--control-font-size);
 }
 .header-select select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
 
@@ -974,3 +977,60 @@ details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
 /* Provisional partial-text bubble: replaced wholesale by the durable
    assistant message; slightly dimmed so an interrupted one reads as such. */
 .msg.partial .body { opacity: 0.75; }
+
+/* ─── Home-screen app shell ───────────────────────────────────────────────── */
+/* All of this is inert in an ordinary browser tab: the custom properties below
+   default to zero-width insets and the existing font sizes, so nothing changes
+   until one of the two standalone signals re-points them. Two signals because
+   they cover different ground — the display-mode media query is the standard
+   one, and [data-standalone] (set by static/standalone.js from
+   navigator.standalone) is the only thing an older iOS home-screen app
+   reports. Both write the same properties, so the rules that consume them
+   stay single-sourced. */
+:root {
+  --safe-top: 0px;
+  --safe-bottom: 0px;
+  --safe-left: 0px;
+  --safe-right: 0px;
+  --control-font-size: 0.85rem;
+  --tap-min-height: auto;
+  /* Height of the whole chat shell. standalone.js overrides this inline on
+     iOS, where the layout viewport does *not* shrink when the on-screen
+     keyboard opens and the composer would otherwise be underneath it. */
+  --app-height: 100%;
+}
+@supports (height: 100dvh) {
+  :root { --app-height: 100dvh; }
+}
+@media (display-mode: standalone) {
+  :root {
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-left: env(safe-area-inset-left, 0px);
+    --safe-right: env(safe-area-inset-right, 0px);
+    /* iOS zooms the page when a focused form control computes under 16px, and
+       offers no way back out. */
+    --control-font-size: 1rem;
+    /* iOS minimum touch target. The header row is otherwise sized for a mouse
+       pointer, which makes it the hardest part of the page to hit by touch. */
+    --tap-min-height: 44px;
+  }
+}
+html[data-standalone="1"] {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --control-font-size: 1rem;
+  --tap-min-height: 44px;
+}
+body.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: var(--app-height);
+}
+.header-actions button,
+.header-actions .header-link,
+.header-select select {
+  min-height: var(--tap-min-height);
+}

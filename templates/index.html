@@ -2,11 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  {% include "_pwa_head.html" %}
   <title>{{ site_title }}</title>
   <link rel="stylesheet" href="/static/style.css?v={{ asset_version('style.css') }}">
 </head>
-<body>
+<body class="app-shell">
   <div class="skip-links">
     <a class="skip" href="#sessions-heading">Skip to sessions</a>
     <a class="skip" href="#transcript-heading">Skip to messages</a>

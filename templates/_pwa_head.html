@@ -1,0 +1,19 @@
+{# Home-screen / PWA metadata. Included by every page, not just the index: iOS
+   captures these tags from whichever page was showing when "Add to Home
+   Screen" was tapped, so a partial rollout produces an icon that opens in the
+   browser with no error to explain why. #}
+<meta name="theme-color" content="{{ manifest_bg_color }}">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+{# black-translucent hands us the area under the status bar, which is what makes
+   env(safe-area-inset-top) non-zero; style.css pads the header back out. #}
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="{{ manifest_short_name }}">
+{# use-credentials because a deployment gated by a reverse proxy (oauth2-proxy
+   and friends) answers an uncredentialed manifest fetch with a login redirect,
+   and the browser reports that only as "no manifest". #}
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v={{ asset_version('apple-touch-icon.png') }}">
+<link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png?v={{ asset_version('icon-192.png') }}">
+{# defer so document.body exists when it runs; it reads body.app-shell. #}
+<script src="/static/standalone.js?v={{ asset_version('standalone.js') }}" defer></script>

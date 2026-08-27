@@ -286,6 +286,22 @@ CODEX_SHARED_ACCOUNT_LABEL = (
 # patching templates. SITE_TITLE shows in <title> and the <h1>; if unset,
 # the original homelab branding is used.
 SITE_TITLE = os.getenv("CLAUDE_WEB_SITE_TITLE", "").strip() or "Claude — homelab"
+# Keep in step with --bg in static/style.css: this paints the standalone
+# window's status bar and the splash screen while the app boots, and a mismatch
+# shows as a flash of the wrong colour on every launch.
+MANIFEST_BG_COLOR = "#1a1a1a"
+# Home-screen labels are truncated by the OS at roughly a dozen characters, so
+# short_name is the title up to its first separator rather than the whole thing.
+HOME_SCREEN_LABEL_MAX = 12
+
+
+def _manifest_short_name(title: str) -> str:
+    """Home-screen label for a site title: text before the first separator."""
+    for sep in ("—", "–", " - ", ":", "|"):
+        if sep in title:
+            title = title.split(sep, 1)[0]
+            break
+    return title.strip()[:HOME_SCREEN_LABEL_MAX].strip() or "Claude"
 
 # Comma-separated email allowlist for the destructive /setup endpoints
 # (apikey replacement, sign-Claude-out, OAuth re-flow). Only enforced in
@@ -899,6 +915,8 @@ def _asset_version(name: str) -> str:
 
 
 templates.env.globals["asset_version"] = _asset_version
+templates.env.globals["manifest_short_name"] = _manifest_short_name(SITE_TITLE)
+templates.env.globals["manifest_bg_color"] = MANIFEST_BG_COLOR
 
 
 # ─── Session-file parsing (unchanged from v1) ────────────────────────────────
@@ -8178,6 +8196,57 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
     # Don't cache the HTML — sidebar contents are time-sensitive.
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest():
+    """Web app manifest, so an installed home-screen icon launches standalone.
+
+    Deliberately unauthenticated: the manifest is fetched by the browser's
+    install machinery, which treats an auth redirect (HTML, not JSON) as a
+    parse failure and silently refuses to install. Nothing here is secret.
+
+    ``scope`` and ``start_url`` must be explicit — they default to the
+    manifest URL's directory, and anything narrower than "/" makes in-app
+    navigation escape the standalone window back into the browser.
+    """
+    icon_ver = _asset_version("icon-512.png")
+    payload = {
+        "id": "/",
+        "name": SITE_TITLE,
+        "short_name": _manifest_short_name(SITE_TITLE),
+        "description": "Claude Code in a browser.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": MANIFEST_BG_COLOR,
+        "theme_color": MANIFEST_BG_COLOR,
+        "icons": [
+            {
+                "src": f"/static/icon-192.png?v={icon_ver}",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any",
+            },
+            {
+                "src": f"/static/icon-512.png?v={icon_ver}",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any",
+            },
+            {
+                "src": f"/static/icon-maskable-512.png?v={icon_ver}",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "maskable",
+            },
+        ],
+    }
+    return JSONResponse(
+        payload,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.get("/api/projects")

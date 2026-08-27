@@ -316,7 +316,7 @@
   padding: 0.4rem 0.6rem;
   font: inherit;
   font-family: var(--mono, monospace);
-  font-size: 0.9rem;
+  font-size: max(0.9rem, var(--control-font-size));
 }
 
 .action-form button {
@@ -391,7 +391,7 @@ dialog#new-thread-dialog textarea {
 
 dialog#new-thread-dialog textarea {
   font-family: var(--mono, monospace);
-  font-size: 0.9rem;
+  font-size: max(0.9rem, var(--control-font-size));
   min-height: 5rem;
 }
 
@@ -421,7 +421,9 @@ body.mode-advanced .assistant       { display: none; }
 .assistant {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 4rem);
+  /* --safe-top is the status-bar inset the header absorbs in a standalone
+     window; without it this column overflows the viewport by that much. */
+  height: calc(100vh - 4rem - var(--safe-top));
   max-width: 70rem;
   margin: 0 auto;
   padding: 1rem;
@@ -683,7 +685,7 @@ body.mode-advanced .assistant       { display: none; }
   border-radius: 4px;
   padding: 0.5rem 0.75rem;
   font: inherit;
-  font-size: 0.95rem;
+  font-size: max(0.95rem, var(--control-font-size));
 }
 
 .assistant-input-row {
