@@ -489,6 +489,8 @@ KNOWN_MODELS = [
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    {"key": "claude-fable-5-1", "model": "claude-fable-5-1", "label": "Fable 5.1", "context": 1000000,
+     "betas": [], "efforts": EFFORT_LEVELS},
     {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     # Split-model entry: "plan_model" runs while the run is in plan mode,
@@ -527,6 +529,11 @@ KNOWN_MODELS = [
     # with tool_use in the history, 2026-08-22.
     {"key": "opus5-fable-advisor", "model": "claude-opus-5",
      "advisor_model": "claude-fable-5", "label": "Opus 5 + Fable 5 advisor",
+     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
+    # Probed working on CLI 2.1.257 with a real advisor_message iteration
+    # served by claude-fable-5-1, 2026-09-01.
+    {"key": "opus5-fable51-advisor", "model": "claude-opus-5",
+     "advisor_model": "claude-fable-5-1", "label": "Opus 5 + Fable 5.1 advisor",
      "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}

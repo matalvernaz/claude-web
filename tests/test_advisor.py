@@ -10,6 +10,7 @@ from tests.test_fableplan import _FakeClient, _stub_run
 OPUS_ADVISOR = app_module.MODELS_BY_KEY.get("opus-fable-advisor") or {}
 COMBO = app_module.MODELS_BY_KEY.get("fableplan-advisor") or {}
 OPUS5_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable-advisor") or {}
+OPUS5_FABLE51_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable51-advisor") or {}
 
 
 def test_advisor_entries_exist() -> None:
@@ -30,6 +31,24 @@ def test_opus5_advisor_entry_exists() -> None:
     assert OPUS5_ADVISOR["advisor_model"] == "claude-fable-5"
     assert "plan_model" not in OPUS5_ADVISOR
     assert OPUS5_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+
+
+def test_opus5_fable51_advisor_entry_exists() -> None:
+    assert OPUS5_FABLE51_ADVISOR, "opus5-fable51-advisor missing from KNOWN_MODELS"
+    assert OPUS5_FABLE51_ADVISOR["model"] == "claude-opus-5"
+    assert OPUS5_FABLE51_ADVISOR["advisor_model"] == "claude-fable-5-1"
+    assert "plan_model" not in OPUS5_FABLE51_ADVISOR
+    assert OPUS5_FABLE51_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+
+
+def test_fable_5_1_switchable_entry() -> None:
+    entry = app_module.MODELS_BY_KEY.get("claude-fable-5-1") or {}
+    assert entry, "claude-fable-5-1 missing from KNOWN_MODELS"
+    assert entry["model"] == "claude-fable-5-1"
+    assert entry["context"] == 1000000
+    assert entry["betas"] == []
+    assert entry["efforts"] == app_module.EFFORT_LEVELS
+    assert "advisor_model" not in entry
 
 
 def test_models_payload_carries_advisor() -> None:
