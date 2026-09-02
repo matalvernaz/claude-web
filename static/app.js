@@ -3233,6 +3233,25 @@
       if (obj.to) sessionProvider = obj.to;
       announce(obj.notice || "Switched provider. Prior conversation carried over.");
       markVisibleActivity();
+    } else if (obj.type === "advisor_disabled") {
+      // The CLI refused to start with the selected advisor (no usage-credit
+      // consent on this account) and the server respawned without it. The turn
+      // is running, so this is a notice, not an error — but it has to be spoken:
+      // what the user got before was a dead turn labelled "exit code 1".
+      const advisorNote = obj.message || "The advisor is off for this chat.";
+      const article = document.createElement("article");
+      article.className = "msg info";
+      const role = document.createElement("h3");
+      role.className = "role";
+      role.textContent = "Advisor off";
+      const body = document.createElement("p");
+      body.className = "info-body";
+      body.textContent = advisorNote;
+      article.appendChild(role);
+      article.appendChild(body);
+      transcript.appendChild(article);
+      maybeAutoScroll();
+      announce(advisorNote);
     } else if (obj.type === "_overflow") {
       // The server's per-subscriber queue filled. When it tells us which idx
       // didn't fit, resume from exactly there: keep the dedup watermark and

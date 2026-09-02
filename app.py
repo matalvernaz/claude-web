@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
@@ -10555,6 +10556,80 @@ def _codex_image_paths(image_blocks: list[dict], run_id: str) -> list[str]:
     return paths
 
 
+# The CLI refuses to start when the chosen advisor model needs usage-credit
+# consent — its wording is "<model> as the advisor bills to usage credits" —
+# and exits 1, killing a turn that would have run fine with no advisor at all.
+# Consent is grantable only from an interactive session (`/model fable`), so a
+# headless spawn can never satisfy it. The CLI's own background sessions
+# downgrade this to a warning and continue; _sdk_client does the same.
+_ADVISOR_CONSENT_STDERR = "as the advisor bills to usage credits"
+
+# Longest CLI stderr line promoted into a user-facing error summary.
+_ERROR_REASON_CAP = 300
+
+
+def _with_cli_reason(summary: str, stderr_tail: str) -> str:
+    """Append the CLI's own last stderr line to a one-line error summary.
+
+    The SDK's exception text stops at "Command failed with exit code 1", which
+    tells the reader nothing, while the CLI's last stderr line is almost always
+    the actual refusal. The summary is the part the browser announces, so the
+    reason has to be in it — not only in the collapsed detail fold.
+    """
+    reason = ""
+    for line in reversed(stderr_tail.splitlines()):
+        if line.strip():
+            reason = line.strip()[:_ERROR_REASON_CAP]
+            break
+    flat = " ".join(summary.split())
+    return f"{flat} — {reason}" if reason else flat
+
+
+@contextlib.asynccontextmanager
+async def _sdk_client(options: ClaudeAgentOptions, run: "ActiveRun",
+                      stderr_buf: list[str]):
+    """Spawn the CLI and yield the connected client, retrying once without
+    ``--advisor`` when it refused to start for want of advisor consent.
+
+    Only a pre-connect ProcessError retries: once the body holds the client a
+    ProcessError is a mid-turn death, and respawning would restart a turn that
+    has already produced output.
+    """
+    connected = False
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            connected = True
+            yield client
+        return
+    except ProcessError:
+        advisor = (options.extra_args or {}).get("advisor")
+        if connected or not advisor or not any(
+                _ADVISOR_CONSENT_STDERR in line for line in stderr_buf):
+            raise
+    log.warning(
+        "run=%s advisor %s refused at spawn (needs usage-credit consent) — "
+        "respawning without it", run.run_id, advisor,
+    )
+    options.extra_args = {
+        k: v for k, v in (options.extra_args or {}).items() if k != "advisor"
+    }
+    # Drop the first attempt's stderr so a second, unrelated failure can't
+    # report the consent line as its reason.
+    stderr_buf.clear()
+    run.emit({
+        "type": "advisor_disabled",
+        "advisor": advisor,
+        "message": (
+            f"Advisor {advisor} is switched off for this chat: this account "
+            "has not granted usage-credit consent for it, and only an "
+            "interactive session can grant that (/model fable). The chat is "
+            "running on its main model."
+        ),
+    })
+    async with ClaudeSDKClient(options=options) as client:
+        yield client
+
+
 @app.post("/api/chat")
 async def api_chat(
     request: Request,
@@ -11407,7 +11482,7 @@ async def api_chat(
                     )
 
         try:
-            async with ClaudeSDKClient(options=options) as client:
+            async with _sdk_client(options, run, stderr_buf) as client:
                 pump_task = asyncio.create_task(_pump_messages(client))
                 try:
                     # Send the initial query, then publish run.client so
@@ -11601,9 +11676,10 @@ async def api_chat(
                                         "to continue."
                                     )
                                 else:
-                                    summary = (
+                                    summary = _with_cli_reason(
                                         f"SDK message stream failed: "
-                                        f"{type(msg.exc).__name__}: {msg.exc}"
+                                        f"{type(msg.exc).__name__}: {msg.exc}",
+                                        tail,
                                     )
                                 run.emit({
                                     "type": "error",
@@ -12030,7 +12106,10 @@ async def api_chat(
             logging.getLogger("claude-web").error(
                 "driver error: %s\nstderr:\n%s\ntraceback:\n%s", e, tail, tb,
             )
-            payload = {"type": "error", "message": f"{type(e).__name__}: {e}"}
+            payload = {
+                "type": "error",
+                "message": _with_cli_reason(f"{type(e).__name__}: {e}", tail),
+            }
             # The CLI stderr tail helps the user; the Python traceback is
             # internal disclosure (absolute paths, module layout) and is already
             # in the server log above, so it doesn't go to the browser.
