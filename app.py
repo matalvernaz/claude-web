@@ -12106,10 +12106,15 @@ async def api_chat(
             logging.getLogger("claude-web").error(
                 "driver error: %s\nstderr:\n%s\ntraceback:\n%s", e, tail, tb,
             )
-            payload = {
-                "type": "error",
-                "message": _with_cli_reason(f"{type(e).__name__}: {e}", tail),
-            }
+            message = f"{type(e).__name__}: {e}"
+            if isinstance(e, ProcessError):
+                # Only a CLI death makes the stderr tail the reason.
+                # For a Python-side driver bug the tail is unrelated
+                # spawn noise (the workspace-trust warning prints on
+                # every spawn), and appending it would misattribute
+                # the failure.
+                message = _with_cli_reason(message, tail)
+            payload = {"type": "error", "message": message}
             # The CLI stderr tail helps the user; the Python traceback is
             # internal disclosure (absolute paths, module layout) and is already
             # in the server log above, so it doesn't go to the browser.
