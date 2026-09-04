@@ -8,6 +8,7 @@ plumbing, and the route-level validation that keeps the two providers'
 sessions from cross-contaminating.
 """
 import asyncio
+import logging
 import json
 import os
 import shutil
@@ -366,6 +367,33 @@ async def test_dispatch_routes_error_responses():
                       "error": {"code": -1, "message": "nope"}})
     with pytest.raises(codex_provider.CodexRPCError, match="nope"):
         await fut
+
+
+async def test_request_sends_an_empty_object_for_parameterless_methods():
+    """A method called with no params still sends ``"params": {}``.
+
+    Probed against `codex app-server` 0.145.0: `account/read` and `model/list`
+    with ``"params": null`` (or the field omitted) are refused outright with
+    ``-32600 Invalid request: missing field `params```, while ``{}`` succeeds.
+    Only methods whose params type is optional — ``account/logout`` is one —
+    accept null, so null is not safe as the default for every method.
+    """
+    server = codex_provider.CodexAppServer()
+    sent = []
+
+    def _fake_send(message):
+        sent.append(message)
+        server._dispatch({
+            "jsonrpc": "2.0", "id": message["id"], "result": {},
+        })
+
+    server._send = _fake_send
+    await server.request("account/logout")
+
+    assert sent == [{
+        "jsonrpc": "2.0", "id": 1, "method": "account/logout",
+        "params": {},
+    }]
 
 
 async def test_dispatch_routes_thread_notifications():
@@ -1099,6 +1127,85 @@ def test_account_page_renders_openai_device_code_controls(client):
     assert 'src="/static/codex-account.js' in response.text
 
 
+def test_claude_oauth_poll_focuses_link_only_on_status_transition():
+    source = (Path(__file__).parents[1] / "static" / "account.js").read_text(
+        encoding="utf-8",
+    )
+    start = source.index('case "awaiting_code":')
+    end = source.index('case "exchanging":', start)
+    awaiting_code_block = source[start:end]
+
+    assert "oauthCodeInput.focus()" not in awaiting_code_block
+    assert "statusChanged && oauthUrl" in awaiting_code_block
+    assert "oauthUrl.focus()" in awaiting_code_block
+
+
+def test_codex_signout_supersedes_bound_runs_and_logs_out(client, monkeypatch):
+    import app as app_module
+
+    cred = app_module._create_codex_credential(
+        "anonymous", "Sign-out Test",
+    )
+    cred_id = cred["id"]
+    home = app_module._ensure_codex_credential_home("anonymous", cred_id)
+    (home / "auth.json").write_text("{}")
+    app_module._set_codex_user_active("anonymous", f"cred:{cred_id}")
+    run = app_module.ActiveRun(
+        "run-codex-signout", owner_sub="anonymous",
+        account_slot=f"cred:{cred_id}",
+    )
+    run.provider = "codex"
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    events = []
+
+    class _FakeServer:
+        async def request(self, method, params=None, timeout=None):
+            events.append((method, params))
+            return {}
+
+    async def _fake_supersede(candidate, reason):
+        events.append(("supersede", candidate.run_id, reason))
+        candidate.done = True
+
+    async def _fake_server_for_account(account):
+        return _FakeServer()
+
+    async def _fake_close_key(key):
+        events.append(("close", key))
+
+    monkeypatch.setattr(
+        app_module, "_supersede_run_for_switch", _fake_supersede,
+    )
+    monkeypatch.setattr(
+        app_module, "_codex_server_for_account", _fake_server_for_account,
+    )
+    monkeypatch.setattr(
+        codex_provider.CodexAppServer, "close_key",
+        staticmethod(_fake_close_key),
+    )
+    try:
+        response = client.post(
+            f"/api/account/codex/credentials/{cred_id}/signout",
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"configured": False}
+        assert events[0] == (
+            "supersede", run.run_id, "account_changed",
+        )
+        assert events[1] == ("account/logout", None)
+        assert events[2] == (
+            "close", app_module._codex_server_key("anonymous", cred_id),
+        )
+        assert not (home / "auth.json").exists()
+        assert app_module._codex_user_active_slot("anonymous") == "shared"
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)
+        app_module._set_codex_user_active("anonymous", "shared")
+        app_module._delete_codex_credential_row("anonymous", cred_id)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_codex_account_change_supersedes_run_without_changing_session(
     client, monkeypatch,
 ):
@@ -1604,3 +1711,38 @@ def test_sessions_search_includes_codex(client):
         app_module._state_db().execute(
             "DELETE FROM codex_session WHERE thread_id = ?", (tid,),
         )
+
+
+def test_expected_shutdown_does_not_log_a_warning():
+    """A shutdown we asked for is routine. It used to log at WARNING, which
+    buried the unexpected exits worth finding — both report code=None.
+
+    Captures on the codex logger directly: app.py configures logging with
+    propagation off, so caplog sees nothing once it has been imported.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger("claude-web.codex")
+    handler = _Capture(level=logging.DEBUG)
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        expected = codex_provider.CodexAppServer()
+        expected.proc = None
+        expected._shutting_down = True
+        expected._on_exit()
+
+        crashed = codex_provider.CodexAppServer()
+        crashed.proc = None
+        crashed._on_exit()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    levels = [r.levelno for r in records if "exited" in r.getMessage()]
+    assert levels == [logging.INFO, logging.WARNING]

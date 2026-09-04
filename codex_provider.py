@@ -416,6 +416,12 @@ class CodexAppServer:
         self._pending[rid] = fut
         try:
             self._send(
+                # `params` is always sent as an object, never null or omitted:
+                # the app-server's request deserializer requires the field for
+                # most methods, and rejects the whole request when it's absent
+                # (-32600 "Invalid request: missing field `params`"). Only
+                # methods whose params type is optional tolerate null, so an
+                # empty object is the one form that works for all of them.
                 {"jsonrpc": "2.0", "id": rid, "method": method,
                  "params": params or {}}
             )
@@ -541,7 +547,15 @@ class CodexAppServer:
 
     def _on_exit(self) -> None:
         code = self.proc.returncode if self.proc else None
-        log.warning("codex app-server exited (code=%s)", code)
+        # A shutdown we asked for is routine — logging it at WARNING buried the
+        # unexpected exits (the ones worth finding) under 30-odd expected ones
+        # per fortnight, and a terminated child reports code=None either way,
+        # so the level is the only thing that separates them.
+        log.log(
+            logging.INFO if self._shutting_down else logging.WARNING,
+            "codex app-server exited (code=%s, requested=%s)",
+            code, self._shutting_down,
+        )
         if code is None and self.proc is not None and not self._shutting_down:
             # The reader stopped while the child is still running (a failed
             # dispatch, a cancelled task). Nobody drains stdout after this, so
