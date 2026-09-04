@@ -50,6 +50,7 @@
   }
   let pollHandle = null;
   let pollInFlight = false;
+  let lastOauthFlowStatus = null;
   const POLL_MS = 1500;
   const ACTIVE_STATUSES = new Set(["starting", "awaiting_code", "exchanging"]);
 
@@ -59,6 +60,7 @@
   function showError(el, msg) { setText(el, msg); show(el); }
 
   function clearOauthState() {
+    lastOauthFlowStatus = null;
     setText(oauthStatus, "");
     hide(oauthProgress);
     hide(oauthLinkBlock);
@@ -106,6 +108,8 @@
 
   function applyFlowState(flow, onConfigured) {
     if (!flow) return;
+    const statusChanged = flow.status !== lastOauthFlowStatus;
+    lastOauthFlowStatus = flow.status;
     if (flow.url) {
       oauthUrl.href = flow.url;
       show(oauthLinkBlock);
@@ -121,9 +125,7 @@
         show(oauthProgress);
         oauthStart.disabled = true;
         oauthCodeSubmit.disabled = false;
-        if (oauthCodeInput && document.activeElement !== oauthCodeInput) {
-          oauthCodeInput.focus();
-        }
+        if (statusChanged && oauthUrl) oauthUrl.focus();
         break;
       case "exchanging":
         setText(oauthStatus, "Exchanging code with Anthropic…");

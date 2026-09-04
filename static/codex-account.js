@@ -231,7 +231,7 @@
       return;
     }
     if (button.classList.contains("codex-signout")) {
-      if (!confirm(`Sign out "${label}"? Active chats using it must be stopped first.`)) return;
+      if (!confirm(`Sign out "${label}"? Any active chats using it will be stopped.`)) return;
       button.disabled = true;
       try {
         const response = await fetch(credentialUrl(credId, "signout"), { method: "POST" });
