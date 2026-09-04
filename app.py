@@ -1502,7 +1502,34 @@ def _tool_signature(tool: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
-async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any]):
+def _permission_context_fields(context) -> dict[str, Any]:
+    """Pull the CLI's own explanation of a permission request off the SDK's
+    ``ToolPermissionContext``, as a dict of only the fields it actually set.
+
+    The CLI decides *why* a call needs approving and says so; without this the
+    card can only show the tool and its input, which is unreadable when the
+    session is in a mode the user believes silences prompts. bypassPermissions
+    is the sharp case: a handful of destructive-removal shapes carry
+    "cannot be auto-allowed by permission rules" and prompt regardless of mode,
+    and a card with no reason on it looks like the mode was ignored.
+
+    Codex has no equivalent, so it passes ``None`` and the keys stay absent.
+    """
+    if context is None:
+        return {}
+    fields = {
+        "reason": getattr(context, "decision_reason", None),
+        "title": getattr(context, "title", None),
+        "display_name": getattr(context, "display_name", None),
+        "description": getattr(context, "description", None),
+        "blocked_path": getattr(context, "blocked_path", None),
+        "agent_id": getattr(context, "agent_id", None),
+    }
+    return {k: v for k, v in fields.items() if v}
+
+
+async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any],
+                                context=None):
     """Allow or deny a non-special tool call via the per-session allowlist,
     falling back to a browser permission prompt.
 
@@ -1546,6 +1573,7 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
 
         d = await _await_permission_decision(
             run, tool_name, tool_input, sig, allow_session_supported,
+            context=context,
         )
         if d is None:
             return PermissionResultDeny(
@@ -1574,15 +1602,20 @@ async def _gate_tool_permission(run, tool_name: str, tool_input: dict[str, Any])
 
 async def _await_permission_decision(
     run, tool_name: str, tool_input: dict[str, Any], sig: str,
-    allow_session_supported: bool,
+    allow_session_supported: bool, context=None,
 ) -> Optional[str]:
     """Emit a permission_request, await the browser's resolution, echo a
     permission_resolved event, and return the raw decision string
     ("allow" / "allow_session" / "deny"). Returns None on timeout (after
     emitting permission_timeout) so the caller picks the no-answer default
     that fits its backend. Shared by the Claude allowlist gate above and
-    the Codex approval bridge, which map the raw decision differently."""
+    the Codex approval bridge, which map the raw decision differently.
+
+    ``context`` is the SDK's ToolPermissionContext when one is available; its
+    fields ride along on the emitted event so the card can say why the CLI
+    asked."""
     owner = run.owner_sub or "?"
+    ctx_fields = _permission_context_fields(context)
     request_id = str(uuid_mod.uuid4())
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
@@ -1595,6 +1628,7 @@ async def _await_permission_decision(
             "signature": sig,
             "timeout_seconds": PERMISSION_TIMEOUT_SECONDS,
             "allow_session_supported": allow_session_supported,
+            **ctx_fields,
         })
         try:
             decision = await asyncio.wait_for(fut, timeout=PERMISSION_TIMEOUT_SECONDS)
@@ -1615,8 +1649,9 @@ async def _await_permission_decision(
 
     d = decision.get("decision")
     log.info(
-        "perm decision=%s tool=%s sig=%r run=%s owner=%s",
-        d, tool_name, sig, run.run_id, owner,
+        "perm decision=%s tool=%s sig=%r run=%s owner=%s mode=%s reason=%r",
+        d, tool_name, sig, run.run_id, owner, run.permission_mode,
+        ctx_fields.get("reason"),
     )
     # Persist the resolution so replays render this card as decided. Without
     # it a reconnect re-renders the request as pending and a click 404s
@@ -11267,7 +11302,7 @@ async def api_chat(
                 ),
             )
 
-        return await _gate_tool_permission(run, tool_name, tool_input)
+        return await _gate_tool_permission(run, tool_name, tool_input, context)
 
     # Buffer the CLI subprocess's stderr so we can include it in any error
     # event we emit. Without this the SDK just surfaces "Error in input
@@ -11318,6 +11353,11 @@ async def api_chat(
         # Partial deltas become transient partial_text SSE frames (typing
         # feel); the durable transcript still comes from whole messages.
         include_partial_messages=True,
+        # Subagent text/thinking arrives as AssistantMessages carrying
+        # parent_tool_use_id, which _sdk_message_to_events routes to its own
+        # transcript block. Without it an Agent call is a silent gap between
+        # tool_use and tool_result, however long the subagent runs.
+        forward_subagent_text=True,
         enable_file_checkpointing=FILE_CHECKPOINTS_ENABLED,
         stderr=_capture_stderr,
         # The SDK prefers its bundled CLI snapshot over PATH, silently
@@ -13031,6 +13071,33 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             # its announce-dedup key so a mid-chat account switch doesn't
             # swallow the new account's first warning.
             "account_slot": run.account_slot if run is not None else None,
+        }]
+    if isinstance(msg, AssistantMessage) and msg.parent_tool_use_id:
+        # forward_subagent_text: a subagent's own turns, tagged with the Agent
+        # tool_use id that spawned them. Deliberately handled before the main
+        # branch and kept out of it: a subagent's TodoWrite/TaskCreate would
+        # otherwise overwrite the parent's task panel, its plan file would
+        # shadow the parent's, and its turns would enter the canonical
+        # transcript as if the main agent had said them. Tool calls are left
+        # out — the subagent's narration is the useful signal, and its tool
+        # traffic would double the transcript.
+        blocks = [
+            {"type": "thinking" if isinstance(blk, ThinkingBlock) else "text",
+             "text": text}
+            for blk in msg.content
+            if isinstance(blk, (TextBlock, ThinkingBlock))
+            and (text := (blk.thinking if isinstance(blk, ThinkingBlock) else blk.text))
+        ]
+        # A subagent turn that was pure tool calls (or an empty redacted
+        # thinking block) has nothing to narrate — emitting anyway would open
+        # an empty block in the transcript for a subagent that never spoke.
+        if not blocks:
+            return []
+        return [{
+            "type": "subagent_text",
+            "parent_tool_use_id": msg.parent_tool_use_id,
+            "blocks": blocks,
+            "session_id": msg.session_id,
         }]
     if isinstance(msg, AssistantMessage):
         out = []

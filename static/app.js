@@ -3154,7 +3154,14 @@
       announce(label + ".");
     } else if (obj.type === "permission_request") {
       ctx.currentAssistantBody = null;
-      announce(`Permission needed for ${obj.tool}.`, { urgent: true });
+      // Speak the CLI's reason when it sent one. In a mode the user set to
+      // stop prompting, "Permission needed for Bash" alone reads as a bug —
+      // the reason is the whole explanation, so it belongs in the live region
+      // and not only in the card.
+      announce(
+        `Permission needed for ${obj.tool}.` + (obj.reason ? ` ${obj.reason}` : ""),
+        { urgent: true },
+      );
       playCue("permission");
       renderPermissionCard(obj);
       enqueuePermRequest("permission", obj);
@@ -3347,6 +3354,8 @@
       renderTaskEvent("progress", obj);
     } else if (obj.type === "task_notification") {
       renderTaskEvent("notification", obj);
+    } else if (obj.type === "subagent_text") {
+      renderSubagentText(obj);
     } else if (obj.type === "auto_fire_capped") {
       // Server reached MAX_CONSECUTIVE_AUTO_FIRES and dropped the latest
       // batch of background-task notifications instead of auto-firing
@@ -3561,6 +3570,49 @@
       announce(`Background task ${id}: ${obj.status || "done"}`);
       playCue(obj.status === "error" ? "task_error" : "task_done");
     }
+  }
+
+  // A subagent's own narration, forwarded by the CLI (forward_subagent_text)
+  // and tagged with the Agent tool_use id that spawned it. Grouped per subagent
+  // so several running in parallel stay legible, and kept visually and
+  // structurally distinct from the main agent's articles — a screen reader
+  // must never hear a subagent's reasoning as the main agent's answer.
+  function renderSubagentText(obj) {
+    const id = obj.parent_tool_use_id;
+    if (!id || !Array.isArray(obj.blocks)) return;
+    const blockId = `subagent-${id}`;
+    let block = document.getElementById(blockId);
+    if (!block) {
+      block = document.createElement("details");
+      block.id = blockId;
+      block.className = "subagent-block";
+      block.open = true;
+      const summary = document.createElement("summary");
+      summary.className = "subagent-summary";
+      // The Agent call is still in flight while its text streams, so its
+      // in-flight entry names which subagent this is. Falls back to a plain
+      // label if the tool_use scrolled past before this page attached.
+      const inFlight = inFlightTools.get(id);
+      summary.textContent = "Subagent" + (inFlight && inFlight.summary ? `: ${inFlight.summary}` : "");
+      block.appendChild(summary);
+      const log = document.createElement("div");
+      log.className = "subagent-log";
+      block.appendChild(log);
+      transcript.appendChild(block);
+      // Subagents can run for minutes; say one has started talking, but say it
+      // once per subagent rather than once per forwarded message.
+      announce(summary.textContent + " is working.");
+    }
+    const log = block.querySelector(".subagent-log");
+    for (const b of obj.blocks) {
+      if (!b.text) continue;
+      const line = document.createElement("div");
+      line.className = "subagent-line subagent-line-" + (b.type || "text");
+      line.textContent = b.text;
+      log.appendChild(line);
+    }
+    maybeAutoScroll();
+    markVisibleActivity();
   }
 
   // Stop one running background task via the stop_task verb. The CLI then
@@ -3906,9 +3958,11 @@
     permDialog.appendChild(title);
 
     if (entry.kind === "permission") {
-      title.textContent = `${assistantLabel()} wants to use ${req.tool}${countSuffix}`;
+      title.textContent = (req.title || `${assistantLabel()} wants to use ${req.tool}`)
+        + countSuffix;
       const detail = document.createElement("div");
       detail.className = "permission-input-wrap";
+      appendPermissionReason(detail, req);
       appendPermissionPayload(detail, req.tool, req.input || {});
       permDialog.appendChild(detail);
 
@@ -4070,7 +4124,10 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = `${assistantLabel()} wants to use ${req.tool}`;
+    // The CLI's `title` is the full prompt sentence it would have shown in the
+    // terminal ("Claude wants to read foo.txt") — better than reconstructing
+    // from tool + input, so prefer it whenever the CLI sent one.
+    heading.textContent = req.title || `${assistantLabel()} wants to use ${req.tool}`;
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
     card.setAttribute("aria-describedby", detailId);
@@ -4083,6 +4140,7 @@
     const detail = document.createElement("div");
     detail.id = detailId;
     detail.className = "permission-input-wrap";
+    appendPermissionReason(detail, req);
     appendPermissionPayload(detail, req.tool, req.input || {});
     card.appendChild(detail);
 
@@ -4152,6 +4210,27 @@
         );
       }
     });
+  }
+
+  // The CLI's own explanation of why this call needs approving, when it sent
+  // one. Load-bearing for a mode the user believes silences prompts: a few
+  // destructive-removal shapes are approved by a person or not at all, even
+  // under Bypass all prompts, and without the reason on the card that reads as
+  // the mode being ignored. Placed before the payload so it's the first thing
+  // after the heading. Absent on replayed events from before this shipped.
+  function appendPermissionReason(parent, req) {
+    if (!req.reason && !req.blocked_path) return;
+    const note = document.createElement("p");
+    note.className = "permission-reason";
+    note.textContent = req.reason
+      || `Path outside the allowed directories: ${req.blocked_path}`;
+    parent.appendChild(note);
+    if (req.blocked_path && req.reason) {
+      const path = document.createElement("p");
+      path.className = "permission-reason";
+      path.textContent = `Path: ${req.blocked_path}`;
+      parent.appendChild(path);
+    }
   }
 
   function appendPermissionPayload(parent, tool, input) {

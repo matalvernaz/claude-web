@@ -1636,3 +1636,103 @@ async def test_gate_overage_timeout_defaults_to_stop(monkeypatch) -> None:
     assert await asyncio.wait_for(app_module._gate_overage(run), timeout=2) is False
     assert run.overage_consent is False
     assert any(e.get("type") == "permission_timeout" for e in events)
+
+
+# ─── Permission-request context + forwarded subagent text ────────────────────
+
+class _FakePermissionContext:
+    """Stand-in for the SDK's ToolPermissionContext with only the fields the
+    CLI actually populated for a given request."""
+
+    def __init__(self, **kwargs):
+        for field in ("decision_reason", "title", "display_name", "description",
+                      "blocked_path", "agent_id"):
+            setattr(self, field, kwargs.get(field))
+
+
+def test_permission_context_fields_keeps_only_what_the_cli_sent() -> None:
+    ctx = _FakePermissionContext(
+        decision_reason="Dangerous rm operation on statically-unresolvable target: /x/*",
+        display_name="Bash",
+    )
+    assert app_module._permission_context_fields(ctx) == {
+        "reason": "Dangerous rm operation on statically-unresolvable target: /x/*",
+        "display_name": "Bash",
+    }
+
+
+def test_permission_context_fields_absent_without_context() -> None:
+    """Codex has no ToolPermissionContext, so the keys must stay off the event
+    rather than arriving as nulls the frontend has to special-case."""
+    assert app_module._permission_context_fields(None) == {}
+
+
+async def test_permission_request_carries_the_cli_reason() -> None:
+    """A prompt raised under a mode the user believes silences prompts is only
+    intelligible if the CLI's reason rides along on the event."""
+    run = app_module.ActiveRun("perm-reason")
+    run.permission_mode = "bypassPermissions"
+    events: list[dict] = []
+    run.emit = events.append  # type: ignore[method-assign]
+    reason = ("Dangerous rm operation on statically-unresolvable target: "
+              "/tmp/gone/*")
+
+    async def _decide() -> None:
+        for _ in range(100):
+            pending = [rid for rid, v in app_module.PENDING.items()
+                       if v.get("run_id") == run.run_id]
+            if pending:
+                app_module.PENDING[pending[0]]["future"].set_result({"decision": "allow"})
+                return
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(_decide())
+    result = await app_module._gate_tool_permission(
+        run, "Bash", {"command": "rm -f /tmp/gone/*"},
+        _FakePermissionContext(decision_reason=reason, display_name="Bash"),
+    )
+    await task
+    assert getattr(result, "behavior", None) == "allow"
+    request = next(e for e in events if e["type"] == "permission_request")
+    assert request["reason"] == reason
+    assert request["display_name"] == "Bash"
+
+
+def _subagent_message(parent_tool_use_id: str, text: str):
+    from claude_agent_sdk import AssistantMessage
+    from claude_agent_sdk.types import TextBlock
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="test",
+        parent_tool_use_id=parent_tool_use_id,
+    )
+
+
+def test_subagent_text_is_its_own_event() -> None:
+    run = app_module.ActiveRun("subagent-text")
+    events = app_module._sdk_message_to_events(
+        _subagent_message("tu_agent", "Reading the config."), run=run,
+    )
+    assert events == [{
+        "type": "subagent_text",
+        "parent_tool_use_id": "tu_agent",
+        "blocks": [{"type": "text", "text": "Reading the config."}],
+        "session_id": None,
+    }]
+
+
+def test_subagent_tool_calls_do_not_touch_the_parent_task_panel() -> None:
+    """A subagent's TaskCreate belongs to the subagent, not to the run's panel."""
+    run = app_module.ActiveRun("subagent-isolation")
+    msg = _assistant_with_tool_use("TaskCreate", "tu_sub", {"subject": "sub work"})
+    msg.parent_tool_use_id = "tu_agent"
+    assert app_module._sdk_message_to_events(msg, run=run) == []
+    assert run.pending_task_creates == {}
+    assert run.tasks == {}
+
+
+def test_subagent_turn_with_nothing_to_say_emits_nothing() -> None:
+    run = app_module.ActiveRun("subagent-empty")
+    assert app_module._sdk_message_to_events(
+        _subagent_message("tu_agent", ""), run=run,
+    ) == []
