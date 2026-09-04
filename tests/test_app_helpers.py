@@ -1736,3 +1736,40 @@ def test_subagent_turn_with_nothing_to_say_emits_nothing() -> None:
     assert app_module._sdk_message_to_events(
         _subagent_message("tu_agent", ""), run=run,
     ) == []
+
+
+def test_subagent_tool_results_are_not_the_parents() -> None:
+    """forward_subagent_text also forwards the subagent's tool results as
+    UserMessages under the same parent id. Rendering them would attribute the
+    subagent's tool runs to the main agent."""
+    from claude_agent_sdk import UserMessage
+    from claude_agent_sdk.types import ToolResultBlock
+    run = app_module.ActiveRun("subagent-tool-result")
+    msg = UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu_sub", content="total 0")],
+        uuid="u1",
+        parent_tool_use_id="tu_agent",
+    )
+    assert app_module._sdk_message_to_events(msg, run=run) == []
+    app_module._maybe_record_checkpoint(run, msg)
+    assert run.checkpoints == []
+
+
+def test_subagent_message_is_never_read_as_the_interrupt_echo() -> None:
+    """A subagent message now maps to no events, which is the shape the
+    post-interrupt echo has. Only a top-level UserMessage is that echo: a
+    subagent message means a turn is running, so it must open one."""
+    from claude_agent_sdk import UserMessage
+    run = app_module.ActiveRun("subagent-not-echo")
+    run.expect_interrupt_echo = True
+    run.between_turns = True
+    app_module._apply_turn_state(
+        run, UserMessage(content=[], parent_tool_use_id="tu_agent"), [],
+    )
+    assert run.between_turns is False
+
+    echo = app_module.ActiveRun("real-echo")
+    echo.expect_interrupt_echo = True
+    echo.between_turns = True
+    app_module._apply_turn_state(echo, UserMessage(content=[]), [])
+    assert echo.between_turns is True

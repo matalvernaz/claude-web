@@ -12954,6 +12954,7 @@ def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
             run.expect_interrupt_echo
             and run.between_turns
             and isinstance(msg, UserMessage)
+            and msg.parent_tool_use_id is None
             and not evts
         )
         run.expect_interrupt_echo = False
@@ -13199,6 +13200,14 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 raw={"content": message_blocks}, replayable=True,
             )
         return out
+    if isinstance(msg, UserMessage) and msg.parent_tool_use_id:
+        # The other half of forward_subagent_text: a subagent's tool results
+        # come back as UserMessages under the same parent id. Dropped rather
+        # than rendered — they would read as the main agent's tool results,
+        # promote the subagent's TaskCreate ids into the parent's task panel,
+        # and enter the canonical transcript as turns the main agent never had.
+        # The subagent's narration in subagent_text is the part worth showing.
+        return []
     if isinstance(msg, UserMessage):
         # Tool results coming back from Claude's tool runs.
         results = []
