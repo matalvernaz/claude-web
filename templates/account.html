@@ -43,8 +43,19 @@
             <span class="cred-label">{{ c.label }}</span>
             <span class="cred-meta">
               {% if c.configured %}Signed in{% else %}Not signed in{% endif %}
+              {% if c.auto_email %}
+                — auto sign-in via {{ c.auto_email }}
+              {% endif %}
             </span>
             <span class="cred-actions">
+              {% if c.auto_signin_available %}
+                <button type="button" class="cred-auto-signin"
+                        data-cred-id="{{ c.id }}"
+                        data-auto-email="{{ c.auto_email }}"
+                        data-label="{{ c.label }}">
+                  {% if c.configured %}Sign in again (auto){% else %}Sign in (auto){% endif %}
+                </button>
+              {% endif %}
               {% if not c.configured %}
                 <button type="button" class="cred-setup" data-cred-id="{{ c.id }}">Sign in</button>
               {% else %}
@@ -69,6 +80,34 @@
       </form>
       <p id="add-error" class="setup-error" role="alert" hidden></p>
       <p id="add-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section aria-labelledby="failover-heading" class="setup-card">
+      <h2 id="failover-heading">Automatic account switching</h2>
+      <p>
+        When the account you picked can't run a turn — its plan limit is spent,
+        or the model you selected isn't on its plan — start the turn on the next
+        account below instead. Only accounts you add here are ever used
+        automatically.
+      </p>
+      <p>
+        <label>
+          <input type="checkbox" id="failover-enabled">
+          Switch accounts automatically
+        </label>
+      </p>
+      <p>
+        <label for="failover-policy">When the plan limit is reached</label>
+        <select id="failover-policy">
+          <option value="free_first">Move to an account with room</option>
+          <option value="prefer_current">Stay and ask about usage credits</option>
+        </select>
+      </p>
+      <h3 id="failover-order-heading">Order accounts are tried in</h3>
+      <ul id="failover-list" aria-labelledby="failover-order-heading"></ul>
+      <p id="failover-gated" class="setup-hint"></p>
+      <p id="failover-error" class="setup-error" role="alert" hidden></p>
+      <p id="failover-status" role="status" aria-live="polite"></p>
     </section>
 
     <section id="signin-section" aria-labelledby="signin-heading" class="setup-card" hidden>

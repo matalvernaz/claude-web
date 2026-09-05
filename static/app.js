@@ -904,6 +904,43 @@
   // account_changed, and the browser respawns the provider driver under the
   // selected credential. Both providers keep the visible conversation; Codex
   // resumes the same rollout from the new account's app-server.
+  // One checkbox for the whole feature: when a turn can't run on the picked
+  // account — plan limit spent, or the selected model isn't on that plan — the
+  // server starts it on another of your subscription accounts instead. The
+  // /account page exists to narrow or reorder that set; most people never
+  // need it. API-key accounts are excluded server-side, so ticking this can't
+  // start per-token billing.
+  const failoverToggle = document.getElementById("failover-toggle");
+  if (failoverToggle) {
+    const describe = (data) => {
+      if (!data.enabled) return "Automatic account switching off.";
+      const n = (data.ring || []).length;
+      return n > 1
+        ? `Automatic account switching on, across ${n} accounts.`
+        : "Automatic account switching on, but you have only one usable account.";
+    };
+    fetch("/api/account/failover")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) failoverToggle.checked = !!data.enabled; })
+      .catch(() => {});
+    failoverToggle.addEventListener("change", async () => {
+      const body = new URLSearchParams({
+        enabled: failoverToggle.checked ? "true" : "false",
+      });
+      try {
+        const r = await fetch("/api/account/failover", { method: "POST", body });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        // Announce the resulting value, not just that something changed —
+        // the control's own state is the only other feedback, and a count
+        // makes "on" mean something concrete.
+        announce(describe(await r.json()));
+      } catch (e) {
+        failoverToggle.checked = !failoverToggle.checked;
+        announce("Could not save that setting. " + e.message);
+      }
+    });
+  }
+
   if (accountSelect) {
     onCommittedChange(accountSelect, async (target) => {
       if (target === lastAccount) return;
@@ -1525,6 +1562,59 @@
     // SCROLL_PIN_PX in the same frame.
     maybeAutoScroll(wasPinned);
     return b;
+  }
+
+  // Text of the most recent user prompt, so a failover offer can put it back
+  // in the composer instead of asking the user to retype it.
+  let lastUserPrompt = "";
+
+  // Offer to retry a limit-killed turn on another account. Deliberately two
+  // steps — the button switches the account and refills the composer, the user
+  // still presses Send. A one-click resend would re-send a prompt the dying
+  // CLI had usually already written into the transcript, duplicating it and
+  // potentially repeating tool side effects from the lost turn.
+  function renderFailoverOffer(obj) {
+    const el = document.createElement("article");
+    el.className = "msg system failover-offer";
+    const header = document.createElement("div");
+    header.className = "msg-header";
+    const h = document.createElement("h3");
+    h.className = "role";
+    h.textContent = "Account limit";
+    header.appendChild(h);
+    el.appendChild(header);
+
+    const body = document.createElement("div");
+    body.className = "body";
+    const why = obj.reason === "model_unavailable"
+      ? "This account can't run the selected model."
+      : "This account has reached its plan limit.";
+    const label = obj.to_label || "another account";
+    body.textContent = `${why} ${label} can take over.`;
+    el.appendChild(body);
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = `Switch to ${label}`;
+    btn.addEventListener("click", () => {
+      const acct = document.getElementById("account-select");
+      if (acct && [...acct.options].some((o) => o.value === obj.to_slot)) {
+        acct.value = obj.to_slot;
+        // The picker's own change handler owns switching a live run; fire it
+        // rather than duplicating that logic here.
+        acct.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      if (lastUserPrompt && !promptEl.value.trim()) promptEl.value = lastUserPrompt;
+      btn.disabled = true;
+      promptEl.focus();
+      announce(
+        `Switched to ${label}. Your message is back in the box — send it when ready.`,
+      );
+    });
+    el.appendChild(btn);
+    transcript.appendChild(el);
+    maybeAutoScroll(isPinnedToBottom());
+    announce(`${why} ${label} can take over — a switch button is in the transcript.`);
   }
 
   function makeCopyButton(bodyEl) {
@@ -2920,11 +3010,29 @@
       if (obj.project) sessionProject = obj.project;
       if (obj.model) lastSeenModel = obj.model;
       if (obj.provider) sessionProvider = obj.provider;
+      // Failover moved this turn to a different account than the picker shows.
+      // Say so out loud: the picker keeps showing the user's standing choice
+      // (the substitution is per-turn and re-decided each time), so without
+      // this the account the turn actually ran on would be invisible.
+      if (obj.account_substitution) {
+        const sub = obj.account_substitution;
+        const why = sub.reason === "model_unavailable"
+          ? `${sub.from_label || "that account"} can't run this model`
+          : `${sub.from_label || "that account"} has reached its plan limit`;
+        announce(`Using ${sub.to_label || "another account"} for this message — ${why}.`);
+      }
+    } else if (obj.type === "failover_offer") {
+      // A turn died on a limit and another account could carry the retry.
+      // Offered, never taken automatically: by now the CLI has usually
+      // written the message into the transcript and may have run tools, so
+      // resending it is a decision the user should see themselves make.
+      renderFailoverOffer(obj);
     } else if (obj.type === "user_prompt") {
       // Single source of truth for "the user's message in the transcript":
       // the server echoes the prompt as an event so both live and resumed
       // streams render it the same way.
       const body = appendMessage("user", obj.text || "");
+      if (obj.text) lastUserPrompt = obj.text;
       if (obj.image_count) appendImagePlaceholder(body, obj.image_count);
       if (obj.file_count) appendFilePlaceholder(body, obj.file_count);
       // The server confirmed this queued message reached the CLI — clear its

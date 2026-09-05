@@ -253,3 +253,25 @@ details.setup-apikey > summary:focus {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* Failover ring editor. The list is the interactive surface; each row's
+   detail text and the gated-model note are secondary, so they're muted
+   rather than hidden — a screen reader still reads them in order. */
+.setup-hint,
+.failover-detail {
+  font-size: 0.95rem;
+  color: var(--fg-muted, var(--fg));
+}
+
+#failover-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem;
+}
+
+#failover-list li {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.3));
+}
+
+#failover-list li:last-child { border-bottom: none; }

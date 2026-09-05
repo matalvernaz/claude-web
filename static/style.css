@@ -116,6 +116,20 @@ h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
   color: var(--fg);
 }
 .header-link:hover, .header-link:focus { border-color: var(--accent); outline: none; }
+/* Automatic-account-switching checkbox. Sits with the pickers rather than
+   behind the Manage accounts link, because it changes what the account picker
+   next to it actually means. */
+.header-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+}
+.header-check:focus-within { border-color: var(--accent); }
 .header-toggle {
   display: inline-flex;
   align-items: center;

@@ -72,6 +72,7 @@ import codex_provider
 import conversation_replay
 import currency
 import setup_flow
+import auto_signin
 
 log = logging.getLogger("claude-web")
 
@@ -240,6 +241,7 @@ USAGE_DIR = Path(os.getenv("CLAUDE_WEB_STATE_DIR", str(Path.home() / ".claude-we
 USAGE_DIR.mkdir(parents=True, exist_ok=True)
 USAGE_LOG = USAGE_DIR / "usage.jsonl"
 RATE_LIMIT_CACHE = USAGE_DIR / "rate_limit.json"
+ENTITLEMENT_CACHE = USAGE_DIR / "account_entitlements.json"
 STATE_DB_PATH = USAGE_DIR / "state.db"
 currency.configure_cache(USAGE_DIR / "currency_rates.json")
 UPLOADS_ROOT = USAGE_DIR / "uploads"
@@ -1830,6 +1832,14 @@ def _state_db() -> sqlite3.Connection:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_credential_sub ON user_credential(user_sub)"
         )
+        # auto_email: opt-in target mailbox for the fully-automated sign-in
+        # flow (see auto_signin.py). NULL means "no automation configured
+        # for this slot" — the regular /oauth/start path still works.
+        # Migrated in-place because ALTER … ADD COLUMN can't be idempotent
+        # on SQLite older than 3.35.
+        _cols = {r[1] for r in conn.execute("PRAGMA table_info(user_credential)").fetchall()}
+        if "auto_email" not in _cols:
+            conn.execute("ALTER TABLE user_credential ADD COLUMN auto_email TEXT")
         # OpenAI account slots parallel the Claude tables but remain separate:
         # their homes, login protocol, and active defaults are provider-specific.
         conn.execute("""CREATE TABLE IF NOT EXISTS user_codex_account (
@@ -1931,6 +1941,45 @@ def _state_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_session_account_user "
             "ON session_account(user_sub)"
         )
+        # Ordered ring of credential slots the app may substitute for the
+        # picked one when that one can't serve the turn (plan window spent, or
+        # the model isn't on that plan). Membership is opt-in per slot: a slot
+        # absent from this table is never chosen automatically, which is what
+        # keeps an API-key slot from silently turning a subscription turn into
+        # a billed one. ``slot`` is polymorphic ('shared' or 'cred:<id>'), so
+        # no foreign key can enforce ownership — every read validates against
+        # _account_slot_visible and deletion of a credential prunes its row.
+        conn.execute("""CREATE TABLE IF NOT EXISTS account_failover (
+            user_sub TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            PRIMARY KEY(user_sub, slot)
+        )""")
+        # Per-user switch + spend policy for the ring above. Separate table
+        # rather than columns on user_account so the failover feature can be
+        # read, written and reasoned about without touching the row that
+        # decides which account the user is on right now.
+        conn.execute("""CREATE TABLE IF NOT EXISTS account_failover_setting (
+            user_sub TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            spend_policy TEXT NOT NULL DEFAULT 'free_first',
+            updated_at REAL NOT NULL
+        )""")
+        # include_all: use every subscription account the user has rather than
+        # the hand-picked ring above. This is the default, so the one checkbox
+        # on the chat page is the whole feature for most people; the ring page
+        # exists for narrowing or reordering. Additive migration because
+        # SQLite before 3.35 can't do ADD COLUMN IF NOT EXISTS.
+        _fo_cols = {
+            r[1] for r in conn.execute(
+                "PRAGMA table_info(account_failover_setting)"
+            ).fetchall()
+        }
+        if "include_all" not in _fo_cols:
+            conn.execute(
+                "ALTER TABLE account_failover_setting "
+                "ADD COLUMN include_all INTEGER NOT NULL DEFAULT 1"
+            )
         # Skills hidden from the model. A row here is a directory name under
         # ``~/.claude/skills/`` (or the per-user equivalent once that exists)
         # that should be excluded from the SDK's ``skills`` option, so the
@@ -4449,14 +4498,14 @@ def _list_user_credentials(user_sub: str) -> list[dict]:
         return []
     try:
         rows = _state_db().execute(
-            "SELECT id, label, created_at FROM user_credential "
+            "SELECT id, label, created_at, auto_email FROM user_credential "
             "WHERE user_sub = ? ORDER BY id",
             (user_sub,),
         ).fetchall()
     except sqlite3.Error:
         return []
     return [
-        {"id": r[0], "label": r[1], "created_at": r[2]}
+        {"id": r[0], "label": r[1], "created_at": r[2], "auto_email": r[3]}
         for r in rows
     ]
 
@@ -4468,7 +4517,7 @@ def _get_credential(user_sub: str, cred_id: int) -> Optional[dict]:
         return None
     try:
         row = _state_db().execute(
-            "SELECT id, label, created_at FROM user_credential "
+            "SELECT id, label, created_at, auto_email FROM user_credential "
             "WHERE user_sub = ? AND id = ?",
             (user_sub, cred_id),
         ).fetchone()
@@ -4476,7 +4525,7 @@ def _get_credential(user_sub: str, cred_id: int) -> Optional[dict]:
         return None
     if not row:
         return None
-    return {"id": row[0], "label": row[1], "created_at": row[2]}
+    return {"id": row[0], "label": row[1], "created_at": row[2], "auto_email": row[3]}
 
 
 def _create_credential(user_sub: str, label: str) -> dict:
@@ -4543,6 +4592,10 @@ def _delete_credential(user_sub: str, cred_id: int) -> None:
         shutil.rmtree(home, ignore_errors=True)
     if _user_active_slot(user_sub) == f"cred:{cred_id}":
         _set_user_active(user_sub, "shared")
+    # Drop it from the failover ring too. _failover_ring validates ownership on
+    # read so a leftover row is already inert, but leaving it would resurrect
+    # the slot in the ring UI if the same id were ever reissued.
+    _prune_failover_slot(user_sub, f"cred:{cred_id}")
 
 
 def _codex_user_active_slot(user_sub: Optional[str]) -> str:
@@ -6907,6 +6960,12 @@ class ActiveRun:
         # the auth identity mid-run — api_chat compares this against the
         # user's current toggle and respawns the run when they differ.
         self.account_slot = account_slot
+        # The slot the user actually picked, which differs from account_slot
+        # only when failover substituted one. The session→slot binding records
+        # this rather than account_slot, so a substitution made because one
+        # plan window was spent doesn't become the session's standing choice
+        # and strand the user on the fallback after their own account resets.
+        self.requested_account_slot = account_slot
         # Which personality the CLI was spawned with. The system_prompt
         # is baked in at SDK init, so a mid-conversation personality flip
         # has to respawn the run with the new append. Compared in api_chat.
@@ -7132,9 +7191,9 @@ class ActiveRun:
                 # Same for the credential slot — a tab opening this resumed
                 # session must resolve to the account it actually spawned
                 # under, not the user-global default.
-                if self.account_slot:
+                if self.requested_account_slot:
                     _bind_session_account(
-                        sid, self.owner_sub, self.account_slot,
+                        sid, self.owner_sub, self.requested_account_slot,
                     )
         if event.get("type") == "run_started":
             meta_changed = True
@@ -8836,8 +8895,10 @@ def _account_payload(user: dict) -> dict:
     sub = (user or {}).get("sub")
     active = _user_active_slot(sub)
     creds = _list_user_credentials(sub) if sub else []
+    auto_available = auto_signin.mailbox_cmd_configured()
     for c in creds:
         c["configured"] = _credential_is_configured(sub, c["id"])
+        c["auto_signin_available"] = bool(auto_available and c.get("auto_email"))
     return {
         # The OIDC subject — useful for support and debugging.
         "user_sub": sub,
@@ -8850,6 +8911,98 @@ def _account_payload(user: dict) -> dict:
 @app.get("/api/account")
 async def api_account_get(user: dict = Depends(auth.require_user)):
     return _account_payload(user)
+
+
+@app.get("/api/account/failover")
+async def api_account_failover_get(
+    model: str = "", user: dict = Depends(auth.require_user),
+):
+    """The failover ring plus, for each slot, why it ranks where it does.
+
+    ``?model=`` scopes the entitlement column to one picked model; without it
+    the column reports only what the cache knows about each slot in general.
+    Every string here is meant to be read aloud — a screen-reader user has to
+    be able to tell "Office can't run Fable" from "Office hasn't been checked
+    lately" without inspecting a colour or a position.
+    """
+    sub = user.get("sub")
+    settings = _failover_settings(sub)
+    ring = _failover_candidates(sub)
+    all_slots = ["shared"] + [f"cred:{c['id']}" for c in (_list_user_credentials(sub) if sub else [])]
+    required = _model_families_for_key(model)
+    gated = _gated_families(all_slots)
+    rows = []
+    for slot in all_slots:
+        entry = _load_entitlement(slot)
+        health = _slot_health_rank(slot)
+        ent = _slot_entitlement_rank(slot, required, gated)
+        rl = _load_rate_limit_entry(slot)
+        rows.append({
+            "slot": slot,
+            "label": _slot_label(sub, slot),
+            "in_ring": slot in ring,
+            "rank": ring.index(slot) if slot in ring else None,
+            "configured": _slot_has_credentials(sub, slot),
+            "health": _HEALTH_STATE_NAMES.get(health, "unknown"),
+            "can_run_model": _ENTITLEMENT_STATE_NAMES.get(ent, "unknown"),
+            "metered_models": sorted(
+                (b.get("display_name") or fam)
+                for fam, b in ((entry or {}).get("scoped") or {}).items()
+            ),
+            "plan": (entry or {}).get("rate_limit_tier"),
+            "checked_at": (entry or {}).get("fetched_at"),
+            "limit_seen_at": (rl or {}).get("captured_at"),
+        })
+    return {
+        "enabled": settings["enabled"],
+        "spend_policy": settings["spend_policy"],
+        "include_all": settings["include_all"],
+        "ring": ring,
+        "model": model or None,
+        "gated_models": sorted(gated),
+        "slots": rows,
+    }
+
+
+@app.post("/api/account/failover")
+async def api_account_failover_set(
+    enabled: str = Form(default=""),
+    spend_policy: str = Form(default=""),
+    ring: str = Form(default=""),
+    user: dict = Depends(auth.require_user),
+):
+    """Update the failover switch, spend policy and/or ring order.
+
+    ``ring`` is a comma-separated slot list in priority order. Slots the caller
+    doesn't own are dropped rather than rejected, so a stale page that still
+    lists a since-deleted credential saves the rest of the order instead of
+    failing outright.
+    """
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(status_code=400, detail="no user")
+    settings = _failover_settings(sub)
+    new_enabled = settings["enabled"] if enabled == "" else enabled.lower() in ("1", "true", "on", "yes")
+    new_policy = spend_policy or settings["spend_policy"]
+    if new_policy not in _SPEND_POLICIES:
+        raise HTTPException(status_code=400, detail="unknown spend policy")
+    # Naming a ring at all is the act of narrowing: it switches this user off
+    # "use every subscription account" without needing a second control.
+    new_include_all = settings["include_all"] if ring == "" else False
+    _set_failover_settings(sub, new_enabled, new_policy, new_include_all)
+    if ring != "":
+        wanted, seen = [], set()
+        for slot in (s.strip() for s in ring.split(",")):
+            if slot and slot not in seen and _account_slot_visible(sub, slot):
+                wanted.append(slot)
+                seen.add(slot)
+        _set_failover_ring(sub, wanted)
+    log.info(
+        "failover settings sub=%s enabled=%s policy=%s all=%s accounts=%s",
+        sub, new_enabled, new_policy, new_include_all,
+        ",".join(_failover_candidates(sub)) or "-",
+    )
+    return await api_account_failover_get(user=user)
 
 
 @app.post("/api/account/active")
@@ -8978,6 +9131,10 @@ async def api_credentials_status(
             "id": cred["id"],
             "label": cred["label"],
             "configured": _credential_is_configured(sub, cred_id),
+            "auto_email": cred.get("auto_email"),
+            "auto_signin_available": bool(
+                auto_signin.mailbox_cmd_configured() and cred.get("auto_email")
+            ),
         },
         "flow": flow.to_public() if flow else None,
         "whoami": setup_flow.whoami(home),
@@ -9002,6 +9159,76 @@ async def api_credentials_oauth_start(
         flow_key=_credential_flow_key(sub, cred_id),
         home=home,
     )
+    return state.to_public()
+
+
+@app.post("/api/account/credentials/{cred_id}/oauth/auto_signin")
+async def api_credentials_oauth_auto_signin(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    """Kick off the fully-automated sign-in flow (see auto_signin.py).
+
+    Only valid for a slot with ``auto_email`` set AND when the host has
+    ``CLAUDE_WEB_MAILBOX_POLL_CMD`` configured. Returns immediately with
+    the started flow state; the browser dance, mailbox poll, and code
+    submission all run in a background task that updates the same
+    ``OAuthFlowState`` the manual flow uses. The frontend polls
+    ``/status`` for progress (``flow.stage``) and terminal state.
+    """
+    sub = user.get("sub")
+    cred = _require_owned_credential(sub, cred_id)
+    email = (cred.get("auto_email") or "").strip()
+    if not email:
+        raise HTTPException(400, "this credential has no auto_email configured")
+    if not auto_signin.mailbox_cmd_configured():
+        raise HTTPException(
+            503,
+            "auto sign-in is not configured on this server "
+            "(CLAUDE_WEB_MAILBOX_POLL_CMD is unset)",
+        )
+    home = _ensure_credential_home(sub, cred_id)
+    flow_key = _credential_flow_key(sub, cred_id)
+    # start_oauth cancels any prior flow for this key and returns once the
+    # OAuth URL is known (or the driver has failed early). We only proceed
+    # into the browser dance if that URL made it out.
+    state = await setup_flow.start_oauth("claudeai", flow_key=flow_key, home=home)
+    if state.status not in ("awaiting_code",) or not state.url:
+        return state.to_public()
+
+    def _stage(msg: str) -> None:
+        state.stage = msg
+        logging.getLogger("claude-web").info(
+            "auto_signin flow_key=%s stage=%s", flow_key, msg
+        )
+
+    async def _driver() -> None:
+        try:
+            _stage("launching browser")
+            await auto_signin.run_auto_signin(
+                oauth_url=state.url,
+                email=email,
+                flow_key=flow_key,
+                on_stage=_stage,
+            )
+        except auto_signin.AutoSigninError as e:
+            state.stage = None
+            await setup_flow.cancel_flow(flow_key=flow_key)
+            # Overwrite the vague "cancelled" verdict cancel_flow set with
+            # the specific failure the user needs to see.
+            current = setup_flow.current_flow(flow_key)
+            if current is not None:
+                current.status = "failed"
+                current.error = str(e)
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("claude-web").exception("auto_signin driver crashed")
+            await setup_flow.cancel_flow(flow_key=flow_key)
+            current = setup_flow.current_flow(flow_key)
+            if current is not None:
+                current.status = "failed"
+                current.error = f"auto-signin driver crashed: {e}"
+
+    asyncio.create_task(_driver())
     return state.to_public()
 
 
@@ -10733,6 +10960,10 @@ async def api_chat(
         else:
             raise HTTPException(400, "session belongs to the codex provider")
     account: Optional[dict] = None
+    # Set by the failover preflight below when it moves the run to a different
+    # credential slot; rides out to the client on run_started so the account
+    # the turn actually runs on is never silently different from the picked one.
+    substitution: Optional[dict] = None
     codex_models: dict[str, dict] = {}
     if provider == "codex":
         account = _resolve_codex_account_for_run(
@@ -10867,6 +11098,31 @@ async def api_chat(
                 session_id=session_id or None,
                 override_slot=account_slot or None,
             )
+            # Failover preflight. Runs here, before the run is created and
+            # before a single byte reaches a CLI, so a substitution costs
+            # nothing and can't duplicate a prompt: the message hasn't been
+            # sent yet. Claude-only — Codex slots are a separate credential
+            # table with their own limits and no comparable usage endpoint.
+            chosen_slot, substitution = _select_account_slot(
+                user, account["slot"], model,
+            )
+            if substitution is not None:
+                substitution["from_label"] = account["label"]
+                account = _resolve_account_for_run(
+                    user, session_id=session_id or None, override_slot=chosen_slot,
+                )
+                # Re-resolution can decline the pick (credentials vanished
+                # between the check and here); only report a move that happened.
+                if account["slot"] == chosen_slot:
+                    substitution["to_label"] = account["label"]
+                    log.info(
+                        "account failover session=%s %s→%s reason=%s model=%s",
+                        session_id or "-", substitution["from_slot"],
+                        substitution["to_slot"], substitution["reason"],
+                        substitution.get("model") or "-",
+                    )
+                else:
+                    substitution = None
         assert account is not None
         personality_for_run = _resolve_personality_for_run(
             user,
@@ -10889,9 +11145,15 @@ async def api_chat(
         # Same for an explicit account pick — bind the resolved slot to this
         # session so a concurrent reader (refresh, second tab) sees it. emit()
         # also binds on SDK init; this closes the pre-init gap.
+        #
+        # Binds what the user ASKED for, not what failover substituted. A
+        # substitution is re-decided every turn from live plan state; persisting
+        # it would quietly rewrite the user's standing choice the first time
+        # their account hit a limit, and they'd never drift back once it reset.
         if session_id and account_slot:
             _bind_session_account(
-                session_id, user.get("sub"), account["slot"],
+                session_id, user.get("sub"),
+                substitution["from_slot"] if substitution else account["slot"],
             )
         existing = _existing_run_for_session(session_id) if session_id else None
         # True when we're spawning a fork sibling of a still-live run. The
@@ -11031,6 +11293,8 @@ async def api_chat(
             personality_id=active_personality_id,
         )
         run.provider = provider
+        if substitution is not None:
+            run.requested_account_slot = substitution["from_slot"]
         # Seed the permission-mode mirror with the user's initial pick and
         # record the spawn model key, so both are accurate from the first turn
         # rather than only after the model drives EnterPlanMode.
@@ -11105,7 +11369,17 @@ async def api_chat(
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
     # echoes assistant content and tool results back).
-    run.emit({"type": "run_started", "run_id": run_id, "project": run.project_key, "model": model or None, "provider": provider})
+    # account_slot rides along because the account a run is on is not always
+    # the one the picker shows: failover can substitute a different slot, and
+    # without this the UI would report the requested account while the turn
+    # billed somewhere else.
+    run.emit({
+        "type": "run_started", "run_id": run_id, "project": run.project_key,
+        "model": model or None, "provider": provider,
+        "account_slot": run.account_slot,
+        "account_label": (account or {}).get("label"),
+        "account_substitution": substitution,
+    })
     run.emit({
         "type": "user_prompt",
         "text": message,
@@ -13319,11 +13593,30 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         # so the picked model's rejection is an unmistakable banner, not a
         # silent "Claude said …" that looks like the app broke.
         if msg.is_error and _looks_like_model_rejection(msg.result or ""):
+            # The credential just told us, authoritatively, that it cannot run
+            # this model. That is the only hard entitlement fact available —
+            # everything else the failover ranker uses is inference — so record
+            # it against this slot and stop offering it for this model family.
+            if run is not None and run.model:
+                _note_model_denial(slot, run.model)
             events.append({
                 "type": "error",
                 "message": msg.result,
                 "model_unavailable": True,
+                "account_slot": slot,
             })
+            offer = _failover_offer(owner, slot, (run.model if run else "") or "",
+                                    "model_unavailable")
+            if offer:
+                events.append({"type": "failover_offer", **offer})
+        elif msg.is_error and msg.api_error_status == 429:
+            # Plan window spent mid-turn. The turn is already lost; point at an
+            # account that could carry the retry instead of leaving the user to
+            # work out which of their slots still has room.
+            offer = _failover_offer(owner, slot, (run.model if run else "") or "",
+                                    "plan_limit")
+            if offer:
+                events.append({"type": "failover_offer", **offer})
         return events
     return []
 
@@ -13514,6 +13807,570 @@ def _save_rate_limit(rli: dict, slot: str) -> None:
         # Log so a permission/disk issue is debuggable, but don't propagate
         # — rate-limit caching is non-critical relative to serving the turn.
         log.exception("save_rate_limit failed")
+
+
+# ─── Account failover ──────────────────────────────────────────────────────
+# Picks a different credential slot when the one the user chose can't serve the
+# turn — its plan window is spent, or the selected model isn't on its plan.
+#
+# The load-bearing asymmetry: this ranks slots, it never refuses one. Anthropic
+# publishes no model-entitlement list. What it does publish, in
+# /api/oauth/usage `limits[]`, is a per-model `weekly_scoped` bucket for models
+# the plan meters separately — measured 2026-09-04, the two premium Team seats
+# carry a `{"kind": "weekly_scoped", "scope": {"model": {"display_name":
+# "Fable"}}}` entry and the Pro account and the standard Team seat don't. But
+# absence is genuinely ambiguous: no account carries a scoped bucket for Opus
+# or Sonnet and every account runs both, so an absent bucket means either "not
+# entitled" or "drawn from the general pool". Treating absence as a denial
+# would silently strand an account that would have worked. So a scoped bucket
+# promotes a slot, a missing one merely fails to, and the only hard exclusion
+# is an actually-observed model rejection for that slot (see _note_model_denial).
+
+# A slot's cached plan window is only rewritten while a run on that slot is
+# live, so anything older than this is treated as "unknown" rather than
+# believed. Unknown still ranks above known-exhausted and stays attemptable —
+# spawning is the only probe available, since refreshing a slot's OAuth token
+# out-of-band could sign its CLI out (see api_usage_live).
+_HEALTH_FRESH_SECONDS = 15 * 60
+# Entitlements move at the speed of billing changes, not usage, so a much
+# longer life is safe. Past this the scoped-bucket read is ignored.
+_ENTITLEMENT_TTL_SECONDS = 24 * 3600
+# How long an observed "this credential can't use that model" is trusted. Long
+# enough to stop re-picking a slot that just refused, short enough that a plan
+# upgrade isn't remembered as a denial for the rest of the week.
+_MODEL_DENIAL_TTL_SECONDS = 7 * 24 * 3600
+
+# Family tokens that appear both in Anthropic model ids (`claude-fable-5-1`)
+# and in the `display_name` of a scoped usage bucket ("Fable"). Explicit rather
+# than inferred from the model id's shape: an upstream rename should make a
+# family unrecognised — which degrades to "ungated", the safe direction — and
+# must never be able to invent a denial. Which of these are actually *gated* is
+# still derived per-user from the buckets their own accounts report.
+_MODEL_FAMILY_TOKENS = frozenset({"fable", "opus", "sonnet", "haiku", "mythos"})
+
+# Ranked slot states. Lower sorts better; the numbers are only meaningful
+# relative to each other.
+_ENTITLEMENT_PROVEN, _ENTITLEMENT_UNKNOWN, _ENTITLEMENT_DENIED = 0, 1, 3
+_HEALTH_FREE, _HEALTH_UNKNOWN, _HEALTH_PAYABLE, _HEALTH_SPENT = 0, 1, 2, 4
+
+_SPEND_POLICIES = frozenset({"free_first", "prefer_current"})
+
+# Spoken forms of the ranks above, for the failover page. A screen-reader user
+# has to be able to tell "Office can't run Fable" from "Office hasn't been
+# checked lately" without inspecting a colour or a row position.
+_HEALTH_STATE_NAMES = {
+    _HEALTH_FREE: "has room",
+    _HEALTH_UNKNOWN: "not checked recently",
+    _HEALTH_PAYABLE: "plan spent, credits available",
+    _HEALTH_SPENT: "plan spent",
+}
+_ENTITLEMENT_STATE_NAMES = {
+    _ENTITLEMENT_PROVEN: "yes",
+    _ENTITLEMENT_UNKNOWN: "unknown",
+    _ENTITLEMENT_DENIED: "no",
+}
+
+
+def _normalize_family(name: str) -> str:
+    """Reduce a model id or bucket display name to its family token.
+
+    ``"Fable"`` and ``claude-fable-5-1`` both reduce to ``"fable"``. Returns
+    ``""`` when nothing recognised is present, which reads downstream as
+    "ungated" rather than as a denial.
+    """
+    low = (name or "").lower()
+    for token in _MODEL_FAMILY_TOKENS:
+        if token in low:
+            return token
+    return ""
+
+
+def _model_families_for_key(model_key: str) -> set[str]:
+    """Family tokens a run on ``model_key`` needs its credential to cover.
+
+    The union over ``model``, ``plan_model`` and ``advisor_model``, because all
+    three bill against the credential: `opus5-fable51-advisor` runs Opus but
+    consults Fable mid-turn, so a slot without Fable fails partway through a
+    turn rather than at spawn. Deliberately conservative — it can pass over an
+    account that would have finished this particular turn without ever
+    reaching the advisor, which costs an unnecessary substitution but never a
+    mid-turn death.
+    """
+    entry = MODELS_BY_KEY.get(model_key or "") or {}
+    families = set()
+    for field in ("model", "plan_model", "advisor_model"):
+        fam = _normalize_family(entry.get(field) or "")
+        if fam:
+            families.add(fam)
+    return families
+
+
+def _entitlement_cache() -> dict:
+    """Parse ENTITLEMENT_CACHE. ``{}`` on missing/corrupt."""
+    try:
+        data = json.loads(ENTITLEMENT_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_entitlement_cache(data: dict) -> None:
+    """Atomically replace ENTITLEMENT_CACHE. Best-effort, like _save_rate_limit."""
+    try:
+        tmp = ENTITLEMENT_CACHE.with_suffix(ENTITLEMENT_CACHE.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, ENTITLEMENT_CACHE)
+    except Exception:
+        log.exception("write_entitlement_cache failed")
+
+
+def _save_entitlements(slot: str, profile: Optional[dict], usage: Optional[dict]) -> None:
+    """Record which models ``slot`` meters separately, and at what utilization.
+
+    Called off the live-usage read the account page already performs, so the
+    ring learns a slot's entitlements as a side effect of the user looking at
+    it — no extra Anthropic traffic. Stores only the plan shape (family names,
+    percentages, tier labels); no token, no email, no raw response.
+    """
+    if not usage:
+        return
+    scoped: dict[str, dict] = {}
+    for lim in usage.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        display = (((lim.get("scope") or {}).get("model")) or {}).get("display_name") or ""
+        fam = _normalize_family(display)
+        if fam:
+            scoped[fam] = {
+                "display_name": display,
+                "percent": lim.get("percent"),
+                "resets_at": lim.get("resets_at"),
+            }
+    org = (profile or {}).get("organization") or {}
+    data = _entitlement_cache()
+    slots = data.setdefault("slots", {}) if isinstance(data.get("slots", {}), dict) else {}
+    slots[slot] = {
+        "scoped": scoped,
+        "rate_limit_tier": org.get("rate_limit_tier"),
+        "seat_tier": org.get("seat_tier"),
+        "organization_type": org.get("organization_type"),
+        "fetched_at": int(time.time()),
+    }
+    data["slots"] = slots
+    _write_entitlement_cache(data)
+
+
+def _load_entitlement(slot: str) -> Optional[dict]:
+    """The cached plan shape for one slot, or None when absent/expired."""
+    entry = (_entitlement_cache().get("slots") or {}).get(slot)
+    if not isinstance(entry, dict):
+        return None
+    fetched = entry.get("fetched_at")
+    if not isinstance(fetched, (int, float)):
+        return None
+    if time.time() - fetched > _ENTITLEMENT_TTL_SECONDS:
+        return None
+    return entry
+
+
+def _note_model_denial(slot: str, model_key: str) -> None:
+    """Remember that ``slot`` refused the families ``model_key`` needs.
+
+    This is the one hard exclusion in the ranking, and it exists because it is
+    the only *observed* entitlement fact available — the CLI told us this
+    credential can't run this model. Inference from usage buckets never
+    produces a denial.
+    """
+    families = _model_families_for_key(model_key)
+    if not families:
+        return
+    data = _entitlement_cache()
+    denied = data.setdefault("denied", {})
+    if not isinstance(denied, dict):
+        denied = {}
+        data["denied"] = denied
+    per_slot = denied.setdefault(slot, {})
+    if not isinstance(per_slot, dict):
+        per_slot = {}
+        denied[slot] = per_slot
+    expires = int(time.time() + _MODEL_DENIAL_TTL_SECONDS)
+    for fam in families:
+        per_slot[fam] = expires
+    _write_entitlement_cache(data)
+    log.info("recorded model denial slot=%s families=%s", slot, sorted(families))
+
+
+def _denied_families(slot: str) -> set[str]:
+    """Families ``slot`` is known to have refused, ignoring expired records."""
+    per_slot = ((_entitlement_cache().get("denied") or {}).get(slot)) or {}
+    if not isinstance(per_slot, dict):
+        return set()
+    now = time.time()
+    return {
+        fam for fam, expires in per_slot.items()
+        if isinstance(expires, (int, float)) and expires > now
+    }
+
+
+def _gated_families(slots: list[str]) -> set[str]:
+    """Families at least one of ``slots`` meters separately.
+
+    A family nobody has a scoped bucket for is *ungated*: every slot ranks
+    equally on entitlement for it, because absence carries no information.
+    """
+    gated: set[str] = set()
+    for slot in slots:
+        entry = _load_entitlement(slot)
+        if entry:
+            gated.update((entry.get("scoped") or {}).keys())
+    return gated
+
+
+def _load_rate_limit_entry(slot: str) -> Optional[dict]:
+    """The full ``{"info", "captured_at"}`` envelope for one slot.
+
+    Separate from ``_load_rate_limit`` (which unwraps to just ``info``) because
+    the ranking needs the observation's age and the overage gate must keep
+    seeing exactly what it has always seen.
+    """
+    entry = _rate_limit_slots().get(slot)
+    return entry if isinstance(entry, dict) and isinstance(entry.get("info"), dict) else None
+
+
+def _slot_entitlement_rank(slot: str, required: set[str], gated: set[str]) -> int:
+    """Rank ``slot`` on its ability to run the required model families.
+
+    ``_ENTITLEMENT_DENIED`` only for an observed refusal. A scoped bucket that
+    is itself spent (100% with a future reset) is not proof of usable access,
+    so it falls back to unknown rather than counting as proven.
+    """
+    if not required:
+        return _ENTITLEMENT_PROVEN
+    if required & _denied_families(slot):
+        return _ENTITLEMENT_DENIED
+    needed = required & gated
+    if not needed:
+        # Nothing the user's accounts meter separately — no signal either way.
+        return _ENTITLEMENT_PROVEN
+    entry = _load_entitlement(slot)
+    if not entry:
+        return _ENTITLEMENT_UNKNOWN
+    scoped = entry.get("scoped") or {}
+    for fam in needed:
+        bucket = scoped.get(fam)
+        if not isinstance(bucket, dict):
+            return _ENTITLEMENT_UNKNOWN
+        percent = bucket.get("percent")
+        resets_at = bucket.get("resets_at")
+        if isinstance(percent, (int, float)) and percent >= 100 and _reset_pending(resets_at):
+            return _ENTITLEMENT_UNKNOWN
+    return _ENTITLEMENT_PROVEN
+
+
+def _reset_pending(resets_at) -> bool:
+    """True if ``resets_at`` is a future instant.
+
+    Accepts the epoch seconds the CLI's rate-limit dict uses and the ISO-8601
+    strings the OAuth usage endpoint returns. An unparseable or absent value
+    reads as not-pending, which keeps an unknown timestamp from pinning a slot
+    into the exhausted class forever.
+    """
+    if isinstance(resets_at, (int, float)):
+        return resets_at > time.time()
+    if isinstance(resets_at, str) and resets_at:
+        try:
+            parsed = datetime.datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.timestamp() > time.time()
+    return False
+
+
+def _slot_health_rank(slot: str) -> int:
+    """Rank ``slot`` on plan headroom, from its cached rate-limit window.
+
+    Mirrors ``_overage_should_gate``'s reading of the same dict: a window whose
+    ``resetsAt`` has passed describes a window that no longer exists, so it
+    reads as unknown rather than as either healthy or spent. A stale "allowed"
+    is likewise unknown — a five-hour window can go from 4% to spent inside one
+    heavy session, so an hour-old observation is not evidence of headroom.
+    """
+    entry = _load_rate_limit_entry(slot)
+    if entry is None:
+        return _HEALTH_UNKNOWN
+    info = entry["info"]
+    if not _reset_pending(info.get("resetsAt")):
+        return _HEALTH_UNKNOWN
+    if info.get("status") == "rejected":
+        # Same distinction the overage gate draws: a spent plan window with
+        # credits behind it is payable, not unusable.
+        if info.get("overageStatus") in ("allowed", "allowed_warning"):
+            return _HEALTH_PAYABLE
+        return _HEALTH_SPENT
+    captured = entry.get("captured_at")
+    if not isinstance(captured, (int, float)):
+        return _HEALTH_UNKNOWN
+    if time.time() - captured > _HEALTH_FRESH_SECONDS:
+        return _HEALTH_UNKNOWN
+    return _HEALTH_FREE
+
+
+_FAILOVER_DEFAULTS = {"enabled": False, "spend_policy": "free_first", "include_all": True}
+
+
+def _failover_settings(user_sub: Optional[str]) -> dict:
+    """``{"enabled", "spend_policy", "include_all"}`` for one user."""
+    if not user_sub:
+        return dict(_FAILOVER_DEFAULTS)
+    try:
+        row = _state_db().execute(
+            "SELECT enabled, spend_policy, include_all FROM account_failover_setting "
+            "WHERE user_sub = ?",
+            (user_sub,),
+        ).fetchone()
+    except sqlite3.Error:
+        return dict(_FAILOVER_DEFAULTS)
+    if not row:
+        return dict(_FAILOVER_DEFAULTS)
+    policy = row[1] if row[1] in _SPEND_POLICIES else "free_first"
+    return {
+        "enabled": bool(row[0]),
+        "spend_policy": policy,
+        "include_all": bool(row[2]),
+    }
+
+
+def _slot_is_subscription(user_sub: Optional[str], slot: str) -> bool:
+    """True if ``slot`` bills against a plan rather than per token.
+
+    Gates what "use all my accounts" is allowed to mean. An API-key slot costs
+    real money per turn, so it only ever enters rotation by being named
+    explicitly in the ring — the blanket checkbox must not be able to start
+    billing someone.
+    """
+    return _resolve_credential_mode(slot, user_sub) != "api_key"
+
+
+def _failover_candidates(user_sub: Optional[str]) -> list[str]:
+    """Slots eligible for automatic substitution, in tiebreak order.
+
+    Either every subscription account the user has (the default, and what the
+    chat-page checkbox turns on) or just the ring they curated on /account.
+    Order matters only among slots that tie on entitlement and headroom, so the
+    implicit list is simply shared-then-credential-order.
+    """
+    if not user_sub:
+        return []
+    if not _failover_settings(user_sub)["include_all"]:
+        return _failover_ring(user_sub)
+    slots = ["shared"] + [f"cred:{c['id']}" for c in _list_user_credentials(user_sub)]
+    return [
+        s for s in slots
+        if _slot_has_credentials(user_sub, s) and _slot_is_subscription(user_sub, s)
+    ]
+
+
+def _failover_ring(user_sub: Optional[str]) -> list[str]:
+    """The user's opt-in slots in rank order, filtered to ones they still own.
+
+    Rows are validated on read rather than cleaned on write alone, so a
+    credential deleted out-of-band can't resurrect as a failover target.
+    """
+    if not user_sub:
+        return []
+    try:
+        rows = _state_db().execute(
+            "SELECT slot FROM account_failover WHERE user_sub = ? ORDER BY rank, slot",
+            (user_sub,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [r[0] for r in rows if _account_slot_visible(user_sub, r[0])]
+
+
+def _set_failover_ring(user_sub: str, slots: list[str]) -> None:
+    """Replace the user's ring wholesale, in one transaction.
+
+    The connection is autocommit (see ``_state_db``), so the delete and the
+    inserts would otherwise be separately visible — a crash between them would
+    leave the user with failover silently switched off rather than unchanged.
+    """
+    conn = _state_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM account_failover WHERE user_sub = ?", (user_sub,))
+        conn.executemany(
+            "INSERT INTO account_failover(user_sub, slot, rank) VALUES(?, ?, ?)",
+            [(user_sub, slot, rank) for rank, slot in enumerate(slots)],
+        )
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def _set_failover_settings(
+    user_sub: str, enabled: bool, spend_policy: str, include_all: bool = True,
+) -> None:
+    """Upsert the user's failover switch, spend policy and account scope."""
+    if spend_policy not in _SPEND_POLICIES:
+        spend_policy = "free_first"
+    _state_db().execute(
+        "INSERT INTO account_failover_setting"
+        "(user_sub, enabled, spend_policy, include_all, updated_at) "
+        "VALUES(?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_sub) DO UPDATE SET "
+        "enabled = excluded.enabled, spend_policy = excluded.spend_policy, "
+        "include_all = excluded.include_all, updated_at = excluded.updated_at",
+        (user_sub, 1 if enabled else 0, spend_policy,
+         1 if include_all else 0, time.time()),
+    )
+
+
+def _prune_failover_slot(user_sub: str, slot: str) -> None:
+    """Drop a slot from the ring when its credential is deleted."""
+    try:
+        _state_db().execute(
+            "DELETE FROM account_failover WHERE user_sub = ? AND slot = ?",
+            (user_sub, slot),
+        )
+    except sqlite3.Error:
+        log.warning("failed pruning failover row sub=%s slot=%s", user_sub or "?", slot)
+
+
+def _slot_has_credentials(user_sub: Optional[str], slot: str) -> bool:
+    """True if spawning on ``slot`` would find credentials to authenticate with.
+
+    Mirrors the existence check inside ``_resolve_account_for_run`` — a slot
+    whose ``.credentials.json`` was deleted out of band resolves back to shared
+    there, so proposing it here would be proposing a no-op.
+    """
+    if slot == "shared":
+        return True
+    cred_id = _parse_cred_active(slot)
+    if cred_id is None or not user_sub:
+        return False
+    home = _credential_home_path(user_sub, cred_id)
+    return (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists()
+
+
+def _select_account_slot(
+    user: dict, requested_slot: str, model_key: str,
+) -> tuple[str, Optional[dict]]:
+    """Choose the slot to actually spawn on. Returns ``(slot, substitution)``.
+
+    ``substitution`` is None when the requested slot stands, else a dict
+    describing the move for the SSE event and the log line.
+
+    The requested slot always competes, and wins every tie — enabling failover
+    must not reshuffle a user off the account they picked for any reason weaker
+    than "this one demonstrably can't serve the turn". When nothing outranks
+    it, it stands: this function never refuses a turn, it only redirects one.
+    """
+    sub = (user or {}).get("sub")
+    settings = _failover_settings(sub)
+    if not settings["enabled"]:
+        return requested_slot, None
+
+    ring = _failover_candidates(sub)
+    candidates = [requested_slot] + [s for s in ring if s != requested_slot]
+    candidates = [s for s in candidates if _slot_has_credentials(sub, s)]
+    if not candidates or requested_slot not in candidates:
+        # Requested slot has no credentials of its own; _resolve_account_for_run
+        # already handles that by falling back to shared. Don't second-guess it.
+        return requested_slot, None
+
+    required = _model_families_for_key(model_key)
+    gated = _gated_families(candidates)
+    ring_rank = {slot: i for i, slot in enumerate(ring)}
+
+    def key(slot: str) -> tuple:
+        health = _slot_health_rank(slot)
+        if settings["spend_policy"] == "prefer_current" and slot == requested_slot:
+            # The user asked to stay put and pay rather than move. Treat a
+            # payable window as free so it can't be outranked; _gate_overage
+            # still asks before a credit is actually spent.
+            health = min(health, _HEALTH_FREE)
+        return (
+            _slot_entitlement_rank(slot, required, gated),
+            health,
+            0 if slot == requested_slot else 1,
+            ring_rank.get(slot, len(ring)),
+        )
+
+    best = min(candidates, key=key)
+    if best == requested_slot:
+        return requested_slot, None
+    from_key, to_key = key(requested_slot), key(best)
+    reason = "model_unavailable" if to_key[0] < from_key[0] else "plan_limit"
+    return best, {
+        "from_slot": requested_slot,
+        "to_slot": best,
+        "reason": reason,
+        "model": model_key or None,
+    }
+
+
+def _failover_offer(
+    user_sub: Optional[str], current_slot: str, model_key: str, reason: str,
+) -> Optional[dict]:
+    """Best slot other than ``current_slot`` to retry this turn on, if any.
+
+    Deliberately an *offer*, not an action. By the time a turn dies the CLI has
+    usually already written the user's message into the session transcript and
+    may have streamed output or run tools, so silently replaying that prompt on
+    another account would duplicate the message and could repeat side effects.
+    The user clicking "retry over there" is a decision they can see; a hidden
+    retry is one they can't.
+    """
+    settings = _failover_settings(user_sub)
+    if not settings["enabled"]:
+        return None
+    ring = _failover_candidates(user_sub)
+    candidates = [
+        s for s in ring
+        if s != current_slot and _slot_has_credentials(user_sub, s)
+    ]
+    if not candidates:
+        return None
+    required = _model_families_for_key(model_key)
+    gated = _gated_families(candidates + [current_slot])
+    ring_rank = {slot: i for i, slot in enumerate(ring)}
+
+    def key(slot: str) -> tuple:
+        return (
+            _slot_entitlement_rank(slot, required, gated),
+            _slot_health_rank(slot),
+            ring_rank.get(slot, len(ring_rank)),
+        )
+
+    best = min(candidates, key=key)
+    ent, health, _ = key(best)
+    if ent == _ENTITLEMENT_DENIED or health == _HEALTH_SPENT:
+        # Everything left is known to be unusable. Say so rather than sending
+        # the user to an account that will fail the same way.
+        return None
+    return {
+        "reason": reason,
+        "from_slot": current_slot,
+        "to_slot": best,
+        "to_label": _slot_label(user_sub, best),
+        "model": model_key or None,
+    }
+
+
+def _slot_label(user_sub: Optional[str], slot: str) -> str:
+    """Human name for a slot, matching what the account picker shows."""
+    if slot == "shared":
+        return SHARED_ACCOUNT_LABEL
+    cred_id = _parse_cred_active(slot)
+    if cred_id is not None and user_sub:
+        cred = _get_credential(user_sub, cred_id)
+        if cred:
+            return cred["label"]
+    return slot
 
 
 def _resolve_credential_mode(account_slot: str, owner_sub: Optional[str]) -> str:
@@ -14228,6 +15085,11 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     if expires_at is not None and expires_at / 1000 <= time.time():
         return {**base, "error": "token_expired"}
     profile, usage, err = await _fetch_anthropic_live_usage(token)
+    # Piggyback the failover ring's entitlement cache on a read the user just
+    # paid for anyway. This is the only place a slot's per-model buckets can be
+    # observed without spawning a CLI on it, and it costs no extra Anthropic
+    # traffic here.
+    _save_entitlements(slot, profile, usage)
     return {
         **base,
         **_shape_live_usage(profile, usage),

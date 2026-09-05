@@ -110,9 +110,13 @@
     if (!flow) return;
     const statusChanged = flow.status !== lastOauthFlowStatus;
     lastOauthFlowStatus = flow.status;
+    // stage is set only during the auto-signin driver. When present, it
+    // supersedes the generic status line and hides the manual paste-back
+    // form (the driver is doing the paste for you).
+    const auto = !!flow.stage;
     if (flow.url) {
       oauthUrl.href = flow.url;
-      show(oauthLinkBlock);
+      if (!auto) show(oauthLinkBlock); else hide(oauthLinkBlock);
     }
     switch (flow.status) {
       case "starting":
@@ -121,14 +125,24 @@
         oauthStart.disabled = true;
         break;
       case "awaiting_code":
-        setText(oauthStatus, "Waiting for the auth code from your browser.");
+        setText(
+          oauthStatus,
+          auto
+            ? "Signing in automatically: " + flow.stage + "…"
+            : "Waiting for the auth code from your browser."
+        );
         show(oauthProgress);
         oauthStart.disabled = true;
         oauthCodeSubmit.disabled = false;
-        if (statusChanged && oauthUrl) oauthUrl.focus();
+        if (statusChanged && !auto && oauthUrl) oauthUrl.focus();
         break;
       case "exchanging":
-        setText(oauthStatus, "Exchanging code with Anthropic…");
+        setText(
+          oauthStatus,
+          auto
+            ? "Signing in automatically: " + flow.stage + "…"
+            : "Exchanging code with Anthropic…"
+        );
         show(oauthProgress);
         oauthStart.disabled = true;
         oauthCodeSubmit.disabled = true;
@@ -350,6 +364,34 @@
         openSignin(credId, label);
         return;
       }
+      if (btn.classList.contains("cred-auto-signin")) {
+        const label = btn.getAttribute("data-label")
+          || (btn.closest(".cred-item")?.querySelector(".cred-label")?.textContent ?? "");
+        const email = btn.getAttribute("data-auto-email") || "";
+        if (!confirm(
+              "Automatically sign in \"" + label + "\" via " + email + "? "
+              + "This will send one magic-link email to that address."
+            )) return;
+        openSignin(credId, label);
+        setText(oauthStatus, "Starting auto sign-in…");
+        show(oauthProgress);
+        oauthStart.disabled = true;
+        hide(oauthLinkBlock);
+        btn.disabled = true;
+        try {
+          const r = await fetch(credUrl(credId, "oauth/auto_signin"), { method: "POST" });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+          applyFlowState(data, () => onCredConfigured(credId));
+          if (ACTIVE_STATUSES.has(data.status)) startPolling(credId);
+        } catch (e) {
+          showError(oauthError, "Auto sign-in failed to start: " + e.message);
+          oauthStart.disabled = false;
+        } finally {
+          btn.disabled = false;
+        }
+        return;
+      }
       if (btn.classList.contains("cred-signout")) {
         if (!confirm("Sign this account out? You'll need to sign in again to use it.")) return;
         btn.disabled = true;
@@ -400,5 +442,164 @@
         return;
       }
     });
+  }
+  // ─── Automatic account switching ────────────────────────────────────────
+  // Renders the failover ring as an ordered list with per-row Move up / Move
+  // down buttons rather than drag-and-drop: reordering has to be reachable by
+  // keyboard and each control has to say what it does out of context, so the
+  // buttons carry the account name in their accessible label. Every mutation
+  // re-announces the resulting order, because a reordered list is otherwise a
+  // silent change to a screen reader.
+  const failoverEnabled = $("failover-enabled");
+  const failoverPolicy = $("failover-policy");
+  const failoverList = $("failover-list");
+  const failoverGated = $("failover-gated");
+  const failoverStatus = $("failover-status");
+  const failoverError = $("failover-error");
+
+  let failoverState = null;
+
+  function orderedSlots(state) {
+    // Ring members in priority order, then everything else the user owns.
+    const inRing = state.slots.filter((s) => s.in_ring);
+    inRing.sort((a, b) => a.rank - b.rank);
+    const rest = state.slots.filter((s) => !s.in_ring);
+    return inRing.concat(rest);
+  }
+
+  function describeSlot(row, position, total) {
+    const bits = [];
+    if (row.in_ring) bits.push(`position ${position} of ${total}`);
+    else bits.push("not used automatically");
+    bits.push(`plan ${row.health}`);
+    if (row.metered_models && row.metered_models.length) {
+      bits.push(`includes ${row.metered_models.join(", ")}`);
+    }
+    if (!row.configured) bits.push("not signed in");
+    return bits.join("; ");
+  }
+
+  function renderFailover(state) {
+    failoverState = state;
+    failoverEnabled.checked = !!state.enabled;
+    failoverPolicy.value = state.spend_policy || "free_first";
+    const rows = orderedSlots(state);
+    const ringCount = rows.filter((r) => r.in_ring).length;
+    failoverList.innerHTML = "";
+    rows.forEach((row, i) => {
+      const li = document.createElement("li");
+      const position = row.in_ring ? i + 1 : null;
+
+      const toggle = document.createElement("label");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = !!row.in_ring;
+      box.disabled = !row.configured;
+      box.setAttribute("data-slot", row.slot);
+      box.className = "failover-include";
+      toggle.appendChild(box);
+      toggle.appendChild(document.createTextNode(` ${row.label}`));
+      li.appendChild(toggle);
+
+      const detail = document.createElement("span");
+      detail.className = "failover-detail";
+      detail.textContent = ` — ${describeSlot(row, position, ringCount)}`;
+      li.appendChild(detail);
+
+      if (row.in_ring) {
+        [["up", "Move up", i > 0],
+         ["down", "Move down", position < ringCount]].forEach(([dir, text, enabled]) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "failover-move";
+          b.textContent = text;
+          b.setAttribute("data-slot", row.slot);
+          b.setAttribute("data-dir", dir);
+          // Out-of-context name: "Move up" alone is meaningless in a rotor.
+          b.setAttribute("aria-label", `${text}: ${row.label}`);
+          b.disabled = !enabled;
+          li.appendChild(document.createTextNode(" "));
+          li.appendChild(b);
+        });
+      }
+      failoverList.appendChild(li);
+    });
+    const notes = [];
+    notes.push(state.include_all
+      ? "Using every subscription account you have. Unticking one below narrows it to just the ones you pick."
+      : "Using only the accounts ticked below, in this order.");
+    if (state.gated_models && state.gated_models.length) {
+      notes.push(`Models only some of your plans include: ${state.gated_models.join(", ")}.`);
+    }
+    failoverGated.textContent = notes.join(" ");
+  }
+
+  function announceOrder(state) {
+    const ring = orderedSlots(state).filter((r) => r.in_ring).map((r) => r.label);
+    setText(
+      failoverStatus,
+      ring.length
+        ? `Saved. Accounts are tried in this order: ${ring.join(", ")}.`
+        : "Saved. No accounts are used automatically.",
+    );
+  }
+
+  async function saveFailover(fields) {
+    hide(failoverError);
+    const body = new URLSearchParams(fields);
+    try {
+      const r = await fetch("/api/account/failover", { method: "POST", body });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+      renderFailover(data);
+      announceOrder(data);
+    } catch (e) {
+      setText(failoverError, "Could not save: " + e.message);
+      show(failoverError);
+    }
+  }
+
+  function currentRing(state) {
+    return orderedSlots(state).filter((r) => r.in_ring).map((r) => r.slot);
+  }
+
+  async function loadFailover() {
+    try {
+      const r = await fetch("/api/account/failover");
+      if (!r.ok) return;
+      renderFailover(await r.json());
+    } catch (e) {
+      /* the section just stays empty; the rest of the page still works */
+    }
+  }
+
+  if (failoverList) {
+    failoverEnabled.addEventListener("change", () => {
+      saveFailover({ enabled: failoverEnabled.checked ? "true" : "false" });
+    });
+    failoverPolicy.addEventListener("change", () => {
+      saveFailover({ spend_policy: failoverPolicy.value });
+    });
+    failoverList.addEventListener("change", (ev) => {
+      const box = ev.target.closest(".failover-include");
+      if (!box || !failoverState) return;
+      const slot = box.getAttribute("data-slot");
+      let ring = currentRing(failoverState);
+      if (box.checked) { if (!ring.includes(slot)) ring.push(slot); }
+      else ring = ring.filter((s) => s !== slot);
+      saveFailover({ ring: ring.join(",") });
+    });
+    failoverList.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".failover-move");
+      if (!btn || !failoverState) return;
+      const slot = btn.getAttribute("data-slot");
+      const ring = currentRing(failoverState);
+      const i = ring.indexOf(slot);
+      const j = btn.getAttribute("data-dir") === "up" ? i - 1 : i + 1;
+      if (i < 0 || j < 0 || j >= ring.length) return;
+      [ring[i], ring[j]] = [ring[j], ring[i]];
+      saveFailover({ ring: ring.join(",") });
+    });
+    loadFailover();
   }
 })();

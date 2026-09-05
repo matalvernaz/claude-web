@@ -17,3 +17,10 @@ openai>=1.50
 mcp>=1.23.0
 # Local schema validation for roundtable_ask_structured (parse + repair loop).
 jsonschema>=4.20
+# Headless browser used by auto_signin.py to drive Anthropic's magic-link
+# sign-in end-to-end. After `pip install -r requirements.txt`, run
+# `playwright install chromium` (or `--with-deps` on Linux) to fetch the
+# browser binary. Auto-signin is off unless CLAUDE_WEB_MAILBOX_POLL_CMD is
+# set on the host, so this dep is present-but-idle for installs that don't
+# want it.
+playwright>=1.55

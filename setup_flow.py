@@ -290,6 +290,11 @@ class OAuthFlowState:
     driver_task: Optional[asyncio.Task] = field(default=None, repr=False)
     code_event: asyncio.Event = field(default_factory=asyncio.Event)
     code: Optional[str] = None
+    # Set by auto_signin.run_auto_signin as it moves through the browser
+    # dance; None for a manually-driven flow. Purely cosmetic — the UI
+    # renders it under the existing status line so users can see what the
+    # background driver is doing.
+    stage: Optional[str] = None
 
     def to_public(self) -> dict:
         return {
@@ -297,6 +302,7 @@ class OAuthFlowState:
             "status": self.status,
             "url": self.url,
             "error": self.error,
+            "stage": self.stage,
         }
 
 

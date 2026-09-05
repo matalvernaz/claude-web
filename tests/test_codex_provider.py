@@ -1136,8 +1136,12 @@ def test_claude_oauth_poll_focuses_link_only_on_status_transition():
     awaiting_code_block = source[start:end]
 
     assert "oauthCodeInput.focus()" not in awaiting_code_block
-    assert "statusChanged && oauthUrl" in awaiting_code_block
+    assert "statusChanged" in awaiting_code_block
     assert "oauthUrl.focus()" in awaiting_code_block
+    # Auto-signin drives the browser dance itself, so there is no link for the
+    # user to follow — moving focus to one mid-flow would yank a screen reader
+    # away from the status line that is actually reporting progress.
+    assert "!auto" in awaiting_code_block
 
 
 def test_codex_signout_supersedes_bound_runs_and_logs_out(client, monkeypatch):
