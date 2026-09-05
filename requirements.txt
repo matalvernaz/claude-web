@@ -14,7 +14,10 @@ anthropic>=0.39
 google-genai>=0.5
 openai>=1.50
 # Floor matches claude-agent-sdk 0.2.82+ for CVE-2025-66416.
-mcp>=1.23.0
+# Ceiling is load-bearing: mcp 2.x renamed FastMCP to MCPServer and changed
+# other APIs, so roundtable/mcp_server.py stops importing the moment 2.x
+# resolves. Raising this means migrating that module, not just the import.
+mcp>=1.23.0,<2
 # Local schema validation for roundtable_ask_structured (parse + repair loop).
 jsonschema>=4.20
 # Headless browser used by auto_signin.py to drive Anthropic's magic-link
