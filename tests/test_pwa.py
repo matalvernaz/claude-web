@@ -68,7 +68,7 @@ def test_apple_touch_icon_exists() -> None:
 def test_manifest_theme_matches_stylesheet_background() -> None:
     """theme_color paints the standalone status bar and splash screen; if it
     drifts from --bg the app flashes the wrong colour on every launch."""
-    css = (STATIC_DIR / "style.css").read_text()
+    css = (STATIC_DIR / "style.css").read_text(encoding="utf-8")
     assert f"--bg: {app_module.MANIFEST_BG_COLOR}" in css
 
 
@@ -85,7 +85,7 @@ def test_every_template_carries_the_pwa_head() -> None:
     was added to the home screen, so one missing page is one broken icon."""
     template_dir = Path(app_module.__file__).parent / "templates"
     for name in TEMPLATES:
-        text = (template_dir / name).read_text()
+        text = (template_dir / name).read_text(encoding="utf-8")
         assert '{% include "_pwa_head.html" %}' in text, name
         assert "viewport-fit=cover" in text, name
 
@@ -94,4 +94,4 @@ def test_index_marks_the_app_shell() -> None:
     """standalone.js only pins the viewport height on the chat page; the marker
     is how it tells."""
     template_dir = Path(app_module.__file__).parent / "templates"
-    assert 'class="app-shell"' in (template_dir / "index.html").read_text()
+    assert 'class="app-shell"' in (template_dir / "index.html").read_text(encoding="utf-8")

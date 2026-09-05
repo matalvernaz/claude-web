@@ -13,9 +13,9 @@ from pathlib import Path
 import app as app_module
 
 ROOT = Path(app_module.__file__).parent
-INDEX = (ROOT / "templates" / "index.html").read_text()
-STYLE = (ROOT / "static" / "style.css").read_text()
-APP_JS = (ROOT / "static" / "app.js").read_text()
+INDEX = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+STYLE = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+APP_JS = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
 # Every control the header carried before it was split into a bar and a sheet.
 HEADER_CONTROL_IDS = [

@@ -182,7 +182,7 @@ def test_switch_codex_to_claude_forges_resume_session(tmp_path) -> None:
     # Forged transcript exists and carries the prior turns in the user line.
     path = app_module._sessions_dir(tmp_path) / f"{new_sid}.jsonl"
     assert path.exists()
-    lines = path.read_text().strip().splitlines()
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
     content = json.loads(lines[0])["message"]["content"]
     assert "PRIOR CONVERSATION" in content and "deploy the thing" in content

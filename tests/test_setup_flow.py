@@ -85,6 +85,6 @@ def test_save_api_key_persists_on_windows(fresh_setup_flow) -> None:
     even though the chmod step is skipped. The directory permissions on
     %USERPROFILE% are the real access boundary there."""
     fresh_setup_flow.save_api_key(_FAKE_KEY)
-    assert fresh_setup_flow.API_KEY_FILE.read_text() == _FAKE_KEY
+    assert fresh_setup_flow.API_KEY_FILE.read_text(encoding="utf-8") == _FAKE_KEY
     home_copy = fresh_setup_flow.api_key_path(fresh_setup_flow.CLAUDE_HOME)
-    assert home_copy.read_text() == _FAKE_KEY
+    assert home_copy.read_text(encoding="utf-8") == _FAKE_KEY
