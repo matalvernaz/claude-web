@@ -37,6 +37,7 @@ for var in (
     "CLAUDE_WEB_PROJECT_DIRS",
     "ANTHROPIC_API_KEY",
     "CODEX_HOME",
+    "CLAUDE_WEB_PERSONAL_HOMES_DIR",
     "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
@@ -47,6 +48,13 @@ os.environ["CLAUDE_HOME"] = os.path.join(_TEST_TMP, "claude-home")
 os.environ["CLAUDE_WEB_STATE_DIR"] = os.path.join(_TEST_TMP, "claude-web-state")
 os.environ["CLAUDE_PROJECT_DIR"] = os.path.join(_TEST_TMP, "project")
 os.environ["CODEX_HOME"] = os.path.join(_TEST_TMP, "codex-home")
+# Without this the Claude credential homes fall back to the real
+# ~/.claude-homes and every fixture that calls _ensure_credential_home
+# leaves a slot directory behind on the developer's machine — the DB
+# rows get cleaned up, the directories never do.
+os.environ["CLAUDE_WEB_PERSONAL_HOMES_DIR"] = os.path.join(
+    _TEST_TMP, "personal-homes",
+)
 os.environ["CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR"] = os.path.join(
     _TEST_TMP, "codex-personal-homes",
 )
