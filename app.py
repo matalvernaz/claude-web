@@ -14288,11 +14288,20 @@ def _select_account_slot(
 
     def key(slot: str) -> tuple:
         health = _slot_health_rank(slot)
-        if settings["spend_policy"] == "prefer_current" and slot == requested_slot:
-            # The user asked to stay put and pay rather than move. Treat a
-            # payable window as free so it can't be outranked; _gate_overage
-            # still asks before a credit is actually spent.
-            health = min(health, _HEALTH_FREE)
+        if slot == requested_slot:
+            if settings["spend_policy"] == "prefer_current":
+                # The user asked to stay put and pay rather than move. Treat a
+                # payable window as free so it can't be outranked; _gate_overage
+                # still asks before a credit is actually spent.
+                health = min(health, _HEALTH_FREE)
+            elif health == _HEALTH_UNKNOWN:
+                # Unknown means "not observed lately", not "can't serve", and a
+                # window can only be observed by spawning on its slot. Losing
+                # to a sibling that merely ran more recently diverts every turn
+                # away from the picked slot, which is exactly what keeps its
+                # window unobserved — it can never leave unknown. An observed
+                # spent or payable window is real evidence and still moves.
+                health = _HEALTH_FREE
         return (
             _slot_entitlement_rank(slot, required, gated),
             health,

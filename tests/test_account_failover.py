@@ -312,6 +312,28 @@ def test_moves_off_a_spent_plan_window(slots) -> None:
     assert sub["from_slot"] == slots["personal"]
 
 
+def test_stale_window_on_the_picked_slot_does_not_divert(slots) -> None:
+    """An unobserved window is not evidence that a slot can't serve the turn.
+
+    A plan window can only be observed by spawning on its slot, so ranking the
+    picked slot below a sibling that merely ran more recently diverts every
+    turn away from it — which is what keeps its window unobserved. The slot
+    could never leave _HEALTH_UNKNOWN. An observed spent window still moves
+    (test_moves_off_a_spent_plan_window).
+    """
+    _enable([slots["personal"], slots["alex"]])
+    _write_rate_limit(
+        slots["personal"], _healthy_window(),
+        age_seconds=app_module._HEALTH_FRESH_SECONDS + 60,
+    )
+    _write_rate_limit(slots["alex"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "claude-opus-5",
+    )
+    assert chosen == slots["personal"]
+    assert sub is None
+
+
 def test_moves_to_the_only_slot_that_meters_the_model(slots) -> None:
     """Fable picked on the Pro account: Alex is the one that can run it."""
     _seed_real_shapes(slots)
