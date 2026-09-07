@@ -803,6 +803,29 @@ def item_events(item: dict, *, completed: bool, session_id: Optional[str],
             failed, preview_cap,
         )]
 
+    if itype == "dynamicToolCall":
+        # Built-in tools codex resolves at runtime. Same shape family as
+        # mcpToolCall, but the output arrives as contentItems rather than a
+        # single result, and only the text parts are renderable as a chip.
+        tool = item.get("tool") or "?"
+        namespace = item.get("namespace")
+        name = f"{namespace}__{tool}" if namespace else tool
+        if not completed:
+            return [_assistant_event([{
+                "type": "tool_use", "id": item_id, "name": name,
+                "input": item.get("arguments") if isinstance(
+                    item.get("arguments"), dict) else {},
+            }], session_id)]
+        texts = [
+            c.get("text") or "" for c in (item.get("contentItems") or [])
+            if isinstance(c, dict) and c.get("type") == "inputText"
+        ]
+        failed = item.get("status") == "failed" or item.get("success") is False
+        return [_tool_result_event(
+            item_id, "\n".join(t for t in texts if t) or "done",
+            failed, preview_cap,
+        )]
+
     if itype == "todoList":
         todos = []
         for t in item.get("items") or []:
@@ -987,12 +1010,16 @@ def thread_transcript(thread: dict, preview_cap: int) -> list[dict]:
     the session-history endpoint returns (same roles the Claude JSONL
     reader produces: user / assistant / tool_use / tool_result).
 
-    Caveat: as of codex 0.144 the thread/read turn items only include the
-    message kinds (userMessage/agentMessage) — command executions and file
-    changes aren't in that view, so a reopened Codex session replays the
-    conversation text without the tool chips the live stream showed. The
-    translation below still handles tool items so richer reads light up
-    if a future CLI starts returning them."""
+    codex 0.144 returned only the message kinds here, so reopened sessions
+    replayed conversation text with no tool chips; 0.153 returns the full
+    item set (verified against live threads: command executions, file
+    changes, web searches, compaction notes), which is why tool and note
+    items are translated below rather than skipped. The versions between
+    were never measured.
+
+    Reasoning items are dropped on purpose — claude-web hides thinking on
+    both providers, so a reopened transcript must not surface what the live
+    stream deliberately withheld."""
     msgs: list[dict] = []
     turns = (thread or {}).get("turns") or []
     for turn in turns:
@@ -1032,4 +1059,7 @@ def thread_transcript(thread: dict, preview_cap: int) -> list[dict]:
                             "content": blk.get("content"),
                             "is_error": blk.get("is_error"),
                         })
+                    elif blk.get("type") == "text" and blk.get("text"):
+                        msgs.append({"role": "assistant",
+                                     "text": blk["text"]})
     return msgs

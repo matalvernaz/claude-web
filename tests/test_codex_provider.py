@@ -202,6 +202,43 @@ def test_review_mode_items_become_text():
     assert exited[0]["message"]["content"][0]["text"] == "Found 2 issues: …"
 
 
+def test_dynamic_tool_call_lifecycle():
+    """codex routes some built-in tools through dynamicToolCall. Without a
+    branch it rendered nothing, so the agent looked idle while the tool ran."""
+    item = {"type": "dynamicToolCall", "id": "d1", "tool": "search_memory",
+            "namespace": "memory", "arguments": {"q": "mount"},
+            "status": "inProgress"}
+    started = codex_provider.item_events(
+        item, completed=False, session_id=None, preview_cap=CAP)
+    blk = started[0]["message"]["content"][0]
+    assert blk["name"] == "memory__search_memory"
+    assert blk["input"] == {"q": "mount"}
+    done = codex_provider.item_events(
+        dict(item, status="completed", contentItems=[
+            {"type": "inputText", "text": "two hits"},
+            {"type": "inputImage", "imageUrl": "http://x/y.png"},
+        ]), completed=True, session_id=None, preview_cap=CAP)
+    res = done[0]["message"]["content"][0]
+    assert res["is_error"] is False
+    assert "two hits" in res["content"]
+
+
+def test_dynamic_tool_call_without_namespace_uses_bare_tool_name():
+    evs = codex_provider.item_events(
+        {"type": "dynamicToolCall", "id": "d2", "tool": "lookup",
+         "arguments": {}, "status": "inProgress"},
+        completed=False, session_id=None, preview_cap=CAP)
+    assert evs[0]["message"]["content"][0]["name"] == "lookup"
+
+
+def test_dynamic_tool_call_failure_marks_the_result():
+    evs = codex_provider.item_events(
+        {"type": "dynamicToolCall", "id": "d3", "tool": "lookup",
+         "arguments": {}, "status": "failed"},
+        completed=True, session_id=None, preview_cap=CAP)
+    assert evs[0]["message"]["content"][0]["is_error"] is True
+
+
 def test_sleep_and_hook_prompt_render_nothing():
     for itype in ("sleep", "hookPrompt"):
         for completed in (False, True):
@@ -305,6 +342,39 @@ def test_thread_transcript_roles():
     assert msgs[-1]["text"] == "done"
 
 
+def test_thread_transcript_keeps_note_items():
+    """Text-bearing items (compaction, plan, review mode) carry a note the
+    live stream renders as assistant text. codex 0.153 returns them from
+    thread/read, so a reopened transcript must show them too rather than
+    silently skipping to the next message."""
+    thread = {"turns": [{"items": [
+        {"type": "userMessage", "id": "u1",
+         "content": [{"type": "text", "text": "go"}]},
+        {"type": "contextCompaction", "id": "k1"},
+        {"type": "plan", "id": "p1", "text": "1. check the mount"},
+        {"type": "agentMessage", "id": "m1", "text": "done"},
+    ]}]}
+    msgs = codex_provider.thread_transcript(thread, CAP)
+    assert [m["role"] for m in msgs] == [
+        "user", "assistant", "assistant", "assistant",
+    ]
+    assert msgs[1]["text"] == codex_provider.COMPACTED_NOTE
+    assert msgs[2]["text"] == "1. check the mount"
+    assert msgs[3]["text"] == "done"
+
+
+def test_thread_transcript_drops_reasoning():
+    """Thinking stays hidden on both providers, so a reopened codex
+    transcript must not surface reasoning items the live stream skipped."""
+    thread = {"turns": [{"items": [
+        {"type": "reasoning", "id": "r1", "text": "pondering"},
+        {"type": "agentMessage", "id": "m1", "text": "done"},
+    ]}]}
+    msgs = codex_provider.thread_transcript(thread, CAP)
+    assert [m["role"] for m in msgs] == ["assistant"]
+    assert msgs[0]["text"] == "done"
+
+
 # ─── availability probe ───────────────────────────────────────────────────────
 
 
@@ -372,7 +442,8 @@ async def test_dispatch_routes_error_responses():
 async def test_request_sends_an_empty_object_for_parameterless_methods():
     """A method called with no params still sends ``"params": {}``.
 
-    Probed against `codex app-server` 0.145.0: `account/read` and `model/list`
+    Probed against `codex app-server` 0.145.0 and re-confirmed on 0.153.4:
+    `account/read` and `model/list`
     with ``"params": null`` (or the field omitted) are refused outright with
     ``-32600 Invalid request: missing field `params```, while ``{}`` succeeds.
     Only methods whose params type is optional — ``account/logout`` is one —
