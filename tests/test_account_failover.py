@@ -592,3 +592,154 @@ def test_naming_a_ring_switches_off_include_all(client) -> None:
     body = r.json()
     assert body["include_all"] is False
     assert body["ring"] == ["shared"]
+
+
+# ─── follow-ups on a live run ─────────────────────────────────────────────
+#
+# api_chat runs the preflight on every message it spawns, but a live run's
+# follow-ups arrive via /api/chat/send/{run_id}. Until 2026-09-06 that path
+# never consulted the ranker, so a run stayed on a slot whose window had just
+# been observed spent and every follow-up failed the same way. AUTH_MODE=none
+# makes the caller "anonymous", so the fixtures build that user's accounts.
+
+ANON = "anonymous"
+
+
+@pytest.fixture
+def alex_slot():
+    """One extra subscription slot for the anonymous caller, with creds on disk."""
+    cred = app_module._create_credential(ANON, "failover-alex")
+    home = app_module._ensure_credential_home(ANON, cred["id"])
+    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    slot = f"cred:{cred['id']}"
+    app_module._set_failover_settings(ANON, True, "free_first", include_all=True)
+    yield slot
+    app_module._state_db().execute(
+        "DELETE FROM user_credential WHERE user_sub = ? AND id = ?",
+        (ANON, cred["id"]),
+    )
+
+
+def _live_run(account_slot: str, requested_slot: str | None = None,
+              between_turns: bool = True) -> app_module.ActiveRun:
+    """A registered, driver-attached run the send endpoint will accept."""
+    import types
+    import uuid
+
+    run = app_module.ActiveRun(
+        str(uuid.uuid4()), owner_sub=ANON, account_slot=account_slot,
+    )
+    run.requested_account_slot = requested_slot or account_slot
+    run.model = "claude-fable-5-1"
+    run.between_turns = between_turns
+    # cancel() is what a supersede does to the driver; a real task stays
+    # not-done until it unwinds, so the fake must too.
+    run.task = types.SimpleNamespace(done=lambda: False, cancel=lambda: None)
+    run.personality_id = app_module._resolve_personality_for_run({"sub": ANON})["id"]
+    app_module.ACTIVE_RUNS[run.run_id] = run
+    return run
+
+
+def _send(client, run: app_module.ActiveRun, picked_slot: str):
+    try:
+        return client.post(
+            f"/api/chat/send/{run.run_id}",
+            data={"message": "hi", "account_slot": picked_slot},
+        )
+    finally:
+        app_module.ACTIVE_RUNS.pop(run.run_id, None)
+
+
+def test_follow_up_leaves_a_live_run_whose_window_is_spent(client, alex_slot) -> None:
+    """The bug as hit: shared's window observed spent, next message still
+    went into shared's CLI and died the same way. The endpoint must hand the
+    browser back to /api/chat, which respawns on the ranker's pick."""
+    _write_rate_limit("shared", _spent_window())
+    run = _live_run("shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+    assert run.accepting_input is False
+    assert run.superseded_reason == "account_changed"
+    assert run.user_input_queue.qsize() == 0
+
+
+def test_follow_up_stays_on_the_substitute_while_the_pick_is_still_spent(
+    client, alex_slot,
+) -> None:
+    """A run already moved to Alex must not respawn on every follow-up just
+    because the picker still says shared — /api/chat would land on Alex too."""
+    _write_rate_limit("shared", _spent_window())
+    run = _live_run(alex_slot, requested_slot="shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
+    assert run.user_input_queue.qsize() == 1
+
+
+def test_follow_up_drifts_back_once_the_picked_slot_recovers(client, alex_slot) -> None:
+    """No live window for shared any more (it reset): the pick wins the tie
+    again and the run must not stay stranded on the fallback."""
+    run = _live_run(alex_slot, requested_slot="shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+    assert run.accepting_input is False
+
+
+def test_follow_up_never_tears_down_a_turn_in_flight(client, alex_slot) -> None:
+    """Mid-turn the message queues into the live CLI as before; an automatic
+    move happens only at a turn boundary."""
+    _write_rate_limit("shared", _spent_window())
+    run = _live_run("shared", between_turns=False)
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
+
+
+def test_follow_up_ignores_entitlement_inference_for_a_live_run(client, alex_slot) -> None:
+    """Alex meters Fable and shared has no fresh read: the ranker prefers Alex
+    on inference alone. That may steer a fresh spawn, but must not kill a
+    live CLI — nothing has been observed about shared."""
+    _write_rate_limit("shared", _healthy_window())
+    app_module._save_entitlements(
+        alex_slot, _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket()]),
+    )
+    run = _live_run("shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
+
+
+def test_follow_up_moves_off_a_slot_that_refused_the_model(client, alex_slot) -> None:
+    """An observed refusal is the one entitlement fact that is not inference."""
+    _write_rate_limit("shared", _healthy_window())
+    app_module._note_model_denial("shared", "claude-fable-5-1")
+    run = _live_run("shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+
+
+def test_changed_pick_lands_where_the_ranker_puts_it(client, alex_slot) -> None:
+    """Picking the slot the run already runs on is a no-op respawn-wise, and
+    the pick becomes the run's standing request from here on."""
+    _write_rate_limit("shared", _spent_window())
+    run = _live_run(alex_slot, requested_slot="shared")
+    r = _send(client, run, alex_slot)
+    assert r.status_code == 202, r.text
+    assert run.requested_account_slot == alex_slot
+
+
+def test_changed_pick_still_respawns_with_failover_off(client, alex_slot) -> None:
+    """The pre-failover contract: a different pick means a different CLI."""
+    app_module._set_failover_settings(ANON, False, "free_first", include_all=True)
+    run = _live_run("shared")
+    r = _send(client, run, alex_slot)
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+    run2 = _live_run("shared")
+    _write_rate_limit("shared", _spent_window())
+    r = _send(client, run2, "shared")
+    assert r.status_code == 202, r.text

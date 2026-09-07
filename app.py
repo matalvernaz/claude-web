@@ -12463,8 +12463,9 @@ async def api_chat_send(
     Returns 202 Accepted; the existing stream emits the new events.
 
     Refuses with 409 if the run has been superseded (personality/account
-    swap) or the client selected a different provider, so the browser falls
-    back to /api/chat and performs the appropriate respawn or handoff.
+    swap), the client selected a different provider, or the failover ranker
+    wants this follow-up on another slot, so the browser falls back to
+    /api/chat and performs the appropriate respawn or handoff.
     """
     _safe_id(run_id)
     if RESTART_STATE["pending"]:
@@ -12535,11 +12536,29 @@ async def api_chat_send(
         return JSONResponse(
             {"ok": False, "error": "personality_changed"}, status_code=409,
         )
-    if run.account_slot != account["slot"]:
+    if run.provider == "codex":
+        handoff = "account_changed" if run.account_slot != account["slot"] else None
+    else:
+        # Claude follow-ups take the same failover preflight api_chat gives a
+        # fresh spawn, so a run whose slot was just observed spent is respawned
+        # elsewhere instead of being fed a message that fails the same way.
+        # 409 account_changed is the browser's cue to re-route via /api/chat,
+        # which re-runs the ranker and owns the respawn.
+        handoff = _follow_up_handoff_reason(run, user, account["slot"])
+    if handoff is not None:
+        if handoff != "account_changed":
+            log.info(
+                "account failover follow-up session=%s run=%s slot=%s reason=%s model=%s",
+                run.session_id or "-", run.run_id, run.account_slot, handoff,
+                run.model or "-",
+            )
         await _supersede_run_for_switch(run, "account_changed")
         return JSONResponse(
             {"ok": False, "error": "account_changed"}, status_code=409,
         )
+    # The pick this run now stands for. Differs from before only when the
+    # user changed the picker and the ranker landed on this run anyway.
+    run.requested_account_slot = account["slot"]
     form = await request.form()
     images = _form_uploads(form, "images")
     files = _form_uploads(form, "files")
@@ -14320,6 +14339,48 @@ def _select_account_slot(
         "reason": reason,
         "model": model_key or None,
     }
+
+
+def _follow_up_handoff_reason(
+    run: ActiveRun, user: dict, picked_slot: str,
+) -> Optional[str]:
+    """Why a follow-up must respawn through ``api_chat`` rather than enter
+    ``run``'s CLI; ``None`` when the CLI it already has is the right place.
+
+    ``api_chat`` runs the failover preflight on every message it spawns, but
+    a live run's follow-ups arrive through ``api_chat_send``, which used to
+    compare the picker against the run's slot and nothing else. A run
+    therefore sat on a slot whose window had just been observed spent, and
+    every follow-up died the same way (2026-09-06). Both entry points now
+    ask the same ranker with the same inputs; this decides only whether the
+    run's current CLI *is* the ranker's destination.
+
+    Two deliberate asymmetries with a fresh spawn. A live CLI is never torn
+    down mid-turn for an automatic move: a spent window ends the in-flight
+    turn on its own within a call or two, and killing it would discard the
+    work so far. And it is never torn down for an entitlement *inference*:
+    ``model_unavailable`` with no observed refusal means only that the slot's
+    scoped-usage bucket hasn't been read lately, and acting on that would
+    respawn every follow-up for as long as it stays unread. An observed
+    refusal (``_note_model_denial``) does move it. A changed pick is the
+    user's call and moves regardless.
+    """
+    chosen, substitution = _select_account_slot(user, picked_slot, run.model or "")
+    if chosen == run.account_slot:
+        return None
+    if picked_slot != run.requested_account_slot:
+        return "account_changed"
+    if not run.between_turns:
+        return None
+    if substitution is None:
+        # The ranker put the pick itself first again: whatever moved this run
+        # off it has cleared, so the user drifts back rather than staying
+        # stranded on the fallback.
+        return "requested_slot_recovered"
+    if substitution["reason"] == "model_unavailable":
+        refused = _denied_families(run.account_slot) & _model_families_for_key(run.model or "")
+        return "model_refused" if refused else None
+    return substitution["reason"]
 
 
 def _failover_offer(
