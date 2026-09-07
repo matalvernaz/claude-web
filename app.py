@@ -14358,29 +14358,37 @@ def _follow_up_handoff_reason(
     Two deliberate asymmetries with a fresh spawn. A live CLI is never torn
     down mid-turn for an automatic move: a spent window ends the in-flight
     turn on its own within a call or two, and killing it would discard the
-    work so far. And it is never torn down for an entitlement *inference*:
-    ``model_unavailable`` with no observed refusal means only that the slot's
-    scoped-usage bucket hasn't been read lately, and acting on that would
-    respawn every follow-up for as long as it stays unread. An observed
-    refusal (``_note_model_denial``) does move it. A changed pick is the
-    user's call and moves regardless.
+    work so far. And it is torn down only on something *observed about its
+    own slot* (a refusal recorded by ``_note_model_denial``, or a plan window
+    seen spent), never because a sibling out-ranks it on an unread usage
+    bucket or on ring order; acting on those would respawn every follow-up
+    for as long as the inference stands. The one exception is the pick itself
+    ranking first again, which is the drift-back a substitution promises. A
+    changed pick is the user's call and moves regardless.
     """
-    chosen, substitution = _select_account_slot(user, picked_slot, run.model or "")
+    chosen, _ = _select_account_slot(user, picked_slot, run.model or "")
     if chosen == run.account_slot:
         return None
     if picked_slot != run.requested_account_slot:
         return "account_changed"
     if not run.between_turns:
         return None
-    if substitution is None:
-        # The ranker put the pick itself first again: whatever moved this run
-        # off it has cleared, so the user drifts back rather than staying
-        # stranded on the fallback.
+    # The ranker was asked about the pick, so its substitution explains why the
+    # PICK lost, not why this run's slot did; the two differ once a run sits on
+    # a fallback. Judge the slot the CLI is actually on by what has been
+    # observed about it, never by a sibling merely out-ranking it on inference
+    # or ring order.
+    families = _model_families_for_key(run.model or "")
+    if families & _denied_families(run.account_slot):
+        return "model_refused"
+    if _slot_health_rank(run.account_slot) >= _HEALTH_PAYABLE:
+        return "plan_limit"
+    if chosen == picked_slot:
+        # Nothing observed against this run's slot, but the pick itself ranks
+        # first again (its window reset, or failover was switched off): drift
+        # back rather than stay stranded on the fallback.
         return "requested_slot_recovered"
-    if substitution["reason"] == "model_unavailable":
-        refused = _denied_families(run.account_slot) & _model_families_for_key(run.model or "")
-        return "model_refused" if refused else None
-    return substitution["reason"]
+    return None
 
 
 def _failover_offer(

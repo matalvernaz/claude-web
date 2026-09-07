@@ -620,6 +620,19 @@ def alex_slot():
     )
 
 
+@pytest.fixture
+def office_slot(alex_slot):
+    """A second extra slot, after Alex in the implicit shared-then-creds ring."""
+    cred = app_module._create_credential(ANON, "failover-office")
+    home = app_module._ensure_credential_home(ANON, cred["id"])
+    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    yield f"cred:{cred['id']}"
+    app_module._state_db().execute(
+        "DELETE FROM user_credential WHERE user_sub = ? AND id = ?",
+        (ANON, cred["id"]),
+    )
+
+
 def _live_run(account_slot: str, requested_slot: str | None = None,
               between_turns: bool = True) -> app_module.ActiveRun:
     """A registered, driver-attached run the send endpoint will accept."""
@@ -743,3 +756,37 @@ def test_changed_pick_still_respawns_with_failover_off(client, alex_slot) -> Non
     _write_rate_limit("shared", _spent_window())
     r = _send(client, run2, "shared")
     assert r.status_code == 202, r.text
+
+
+def test_follow_up_leaves_a_spent_fallback_even_when_the_pick_loses_on_inference(
+    client, alex_slot, office_slot,
+) -> None:
+    """The ranker is asked about the PICK, so its reason describes the pick.
+
+    A run sitting on a fallback whose own window was observed spent must
+    still move, even when the pick lost to a third slot on entitlement
+    inference (reason ``model_unavailable``). Panel finding, thread 299.
+    """
+    _write_rate_limit("shared", _spent_window())
+    _write_rate_limit(alex_slot, _spent_window())
+    app_module._save_entitlements(
+        office_slot, _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket()]),
+    )
+    run = _live_run(alex_slot, requested_slot="shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+
+
+def test_follow_up_does_not_migrate_a_fallback_on_ring_order(
+    client, alex_slot, office_slot,
+) -> None:
+    """Nothing observed against the fallback the run is on: a sibling that
+    merely out-ranks it on ring order among unchecked slots is no reason to
+    respawn a live CLI."""
+    _write_rate_limit("shared", _spent_window())
+    run = _live_run(office_slot, requested_slot="shared")
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
