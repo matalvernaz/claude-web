@@ -41,6 +41,8 @@ for var in (
     "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
+    "CLAUDE_WEB_OLLAMA_URL",
+    "CLAUDE_WEB_OLLAMA_MODELS",
 ):
     os.environ.pop(var, None)
 os.environ["AUTH_MODE"] = "none"

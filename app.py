@@ -69,6 +69,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
 import codex_provider
+import local_provider
 import conversation_replay
 import currency
 import setup_flow
@@ -258,7 +259,7 @@ PER_USER_SESSIONS = os.getenv("CLAUDE_WEB_PER_USER_SESSIONS", "").lower() in ("1
 # api_chat) stays dark until deliberately enabled. See
 # DESIGN-multiprovider-switch.md.
 PROVIDER_SWITCH_ENABLED = os.getenv("CLAUDE_WEB_PROVIDER_SWITCH", "").lower() in ("1", "true", "yes")
-_PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+_PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "local": "Local"}
 # Screen-reader boundary announced on a switch. Kept as one constant so the
 # wording is a one-line change (UX default: an explicit announced boundary).
 PROVIDER_SWITCH_NOTICE = "Switched to {to}. Prior conversation carried over."
@@ -564,7 +565,7 @@ def _models_payload() -> list[dict]:
 # for the life of a conversation — models can change mid-chat (per-turn on
 # Codex, set_model on Claude), providers cannot.
 
-VALID_PROVIDERS = ("claude", "codex")
+VALID_PROVIDERS = ("claude", "codex", "local")
 
 # Codex thread ids double as claude-web session ids. Runtime knobs like
 # approval policy and sandbox mode live in codex_provider.py.
@@ -642,7 +643,26 @@ async def _providers_payload(
             log.warning("codex model list failed: %s", e)
             codex_entry["available"] = False
             codex_entry["reason"] = f"codex app-server error: {e}"
-    return [claude_entry, codex_entry]
+    local_reason = local_provider.unavailable_reason()
+    local_models = []
+    if local_reason is None:
+        try:
+            local_models = list(await asyncio.gather(*(
+                local_provider.check_model(name) for name in local_provider.MODEL_NAMES
+            )))
+        except (httpx.HTTPError, ValueError) as exc:
+            local_reason = f"Local model unavailable: {exc}"
+    local_entry = {
+        "key": "local", "label": "Local (Ollama)",
+        "available": local_reason is None, "reason": local_reason,
+        "models": local_models, "accounts": {},
+        "capabilities": {
+            "plan_mode": True, "fork": True, "rewind": True,
+            "permission_modes": list(local_provider.PERMISSION_MODES),
+            "accounts": False, "usage": False,
+        },
+    }
+    return [claude_entry, codex_entry, local_entry]
 
 
 def _codex_models_by_key(account: dict) -> dict[str, dict]:
@@ -1095,7 +1115,7 @@ def list_sessions(user: Optional[dict] = None) -> list[dict]:
             "project_path": r["project_path"],
             "title": title,
             "mtime": r["mtime"],
-            "provider": "claude",
+            "provider": "local" if _local_session_row(r["id"]) else "claude",
         })
     out.extend(_codex_sessions_for_list(user))
     out.sort(key=lambda r: r["mtime"], reverse=True)
@@ -2006,6 +2026,11 @@ def _state_db() -> sqlite3.Connection:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS local_session (
+            session_id TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            effort TEXT NOT NULL DEFAULT ''
+        )""")
         # ── Mid-chat provider switching (Claude ⇄ Codex) ──────────────────
         # Provider-neutral conversation model layered over the two native
         # session stores (Claude on-disk JSONL; the codex_session registry
@@ -2040,7 +2065,7 @@ def _state_db() -> sqlite3.Connection:
         conn.execute("""CREATE TABLE IF NOT EXISTS conversation_binding (
             binding_id TEXT PRIMARY KEY,
             conversation_id TEXT NOT NULL,
-            provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+            provider TEXT NOT NULL CHECK(provider IN ('claude','codex','local')),
             native_session_id TEXT,
             project_key TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'provisional',
@@ -2050,6 +2075,7 @@ def _state_db() -> sqlite3.Connection:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )""")
+        _migrate_local_provider_binding(conn)
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_native "
             "ON conversation_binding(provider, project_key, native_session_id) "
@@ -2110,6 +2136,68 @@ def _state_db() -> sqlite3.Connection:
         _seed_personalities(conn)
         _STATE_DB = conn
     return _STATE_DB
+
+
+def _migrate_local_provider_binding(conn: sqlite3.Connection) -> None:
+    """Widen the provider constraint while preserving native session bindings."""
+    schema = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_binding'"
+    ).fetchone()[0]
+    if "'local'" in schema:
+        return
+    schema = schema.replace("conversation_binding", "conversation_binding_local", 1)
+    schema = schema.replace("'claude','codex'", "'claude','codex','local'")
+    conn.execute("SAVEPOINT local_provider_binding")
+    try:
+        conn.execute(schema)
+        conn.execute("INSERT INTO conversation_binding_local SELECT * FROM conversation_binding")
+        conn.execute("DROP TABLE conversation_binding")
+        conn.execute("ALTER TABLE conversation_binding_local RENAME TO conversation_binding")
+        conn.execute("RELEASE local_provider_binding")
+    except BaseException:
+        conn.execute("ROLLBACK TO local_provider_binding")
+        conn.execute("RELEASE local_provider_binding")
+        raise
+
+
+def _local_session_row(session_id: str) -> Optional[dict]:
+    row = _state_db().execute(
+        "SELECT model, effort FROM local_session WHERE session_id=?", (session_id,),
+    ).fetchone()
+    return {"model": row[0], "effort": row[1]} if row else None
+
+
+def _record_local_session(run: "ActiveRun") -> None:
+    if run.provider == "local" and run.session_id:
+        _state_db().execute(
+            "INSERT INTO local_session(session_id, model, effort) VALUES(?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, effort=excluded.effort",
+            (run.session_id, run.model, run.effort),
+        )
+
+
+def _local_account_for_run(user: dict, model: str) -> dict:
+    return {"slot": "local", "label": "Local", "env": {
+        **_identity_env_for(user), **local_provider.child_env(model),
+    }}
+
+
+async def _local_model_for_run(model: str, effort: str) -> dict:
+    reason = local_provider.unavailable_reason()
+    if reason:
+        raise HTTPException(503, reason)
+    name = model or local_provider.MODEL_NAMES[0]
+    if name not in local_provider.MODEL_NAMES:
+        raise HTTPException(400, "unknown local model")
+    try:
+        metadata = await local_provider.check_model(name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, f"Local model unavailable: {exc}") from exc
+    if effort and effort not in metadata.get("efforts", []):
+        raise HTTPException(400, "model does not support this effort level")
+    return metadata
 
 
 def _migrate_runs_add_conversation(conn: sqlite3.Connection) -> None:
@@ -6981,6 +7069,7 @@ class ActiveRun:
         # switches model live via ClaudeSDKClient.set_model() — no respawn,
         # the conversation continues on the new model from the next turn.
         self.model: Optional[str] = None
+        self.effort: str = ""
         # SDK model id the CLI is actually running right now (spawn value or
         # last successful set_model). Lets _sync_plan_model skip redundant
         # control requests when plan state flaps without a model change.
@@ -7191,10 +7280,11 @@ class ActiveRun:
                 # Same for the credential slot — a tab opening this resumed
                 # session must resolve to the account it actually spawned
                 # under, not the user-global default.
-                if self.requested_account_slot:
+                if self.requested_account_slot and self.provider != "local":
                     _bind_session_account(
                         sid, self.owner_sub, self.requested_account_slot,
                     )
+            _record_local_session(self)
         if event.get("type") == "run_started":
             meta_changed = True
         self.last_activity = time.time()
@@ -8259,7 +8349,7 @@ def _log_task_exception(task: asyncio.Task) -> None:
 
 @app.get("/")
 async def index(request: Request, user: dict = Depends(auth.require_user)):
-    if not setup_flow.is_configured():
+    if not setup_flow.is_configured() and local_provider.unavailable_reason() is not None:
         return RedirectResponse(url="/setup", status_code=302)
     # If the URL points at a specific session, render the picker selected
     # to that session's bound personality rather than the user-global
@@ -8585,6 +8675,9 @@ async def api_sessions_search(
         return found[:MAX_SEARCH_RESULTS]
 
     hits = await asyncio.to_thread(_scan_both)
+    for hit in hits:
+        if _local_session_row(hit["id"]):
+            hit["provider"] = "local"
     return {"query": q, "hits": hits}
 
 
@@ -8682,15 +8775,17 @@ async def api_session(
             # on a spinner while the tool call silently times out.
             "pending_prompts": _pending_prompts_for_run(live),
         }
+    local_session = _local_session_row(sid)
     return {
         "id": sid,
         "project": project_key,
         "messages": messages,
         "live_run": live_run,
-        "provider": "claude",
-        "account_slot": _resolve_account_for_run(
+        "provider": "local" if local_session else "claude",
+        "account_slot": None if local_session else _resolve_account_for_run(
             user, session_id=sid,
         )["slot"],
+        **(local_session or {}),
     }
 
 
@@ -8764,6 +8859,7 @@ async def api_delete_session(
     # Drop the ownership row too so we don't leak rows for deleted sessions.
     try:
         _state_db().execute("DELETE FROM session_owners WHERE session_id = ?", (sid,))
+        _state_db().execute("DELETE FROM local_session WHERE session_id = ?", (sid,))
     except sqlite3.Error:
         pass
     return {"ok": True}
@@ -10936,6 +11032,16 @@ async def api_chat(
     if provider and provider not in VALID_PROVIDERS:
         raise HTTPException(400, "unknown provider")
     _codex_sess = _codex_session_row(session_id) if session_id else None
+    _local_sess = _local_session_row(session_id) if session_id else None
+    if _local_sess:
+        if provider and provider != "local":
+            raise HTTPException(400, "local provider changes require a new chat")
+        provider = "local"
+        model = model or _local_sess["model"]
+        if not effort and model == _local_sess["model"]:
+            effort = _local_sess["effort"]
+    elif provider == "local" and session_id:
+        raise HTTPException(400, "session does not belong to the local provider")
     # A provider that differs from the session's is normally a client bug and
     # rejected. With PROVIDER_SWITCH_ENABLED it instead means "switch this
     # conversation to the other provider": we remember the source, then clear
@@ -10981,6 +11087,10 @@ async def api_chat(
                  "detail": _codex_avail["reason"]},
                 status_code=503,
             )
+    elif provider == "local":
+        reason = local_provider.unavailable_reason()
+        if reason:
+            return JSONResponse({"error": "local_not_configured", "detail": reason}, status_code=503)
     elif not setup_flow.is_configured():
         return JSONResponse(
             {"error": "claude_not_configured", "setup_url": "/setup"},
@@ -11039,6 +11149,14 @@ async def api_chat(
         if (effort and selected_model
                 and effort not in (selected_model.get("efforts") or [])):
             raise HTTPException(400, "model does not support this effort level")
+    elif provider == "local":
+        selected_model = await _local_model_for_run(model, effort)
+        model = selected_model["key"]
+        effort = effort or selected_model.get("default_effort") or ""
+        if permission_mode not in local_provider.PERMISSION_MODES:
+            raise HTTPException(400, "unsupported local permission mode")
+        if fork and not session_id:
+            raise HTTPException(400, "fork requires a session to fork from")
     else:
         if model and model not in MODELS_BY_KEY:
             raise HTTPException(400, "unknown model")
@@ -11092,7 +11210,9 @@ async def api_chat(
         # HTTPException from a bad active slot, etc.) still releases the
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
-        if provider != "codex":
+        if provider == "local":
+            account = _local_account_for_run(user, model)
+        elif provider == "claude":
             account = _resolve_account_for_run(
                 user,
                 session_id=session_id or None,
@@ -11150,7 +11270,7 @@ async def api_chat(
         # substitution is re-decided every turn from live plan state; persisting
         # it would quietly rewrite the user's standing choice the first time
         # their account hit a limit, and they'd never drift back once it reset.
-        if session_id and account_slot:
+        if session_id and account_slot and provider != "local":
             _bind_session_account(
                 session_id, user.get("sub"),
                 substitution["from_slot"] if substitution else account["slot"],
@@ -11176,6 +11296,11 @@ async def api_chat(
         # toggled credentials or personality between turns. The Claude spawn
         # below forks; Codex resumes the same thread id in a fresh app-server.
         swap_respawn = False
+        if (existing is not None and provider == "local"
+                and (existing.model != model or existing.effort != effort)):
+            _require_owner(existing, user)
+            await _supersede_run_for_switch(existing, "local_settings_changed")
+            existing = None
         if existing is not None and existing.account_slot != account["slot"]:
             # User toggled their account between turns. The CLI subprocess
             # bound its credentials at startup, so we can't just keep using
@@ -11300,6 +11425,7 @@ async def api_chat(
         # rather than only after the model drives EnterPlanMode.
         run.permission_mode = _init_permission_mode
         run.model = model or None
+        run.effort = effort
         run.project_key = _sanitize_project_key(cwd)
         # Canonical conversation linkage (Slice 0, shadow-only — nothing reads
         # these tables yet). Resuming an already-wrapped native session reuses
@@ -11360,6 +11486,8 @@ async def api_chat(
             run.session_id = session_id
             ACTIVE_RUNS_BY_SESSION[session_id] = run
             _claim_session_owner(session_id, user.get("sub"), run.project_key)
+            if not fork:
+                _record_local_session(run)
     finally:
         if sess_lock:
             sess_lock.release()
@@ -11376,6 +11504,7 @@ async def api_chat(
     run.emit({
         "type": "run_started", "run_id": run_id, "project": run.project_key,
         "model": model or None, "provider": provider,
+        "effort": effort,
         "account_slot": run.account_slot,
         "account_label": (account or {}).get("label"),
         "account_substitution": substitution,
@@ -11665,14 +11794,16 @@ async def api_chat(
         # only set this when the picked variant actually wants it (currently
         # only Opus 4.7's 1M-context option).
         options_kwargs["betas"] = sdk_betas
-    if effort:
+    if provider == "local":
+        options_kwargs.update(local_provider.sdk_options(selected_model, effort))
+    elif effort:
         # Validated upstream against the variant's `efforts` list; reaches
         # the CLI as --effort. Unset leaves the model's server-side default
         # (high on Opus 4.8).
         options_kwargs["effort"] = effort
-    if FALLBACK_MODEL and FALLBACK_MODEL != sdk_model:
+    if provider == "claude" and FALLBACK_MODEL and FALLBACK_MODEL != sdk_model:
         options_kwargs["fallback_model"] = FALLBACK_MODEL
-    if MAX_BUDGET_USD > 0:
+    if provider == "claude" and MAX_BUDGET_USD > 0:
         options_kwargs["max_budget_usd"] = MAX_BUDGET_USD
     # Identity (CLAUDE_WEB_USER_*) is always present so SessionStart
     # hooks can address the user by name; CLAUDE_CONFIG_DIR/
@@ -11680,7 +11811,9 @@ async def api_chat(
     # credential slot. The SDK merges this dict over inherited env, so
     # PATH/HOME/etc. survive. Set unconditionally: even a shared-slot run with
     # no account env needs the CHILD_ENV_SCRUB overlay.
-    options_kwargs["env"] = _scrubbed_child_env(account["env"])
+    options_kwargs["env"] = _scrubbed_child_env({
+        **account["env"], **options_kwargs.get("env", {}),
+    })
     if swap_respawn or fork:
         # Personality / credential toggles cancelled an in-flight run (or
         # the user explicitly asked to branch via the fork field). Fork
@@ -12495,6 +12628,8 @@ async def api_chat_send(
     if requested_provider not in VALID_PROVIDERS:
         raise HTTPException(400, "unknown provider")
     if requested_provider != run.provider:
+        if "local" in (requested_provider, run.provider):
+            raise HTTPException(400, "local provider changes require a new chat")
         if not PROVIDER_SWITCH_ENABLED:
             return JSONResponse(
                 {"ok": False, "error": "provider_switch_disabled"},
@@ -12519,12 +12654,26 @@ async def api_chat_send(
         session_id=run.session_id,
         override_personality_id=personality_id,
     )
+    if run.provider == "local":
+        local_form = await request.form()
+        requested_model = str(local_form.get("model") or run.model or "")
+        prior_effort = run.effort if requested_model == run.model else ""
+        requested_effort = str(local_form.get("effort", prior_effort) or "").lower()
+        metadata = await _local_model_for_run(requested_model, requested_effort)
+        requested_effort = requested_effort or metadata.get("default_effort") or ""
+        changed = ("model_changed" if metadata["key"] != run.model else
+                   "effort_changed" if requested_effort != run.effort else None)
+        if changed:
+            await _supersede_run_for_switch(run, changed)
+            return JSONResponse({"ok": False, "error": changed}, status_code=409)
     if run.provider == "codex":
         account = _resolve_codex_account_for_run(
             user,
             session_id=run.session_id,
             override_slot=account_slot or None,
         )
+    elif run.provider == "local":
+        account = _local_account_for_run(user, run.model)
     else:
         account = _resolve_account_for_run(
             user,
@@ -12536,7 +12685,7 @@ async def api_chat_send(
         return JSONResponse(
             {"ok": False, "error": "personality_changed"}, status_code=409,
         )
-    if run.provider == "codex":
+    if run.provider in ("codex", "local"):
         handoff = "account_changed" if run.account_slot != account["slot"] else None
     else:
         # Claude follow-ups take the same failover preflight api_chat gives a
@@ -12841,6 +12990,8 @@ async def _sync_plan_model(run: "ActiveRun") -> None:
     entries, before the client exists, or when the target is already live.
     Failures are logged, not raised — a missed swap must not kill the run.
     """
+    if getattr(run, "provider", "claude") != "claude":
+        return
     entry = MODELS_BY_KEY.get(run.model or "")
     if not entry or not entry.get("plan_model"):
         return
@@ -12899,6 +13050,8 @@ async def api_chat_permission_mode(
     if mode not in _VALID_PERMISSION_MODES:
         raise HTTPException(400, f"invalid permission mode {mode!r}")
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "local" and mode not in local_provider.PERMISSION_MODES:
+        raise HTTPException(400, f"{mode} mode is not available with Local")
     if run.provider == "codex":
         if mode not in codex_provider.CODEX_PERMISSION_MODES:
             raise HTTPException(
@@ -12941,6 +13094,8 @@ async def api_chat_set_model(
     — ``--advisor`` only attaches at spawn.
     """
     run, client = _live_run_or_400(session_id, user)
+    if run.provider == "local":
+        raise HTTPException(409, "local model changes apply with the next message")
     if run.provider == "codex":
         # Codex takes the model per turn (turn/start), so a mid-chat switch
         # is just a field write — the next turn picks it up, no client call.
@@ -13329,7 +13484,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         if msg.subtype == "init":
             data = msg.data or {}
             rli = data.get("rate_limit_info") or {}
-            if rli and run is not None:
+            if rli and run is not None and run.provider == "claude":
                 # No run means no way to attribute the info to a credential
                 # slot, so it isn't cached (misfiling it would re-poison the
                 # cross-account gate this cache is keyed to prevent).
@@ -13344,6 +13499,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             }]
         return []
     if isinstance(msg, RateLimitEvent):
+        if run is not None and run.provider == "local":
+            return []
         # Live plan-usage transition (allowed → allowed_warning → rejected, or a
         # flip onto the overage bucket). Cache it for the turn-boundary gate and
         # surface a non-blocking status event so the UI can warn as the limit
@@ -13488,7 +13645,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         if run is not None and (msg.uuid or msg.message_id):
             _replay_blocks = [b for b in message_blocks if b.get("type") != "thinking"]
             _capture_canonical(
-                run, "claude", f"claude:assistant:{msg.uuid or msg.message_id}",
+                run, run.provider, f"{run.provider}:assistant:{msg.uuid or msg.message_id}",
                 "assistant", {"role": "assistant", "content": _replay_blocks},
                 raw={"content": message_blocks}, replayable=True,
             )
@@ -13526,7 +13683,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 # slice above that would otherwise poison the source of truth.
                 if run is not None:
                     _capture_canonical(
-                        run, "claude", f"claude:tool_result:{blk.tool_use_id}",
+                        run, run.provider, f"{run.provider}:tool_result:{blk.tool_use_id}",
                         "tool_result",
                         {"tool_use_id": blk.tool_use_id,
                          "is_error": bool(blk.is_error)},
@@ -13582,8 +13739,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
     if isinstance(msg, ResultMessage):
         slot = run.account_slot if run is not None else "shared"
         owner = run.owner_sub if run is not None else None
-        _log_usage(msg, account_slot=slot, owner_sub=owner)
-        cred_mode = _resolve_credential_mode(slot, owner)
+        is_local = run is not None and run.provider == "local"
+        if not is_local:
+            _log_usage(msg, account_slot=slot, owner_sub=owner)
+        cred_mode = "local" if is_local else _resolve_credential_mode(slot, owner)
         usage = msg.usage or {}
         creation = usage.get("cache_creation") or {}
         events: list[dict] = [{
@@ -13592,7 +13751,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "result": msg.result,
             "errors": list(msg.errors or []),
             "duration_ms": msg.duration_ms,
-            "total_cost_usd": msg.total_cost_usd,
+            "total_cost_usd": 0 if is_local else msg.total_cost_usd,
             "cost_is_billed": cred_mode == "api_key",
             "session_id": msg.session_id,
             "subtype": msg.subtype,
@@ -13616,7 +13775,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             # this model. That is the only hard entitlement fact available —
             # everything else the failover ranker uses is inference — so record
             # it against this slot and stop offering it for this model family.
-            if run is not None and run.model:
+            if run is not None and run.model and not is_local:
                 _note_model_denial(slot, run.model)
             events.append({
                 "type": "error",
@@ -13624,11 +13783,11 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 "model_unavailable": True,
                 "account_slot": slot,
             })
-            offer = _failover_offer(owner, slot, (run.model if run else "") or "",
-                                    "model_unavailable")
+            offer = None if is_local else _failover_offer(
+                owner, slot, (run.model if run else "") or "", "model_unavailable")
             if offer:
                 events.append({"type": "failover_offer", **offer})
-        elif msg.is_error and msg.api_error_status == 429:
+        elif msg.is_error and msg.api_error_status == 429 and not is_local:
             # Plan window spent mid-turn. The turn is already lost; point at an
             # account that could carry the retry instead of leaving the user to
             # work out which of their slots still has room.
@@ -13749,7 +13908,7 @@ async def _gate_overage(run: "ActiveRun") -> bool:
     every turn. A timeout or a stop resolves to False — credits are never spent
     without an explicit "keep going".
     """
-    if run.overage_consent:
+    if run.provider == "local" or run.overage_consent:
         return True
     request_id = str(uuid_mod.uuid4())
     fut = asyncio.get_running_loop().create_future()

@@ -196,6 +196,36 @@ The header has an AI-provider picker next to the model picker. It stays hidden u
 - **Not supported with Codex** (capability-gated in the UI, 400 with a clear message server-side): plan mode, file rewind/checkpoints (codex has no file-checkpoint analog; its `thread/fork`+`lastTurnId` rewinds *conversation*, a different feature; 0.153's `thread/revert` is likewise conversation-only — its own schema says it "does not revert local file changes"), MCP page (configure in `~/.codex/config.toml`), background tasks, advisor combos. Forking IS supported: the fork flag maps to codex's native `thread/fork`, which branches the source rollout into a brand-new thread id (verified live on 0.144.6 — history carries over, source untouched; forking a thread with no turns on disk fails with "no rollout found", unreachable from the UI since fork is only offered on existing conversations). Codex supports the permission-mode subset `default`, `acceptEdits`, and `bypassPermissions`. Personalities carry over via `developerInstructions` at thread start/resume.
 - **Usage dialog**: the header Usage button stays visible for codex and opens a provider-aware view (`GET /api/codex/usage` → `codex_provider.CodexAppServer.account_usage`). `account/rateLimits/read` + `account/usage/read` are **ChatGPT-auth only** — on API-key auth the app-server rejects them ("chatgpt authentication required"), so the dialog degrades to the account-type line plus the live conversation's cumulative token totals (folded in via `?session_id=`) and a pointer to the OpenAI dashboard. On a ChatGPT-plan login it shows the real primary/secondary rate-limit windows and daily token buckets. The running header **cost** figure ($-spend) stays hidden for codex (the `usage` capability gates only that — codex reports no per-turn cost).
 
+### Local provider (Ollama)
+
+`local_provider.py` validates the configured server/model allowlist and discovers
+tool, vision, context, and thinking capabilities from Ollama. Local runs use the
+Claude SDK driver and the same approval callback, with local routing and model
+defaults applied only to the child process. They bypass Claude account selection,
+paid fallback, billing logs, and entitlement/overage handling.
+
+`local_session` stores the native Claude JSONL session's local model and effort;
+the canonical binding uses provider `local`. Reopen/search/list paths must retain
+that provider. Switching between Local and a cloud provider requires a new chat.
+Model/effort changes respawn on the next message, since subagent defaults and
+thinking overrides are fixed in the child environment.
+
+Ollama 0.16.1 ignores explicit disabled thinking through its Anthropic adapter;
+0.33.3 handles it. Claude Code 2.1.266 also rewrites/omits thinking for custom
+model names, so `sdk_options` preserves the request fields via
+`CLAUDE_CODE_EXTRA_BODY`. Merge its `env` overlay after `child_env`, rather than
+overwriting it. Never expose arbitrary token-budget levels: Ollama accepts but
+does not enforce those budgets. Verified Qwen families expose off/on, GPT-OSS
+low/medium/high. Unknown model families and server versions have no effort control.
+
+CPU inference spends minutes in prompt processing before the first streamed byte
+(measured ~22 tokens/s on the storage server; a fresh session prompt is ~17k
+tokens). Claude Code's watchdogs for a custom base URL default to five minutes
+between bytes and ten minutes per request, and Ollama logs the resulting client
+disconnect as a 500. `child_env` raises `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS`,
+`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` (the CLI
+clamps these at 30 minutes) and `API_TIMEOUT_MS`. Keep them when editing the env.
+
 ### Portability
 
 All paths are env-driven: `CLAUDE_PROJECT_DIR`, `CLAUDE_WEB_PROJECT_DIRS`, `CLAUDE_HOME`, `CODEX_HOME`, `CLAUDE_WEB_STATE_DIR`, `CLAUDE_WEB_PERSONAL_HOMES_DIR`, `CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR`, `CLAUDE_WEB_SHARED_ACCOUNT_LABEL`, `CLAUDE_WEB_CODEX_SHARED_ACCOUNT_LABEL`, `CLAUDE_WEB_SITE_TITLE`, `AUTH_MODE=oidc|none`. **Don't hardcode an operator's home directory back into the source.**

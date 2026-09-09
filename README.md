@@ -8,6 +8,7 @@ A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) 
 - OIDC sign-in (Keycloak, Authentik, Authelia, Auth0, Google, …) with optional email- or group-based allowlists.
 - One container, one `.env` file, no separate database.
 - Optional second AI provider: install the OpenAI `codex` CLI and sign in either the shared host slot or personal ChatGPT subscription accounts from `/account`. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, mid-chat model switching, and same-chat account switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
+- Optional local AI provider: connect an Ollama server for coding and writing with the existing file tools, command approvals, and saved conversations.
 
 > ## Trust model — read this first
 >
@@ -37,6 +38,51 @@ Open the URL you put in `OIDC_REDIRECT_URI` (minus `/auth/callback`). On first v
 Either way, credentials persist in the `claude-home` (or `claude-web-state`) volume across container restarts. The `/setup` page locks itself once a credential is provisioned (`CLAUDE_WEB_ENABLE_SETUP=auto`); to switch accounts later, set `CLAUDE_WEB_ENABLE_SETUP=true` and restart, or shell into the container and run `claude auth login` directly.
 
 If you'd rather sign in from a shell from the start: `docker compose exec claude-web claude auth login`.
+
+## Local models (Ollama)
+
+Install a tool-capable model on your Ollama server, then configure the app:
+
+```dotenv
+CLAUDE_WEB_OLLAMA_URL=http://ollama:11434
+CLAUDE_WEB_OLLAMA_MODELS=qwen3.5:35b-32k
+```
+
+The model names are a comma-separated allowlist of models already installed on
+that server. The app checks their capabilities without downloading or loading
+weights. The URL must be the server origin, with no `/v1` suffix. A Claude Code
+CLI is still required for tools and permissions; a Claude subscription is not
+required for local inference.
+
+Configure the context window in the model's Ollama Modelfile. For example,
+`FROM qwen3.5:35b` and `PARAMETER num_ctx 32768` can be saved as a Modelfile and
+installed with `ollama create qwen3.5:35b-32k -f Modelfile`. Choose a window that
+fits the server; larger contexts require more memory and prompt-processing time.
+When no explicit model window is available, the UI leaves its capacity unknown.
+
+After restarting the app, choose **Local (Ollama)**. The default permission mode
+uses the same approval cards as Claude. Other permission modes retain their
+existing behavior, including the explicit option to bypass approvals. Tools run
+on the **Claude web host**; inference runs on the **Ollama server**.
+
+With Ollama 0.33.3 or newer, supported Qwen3/Qwen3.5 models expose a two-position
+thinking slider, and GPT-OSS exposes low, medium, and high reasoning effort.
+Models without verified controls display an explanation instead of an active
+slider. More thinking can take longer; it does not guarantee a better answer.
+
+On CPU-only servers the first reply of a new conversation can take several
+minutes while the model reads the full Claude Code prompt; later turns reuse the
+server's prompt cache and respond faster. The app raises the CLI's request
+timeouts for local runs so slow prompt processing is not reported as an error.
+Ollama does not enforce Anthropic thinking-token budgets. Model and effort
+changes take effect on the next message through a restarted local process.
+
+Local sessions keep their provider when reopened. Switching between Local and a
+cloud provider starts a separate chat. Missing models or an unavailable server
+produce an error; local runs never use the app's cloud-account failover or
+`CLAUDE_WEB_FALLBACK_MODEL`. Cloud model tags are rejected. Local inference does
+not make the whole assistant offline: configured MCP tools, hooks, and approved
+commands can still access external services.
 
 ## Running from source (no Docker)
 

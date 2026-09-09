@@ -37,7 +37,7 @@
       <div id="header-controls" class="header-controls">
         <label class="header-select" for="provider-select" id="provider-select-label" hidden>
           <span class="sr-only">AI provider</span>
-          <select id="provider-select" aria-label="AI provider" title="Which AI runs this conversation. More providers appear here once their CLI is installed and signed in. Switching provider starts a new chat.">
+          <select id="provider-select" aria-label="AI provider" title="Which AI runs this conversation. Providers appear when configured and available. Switching provider starts a new chat.">
             <option value="claude" selected>Claude</option>
           </select>
         </label>
@@ -69,6 +69,12 @@
             {% endfor %}
           </select>
         </label>
+        <div class="local-effort" id="local-effort-control" hidden>
+          <label for="local-effort-range">Effort: <span id="local-effort-value" aria-hidden="true">Not adjustable</span></label>
+          <input id="local-effort-range" type="range" min="0" max="1" step="1" value="0"
+            aria-describedby="local-effort-help" disabled>
+          <span id="local-effort-help" class="local-effort-help"></span>
+        </div>
         <label class="header-select" for="account-select">
           <span class="sr-only">Account</span>
           <select id="account-select" aria-label="Account">
@@ -86,7 +92,7 @@
           <input type="checkbox" id="failover-toggle">
           <span>Switch accounts automatically</span>
         </label>
-        <a href="/account" class="header-link" aria-label="Manage your Claude and OpenAI accounts">Manage accounts</a>
+        <a href="/account" id="manage-accounts" class="header-link" aria-label="Manage your Claude and OpenAI accounts">Manage accounts</a>
         <label class="header-select" for="personality-select">
           <span class="sr-only">Personality</span>
           <select id="personality-select" aria-label="Personality">

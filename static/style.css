@@ -1094,6 +1094,18 @@ body.app-shell {
 }
 .header-controls { flex: 1 1 auto; min-width: 0; }
 .header-menu-toggle { display: none; }
+.local-effort {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  width: 18rem;
+  max-width: 100%;
+  font-size: 0.8rem;
+}
+.local-effort input { width: 100%; min-height: var(--tap-min-height); accent-color: var(--accent); }
+.local-effort input:focus-visible { outline: 2px solid var(--accent); }
+.local-effort-help { color: #aaa; }
+.header-controls [hidden] { display: none !important; }
 
 /* ─── Sheets (mobile Chats / Settings) ────────────────────────────────────── */
 /* Native <dialog> + showModal(), matching the approval modal: it makes the

@@ -18,6 +18,10 @@
   const permModeSelect = document.getElementById("permission-mode-select");
   const effortSelect = document.getElementById("effort-select");
   const effortSelectLabel = document.getElementById("effort-select-label");
+  const localEffortControl = document.getElementById("local-effort-control");
+  const localEffortRange = document.getElementById("local-effort-range");
+  const localEffortValue = document.getElementById("local-effort-value");
+  const localEffortHelp = document.getElementById("local-effort-help");
   const projectSelect = document.getElementById("project-select");
   const attachInput = document.getElementById("attach-input");
   const attachmentsEl = document.getElementById("attachments");
@@ -54,6 +58,7 @@
   const PERM_MODE_KEY = "claude-web.permission-mode";
   const PROJECT_KEY = "claude-web.project";
   const PROVIDER_KEY = "claude-web.provider";
+  const PROVIDERS = { claude: null, codex: null, local: null };
   // Per-provider model memory: each provider's model list is disjoint, so
   // remembering one pick per provider means toggling back and forth doesn't
   // lose either choice. "claude-web.model" stays Claude's key for
@@ -520,7 +525,35 @@
   }
   function syncEffortVisibility() {
     if (!effortSelect || !effortSelectLabel) return;
-    effortSelectLabel.hidden = !effortSupported();
+    const local = currentProvider() === "local";
+    effortSelectLabel.hidden = local || !effortSupported();
+    if (localEffortControl) localEffortControl.hidden = !local;
+    if (local) syncLocalEffort();
+  }
+
+  function syncLocalEffort() {
+    if (!localEffortRange || !effortSelect) return;
+    const model = ((PROVIDERS.local && PROVIDERS.local.models) || [])
+      .find((m) => m.key === modelSelect.value);
+    const efforts = (model && model.efforts) || [];
+    if (model && !efforts.includes(effortSelect.value)) {
+      effortSelect.value = efforts.includes(model.default_effort)
+        ? model.default_effort : (efforts[0] || "");
+    }
+    const value = effortSelect.value;
+    const label = ((model && model.effort_labels) || {})[value] || value || "Not adjustable";
+    localEffortRange.max = String(Math.max(1, efforts.length - 1));
+    localEffortRange.value = String(Math.max(0, efforts.indexOf(value)));
+    localEffortRange.disabled = efforts.length < 2;
+    localEffortRange.setAttribute("aria-valuetext", label);
+    if (localEffortValue) localEffortValue.textContent = label;
+    if (localEffortHelp) {
+      localEffortHelp.textContent = !model
+        ? "Saved model is unavailable. Choose an installed model to continue."
+        : model.effort_help || (efforts.length
+        ? "More thinking may take longer. Speed and answer quality depend on the model and task."
+        : "This model does not expose adjustable effort.");
+    }
   }
 
   // Restore model + effort + project from localStorage so the picks persist across reloads.
@@ -565,6 +598,10 @@
   // variant still needs a fresh chat to pick up the beta.
   async function pushModelChange(modelKey) {
     if (!sessionId) return;
+    if (currentProvider() === "local") {
+      announce("Local model change takes effect on your next message.");
+      return;
+    }
     try {
       const fd = new FormData();
       fd.append("session_id", sessionId);
@@ -631,9 +668,19 @@
       effortSelect.value = savedEffort;
     }
     effortSelect.addEventListener("change", () => {
-      safeSet(localStorage, EFFORT_KEY, effortSelect.value);
+      const local = currentProvider() === "local";
+      if (local) syncLocalEffort();
+      safeSet(localStorage, local ? EFFORT_KEY + ".local" : EFFORT_KEY, effortSelect.value);
     });
     syncEffortVisibility();
+  }
+  if (localEffortRange) {
+    localEffortRange.addEventListener("input", () => {
+      const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
+      if (!effortSelect || !efforts.length) return;
+      effortSelect.value = efforts[Number(localEffortRange.value)] || "";
+      effortSelect.dispatchEvent(new Event("change"));
+    });
   }
   if (projectSelect) {
     const savedProject = safeGet(localStorage, PROJECT_KEY);
@@ -649,13 +696,8 @@
   }
 
   // ── AI provider picker ─────────────────────────────────────────────────
-  // Hidden until /api/providers reports more than one available provider,
-  // so a Claude-only install renders exactly as before. Provider is fixed
-  // per conversation: changing it with a session open starts a new chat
-  // (the server refuses cross-provider resumes). Each provider brings its
-  // own model list; the shared MODEL_* maps merge both lists because the
-  // key spaces are disjoint (claude-* vs gpt-*).
-  const PROVIDERS = { claude: null, codex: null };
+  // Local always starts a new conversation at provider boundaries. Cloud
+  // providers can carry history across when provider switching is enabled.
   // Set from /api/providers (CLAUDE_WEB_PROVIDER_SWITCH server-side). Gates the
   // mid-chat provider switch: off → changing provider on a live chat starts a
   // new chat (the original behavior); on → it carries the conversation over.
@@ -671,16 +713,23 @@
   // Display name of the active assistant, for turn-status strings and
   // announcements. Falls back to the picker's own label so a future third
   // provider needs no change here.
-  function assistantLabel() {
-    const p = currentProvider();
+  function assistantLabel(provider) {
+    const p = provider || currentProvider();
     if (providerSelect) {
       const opt = [...providerSelect.options].find((o) => o.value === p);
       if (opt) return opt.textContent.replace(/\s*\(.*\)$/, "");
     }
-    return p === "codex" ? "Codex" : "Claude";
+    return p === "local" ? "Local" : p === "codex" ? "Codex" : "Claude";
   }
   function providerCapabilities(key) {
-    const p = PROVIDERS[key || currentProvider()];
+    const provider = key || currentProvider();
+    const p = PROVIDERS[provider];
+    if (provider === "local" && !(p && p.capabilities)) {
+      return {
+        plan_mode: false, fork: false, rewind: false,
+        permission_modes: ["default"], accounts: false, usage: false,
+      };
+    }
     return (p && p.capabilities) || {
       plan_mode: true, fork: true, rewind: true,
       permission_modes: true, accounts: true, usage: true,
@@ -746,9 +795,16 @@
   function rebuildModelOptions(provider) {
     if (!modelSelect) return;
     const p = PROVIDERS[provider];
-    if (!p || !p.models || !p.models.length) return;
+    if ((!p || !p.models) && provider !== "local") return;
+    const models = (p && p.models) || [];
     modelSelect.innerHTML = "";
-    for (const m of p.models) {
+    if (!models.length) {
+      const unavailable = document.createElement("option");
+      unavailable.value = "";
+      unavailable.textContent = "No models available";
+      modelSelect.appendChild(unavailable);
+    }
+    for (const m of models) {
       const o = document.createElement("option");
       o.value = m.key || "";
       o.textContent = m.label || m.key || "Default";
@@ -757,8 +813,8 @@
     const saved = safeGet(localStorage, modelKeyFor(provider));
     if (saved !== null && [...modelSelect.options].some((o) => o.value === saved)) {
       modelSelect.value = saved;
-    } else if (provider === "codex") {
-      const dflt = p.models.find((m) => m.is_default) || p.models[0];
+    } else if (provider !== "claude") {
+      const dflt = models.find((m) => m.is_default) || models[0];
       if (dflt) modelSelect.value = dflt.key;
     }
     lastSeenModel = modelSelect.value || null;
@@ -767,7 +823,9 @@
   function rebuildEffortOptions() {
     if (!effortSelect) return;
     const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
-    const saved = effortSelect.value;
+    const local = currentProvider() === "local";
+    const saved = safeGet(localStorage, local ? EFFORT_KEY + ".local" : EFFORT_KEY)
+      ?? (local ? "" : effortSelect.value);
     effortSelect.innerHTML = "";
     const dflt = document.createElement("option");
     dflt.value = "";
@@ -811,12 +869,17 @@
     }
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
+    const failoverLabel = document.getElementById("failover-toggle")?.closest("label");
+    if (failoverLabel) failoverLabel.hidden = !caps.accounts;
+    const manageAccounts = document.getElementById("manage-accounts");
+    if (manageAccounts) manageAccounts.hidden = !caps.accounts;
     rebuildAccountOptions(provider, preferredAccount);
-    // The running header cost is Anthropic $-spend; hide it when the provider
-    // can't populate it (Codex reports no per-turn cost). The Usage button
-    // stays visible for every provider — the dialog itself branches on the
-    // active provider and shows whatever that backend exposes.
+    // Only cloud providers have account usage. Codex has usage limits but
+    // no per-turn cost, so the button and cost figure have separate gates.
     if (headerCostEl) headerCostEl.hidden = !caps.usage;
+    const usageButton = document.getElementById("show-usage");
+    if (usageButton) usageButton.hidden = provider === "local";
+    if (promptEl) promptEl.placeholder = "Ask " + assistantLabel(provider) + "…";
     rebuildModelOptions(provider);
     rebuildEffortOptions();
     renderContextMeter();
@@ -832,26 +895,27 @@
     providerSwitchEnabled = !!(payload && payload.provider_switch);
     for (const p of provs) ingestProvider(p);
     const available = provs.filter((p) => p.available);
-    if (!providerSelect || available.length < 2) return;
+    if (!providerSelect) return;
     // The markup can't know whether the switch is enabled — that's server-side
     // — and `title` is what a screen reader reads as this control's
     // description. Left static it told the user switching starts a new chat,
     // which is the opposite of what the switch path does, so the one feature
     // built to make a mid-chat change safe read as the thing to avoid.
     providerSelect.title = providerSwitchEnabled
-      ? "Which AI runs this conversation. More providers appear here once their"
-        + " CLI is installed and signed in. Switching mid-chat carries this"
-        + " conversation over to the new provider on your next message."
-      : "Which AI runs this conversation. More providers appear here once their"
-        + " CLI is installed and signed in. Switching provider starts a new chat.";
-    providerSelect.innerHTML = "";
-    for (const p of available) {
-      const o = document.createElement("option");
-      o.value = p.key;
-      o.textContent = p.label;
-      providerSelect.appendChild(o);
+      ? "Which AI runs this conversation. Switching between Claude and Codex carries"
+        + " the conversation over on your next message. Switching to or from Local starts a new chat."
+      : "Which AI runs this conversation. Providers appear when configured and available."
+        + " Switching provider starts a new chat.";
+    if (available.length) {
+      providerSelect.innerHTML = "";
+      for (const p of available) {
+        const o = document.createElement("option");
+        o.value = p.key;
+        o.textContent = p.label;
+        providerSelect.appendChild(o);
+      }
     }
-    if (providerSelectLabel) providerSelectLabel.hidden = false;
+    if (providerSelectLabel) providerSelectLabel.hidden = available.length < 2;
     const saved = safeGet(localStorage, PROVIDER_KEY);
     if (saved && [...providerSelect.options].some((o) => o.value === saved)) {
       providerSelect.value = saved;
@@ -866,7 +930,7 @@
       safeSet(localStorage, PROVIDER_KEY, provider);
       const label = [...providerSelect.options].find((o) => o.value === provider);
       const name = label ? label.textContent : provider;
-      if (sessionId && providerSwitchEnabled) {
+      if (sessionId && providerSwitchEnabled && provider !== "local" && sessionProvider !== "local") {
         // Carry this conversation across providers. Keep the session id: the
         // next send posts the new provider WITH it, the server supersedes the
         // old binding, seeds the destination with a handoff, and confirms via
@@ -1396,8 +1460,16 @@
     // since initProviders skips the apply whenever a URL session is
     // present (it can't know the session's provider yet).
     await providersReady;
-    const sessProvider = data.provider === "codex" ? "codex" : "claude";
+    const sessProvider = ["claude", "codex", "local"].includes(data.provider)
+      ? data.provider : "claude";
     sessionProvider = sessProvider;
+    if (providerSelect && ![...providerSelect.options].some((o) => o.value === sessProvider)) {
+      const option = document.createElement("option");
+      option.value = sessProvider;
+      option.textContent = (PROVIDERS[sessProvider] || {}).label || assistantLabel(sessProvider);
+      providerSelect.appendChild(option);
+      if (providerSelectLabel) providerSelectLabel.hidden = providerSelect.options.length < 2;
+    }
     if (providerSelect
         && [...providerSelect.options].some((o) => o.value === sessProvider)) {
       providerSelect.value = sessProvider;
@@ -1406,6 +1478,28 @@
         try { await refreshCodexProvider(data.account_slot); } catch (_) {}
       }
       applyProviderUI(sessProvider, data.account_slot || undefined);
+      if (sessProvider === "local" && modelSelect && data.model) {
+        const modelAvailable = [...modelSelect.options].some((o) => o.value === data.model);
+        if (!modelAvailable) {
+          const option = document.createElement("option");
+          option.value = data.model;
+          option.textContent = data.model + " (unavailable)";
+          modelSelect.appendChild(option);
+        }
+        modelSelect.value = data.model;
+        lastSeenModel = data.model;
+        rebuildEffortOptions();
+        if (effortSelect && data.effort && !modelAvailable) {
+          const option = document.createElement("option");
+          option.value = data.effort;
+          option.textContent = data.effort;
+          effortSelect.appendChild(option);
+        }
+        if (effortSelect && [...effortSelect.options].some((o) => o.value === (data.effort || ""))) {
+          effortSelect.value = data.effort || "";
+          syncLocalEffort();
+        }
+      }
     }
     // Use ?? not || so the loaded session's own (possibly empty) project
     // wins over the URL-pinned project — otherwise switching to an
@@ -2280,10 +2374,14 @@
       }
       // Same for the credential slot: a mid-conversation switch 409s
       // account_changed and the browser respawns under the new account.
-      if (accountSelect && accountSelect.value) {
+      if (providerCapabilities().accounts && accountSelect && accountSelect.value) {
         fd.append("account_slot", accountSelect.value);
       }
       fd.append("provider", currentProvider());
+      if (currentProvider() === "local") {
+        if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+        if (effortSelect && effortSupported()) fd.append("effort", effortSelect.value);
+      }
       for (const img of entry.images) {
         fd.append("images", img.file, sendName(img.file));
       }
@@ -2337,11 +2435,18 @@
         queueRebindFromRunId = rid;
         const benign409 = supersededReason === "personality_changed" ||
                           supersededReason === "account_changed" ||
-                          supersededReason === "provider_changed";
+                          supersededReason === "provider_changed" ||
+                          supersededReason === "model_changed" ||
+                          supersededReason === "effort_changed";
         if (r.status !== 404 && !benign409) {
           setStatus(`Send failed (HTTP ${r.status}) — starting a new run.`);
         }
-        const sent = await sendOne(entry);
+        // A picker change while this POST was pending applies to the next
+        // message. Retrying this message must keep its submitted settings.
+        const retrySelection = fd.get("provider") === "local" ? {
+          provider: "local", model: fd.get("model"), effort: fd.get("effort"),
+        } : null;
+        const sent = await sendOne({ ...entry, text: fd.get("message") }, retrySelection);
         // Only report "fresh" (which drops the chip) when the fresh send
         // actually succeeded. A failed fallback (e.g. server restarting)
         // reports "failed" so the caller keeps the chip rather than silently
@@ -2427,7 +2532,7 @@
     }
   }
 
-  async function sendOne(entry) {
+  async function sendOne(entry, retrySelection = null) {
     setStreaming(true);
     // Bump the stream generation BEFORE any await, so handleSSEEvent calls
     // from a previously-aborted stream see ctx.gen !== streamGeneration and
@@ -2447,9 +2552,10 @@
       if (sessionId) fd.append("session_id", sessionId);
       const project = currentProject();
       if (project) fd.append("project", project);
-      const provider = currentProvider();
+      const provider = retrySelection ? retrySelection.provider : currentProvider();
       fd.append("provider", provider);
-      if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
+      const model = retrySelection ? retrySelection.model : modelSelect && modelSelect.value;
+      if (model) fd.append("model", model);
       // Both backends resolve their advertised permission-mode subset
       // server-side. Include the persisted picker value on the first turn so
       // Codex does not silently start in "default" while displaying bypass.
@@ -2457,7 +2563,9 @@
           providerCapabilities(provider).permission_modes) {
         fd.append("permission_mode", permModeSelect.value);
       }
-      if (effortSelect && effortSelect.value && effortSupported()) {
+      if (retrySelection) {
+        if (retrySelection.effort !== null) fd.append("effort", retrySelection.effort);
+      } else if (effortSelect && effortSelect.value && effortSupported()) {
         fd.append("effort", effortSelect.value);
       }
       if (entry.fork) fd.append("fork", "true");
@@ -2471,7 +2579,7 @@
       }
       // Picker value as session-scoped account override — same per-session
       // binding as personality, so two tabs run under two accounts at once.
-      if (accountSelect && accountSelect.value) {
+      if (providerCapabilities(provider).accounts && accountSelect && accountSelect.value) {
         fd.append("account_slot", accountSelect.value);
       }
       for (const img of entry.images) {
@@ -3277,7 +3385,7 @@
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
       announce(
-        `${obj.provider === "codex" ? "Codex" : "Claude"} is asking you a question.`,
+        `${assistantLabel(obj.provider)} is asking you a question.`,
         { urgent: true },
       );
       playCue("permission");
@@ -4561,7 +4669,7 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = req.provider === "codex" ? "Codex is asking" : "Claude is asking";
+    heading.textContent = assistantLabel(req.provider) + " is asking";
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
 
@@ -4846,6 +4954,10 @@
     usageBody.textContent = "Loading…";
     if (typeof usageDialog.showModal === "function") usageDialog.showModal();
     else usageDialog.setAttribute("open", "open");
+    if (currentProvider() === "local") {
+      usageBody.textContent = "This conversation runs on the local model server. Cloud account usage does not apply.";
+      return;
+    }
     if (currentProvider() === "codex") {
       let data = null;
       try {
@@ -5480,7 +5592,7 @@
       if (s.provider && s.provider !== "claude") {
         const prov = document.createElement("span");
         prov.className = "session-provider";
-        prov.textContent = s.provider === "codex" ? "Codex" : s.provider;
+        prov.textContent = assistantLabel(s.provider);
         meta.appendChild(prov);
       }
       if (s.project_path || s.project) {
@@ -5950,7 +6062,7 @@
     stop: { description: "Stop the current turn", run: () => { if (!stopBtn.hidden) stopBtn.click(); } },
     help: { description: "Show what slash commands work in claude-web", run: () => showSlashHelp() },
     model: { description: "Switch model: /model <id> (e.g. /model claude-sonnet-4-6)", run: (arg) => switchModel(arg) },
-    effort: { description: "Set effort for new turns: /effort low|medium|high|xhigh|max (no arg = default)", run: (arg) => switchEffort(arg) },
+    effort: { description: "Set a supported model effort level: /effort <level> (no arg = default)", run: (arg) => switchEffort(arg) },
     fork: { description: "Branch this chat into a new session: /fork [first message] — the original stays intact", run: (arg) => forkChat(arg) },
     rewind: { description: "Undo file changes: /rewind [n] — restore files to before your nth-last message (default 1)", run: (arg) => rewindFiles(arg) },
   };
