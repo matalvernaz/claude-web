@@ -256,6 +256,7 @@ def test_child_environment_keeps_all_model_routes_on_local_server():
                  "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"):
         assert int(env[name]) == 30 * 60 * 1000
     assert int(env["API_TIMEOUT_MS"]) == 60 * 60 * 1000
+    assert env["API_FORCE_IDLE_TIMEOUT"] == "false"
 
 
 def test_child_environment_overrides_inherited_credentials_and_request_options(monkeypatch):

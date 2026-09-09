@@ -224,7 +224,10 @@ tokens). Claude Code's watchdogs for a custom base URL default to five minutes
 between bytes and ten minutes per request, and Ollama logs the resulting client
 disconnect as a 500. `child_env` raises `CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS`,
 `CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` (the CLI
-clamps these at 30 minutes) and `API_TIMEOUT_MS`. Keep them when editing the env.
+clamps these at 30 minutes) and `API_TIMEOUT_MS`. Those alone were not enough:
+the runtime's own fetch idle timeout stays on for non-Anthropic routes and cut
+silent connections at six minutes (verified with a fake slow server), so
+`API_FORCE_IDLE_TIMEOUT=false` is set too. Keep all of them when editing the env.
 
 ### Portability
 

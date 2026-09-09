@@ -215,6 +215,10 @@ def child_env(model: str) -> dict[str, str]:
         "CLAUDE_CODE_AUTO_MODE_MODEL": model,
         "CLAUDE_CODE_BG_CLASSIFIER_MODEL": model,
         "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
+        # The CLI leaves the runtime's own idle timeout on for non-Anthropic
+        # routes; it dropped silent connections at six minutes regardless
+        # of the stream watchdog settings below.
+        "API_FORCE_IDLE_TIMEOUT": "false",
         "CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS": str(STREAM_TIMEOUT_MS),
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS": str(STREAM_TIMEOUT_MS),
         "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(STREAM_TIMEOUT_MS),
