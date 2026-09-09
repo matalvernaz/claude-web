@@ -58,6 +58,10 @@ Configure the context window in the model's Ollama Modelfile. For example,
 `FROM qwen3.5:35b` and `PARAMETER num_ctx 32768` can be saved as a Modelfile and
 installed with `ollama create qwen3.5:35b-32k -f Modelfile`. Choose a window that
 fits the server; larger contexts require more memory and prompt-processing time.
+If Ollama runs in a container or VM with fewer CPUs than the host, add
+`PARAMETER num_thread <cpus available>` to the same Modelfile. Ollama sizes its
+thread pool from the host's core count, and an oversubscribed pool can slow
+generation by more than an order of magnitude.
 When no explicit model window is available, the UI leaves its capacity unknown.
 
 After restarting the app, choose **Local (Ollama)**. The default permission mode
