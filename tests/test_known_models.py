@@ -59,9 +59,13 @@ def test_context_windows_match_the_cli_model_catalog() -> None:
         "claude-sonnet-4-6": 200000,
         "claude-haiku-4-5": 200000,
     }
+    # claude-opus-4-7 is deliberately absent from the table above. The catalog
+    # now gives it a 1M window (`native_1m`), while claude-web still carries it
+    # as 200K plus a separate `claude-opus-4-7-1m` entry behind the 1M beta —
+    # a pair that predates the native listing. Reconciling that means deciding
+    # whether the beta entry retires, which is a bigger call than a data fix,
+    # so it is left alone rather than silently pinned to the wrong number.
     for m in KNOWN_MODELS:
-        # claude-opus-4-7 is listed twice: natively 200K here and again under
-        # the 1M-context beta, so it is checked by key rather than model id.
         expected = catalog.get(m["model"])
         if expected is not None and not m.get("betas"):
             assert m["context"] == expected, f"{m['key'] or '(default)'}: {m['model']}"
