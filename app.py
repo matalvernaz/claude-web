@@ -489,8 +489,17 @@ EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 # they wanted. Keeping the spawn-only entries contiguous at the bottom removes
 # every such crossing for the common models.
 KNOWN_MODELS = [
-    {"key": "", "model": "claude-opus-4-8", "label": "Default", "context": 1000000, "betas": [],
+    # "model" here is never spawned with (an empty key sends no --model at all,
+    # so the CLI picks its own default); it names the model the CLI would pick,
+    # which is what _model_families_for_key reads to size the entitlement check.
+    # Keep it tracking the CLI's `opus` alias — 2.1.280 moved that to Opus 5.5.
+    {"key": "", "model": "claude-opus-5-5", "label": "Default", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
+    # Opus 5.5 is the CLI's default Opus as of 2.1.280 — 1M context, cheaper than
+    # Opus 5 ($4/$20 per Mtok vs $5/$25) and the only model here whose catalog
+    # default effort is "medium" rather than "high".
+    {"key": "claude-opus-5-5", "model": "claude-opus-5-5", "label": "Opus 5.5", "context": 1000000,
+     "betas": [], "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
      "efforts": EFFORT_LEVELS},
     {"key": "claude-fable-5-1", "model": "claude-fable-5-1", "label": "Fable 5.1", "context": 1000000,
@@ -508,7 +517,12 @@ KNOWN_MODELS = [
      "efforts": EFFORT_LEVELS},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
      "efforts": []},
-    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 1000000, "betas": [],
+    {"key": "claude-sonnet-5", "model": "claude-sonnet-5", "label": "Sonnet 5", "context": 1000000,
+     "betas": [], "efforts": EFFORT_LEVELS},
+    # 200K, not 1M: the CLI's model catalog gives Sonnet 4.6 a 200000-token
+    # window (only Sonnet 5 went to 1M). The meter and the context-threshold
+    # announcements read this number, so an inflated one silences the warning.
+    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 200000, "betas": [],
      "efforts": []},
     {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
      "efforts": []},
@@ -538,6 +552,13 @@ KNOWN_MODELS = [
     # served by claude-fable-5-1, 2026-09-01.
     {"key": "opus5-fable51-advisor", "model": "claude-opus-5",
      "advisor_model": "claude-fable-5-1", "label": "Opus 5 + Fable 5.1 advisor",
+     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
+    # Opus 5.5 executor. The CLI gates an advisor on advisor_rank: the advisor's
+    # rank must be >= 2 and >= the executor's. Opus 5.5 ranks 4, Fable 5.1 ranks
+    # 5, so the pairing is valid. Probed live on CLI 2.1.280, 2026-09-23.
+    # (Mythos 5 / 5.1 also rank 5 and would pair, but both 404 on this account.)
+    {"key": "opus55-fable51-advisor", "model": "claude-opus-5-5",
+     "advisor_model": "claude-fable-5-1", "label": "Opus 5.5 + Fable 5.1 advisor",
      "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
 ]
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}

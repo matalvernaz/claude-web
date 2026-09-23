@@ -14,6 +14,7 @@ OPUS_ADVISOR = app_module.MODELS_BY_KEY.get("opus-fable-advisor") or {}
 COMBO = app_module.MODELS_BY_KEY.get("fableplan-advisor") or {}
 OPUS5_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable-advisor") or {}
 OPUS5_FABLE51_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable51-advisor") or {}
+OPUS55_FABLE51_ADVISOR = app_module.MODELS_BY_KEY.get("opus55-fable51-advisor") or {}
 
 
 def test_advisor_entries_exist() -> None:
@@ -44,6 +45,26 @@ def test_opus5_fable51_advisor_entry_exists() -> None:
     assert OPUS5_FABLE51_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
 
 
+def test_opus55_fable51_advisor_entry_exists() -> None:
+    assert OPUS55_FABLE51_ADVISOR, "opus55-fable51-advisor missing from KNOWN_MODELS"
+    assert OPUS55_FABLE51_ADVISOR["model"] == "claude-opus-5-5"
+    assert OPUS55_FABLE51_ADVISOR["advisor_model"] == "claude-fable-5-1"
+    assert "plan_model" not in OPUS55_FABLE51_ADVISOR
+    assert OPUS55_FABLE51_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+
+
+def test_every_advisor_executor_is_separately_switchable() -> None:
+    # An advisor combo is spawn-only, so a user who wants the same executor
+    # without paying for consults needs a plain entry for it. Also guards the
+    # label lookup in _sync_plan_model, which resolves a model id back through
+    # the keyed entries and would fall back to a raw id without one.
+    switchable = {m["model"] for m in app_module.KNOWN_MODELS
+                  if m["key"] and not m.get("advisor_model")}
+    for entry in app_module.KNOWN_MODELS:
+        if entry.get("advisor_model"):
+            assert entry["model"] in switchable, entry["key"]
+
+
 def test_fable_5_1_switchable_entry() -> None:
     entry = app_module.MODELS_BY_KEY.get("claude-fable-5-1") or {}
     assert entry, "claude-fable-5-1 missing from KNOWN_MODELS"
@@ -59,6 +80,7 @@ def test_models_payload_carries_advisor() -> None:
     assert payload["opus-fable-advisor"]["advisor"] == "claude-fable-5"
     assert payload["fableplan-advisor"]["advisor"] == "claude-fable-5"
     assert payload["opus5-fable-advisor"]["advisor"] == "claude-fable-5"
+    assert payload["opus55-fable51-advisor"]["advisor"] == "claude-fable-5-1"
     # Ordinary entries expose an empty advisor so switchKey() compares "" to
     # "" rather than undefined to a model id.
     assert payload[""]["advisor"] == ""

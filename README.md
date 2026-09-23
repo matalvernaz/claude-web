@@ -185,7 +185,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `CLAUDE_WEB_STATE_DIR` | `$HOME/.claude-web` | Where this app keeps usage log, rate-limit cache, persisted runs, and uploads. |
 | `SAFE_TOOLS` | `TodoWrite` | Tools auto-approved without prompting. Comma-separated. |
 | `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
-| `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-4-6`. Unset = no fallback. |
+| `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-5`. A comma-separated list is tried in order, and the primary is retried at the start of each user turn. Unset = no fallback. |
 | `CLAUDE_WEB_MAX_BUDGET_USD` | `0` (off) | Hard per-run API-spend ceiling in USD. Only meaningful for API-key credentials — subscription turns report synthetic costs. |
 | `CLAUDE_WEB_PUSHOVER_TOKEN` / `CLAUDE_WEB_PUSHOVER_USER` | (unset) | When both are set, a Pushover notification fires when a turn finishes after running longer than `CLAUDE_WEB_NOTIFY_MIN_SECONDS` (default `120`) — for the walked-away-during-a-long-turn case the in-page earcons can't cover. |
 | `CLAUDE_WEB_FILE_CHECKPOINTS` | `true` | The CLI snapshots files before edits so `/rewind [n]` can restore them to before your nth-last message (only while the conversation's CLI is alive, and only between turns). Set `false` to skip the snapshot overhead. |
