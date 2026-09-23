@@ -166,7 +166,9 @@ def _spawn_recorder(monkeypatch, fail_attempts: int,
 
 def _spawn_run() -> tuple[SimpleNamespace, list[dict]]:
     events: list[dict] = []
-    return SimpleNamespace(run_id="t-run", emit=events.append), events
+    return SimpleNamespace(
+        run_id="t-run", emit=events.append, advisor=True,
+    ), events
 
 
 async def test_sdk_client_respawns_without_advisor_on_consent_refusal(
@@ -189,6 +191,9 @@ async def test_sdk_client_respawns_without_advisor_on_consent_refusal(
     assert "/model fable" in events[0]["message"]
     # The stale refusal must not be re-reported as a later failure's reason.
     assert stderr_buf == []
+    # The run must stop claiming an advisor the CLI is not running with, or the
+    # checkbox reads "on" over a CLI that has none and re-enabling it no-ops.
+    assert run.advisor is False
 
 
 async def test_sdk_client_keeps_other_extra_args_on_respawn(

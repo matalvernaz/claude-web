@@ -3560,6 +3560,10 @@
       announce(obj.notice || "Switched provider. Prior conversation carried over.");
       markVisibleActivity();
     } else if (obj.type === "advisor_disabled") {
+      // The spawn refused the advisor (usage-credit consent). Clear the
+      // checkbox so it matches the CLI actually running this chat.
+      if (advisorToggle) advisorToggle.checked = false;
+      safeSet(localStorage, ADVISOR_KEY, "");
       // The CLI refused to start with the selected advisor (no usage-credit
       // consent on this account) and the server respawned without it. The turn
       // is running, so this is a notice, not an error — but it has to be spoken:

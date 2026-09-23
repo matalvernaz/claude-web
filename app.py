@@ -11071,6 +11071,10 @@ async def _sdk_client(options: ClaudeAgentOptions, run: "ActiveRun",
     # Drop the first attempt's stderr so a second, unrelated failure can't
     # report the consent line as its reason.
     stderr_buf.clear()
+    # The CLI is about to start without it, so the run must stop claiming it
+    # has one: the checkbox would read "on" over a CLI that has no advisor,
+    # and /api/chat/advisor would then treat re-enabling it as a no-op.
+    run.advisor = False
     run.emit({
         "type": "advisor_disabled",
         "advisor": advisor,
