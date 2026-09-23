@@ -488,92 +488,132 @@ EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 # the selection back and traps AT/keyboard users before they reach the model
 # they wanted. Keeping the spawn-only entries contiguous at the bottom removes
 # every such crossing for the common models.
+#
+# The advisor is NOT a model here. It used to be: every executor/advisor pair
+# was its own entry, so the picker carried the same model twice and adding one
+# advisor doubled the list. It is now an independent on/off (see ADVISOR_MODEL
+# and the "advisor" field on /api/chat), which is also what the CLI models it
+# as -- one flag, switchable mid-session since 2.1.260.
+#
+# "advisor_rank" mirrors the rank the CLI's own model catalog gives each model,
+# and is the highest rank the entry can run at: a split-model entry takes the
+# max of its two halves, because the CLI drops the advisor the moment the run
+# switches to a half that outranks it. None means the catalog gives the model
+# no rank at all, and the CLI then refuses any advisor for it.
 KNOWN_MODELS = [
     # "model" here is never spawned with (an empty key sends no --model at all,
     # so the CLI picks its own default); it names the model the CLI would pick,
     # which is what _model_families_for_key reads to size the entitlement check.
     # Keep it tracking the CLI's `opus` alias — 2.1.280 moved that to Opus 5.5.
     {"key": "", "model": "claude-opus-5-5", "label": "Default", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
     # Opus 5.5 is the CLI's default Opus as of 2.1.280 — 1M context, cheaper than
     # Opus 5 ($4/$20 per Mtok vs $5/$25) and the only model here whose catalog
     # default effort is "medium" rather than "high".
     {"key": "claude-opus-5-5", "model": "claude-opus-5-5", "label": "Opus 5.5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 4},
     {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
     {"key": "claude-fable-5-1", "model": "claude-fable-5-1", "label": "Fable 5.1", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 5},
     {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
     # Split-model entry: "plan_model" runs while the run is in plan mode,
     # "model" the rest of the time (the CLI's opusplan pattern, pointed at
     # Fable). _sync_plan_model drives the swap on plan enter/approve. Switchable
-    # mid-chat (no betas/advisor), so it stays in the top block.
+    # mid-chat (no betas), so it stays in the top block. advisor_rank is 5, the
+    # Fable 5 half, not the Opus 4.8 one: an advisor valid only for Opus 4.8
+    # would be silently dropped the moment the run entered plan mode.
     {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
      "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
-     "efforts": []},
+     "efforts": [], "advisor_rank": 4},
     {"key": "claude-sonnet-5", "model": "claude-sonnet-5", "label": "Sonnet 5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 3},
     # 200K, not 1M: the CLI's model catalog gives Sonnet 4.6 a 200000-token
     # window (only Sonnet 5 went to 1M). The meter and the context-threshold
     # announcements read this number, so an inflated one silences the warning.
     {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 200000, "betas": [],
-     "efforts": []},
+     "efforts": [], "advisor_rank": 2},
     {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
-     "efforts": []},
+     "efforts": [], "advisor_rank": 1},
     # ─── Spawn-only block (kept last; see the module comment above) ───────────
-    # Request betas / an advisor attachment only apply at spawn, so switchKey()
-    # refuses a mid-chat switch across any of these and reverts the picker.
+    # Request betas only apply at spawn, so switchKey() refuses a mid-chat
+    # switch across any of these and reverts the picker. The advisor used to
+    # live here too; it no longer does, because it can now be toggled on a
+    # live CLI.
     {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
-     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": []},
-    # Advisor entries: "advisor_model" attaches the CLI's hidden server-side
-    # advisor tool at spawn (--advisor, verified on 2.1.198) — the main model
-    # consults it on demand and only those consults bill at advisor rates.
-    {"key": "opus-fable-advisor", "model": "claude-opus-4-8",
-     "advisor_model": "claude-fable-5", "label": "Opus 4.8 + Fable 5 advisor",
-     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
-    {"key": "fableplan-advisor", "model": "claude-opus-4-8",
-     "plan_model": "claude-fable-5", "advisor_model": "claude-fable-5",
-     "label": "Fableplan + Fable 5 advisor", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS},
-    # Officially valid pairing per the advisor tool's model-compatibility
-    # table (the advisor must be at least as capable as the executor; Opus 5
-    # accepts Mythos 5 / Fable 5 / Opus 5). Probed working on CLI 2.1.240
-    # with tool_use in the history, 2026-08-22.
-    {"key": "opus5-fable-advisor", "model": "claude-opus-5",
-     "advisor_model": "claude-fable-5", "label": "Opus 5 + Fable 5 advisor",
-     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
-    # Probed working on CLI 2.1.257 with a real advisor_message iteration
-    # served by claude-fable-5-1, 2026-09-01.
-    {"key": "opus5-fable51-advisor", "model": "claude-opus-5",
-     "advisor_model": "claude-fable-5-1", "label": "Opus 5 + Fable 5.1 advisor",
-     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
-    # Opus 5.5 executor. The CLI gates an advisor on advisor_rank: the advisor's
-    # rank must be >= 2 and >= the executor's. Opus 5.5 ranks 4, Fable 5.1 ranks
-    # 5, so the pairing is valid. Probed live on CLI 2.1.280, 2026-09-23.
-    # (Mythos 5 / 5.1 also rank 5 and would pair, but both 404 on this account.)
-    {"key": "opus55-fable51-advisor", "model": "claude-opus-5-5",
-     "advisor_model": "claude-fable-5-1", "label": "Opus 5.5 + Fable 5.1 advisor",
-     "context": 1000000, "betas": [], "efforts": EFFORT_LEVELS},
+     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": [], "advisor_rank": 4},
 ]
+
+# The model claude-web attaches when the advisor is on. The CLI accepts any
+# model whose catalog advisor_rank is both >= 2 and >= the executor's; Fable
+# 5.1 sits at the top rank, so it can advise every model in the picker and
+# there is nothing left to choose between. That is why the advisor is a
+# checkbox and not a second model picker.
+ADVISOR_MODEL = "claude-fable-5-1"
+_ADVISOR_MODEL_RANK = 5
+
+# Picker keys retired when the advisor became its own control. Each mapped to
+# one executor/advisor pair; they still arrive from a browser whose
+# localStorage predates the change, and from run rows already in state.db, so
+# every path that reads a model key resolves them first rather than 400ing.
+# The three that named Fable 5 resolve to the Fable 5.1 advisor: it is the only
+# advisor offered now, and it outranks the one they asked for.
+LEGACY_MODEL_KEYS = {
+    "opus-fable-advisor": ("claude-opus-4-8", True),
+    "fableplan-advisor": ("fableplan", True),
+    "opus5-fable-advisor": ("claude-opus-5", True),
+    "opus5-fable51-advisor": ("claude-opus-5", True),
+    "opus55-fable51-advisor": ("claude-opus-5-5", True),
+}
+
 MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
+
+
+def _form_flag(value: str) -> bool:
+    """Read a checkbox's form value. Absent or empty reads as off."""
+    return (value or "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def model_supports_advisor(model_key: str) -> bool:
+    """Whether ADVISOR_MODEL is a legal advisor for ``model_key``.
+
+    Mirrors the CLI's own gate: the executor must carry a rank at all, and the
+    advisor's rank must be at least the executor's. An unknown key reads as
+    "no advisor" rather than raising, so a stale key can only cost the
+    checkbox, never the turn.
+    """
+    rank = (MODELS_BY_KEY.get(model_key or "") or {}).get("advisor_rank")
+    return rank is not None and rank <= _ADVISOR_MODEL_RANK
+
+
+def resolve_model_key(model_key: str) -> tuple[str, bool]:
+    """Split a picker value into ``(model_key, advisor_on)``.
+
+    Current keys pass through with advisor off; a retired combo key (see
+    LEGACY_MODEL_KEYS) resolves to the executor it named with the advisor on.
+    """
+    legacy = LEGACY_MODEL_KEYS.get(model_key or "")
+    if legacy is None:
+        return (model_key or "", False)
+    return legacy
 
 
 def _models_payload() -> list[dict]:
     """Client-visible slice of KNOWN_MODELS (the index page's models-data tag).
 
-    ``advisor`` rides along so the browser can refuse mid-chat switches
-    across differing advisor attachments the same way it does for betas.
+    ``advisor_ok`` drives whether the advisor checkbox is offered for the
+    entry; ``betas`` still drives the mid-chat switch refusal, which the
+    advisor no longer needs.
     """
     return [
         {"key": m["key"], "label": m["label"], "context": m.get("context"),
          "efforts": m.get("efforts") or [], "betas": m.get("betas") or [],
-         "advisor": m.get("advisor_model") or ""}
+         "advisor_ok": model_supports_advisor(m["key"])}
         for m in KNOWN_MODELS
     ]
 
@@ -615,6 +655,11 @@ async def _providers_payload(
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
             "permission_modes": True, "accounts": True, "usage": True,
+            # The advisor is a Claude-CLI concept; no other provider has one.
+            # A capability rather than a provider-name check in the browser, so
+            # the send path keeps asking what a provider can do rather than
+            # who it is.
+            "advisor": True,
         },
     }
     codex_account = _resolve_codex_account_for_run(
@@ -638,6 +683,7 @@ async def _providers_payload(
             "plan_mode": False, "fork": True, "rewind": False,
             "permission_modes": list(codex_provider.CODEX_PERMISSION_MODES),
             "accounts": True,
+            "advisor": False,
             # The Usage dialog + header cost are Anthropic plan/cost data
             # (today's spend, plan rate limits, 30-day history) — none of it
             # applies to a codex conversation, and the app-server reports no
@@ -6803,22 +6849,21 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
 
 def _in_process_mcp_servers_for_run(
     run: "Optional[ActiveRun]" = None,
-    selected_model: Optional[dict] = None,
     account: Optional[dict] = None,
     cwd: Any = None,
 ) -> dict[str, Any]:
     """Return the dict of in-process MCP servers to merge into a run's options.
 
-    For advisor-combo runs with INPROCESS_ADVISOR on, returns a per-run
-    ``claude_web`` server carrying the transcript-forwarding ``advisor`` tool
-    (the caller also skips the ``--advisor`` CLI flag so the two don't collide).
-    Otherwise falls back to the opt-in ping-only stub. Callable with no args
-    (the /api/mcp status page) — then it only ever yields the stub.
+    When the run has the advisor on and INPROCESS_ADVISOR is set, returns a
+    per-run ``claude_web`` server carrying the transcript-forwarding
+    ``advisor`` tool (the caller also skips the ``--advisor`` CLI flag so the
+    two don't collide). Otherwise falls back to the opt-in ping-only stub.
+    Callable with no args (the /api/mcp status page) — then it only ever
+    yields the stub.
     """
-    if (INPROCESS_ADVISOR and run is not None and selected_model
-            and selected_model.get("advisor_model")):
+    if INPROCESS_ADVISOR and run is not None and run.advisor:
         server = _build_advisor_mcp_server(
-            run, account or {}, cwd, selected_model["advisor_model"],
+            run, account or {}, cwd, ADVISOR_MODEL,
         )
         if server is not None:
             return {"claude_web": server}
@@ -7090,6 +7135,10 @@ class ActiveRun:
         # switches model live via ClaudeSDKClient.set_model() — no respawn,
         # the conversation continues on the new model from the next turn.
         self.model: Optional[str] = None
+        # Whether ADVISOR_MODEL is attached. Set at spawn from the checkbox and
+        # flipped by /api/chat/advisor, which drives the CLI's own /advisor
+        # command rather than respawning. In-memory only, like run.model.
+        self.advisor: bool = False
         self.effort: str = ""
         # SDK model id the CLI is actually running right now (spawn value or
         # last successful set_model). Lets _sync_plan_model skip redundant
@@ -8295,6 +8344,24 @@ async def _confirm_and_emit_user_prompt(
         )
 
 
+async def _await_delivery_quietly(
+    run: ActiveRun, text: str, delivered: asyncio.Future,
+) -> None:
+    """Consume a silent injection's delivery Future.
+
+    Nothing is emitted on success — the caller already told the user what it
+    did. A failure still has to surface, or a command that never reached the
+    CLI would leave the UI claiming a state the CLI is not in.
+    """
+    try:
+        await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+    except Exception:
+        log.warning("silent injection not delivered run=%s text=%r",
+                    run.run_id, text[:60])
+        run.emit({"type": "error",
+                  "message": "That change did not reach Claude. Try again."})
+
+
 async def _inject_user_input(
     run: ActiveRun,
     text: str,
@@ -8302,8 +8369,14 @@ async def _inject_user_input(
     image_count: int,
     file_count: int,
     queue_id: Optional[str] = None,
+    announce: bool = True,
 ) -> Optional[str]:
     """Queue user input for the driver to deliver to the CLI.
+
+    ``announce=False`` enqueues without emitting a ``user_prompt`` event, for
+    text claude-web generated on the user's behalf (a slash command standing in
+    for a control the SDK does not expose). The CLI's own one-line reply still
+    renders, so the transcript keeps a record of what changed.
 
     Returns None when the item was enqueued — a background task will emit
     either ``user_prompt`` (on delivery success) or an ``error`` event with
@@ -8343,7 +8416,7 @@ async def _inject_user_input(
         _confirm_and_emit_user_prompt(
             run, text, image_count, file_count, delivered,
             queue_id=queue_id,
-        )
+        ) if announce else _await_delivery_quietly(run, text, delivered)
     )
     # Log unexpected exceptions instead of letting them surface as the
     # generic "Task exception was never retrieved" warning at GC time.
@@ -9032,12 +9105,15 @@ async def api_account_get(user: dict = Depends(auth.require_user)):
 
 @app.get("/api/account/failover")
 async def api_account_failover_get(
-    model: str = "", user: dict = Depends(auth.require_user),
+    model: str = "", advisor: str = "", user: dict = Depends(auth.require_user),
 ):
     """The failover ring plus, for each slot, why it ranks where it does.
 
-    ``?model=`` scopes the entitlement column to one picked model; without it
-    the column reports only what the cache knows about each slot in general.
+    ``?model=`` scopes the entitlement column to one picked model, and
+    ``?advisor=1`` adds the advisor's own family to that scope — an advisor-on
+    run bills two families, and a slot entitled to only the executor's dies
+    mid-turn rather than at spawn. Without either, the column reports only what
+    the cache knows about each slot in general.
     Every string here is meant to be read aloud — a screen-reader user has to
     be able to tell "Office can't run Fable" from "Office hasn't been checked
     lately" without inspecting a colour or a position.
@@ -9046,7 +9122,7 @@ async def api_account_failover_get(
     settings = _failover_settings(sub)
     ring = _failover_candidates(sub)
     all_slots = ["shared"] + [f"cred:{c['id']}" for c in (_list_user_credentials(sub) if sub else [])]
-    required = _model_families_for_key(model)
+    required = _model_families_for_key(model, _form_flag(advisor))
     gated = _gated_families(all_slots)
     rows = []
     for slot in all_slots:
@@ -11016,6 +11092,7 @@ async def api_chat(
     session_id: str = Form(default=""),
     project: str = Form(default=""),
     model: str = Form(default=""),
+    advisor: str = Form(default=""),
     effort: str = Form(default=""),
     permission_mode: str = Form(default="default"),
     fork: bool = Form(default=False),
@@ -11179,9 +11256,17 @@ async def api_chat(
         if fork and not session_id:
             raise HTTPException(400, "fork requires a session to fork from")
     else:
+        # A retired combo key (Opus 5 + Fable 5.1 advisor, …) still arrives from
+        # a browser whose localStorage predates the split. Resolve it to the
+        # executor it named plus the advisor flag rather than 400ing, which
+        # would have stranded anyone parked on one.
+        model, legacy_advisor = resolve_model_key(model)
+        advisor_on = legacy_advisor or _form_flag(advisor)
         if model and model not in MODELS_BY_KEY:
             raise HTTPException(400, "unknown model")
         selected_model = MODELS_BY_KEY.get(model, {}) if model else {}
+        if advisor_on and not model_supports_advisor(model):
+            raise HTTPException(400, "this model cannot take an advisor")
         # Effort rides the model's semantics: a spawn-time CLI flag, so it
         # applies to fresh spawns and an existing run keeps its level. Validate
         # against the picked variant (the "" key is the explicit default entry)
@@ -11245,7 +11330,7 @@ async def api_chat(
             # sent yet. Claude-only — Codex slots are a separate credential
             # table with their own limits and no comparable usage endpoint.
             chosen_slot, substitution = _select_account_slot(
-                user, account["slot"], model,
+                user, account["slot"], model, advisor_on,
             )
             if substitution is not None:
                 substitution["from_label"] = account["label"]
@@ -11446,6 +11531,7 @@ async def api_chat(
         # rather than only after the model drives EnterPlanMode.
         run.permission_mode = _init_permission_mode
         run.model = model or None
+        run.advisor = bool(advisor_on) if provider == "claude" else False
         run.effort = effort
         run.project_key = _sanitize_project_key(cwd)
         # Canonical conversation linkage (Slice 0, shadow-only — nothing reads
@@ -11772,7 +11858,7 @@ async def api_chat(
         # stays False so the CLI's configured servers continue to load. Run
         # context lets an advisor combo get its per-run in-process advisor tool.
         mcp_servers=_in_process_mcp_servers_for_run(
-            run=run, selected_model=selected_model, account=account, cwd=cwd,
+            run=run, account=account, cwd=cwd,
         ),
         # Partial deltas become transient partial_text SSE frames (typing
         # feel); the durable transcript still comes from whole messages.
@@ -11800,7 +11886,7 @@ async def api_chat(
     if sdk_model:
         options_kwargs["model"] = sdk_model
     run.live_sdk_model = sdk_model or None
-    advisor_model = selected_model.get("advisor_model") or ""
+    advisor_model = ADVISOR_MODEL if (provider == "claude" and advisor_on) else ""
     if advisor_model and not INPROCESS_ADVISOR:
         # Server-side --advisor beta. Only when the in-process replacement is
         # off: the beta disables itself once the transcript carries tool_use
@@ -12781,6 +12867,10 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         "run_id": run.run_id,
         "session_id": run.session_id,
         "project": run.project_key,
+        # The checkbox is restored from this on a rejoin. Without it a reload
+        # showed the browser's last local value, which is a lie whenever the
+        # run was spawned from another tab or the advisor was toggled there.
+        "advisor": run.advisor,
         "buffered_events": len(run.events),
         # Turn state + tail index, mirroring the live_run payload in
         # /api/sessions/{sid}. tryResume seeds its streaming UI from
@@ -13111,8 +13201,8 @@ async def api_chat_set_model(
     1M-context variant) — only a fresh spawn applies betas. The browser
     enforces this: its model picker refuses a mid-chat switch across differing
     betas and tells the user to start a new chat, so this route only ever sees
-    beta-compatible switches. The same guard covers ``advisor_model`` entries
-    — ``--advisor`` only attaches at spawn.
+    beta-compatible switches. The advisor used to need the same guard; it no
+    longer does, because /api/chat/advisor can change it on a live CLI.
     """
     run, client = _live_run_or_400(session_id, user)
     if run.provider == "local":
@@ -13133,6 +13223,10 @@ async def api_chat_set_model(
         run.emit({"type": "model_changed", "model": model, "label": label})
         log.info("codex model set run=%s model=%s", run.run_id, model or "(default)")
         return {"ok": True, "model": model, "label": label}
+    # A retired combo key can still arrive from an old browser; take the
+    # executor it named and leave the advisor alone (this route does not
+    # change it — /api/chat/advisor does).
+    model, _legacy_advisor = resolve_model_key(model)
     if model and model not in MODELS_BY_KEY:
         raise HTTPException(400, f"unknown model {model!r}")
     entry = MODELS_BY_KEY.get(model, {}) if model else {}
@@ -13152,6 +13246,57 @@ async def api_chat_set_model(
     run.emit({"type": "model_changed", "model": model, "label": label})
     log.info("model set run=%s model=%s", run.run_id, model or "(default)")
     return {"ok": True, "model": model, "label": label}
+
+
+@app.post("/api/chat/advisor")
+async def api_chat_set_advisor(
+    session_id: str = Form(...),
+    advisor: str = Form(default=""),
+    user: dict = Depends(auth.require_user),
+):
+    """Attach or detach the advisor on a live conversation.
+
+    The SDK has no control verb for this — ``ClaudeSDKClient`` exposes
+    ``set_model`` and friends but nothing for the advisor — so the switch goes
+    through the CLI's own ``/advisor`` command, which has worked in headless
+    and Agent SDK sessions since CLI 2.1.260. Verified on 2.1.281: the command
+    runs as an ordinary turn costing no API tokens, and a later turn in the
+    same session really does consult the advisor with no ``--advisor`` flag at
+    spawn.
+
+    The command is injected without a ``user_prompt`` event, so the transcript
+    does not show the user typing a slash command they never typed. The CLI's
+    own one-line reply ("Advisor set to Fable 5.1") is left to render: it is
+    the record that the change landed, and suppressing it would mean reaching
+    into the driver loop to swallow a turn, which is the mechanism that wedged
+    conversations in 2026-07 and again in 2026-08.
+    """
+    run, _client = _live_run_or_400(session_id, user)
+    if run.provider != "claude":
+        raise HTTPException(409, "the advisor is only available on Claude")
+    wanted = _form_flag(advisor)
+    if wanted and not model_supports_advisor(run.model or ""):
+        raise HTTPException(400, "this model cannot take an advisor")
+    if wanted == run.advisor:
+        return {"ok": True, "advisor": run.advisor, "unchanged": True}
+    command = f"/advisor {ADVISOR_MODEL}" if wanted else "/advisor off"
+    reason = await _inject_user_input(
+        run, command, [], 0, 0, announce=False,
+    )
+    if reason == "queue_full":
+        raise HTTPException(429, "too many queued messages; try again shortly")
+    if reason is not None:
+        raise HTTPException(409, "this conversation is no longer accepting input")
+    # Optimistic: the command is queued, not yet acknowledged. A delivery
+    # failure emits its own error event (_await_delivery_quietly), and the
+    # worst case is a checkbox one turn ahead of the CLI — not a wrong spawn,
+    # because every later spawn reads the checkbox afresh.
+    run.advisor = wanted
+    run.emit({"type": "advisor_changed", "advisor": wanted,
+              "model": ADVISOR_MODEL if wanted else ""})
+    log.info("advisor %s run=%s model=%s",
+             "on" if wanted else "off", run.run_id, run.model or "(default)")
+    return {"ok": True, "advisor": wanted}
 
 
 @app.post("/api/chat/stop-task")
@@ -13797,7 +13942,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             # everything else the failover ranker uses is inference — so record
             # it against this slot and stop offering it for this model family.
             if run is not None and run.model and not is_local:
-                _note_model_denial(slot, run.model)
+                _note_model_denial(slot, run.model, run.advisor)
             events.append({
                 "type": "error",
                 "message": msg.result,
@@ -13805,7 +13950,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 "account_slot": slot,
             })
             offer = None if is_local else _failover_offer(
-                owner, slot, (run.model if run else "") or "", "model_unavailable")
+                owner, slot, (run.model if run else "") or "", "model_unavailable",
+                bool(run and run.advisor))
             if offer:
                 events.append({"type": "failover_offer", **offer})
         elif msg.is_error and msg.api_error_status == 429 and not is_local:
@@ -13813,7 +13959,7 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             # account that could carry the retry instead of leaving the user to
             # work out which of their slots still has room.
             offer = _failover_offer(owner, slot, (run.model if run else "") or "",
-                                    "plan_limit")
+                                    "plan_limit", bool(run and run.advisor))
             if offer:
                 events.append({"type": "failover_offer", **offer})
         return events
@@ -14084,21 +14230,28 @@ def _normalize_family(name: str) -> str:
     return ""
 
 
-def _model_families_for_key(model_key: str) -> set[str]:
+def _model_families_for_key(model_key: str, advisor: bool = False) -> set[str]:
     """Family tokens a run on ``model_key`` needs its credential to cover.
 
-    The union over ``model``, ``plan_model`` and ``advisor_model``, because all
-    three bill against the credential: `opus5-fable51-advisor` runs Opus but
-    consults Fable mid-turn, so a slot without Fable fails partway through a
-    turn rather than at spawn. Deliberately conservative — it can pass over an
-    account that would have finished this particular turn without ever
-    reaching the advisor, which costs an unnecessary substitution but never a
-    mid-turn death.
+    The union over ``model``, ``plan_model`` and — when ``advisor`` is on —
+    ADVISOR_MODEL, because all of them bill against the credential: an Opus run
+    with the advisor on consults Fable mid-turn, so a slot without Fable fails
+    partway through a turn rather than at spawn. Deliberately conservative — it
+    can pass over an account that would have finished this particular turn
+    without ever reaching the advisor, which costs an unnecessary substitution
+    but never a mid-turn death.
+
+    A retired combo key resolves to its executor plus the advisor, so an old
+    key still asks for the Fable entitlement it always did.
     """
+    model_key, legacy_advisor = resolve_model_key(model_key)
     entry = MODELS_BY_KEY.get(model_key or "") or {}
     families = set()
-    for field in ("model", "plan_model", "advisor_model"):
-        fam = _normalize_family(entry.get(field) or "")
+    sources = [entry.get("model"), entry.get("plan_model")]
+    if advisor or legacy_advisor:
+        sources.append(ADVISOR_MODEL)
+    for field in sources:
+        fam = _normalize_family(field or "")
         if fam:
             families.add(fam)
     return families
@@ -14172,7 +14325,7 @@ def _load_entitlement(slot: str) -> Optional[dict]:
     return entry
 
 
-def _note_model_denial(slot: str, model_key: str) -> None:
+def _note_model_denial(slot: str, model_key: str, advisor: bool = False) -> None:
     """Remember that ``slot`` refused the families ``model_key`` needs.
 
     This is the one hard exclusion in the ranking, and it exists because it is
@@ -14456,7 +14609,7 @@ def _slot_has_credentials(user_sub: Optional[str], slot: str) -> bool:
 
 
 def _select_account_slot(
-    user: dict, requested_slot: str, model_key: str,
+    user: dict, requested_slot: str, model_key: str, advisor: bool = False,
 ) -> tuple[str, Optional[dict]]:
     """Choose the slot to actually spawn on. Returns ``(slot, substitution)``.
 
@@ -14546,7 +14699,8 @@ def _follow_up_handoff_reason(
     ranking first again, which is the drift-back a substitution promises. A
     changed pick is the user's call and moves regardless.
     """
-    chosen, _ = _select_account_slot(user, picked_slot, run.model or "")
+    chosen, _ = _select_account_slot(
+        user, picked_slot, run.model or "", run.advisor)
     if chosen == run.account_slot:
         return None
     if picked_slot != run.requested_account_slot:
@@ -14558,7 +14712,7 @@ def _follow_up_handoff_reason(
     # a fallback. Judge the slot the CLI is actually on by what has been
     # observed about it, never by a sibling merely out-ranking it on inference
     # or ring order.
-    families = _model_families_for_key(run.model or "")
+    families = _model_families_for_key(run.model or "", run.advisor)
     if families & _denied_families(run.account_slot):
         return "model_refused"
     if _slot_health_rank(run.account_slot) >= _HEALTH_PAYABLE:
@@ -14573,6 +14727,7 @@ def _follow_up_handoff_reason(
 
 def _failover_offer(
     user_sub: Optional[str], current_slot: str, model_key: str, reason: str,
+    advisor: bool = False,
 ) -> Optional[dict]:
     """Best slot other than ``current_slot`` to retry this turn on, if any.
 
@@ -14593,7 +14748,7 @@ def _failover_offer(
     ]
     if not candidates:
         return None
-    required = _model_families_for_key(model_key)
+    required = _model_families_for_key(model_key, advisor)
     gated = _gated_families(candidates + [current_slot])
     ring_rank = {slot: i for i, slot in enumerate(ring)}
 

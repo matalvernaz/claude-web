@@ -1,5 +1,12 @@
-"""Advisor wiring: KNOWN_MODELS invariants, _models_payload, and the
-spawn-time fallback for an advisor the account can't consent to."""
+"""Advisor wiring: it is an independent on/off, not a set of model entries.
+
+The advisor used to be baked into KNOWN_MODELS as executor+advisor combo keys,
+which meant the picker carried every executor twice. It is now one flag
+(ADVISOR_MODEL + the "advisor" field on /api/chat), so these tests pin the
+replacement: no entry may reintroduce a per-model advisor, the retired keys
+still resolve, and the entitlement check still knows an advisor-on run bills
+the advisor's family too.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,89 +17,106 @@ import app as app_module
 
 from tests.test_fableplan import _FakeClient, _stub_run
 
-OPUS_ADVISOR = app_module.MODELS_BY_KEY.get("opus-fable-advisor") or {}
-COMBO = app_module.MODELS_BY_KEY.get("fableplan-advisor") or {}
-OPUS5_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable-advisor") or {}
-OPUS5_FABLE51_ADVISOR = app_module.MODELS_BY_KEY.get("opus5-fable51-advisor") or {}
-OPUS55_FABLE51_ADVISOR = app_module.MODELS_BY_KEY.get("opus55-fable51-advisor") or {}
+
+def test_advisor_is_one_model_not_a_set_of_combo_entries() -> None:
+    assert app_module.ADVISOR_MODEL == "claude-fable-5-1"
+    # The advisor must also be pickable as a main model, so "consult Fable"
+    # and "run on Fable" are not two different vocabularies.
+    assert app_module.ADVISOR_MODEL in {
+        m["model"] for m in app_module.KNOWN_MODELS if m["key"]
+    }
 
 
-def test_advisor_entries_exist() -> None:
-    assert OPUS_ADVISOR, "opus-fable-advisor missing from KNOWN_MODELS"
-    assert OPUS_ADVISOR["model"] == "claude-opus-4-8"
-    assert OPUS_ADVISOR["advisor_model"] == "claude-fable-5"
-    assert "plan_model" not in OPUS_ADVISOR
-
-    assert COMBO, "fableplan-advisor missing from KNOWN_MODELS"
-    assert COMBO["model"] == "claude-opus-4-8"
-    assert COMBO["plan_model"] == "claude-fable-5"
-    assert COMBO["advisor_model"] == "claude-fable-5"
+def test_no_entry_carries_its_own_advisor() -> None:
+    # A reintroduced advisor_model would silently win over the checkbox at
+    # spawn and bring the duplicate-entry problem back with it.
+    for m in app_module.KNOWN_MODELS:
+        assert "advisor_model" not in m, m["key"]
 
 
-def test_opus5_advisor_entry_exists() -> None:
-    assert OPUS5_ADVISOR, "opus5-fable-advisor missing from KNOWN_MODELS"
-    assert OPUS5_ADVISOR["model"] == "claude-opus-5"
-    assert OPUS5_ADVISOR["advisor_model"] == "claude-fable-5"
-    assert "plan_model" not in OPUS5_ADVISOR
-    assert OPUS5_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+def test_model_supports_advisor_follows_the_cli_rank_rule() -> None:
+    # The CLI allows an advisor when the executor has a rank at all and the
+    # advisor's rank is at least the executor's. Fable 5.1 is rank 5, the top,
+    # so every ranked model qualifies.
+    for m in app_module.KNOWN_MODELS:
+        rank = m.get("advisor_rank")
+        expected = rank is not None and rank <= app_module._ADVISOR_MODEL_RANK
+        assert app_module.model_supports_advisor(m["key"]) is expected, m["key"]
+    # An unknown key reads as "no advisor" rather than raising.
+    assert app_module.model_supports_advisor("not-a-model") is False
 
 
-def test_opus5_fable51_advisor_entry_exists() -> None:
-    assert OPUS5_FABLE51_ADVISOR, "opus5-fable51-advisor missing from KNOWN_MODELS"
-    assert OPUS5_FABLE51_ADVISOR["model"] == "claude-opus-5"
-    assert OPUS5_FABLE51_ADVISOR["advisor_model"] == "claude-fable-5-1"
-    assert "plan_model" not in OPUS5_FABLE51_ADVISOR
-    assert OPUS5_FABLE51_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+def test_fableplan_rank_is_the_higher_of_its_two_halves() -> None:
+    # The CLI drops the advisor the moment the run switches to a half that
+    # outranks it, and it does so silently — so the entry has to advertise the
+    # stricter of the two, not the model it spends most of its time on.
+    entry = app_module.MODELS_BY_KEY["fableplan"]
+    halves = {entry["model"], entry["plan_model"]}
+    ranks = {
+        m["advisor_rank"] for m in app_module.KNOWN_MODELS
+        if m["key"] and m["model"] in halves and m.get("advisor_rank")
+    }
+    assert entry["advisor_rank"] == max(ranks)
 
 
-def test_opus55_fable51_advisor_entry_exists() -> None:
-    assert OPUS55_FABLE51_ADVISOR, "opus55-fable51-advisor missing from KNOWN_MODELS"
-    assert OPUS55_FABLE51_ADVISOR["model"] == "claude-opus-5-5"
-    assert OPUS55_FABLE51_ADVISOR["advisor_model"] == "claude-fable-5-1"
-    assert "plan_model" not in OPUS55_FABLE51_ADVISOR
-    assert OPUS55_FABLE51_ADVISOR["efforts"] == app_module.EFFORT_LEVELS
+def test_every_retired_combo_key_still_resolves() -> None:
+    # These arrive from a browser whose localStorage predates the split, and
+    # from run rows already in state.db. Dropping one 400s a real user's next
+    # message, so each must land on a live entry with the advisor on.
+    assert app_module.LEGACY_MODEL_KEYS, "the legacy map must not be emptied"
+    for legacy, (target, advisor) in app_module.LEGACY_MODEL_KEYS.items():
+        assert legacy not in app_module.MODELS_BY_KEY, legacy
+        assert target in app_module.MODELS_BY_KEY, legacy
+        assert advisor is True, legacy
+        assert app_module.resolve_model_key(legacy) == (target, True)
+        assert app_module.model_supports_advisor(target), legacy
 
 
-def test_every_advisor_executor_is_separately_switchable() -> None:
-    # An advisor combo is spawn-only, so a user who wants the same executor
-    # without paying for consults needs a plain entry for it. Also guards the
-    # label lookup in _sync_plan_model, which resolves a model id back through
-    # the keyed entries and would fall back to a raw id without one.
-    switchable = {m["model"] for m in app_module.KNOWN_MODELS
-                  if m["key"] and not m.get("advisor_model")}
-    for entry in app_module.KNOWN_MODELS:
-        if entry.get("advisor_model"):
-            assert entry["model"] in switchable, entry["key"]
+def test_current_keys_resolve_to_themselves_with_no_advisor() -> None:
+    for m in app_module.KNOWN_MODELS:
+        assert app_module.resolve_model_key(m["key"]) == (m["key"], False)
 
 
-def test_fable_5_1_switchable_entry() -> None:
-    entry = app_module.MODELS_BY_KEY.get("claude-fable-5-1") or {}
-    assert entry, "claude-fable-5-1 missing from KNOWN_MODELS"
-    assert entry["model"] == "claude-fable-5-1"
-    assert entry["context"] == 1000000
-    assert entry["betas"] == []
-    assert entry["efforts"] == app_module.EFFORT_LEVELS
-    assert "advisor_model" not in entry
-
-
-def test_models_payload_carries_advisor() -> None:
+def test_models_payload_carries_advisor_availability() -> None:
     payload = {m["key"]: m for m in app_module._models_payload()}
-    assert payload["opus-fable-advisor"]["advisor"] == "claude-fable-5"
-    assert payload["fableplan-advisor"]["advisor"] == "claude-fable-5"
-    assert payload["opus5-fable-advisor"]["advisor"] == "claude-fable-5"
-    assert payload["opus55-fable51-advisor"]["advisor"] == "claude-fable-5-1"
-    # Ordinary entries expose an empty advisor so switchKey() compares "" to
-    # "" rather than undefined to a model id.
-    assert payload[""]["advisor"] == ""
-    assert payload["fableplan"]["advisor"] == ""
-    # The pre-advisor fields still ride along for the meter/effort pickers.
+    assert payload[""]["advisor_ok"] is True
+    assert payload["claude-opus-5-5"]["advisor_ok"] is True
+    # The old per-entry advisor id is gone; the browser reads a boolean.
+    assert "advisor" not in payload[""]
     assert payload[""]["betas"] == []
     assert payload[""]["efforts"] == app_module.EFFORT_LEVELS
 
 
-def test_combo_entry_drives_plan_model_swaps() -> None:
+def test_entitlement_families_include_the_advisor_only_when_it_is_on() -> None:
+    # An advisor-on run consults Fable mid-turn, so a slot entitled to only the
+    # executor's family dies partway through a turn rather than at spawn.
+    assert app_module._model_families_for_key("claude-opus-5-5") == {"opus"}
+    assert app_module._model_families_for_key(
+        "claude-opus-5-5", advisor=True) == {"opus", "fable"}
+    # A retired key asks for the Fable entitlement it always did, with no
+    # caller having to know it was a combo.
+    assert app_module._model_families_for_key(
+        "opus55-fable51-advisor") == {"opus", "fable"}
+
+
+def test_fableplan_families_cover_both_halves_and_the_advisor() -> None:
+    assert app_module._model_families_for_key("fableplan") == {"opus", "fable"}
+    assert app_module._model_families_for_key(
+        "fableplan", advisor=True) == {"opus", "fable"}
+
+
+def test_form_flag_reads_a_checkbox() -> None:
+    for on in ("1", "true", "on", "yes", "TRUE"):
+        assert app_module._form_flag(on) is True
+    for off in ("", "0", "false", "off", "no", None):
+        assert app_module._form_flag(off) is False
+
+
+def test_split_model_entry_still_drives_plan_model_swaps() -> None:
+    # Unchanged behaviour, re-pinned on the surviving key: the combo entry this
+    # used to run against no longer exists.
     client = _FakeClient()
-    run = _stub_run("fableplan-advisor", "plan", client)
+    run = _stub_run("fableplan", "plan", client)
 
     asyncio.run(app_module._sync_plan_model(run))
     assert client.calls == ["claude-fable-5"]

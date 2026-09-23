@@ -12,6 +12,8 @@
   const sessionList = document.getElementById("session-list");
   const headerCostEl = document.getElementById("header-cost");
   const modelSelect = document.getElementById("model-select");
+  const advisorToggle = document.getElementById("advisor-toggle");
+  const advisorToggleLabel = document.getElementById("advisor-toggle-label");
   const providerSelect = document.getElementById("provider-select");
   const providerSelectLabel = document.getElementById("provider-select-label");
   const accountSelect = document.getElementById("account-select");
@@ -66,6 +68,19 @@
   function modelKeyFor(provider) {
     return provider === "claude" ? MODEL_KEY : MODEL_KEY + "." + provider;
   }
+  // The advisor is Claude-only, so it needs no per-provider suffix.
+  const ADVISOR_KEY = "claude-web.advisor";
+  // Picker values retired when the advisor became its own checkbox. A browser
+  // that has one saved is migrated in place on load, so the pick survives
+  // instead of silently falling back to Default (the restore below drops any
+  // saved value that is no longer an <option>, with no announcement).
+  const LEGACY_MODEL_KEYS = {
+    "opus-fable-advisor": "claude-opus-4-8",
+    "fableplan-advisor": "fableplan",
+    "opus5-fable-advisor": "claude-opus-5",
+    "opus5-fable51-advisor": "claude-opus-5",
+    "opus55-fable51-advisor": "claude-opus-5-5",
+  };
 
   // One-shot flag armed by /fork: the next send branches the conversation
   // into a new session (server passes fork_session=True) instead of
@@ -159,9 +174,11 @@
   // can't change betas on a live CLI, so a switch across differing betas has to
   // go through a fresh spawn — see the model picker's change handler.
   const MODEL_BETAS = {};
-  // Advisor model attached at spawn (--advisor). Like betas, it can't change
-  // on a live CLI, so switches across differing advisors need a fresh chat.
-  const MODEL_ADVISOR = {};
+  // Whether each model may take the advisor at all. The CLI refuses one for a
+  // model its catalog gives no advisor rank, and every model here currently
+  // qualifies — but the checkbox is hidden rather than offered-and-rejected
+  // for any that does not.
+  const MODEL_ADVISOR_OK = {};
   (() => {
     let data = [];
     const dataEl = document.getElementById("models-data");
@@ -172,14 +189,15 @@
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
       MODEL_BETAS[m.key || ""] = m.betas || [];
-      MODEL_ADVISOR[m.key || ""] = m.advisor || "";
+      MODEL_ADVISOR_OK[m.key || ""] = !!m.advisor_ok;
     }
   })();
-  // Stable comparison key for the spawn-only parts of a model entry (betas +
-  // advisor, order-insensitive). Differing keys = mid-chat switch refused.
+  // Stable comparison key for the spawn-only parts of a model entry — now
+  // just request betas, order-insensitive. Differing keys = mid-chat switch
+  // refused. The advisor used to be part of this; it no longer is, because
+  // /api/chat/advisor changes it on a live CLI.
   function switchKey(modelKey) {
-    const betas = (MODEL_BETAS[modelKey || ""] || []).slice().sort().join(",");
-    return betas + "|" + (MODEL_ADVISOR[modelKey || ""] || "");
+    return (MODEL_BETAS[modelKey || ""] || []).slice().sort().join(",");
   }
   let lastSeenModel = null;
   let lastInputTokens = null;
@@ -558,10 +576,18 @@
 
   // Restore model + effort + project from localStorage so the picks persist across reloads.
   if (modelSelect) {
-    const savedModel = safeGet(localStorage, MODEL_KEY);
+    let savedModel = safeGet(localStorage, MODEL_KEY);
+    if (savedModel !== null && LEGACY_MODEL_KEYS[savedModel]) {
+      // Old combo key: keep the executor it named and turn the advisor on,
+      // which is what that entry meant.
+      safeSet(localStorage, ADVISOR_KEY, "1");
+      savedModel = LEGACY_MODEL_KEYS[savedModel];
+      safeSet(localStorage, MODEL_KEY, savedModel);
+    }
     if (savedModel !== null && [...modelSelect.options].some((o) => o.value === savedModel)) {
       modelSelect.value = savedModel;
     }
+    syncAdvisorControl();
     modelSelect.addEventListener("change", () => {
       const newModel = modelSelect.value;
       // set_model can't change request betas or the advisor on a live CLI. A
@@ -583,6 +609,7 @@
       lastSeenModel = newModel || lastSeenModel;
       renderContextMeter();
       rebuildEffortOptions();
+      syncAdvisorControl();
       // With a live conversation, switch the running CLI's model in place via
       // set_model so it takes effect from the next turn. Without one, the pick
       // rides the next /api/chat spawn (which reads the model field).
@@ -728,11 +755,12 @@
       return {
         plan_mode: false, fork: false, rewind: false,
         permission_modes: ["default"], accounts: false, usage: false,
+        advisor: false,
       };
     }
     return (p && p.capabilities) || {
       plan_mode: true, fork: true, rewind: true,
-      permission_modes: true, accounts: true, usage: true,
+      permission_modes: true, accounts: true, usage: true, advisor: true,
     };
   }
 
@@ -743,7 +771,7 @@
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
       MODEL_BETAS[m.key || ""] = m.betas || [];
-      MODEL_ADVISOR[m.key || ""] = m.advisor || "";
+      MODEL_ADVISOR_OK[m.key || ""] = !!m.advisor_ok;
     }
   }
 
@@ -820,6 +848,57 @@
     lastSeenModel = modelSelect.value || null;
   }
 
+  // Show the advisor checkbox only where it means something: the Claude
+  // provider, and a model the CLI will actually accept an advisor for. Hiding
+  // beats disabling here — a disabled control still lands in the tab order and
+  // reads as "Advisor, checkbox, unavailable", which is a dead end rather than
+  // information.
+  function syncAdvisorControl() {
+    if (!advisorToggle || !advisorToggleLabel) return;
+    const ok = !!providerCapabilities().advisor
+      && !!MODEL_ADVISOR_OK[(modelSelect && modelSelect.value) || ""];
+    advisorToggleLabel.hidden = !ok;
+    // Unchecked while hidden, so a control the user cannot see can never ask
+    // for an advisor. The saved preference is untouched, so moving to a model
+    // that cannot take one and back does not quietly lose the pick.
+    advisorToggle.checked = ok && safeGet(localStorage, ADVISOR_KEY) === "1";
+  }
+
+  // Whether the next spawn should attach the advisor. Reads the control rather
+  // than storage so a hidden checkbox never contributes.
+  function advisorWanted() {
+    return !!(advisorToggle && advisorToggleLabel
+              && !advisorToggleLabel.hidden && advisorToggle.checked);
+  }
+
+  if (advisorToggle) {
+    advisorToggle.addEventListener("change", async () => {
+      const on = advisorToggle.checked;
+      safeSet(localStorage, ADVISOR_KEY, on ? "1" : "");
+      if (!sessionId) {
+        // No live CLI yet: the pick rides the next spawn, which reads the
+        // checkbox. Say so, because nothing else confirms it.
+        announce(on
+          ? "Advisor on. It will be attached when this chat starts."
+          : "Advisor off.");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("advisor", on ? "1" : "");
+      try {
+        const r = await fetch("/api/chat/advisor", { method: "POST", body: fd });
+        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+      } catch (e) {
+        // Put the control back where the CLI actually is, or it would claim a
+        // state no turn will honour.
+        advisorToggle.checked = !on;
+        safeSet(localStorage, ADVISOR_KEY, advisorToggle.checked ? "1" : "");
+        announce("Could not change the advisor. " + e.message);
+      }
+    });
+  }
+
   function rebuildEffortOptions() {
     if (!effortSelect) return;
     const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
@@ -882,6 +961,7 @@
     if (promptEl) promptEl.placeholder = "Ask " + assistantLabel(provider) + "…";
     rebuildModelOptions(provider);
     rebuildEffortOptions();
+    syncAdvisorControl();
     renderContextMeter();
   }
 
@@ -1489,6 +1569,7 @@
         modelSelect.value = data.model;
         lastSeenModel = data.model;
         rebuildEffortOptions();
+        syncAdvisorControl();
         if (effortSelect && data.effort && !modelAvailable) {
           const option = document.createElement("option");
           option.value = data.effort;
@@ -2556,6 +2637,13 @@
       fd.append("provider", provider);
       const model = retrySelection ? retrySelection.model : modelSelect && modelSelect.value;
       if (model) fd.append("model", model);
+      // Spawn-time advisor. A retry reuses whatever that turn ran with rather
+      // than whatever the header says now.
+      const wantAdvisor = retrySelection
+        ? !!retrySelection.advisor : advisorWanted();
+      if (wantAdvisor && providerCapabilities(provider).advisor) {
+        fd.append("advisor", "1");
+      }
       // Both backends resolve their advertised permission-mode subset
       // server-side. Include the persisted picker value on the first turn so
       // Codex does not silently start in "default" while displaying bypass.
@@ -2873,6 +2961,12 @@
       return false;
     }
     if (info.project) sessionProject = info.project;
+    // The run is the authority on the advisor, not this tab's localStorage:
+    // the run may have been spawned elsewhere, or toggled from another tab.
+    if (advisorToggle && typeof info.advisor === "boolean") {
+      advisorToggle.checked = info.advisor;
+      safeSet(localStorage, ADVISOR_KEY, info.advisor ? "1" : "");
+    }
     // Incremental resume: if we still hold this run's high-watermark (the
     // highest _idx already rendered), resume from watermark+1 and keep the
     // transcript/queue/watermark — we append only what we missed while
@@ -3441,6 +3535,15 @@
         syncEffortVisibility();
       }
       announce(`Model switched to ${obj.label || "default"} for the rest of this conversation.`);
+      markVisibleActivity();
+    } else if (obj.type === "advisor_changed") {
+      // Server queued the CLI's own /advisor command. Align the checkbox and
+      // say what changed; the CLI's one-line reply lands in the transcript
+      // right after, so this announcement is the fast signal, not the record.
+      if (advisorToggle) advisorToggle.checked = !!obj.advisor;
+      announce(obj.advisor
+        ? "Advisor on. Claude can consult it from your next message."
+        : "Advisor off.");
       markVisibleActivity();
     } else if (obj.type === "provider_switched") {
       // The server carried this conversation into the other provider: the old
