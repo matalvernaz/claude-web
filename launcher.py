@@ -609,6 +609,25 @@ def _run(argv: list[str] | None) -> int:
     )
 
 
+def _utf8_output() -> None:
+    """Stop non-ASCII output from killing the launcher on Windows.
+
+    A real Windows console takes Unicode, but redirected output (a pipe, a
+    log file, CI) falls back to the ANSI code page, and cp1252 can't encode
+    the first-run banner's box-drawing rule: the binary died at startup with
+    UnicodeEncodeError before serving a single page. The windowed build has
+    no streams at all, hence the getattr.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """Wrap `_run` so a startup crash is *visible* instead of vanishing.
 
@@ -619,6 +638,7 @@ def main(argv: list[str] | None = None) -> int:
     still-attached console, and pause on input() so the user can read
     the traceback before the window closes.
     """
+    _utf8_output()
     try:
         return _run(argv)
     except SystemExit:

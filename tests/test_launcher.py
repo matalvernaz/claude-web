@@ -243,3 +243,28 @@ def test_is_loopback_host_true(host) -> None:
 def test_is_loopback_host_false(host) -> None:
     import launcher
     assert launcher._is_loopback_host(host) is False
+
+
+def test_first_run_banner_survives_a_cp1252_pipe(launcher, monkeypatch) -> None:
+    """Windows falls back to the ANSI code page when output is redirected,
+    and the banner's box-drawing rule used to kill the binary at startup
+    with UnicodeEncodeError (caught by the release smoke test in CI)."""
+    import io
+
+    raw = io.BytesIO()
+    pipe = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", pipe)
+    with pytest.raises(UnicodeEncodeError):
+        launcher._print_first_run_banner("127.0.0.1", 3001, launcher.UI_HEADLESS)
+
+    launcher._utf8_output()
+    launcher._print_first_run_banner("127.0.0.1", 3001, launcher.UI_HEADLESS)
+    pipe.flush()
+    assert "first-run bootstrap" in raw.getvalue().decode("utf-8")
+
+
+def test_utf8_output_tolerates_missing_streams(launcher, monkeypatch) -> None:
+    # The windowed build runs with no console, so sys.stdout is None.
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    launcher._utf8_output()
