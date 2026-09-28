@@ -20,13 +20,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Python ${{ matrix.python-version }}
         # setup-python's built-in `cache: pip` handles the per-OS cache
         # path (~/.cache/pip on Linux, ~/Library/Caches/pip on macOS,
         # %LOCALAPPDATA%\pip\Cache on Windows) so we don't have to fan a
         # matrix variable through actions/cache.
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip

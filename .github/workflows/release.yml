@@ -37,13 +37,13 @@ jobs:
             target: linux-x64
             archive_ext: tar.gz
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
         # 3.13 is the highest version covered by the CI matrix; pin one
         # to keep the frozen bundle's interpreter version deterministic
         # across releases.
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -120,7 +120,7 @@ jobs:
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: claude-web-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -136,11 +136,11 @@ jobs:
     # artifacts are still uploadable from the build job's artifact list).
     if: github.event_name == 'push'
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Glob across the three platform artifact folders.
           files: artifacts/**/*
