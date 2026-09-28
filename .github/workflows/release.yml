@@ -105,12 +105,13 @@ jobs:
         shell: bash
         run: |
           cli=dist/claude-web/_internal/claude_agent_sdk/_bundled/claude
-          if [ -s "$cli" ] || [ -s "$cli.exe" ]; then
-            ls -l "$cli"*
-          else
+          [ -s "$cli.exe" ] && cli="$cli.exe"
+          if [ ! -s "$cli" ]; then
             echo "::error::claude_agent_sdk's bundled CLI is missing from the bundle"
             exit 1
           fi
+          ls -l "$cli"
+          "$cli" --version
 
       - name: Drop .env.example next to the binary
         # PyInstaller's onedir mode buries `datas` under `_internal/`,
@@ -138,6 +139,51 @@ jobs:
           archive="claude-web-${{ steps.tag.outputs.name }}-${{ matrix.target }}.tar.gz"
           tar -C dist -czf "$archive" claude-web
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Smoke-test the binary on a machine with no claude installed
+        # Boots the built app the way a first-time user does and checks it
+        # finds its bundled CLI and can start a sign-in with it. v0.4.0's
+        # Windows binary carried the CLI, but sign-in looked on PATH alone
+        # and failed with "claude CLI not found on PATH". Runs after
+        # packaging so the logs the app writes beside itself stay out of
+        # the archive.
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          if command -v claude >/dev/null 2>&1; then
+            echo "::error::this runner has a claude on PATH; the smoke test needs a machine without one"
+            exit 1
+          fi
+          exe=dist/claude-web/claude-web
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          base=http://127.0.0.1:38471
+          "$exe" --headless --port 38471 > smoke.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 90); do
+            curl -sf "$base/healthz" >/dev/null && break
+            sleep 1
+          done
+          curl -sf "$base/api/claude-cli/status" > cli-status.json || true
+          curl -sf -X POST -H "Content-Type: application/json" -H "Origin: $base" \
+            -d '{"variant":"claudeai"}' "$base/api/setup/oauth/start" > sign-in.json || true
+          curl -s -X POST -H "Origin: $base" "$base/api/setup/oauth/cancel" >/dev/null || true
+          kill "$pid" 2>/dev/null || true
+          cat smoke.log
+          python - <<'PY'
+          import json, sys
+
+          def load(name):
+              try:
+                  return json.load(open(name))
+              except Exception as exc:
+                  return {"error": f"{name}: {exc}"}
+
+          status, sign_in = load("cli-status.json"), load("sign-in.json")
+          print("cli:", status.get("cli_source"), status.get("cli_path"), status.get("error") or "")
+          print("sign-in:", sign_in.get("status"), sign_in.get("error") or "")
+          ok = status.get("cli_source") == "bundled" and sign_in.get("status") == "awaiting_code"
+          sys.exit(0 if ok else 1)
+          PY
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

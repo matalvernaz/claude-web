@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 import threading
 import time
@@ -49,6 +48,8 @@ import webbrowser
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
+
+import claude_cli
 
 
 # The three UI modes are mutually exclusive. The launcher resolves which
@@ -169,23 +170,35 @@ def _print_first_run_banner(host: str, port: int, ui_mode: str) -> None:
 
 
 def _check_claude_cli() -> None:
-    """Warn loudly if the `claude` CLI isn't on PATH.
+    """Say at startup which `claude` CLI will run, and warn if none will.
 
-    The Anthropic Agent SDK shells out to the bundled Node CLI for every
-    model interaction; without it the user can sign into Claude on the
-    /setup page but every subsequent chat turn will fail with an opaque
-    "claude not found" error from the SDK. Better to surface this once,
-    visibly, at startup. Doesn't block — the user may install it
-    afterwards or use the binary purely as a viewer.
+    Sign-in and every chat turn shell out to the CLI. The binary carries
+    the copy bundled in the Agent SDK, so an installed CLI is optional; it
+    is still worth installing because the bundled copy never updates. The
+    install advice is the native installer, not npm: on Windows npm gives
+    a claude.cmd shim the SDK refuses to run. Doesn't block.
     """
-    if shutil.which("claude") is not None or shutil.which("claude.cmd") is not None:
+    _path, source = claude_cli.find()
+    if source == claude_cli.SYSTEM:
         return
+    install = "    " + claude_cli.install_instructions() + "\n"
+    if source == claude_cli.BUNDLED:
+        print(
+            "\nUsing the Claude Code CLI bundled with claude-web. It doesn't\n"
+            "  update itself; to stay current, install Claude Code:\n"
+            + install,
+            flush=True,
+        )
+        return
+    found = (
+        "  Only npm's claude.cmd was found, which can't be run on Windows.\n"
+        if source == claude_cli.SHIM else ""
+    )
     print(
-        "\nWarning: the `claude` CLI was not found on PATH.\n"
-        "  claude-web relies on @anthropic-ai/claude-code (the Node CLI)\n"
-        "  for every model interaction. Install Node.js, then:\n"
-        "    npm install -g @anthropic-ai/claude-code\n"
-        "  Chat turns will fail until that's done.\n",
+        "\nWarning: no usable `claude` CLI was found.\n"
+        + found
+        + "  Signing in and chatting both need it. Install Claude Code:\n"
+        + install,
         flush=True,
     )
 

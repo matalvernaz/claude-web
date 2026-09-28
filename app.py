@@ -68,6 +68,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
+import claude_cli
 import codex_provider
 import local_provider
 import conversation_replay
@@ -82,8 +83,8 @@ log = logging.getLogger("claude-web")
 # almost everything is `pathlib` and `subprocess`, both portable — but
 # three pieces need it: `os.chmod(fd, mode)` is unsupported, `os.symlink`
 # needs Developer Mode/admin (we fall back to junctions + hardlinks), and
-# the bundled `claude` CLI is `claude.cmd` on PATH (resolved via
-# ``shutil.which`` rather than passed bare to subprocess_exec).
+# npm's `claude.cmd` shim can't be spawned (claude_cli.py skips it for a
+# native claude.exe or the SDK's bundled one).
 IS_WINDOWS = os.name == "nt"
 
 
@@ -6059,7 +6060,7 @@ def _claude_cli_version() -> str:
     global _CLAUDE_CLI_VERSION
     if _CLAUDE_CLI_VERSION is None:
         _CLAUDE_CLI_VERSION = "unknown"
-        binary = shutil.which("claude")
+        binary = claude_cli.resolve()
         if binary:
             try:
                 out = subprocess.run(
@@ -6078,7 +6079,7 @@ def _run_forge_probe() -> bool:
     checks the nonce comes back. A switch into Claude only uses the forged-resume
     path when this passes; otherwise it injects the handoff as the first message.
     Any error → False (fall back), never raises."""
-    binary = shutil.which("claude")
+    binary = claude_cli.resolve()
     if not binary:
         return False
     nonce = "PROBE-" + uuid_mod.uuid4().hex[:10]
@@ -6618,9 +6619,9 @@ def _list_cli_mcp_servers(timeout_seconds: float = 15.0) -> dict[str, Any]:
     ``connected`` (bool) / ``transport`` (best-effort heuristic from the
     address string).
     """
-    cli = shutil.which("claude")
+    cli = claude_cli.resolve()
     if not cli:
-        return {"servers": [], "error": "claude CLI not on PATH"}
+        return {"servers": [], "error": "claude CLI not found"}
     try:
         proc = subprocess.run(
             [cli, "mcp", "list"], capture_output=True, text=True,
@@ -6780,7 +6781,7 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
             mcp_servers={},
             permission_mode="plan",
             env=_scrubbed_child_env(account.get("env")),
-            cli_path=shutil.which("claude"),
+            cli_path=claude_cli.resolve(),
         )
         chunks: list[str] = []
         # The installed SDK builds its error text from `errors` alone, falling
@@ -7887,8 +7888,8 @@ def _notify_turn_complete(run: "ActiveRun") -> None:
 # Every claude spawn on this install is headless (SDK stream-json), and Claude
 # Code's built-in auto-updater only runs in interactive TUI sessions — so the
 # CLI silently rots until someone remembers `claude update` (2.1.218 sat stale
-# for a month while upstream fixed the Fable advisor). Both spawn sites resolve
-# cli_path=shutil.which("claude") per spawn and the native installer swaps a
+# for a month while upstream fixed the Fable advisor). Every spawn resolves
+# claude_cli.resolve() per spawn and the native installer swaps a
 # symlink between versioned files, so an update reaches every NEW run with no
 # service restart; in-flight runs keep the version file they already hold open.
 CLI_AUTOUPDATE = os.getenv("CLAUDE_WEB_CLI_AUTOUPDATE", "true").lower() in (
@@ -7942,6 +7943,8 @@ async def _run_cli_update(source: str) -> dict:
     A version change is detected by diffing ``--version`` around the run, so
     a nonzero installer exit with a swapped symlink still counts as updated.
     """
+    # PATH only, not claude_cli.resolve(): the SDK's bundled copy is part of
+    # the install and must never be "updated" in place.
     cli = shutil.which("claude")
     if not cli:
         CLI_UPDATE_STATE.update(
@@ -11894,9 +11897,9 @@ async def api_chat(
         # pinning every run to the CLI version the SDK shipped with —
         # spawn-time flags newer than that snapshot (e.g. --advisor) then
         # die with "unknown option". Prefer the system CLI, which
-        # auto-updates; None falls back to the bundle for installs
-        # without one.
-        cli_path=shutil.which("claude"),
+        # auto-updates; claude_cli falls back to the bundle for installs
+        # without one (and on Windows, past npm's unrunnable claude.cmd).
+        cli_path=claude_cli.resolve(),
     )
     sdk_model = selected_model.get("model") or ""
     if selected_model.get("plan_model") and _init_permission_mode == "plan":
@@ -15823,8 +15826,8 @@ async def api_setup_signout(user: dict = Depends(auth.require_user)):
 
 
 # ─── claude CLI presence + one-click install ────────────────────────────────
-# The frozen desktop binary can boot without the `claude` Node CLI on PATH;
-# the Agent SDK then fails every chat turn with an opaque error. launcher.py's
+# A source install can boot with no `claude` CLI at all; the desktop binary
+# carries the SDK's bundled copy, which claude_cli.find() counts. launcher.py's
 # _check_claude_cli() prints a console warning, but the windowed binary buries
 # it behind the webview. These endpoints surface the missing-CLI state in the
 # UI and offer a one-click install — the npm package directly when Node is
@@ -15867,8 +15870,13 @@ def _claude_cli_status() -> dict:
         node_installer = "brew" if shutil.which("brew") else None
     else:
         node_installer = None
+    cli_path, cli_source = claude_cli.find()
     return {
-        "cli_present": _which_cli("claude", "claude.cmd") is not None,
+        # The Node hint dirs cover an npm install that finished after this
+        # process's PATH was read.
+        "cli_present": cli_path is not None or _which_cli("claude", "claude.cmd") is not None,
+        "cli_path": cli_path,
+        "cli_source": cli_source,
         "npm_present": _which_cli("npm", "npm.cmd") is not None,
         "node_present": _which_cli("node", "node.exe") is not None,
         "platform": system,

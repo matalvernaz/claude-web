@@ -25,11 +25,12 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
+
+import claude_cli
 
 
 # os.chmod on a file descriptor needs os.fchmod, which doesn't exist on
@@ -39,17 +40,16 @@ _FCHMOD_SUPPORTED = "fchmod" in dir(os)
 
 
 def _resolve_claude_cli() -> str:
-    """Locate the bundled `claude` CLI for ``create_subprocess_exec``.
+    """Locate the `claude` CLI for ``create_subprocess_exec``.
 
-    On POSIX the bare name ``"claude"`` resolves through ``$PATH`` fine.
-    On Windows it's installed as ``claude.cmd`` and Python's
-    ``asyncio.create_subprocess_exec`` doesn't follow PATHEXT — pass it
-    ``"claude"`` and it raises FileNotFoundError. ``shutil.which`` does
-    walk PATHEXT, so use whatever it returns; fall back to the bare name
-    so the existing ``FileNotFoundError`` handlers fire if the CLI really
-    isn't installed.
+    claude_cli.resolve() picks the installed CLI, else the copy bundled in
+    the Agent SDK, which is all a desktop-binary user may have; sign-in used
+    to look on PATH alone and fail there. A full path also sidesteps
+    ``create_subprocess_exec`` not following PATHEXT on Windows. Fall back to
+    the bare name so the existing ``FileNotFoundError`` handlers fire if
+    there is no CLI at all.
     """
-    return shutil.which("claude") or "claude"
+    return claude_cli.resolve() or "claude"
 
 
 log = logging.getLogger(__name__)
@@ -252,7 +252,7 @@ async def sign_out(home: Optional[Path] = None) -> None:
             log.warning("claude auth logout timed out; killing")
             await _kill_and_reap(proc)
     except FileNotFoundError:
-        log.warning("claude CLI not on PATH; skipping logout subprocess")
+        log.warning("claude CLI not found; skipping logout subprocess")
     except Exception as e:
         log.warning("claude auth logout failed: %r", e)
         if proc is not None:
@@ -338,7 +338,7 @@ async def _drive(state: OAuthFlowState) -> None:
             )
         except FileNotFoundError:
             state.status = "failed"
-            state.error = "claude CLI not found on PATH"
+            state.error = "claude CLI not found"
             return
         state.proc = proc
         assert proc.stdout is not None and proc.stdin is not None
