@@ -67,10 +67,17 @@ jobs:
       - name: Install runtime + PyInstaller
         # bash is uniform across all three runners; PowerShell would
         # otherwise parse `>=6.10` as a redirection.
+        #
+        # --only-binary for the SDK: its wheels carry the bundled Claude CLI
+        # the app falls back to when claude isn't on PATH, and its sdist
+        # doesn't. 0.2.160 published no Windows wheel (it outgrew PyPI's
+        # per-file limit), so pip built the sdist and the Windows bundle
+        # shipped without a CLI. Wheel-only picks the newest release that
+        # has one for each platform.
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --only-binary claude-agent-sdk -r requirements.txt
           pip install -r requirements-desktop.txt
           pip install "pyinstaller>=6.10"
 
@@ -91,6 +98,19 @@ jobs:
         # --clean wipes prior build caches so a stale hook doesn't
         # silently pin an old hidden-import list across releases.
         run: pyinstaller --clean --noconfirm claude_web.spec
+
+      - name: Check the bundled Claude CLI made it in
+        # Without it, a user with no system claude install can't run a
+        # single chat turn, and nothing else in the build would notice.
+        shell: bash
+        run: |
+          cli=dist/claude-web/_internal/claude_agent_sdk/_bundled/claude
+          if [ -s "$cli" ] || [ -s "$cli.exe" ]; then
+            ls -l "$cli"*
+          else
+            echo "::error::claude_agent_sdk's bundled CLI is missing from the bundle"
+            exit 1
+          fi
 
       - name: Drop .env.example next to the binary
         # PyInstaller's onedir mode buries `datas` under `_internal/`,
