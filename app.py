@@ -726,7 +726,7 @@ async def _providers_payload(
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
             "permission_modes": list(local_provider.PERMISSION_MODES),
-            "accounts": False, "usage": False,
+            "accounts": False, "usage": False, "advisor": False,
         },
     }
     return [claude_entry, codex_entry, local_entry]
@@ -9945,15 +9945,31 @@ def _supersede_run(run: ActiveRun, reason: str) -> None:
 
 
 async def _supersede_run_for_switch(run: ActiveRun, reason: str) -> None:
-    """Stop a run at a clean boundary before replacing its credential.
+    """Stop a run at a clean boundary before resuming its transcript.
 
     Codex account processes share rollout files. A mid-turn handoff must
     interrupt the old writer and wait for its driver to release the loaded
-    thread before another process resumes it.
+    thread before another process resumes it. Local settings changes likewise
+    resume the same JSONL and must wait for SDK teardown to finish.
     """
     task = run.task
     run.accepting_input = False
     run.superseded_reason = reason
+    if run.provider == "local":
+        if task is not None:
+            # A racing follow-up can find this run while its SDK is closing.
+            # Cancelling it again would abort that cleanup. Shield it from
+            # request cancellation too, while preserving the caller's cancel.
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+            except Exception:
+                pass
+        return
     interrupted = False
     if run.provider == "codex" and run.client is not None:
         try:
@@ -11925,6 +11941,10 @@ async def api_chat(
     options_kwargs["env"] = _scrubbed_child_env({
         **account["env"], **options_kwargs.get("env", {}),
     })
+    if provider == "local":
+        # Loaded settings.env overrides the inherited subprocess environment.
+        # Keep local routing and thinking controls authoritative in both layers.
+        options_kwargs["settings"] = json.dumps({"env": options_kwargs["env"]})
     if swap_respawn or fork:
         # Personality / credential toggles cancelled an in-flight run (or
         # the user explicitly asked to branch via the fork field). Fork

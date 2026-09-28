@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
@@ -10,7 +11,11 @@ from urllib.parse import urlparse
 import pytest
 from jinja2 import Environment, FileSystemLoader
 
-playwright = pytest.importorskip("playwright.sync_api")
+REQUIRE_BROWSER = os.environ.get("CLAUDE_WEB_REQUIRE_BROWSER") == "1"
+if REQUIRE_BROWSER:
+    import playwright.sync_api as playwright
+else:
+    playwright = pytest.importorskip("playwright.sync_api")
 ROOT = Path(__file__).resolve().parents[1]
 CLOUD_CAPS = {"accounts": True, "usage": True, "permission_modes": True}
 LOCAL_CAPS = {
@@ -33,6 +38,8 @@ def browser():
         try:
             instance = manager.chromium.launch()
         except playwright.Error as exc:
+            if REQUIRE_BROWSER:
+                pytest.fail(f"Playwright Chromium required: {exc}")
             pytest.skip(f"Playwright Chromium unavailable: {exc}")
         yield instance
         instance.close()
@@ -55,6 +62,7 @@ def ui(browser):
         "session": {"provider": "local", "model": "gpt-oss:20b", "effort": "high",
                     "messages": [{"role": "user", "text": "Saved conversation"}]},
         "posts": [], "initial_local": False, "providers_error": False,
+        "providers_pending": False, "pending_routes": [],
     }
     html = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("index.html").render(
         site_title="Test chat", asset_version=lambda _: "test", models=[cloud_model],
@@ -95,7 +103,12 @@ def ui(browser):
             asset = ROOT / path.lstrip("/")
             request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
         elif path == "/api/providers":
-            request_route.fulfill(status=503 if state["providers_error"] else 200, json=state["providers"])
+            if state["providers_pending"]:
+                state["pending_routes"].append(request_route)
+            elif state["providers_error"] == "network":
+                request_route.abort()
+            else:
+                request_route.fulfill(status=503 if state["providers_error"] else 200, json=state["providers"])
         elif path == "/api/sessions/saved":
             request_route.fulfill(json=state["session"])
         elif path == "/api/sessions":
@@ -145,6 +158,150 @@ def test_local_boot_and_keyboard_effort_follow_model_capabilities(ui):
     playwright.expect(page.locator("#show-usage")).to_be_visible()
     playwright.expect(page.locator("#account-select")).to_be_visible()
     assert state["posts"] == []
+
+
+@pytest.mark.parametrize("availability", ["offline", "unconfigured", "http_error", "network"])
+def test_saved_local_unavailable_never_falls_back_to_cloud(ui, availability):
+    page, state = ui
+    if availability == "offline":
+        state["providers"]["providers"][1].update(available=False, models=[])
+    elif availability == "unconfigured":
+        state["providers"]["providers"] = state["providers"]["providers"][:1]
+    else:
+        state["providers_error"] = availability
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'local')")
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#provider-select")).to_have_value("local")
+    playwright.expect(page.locator("#provider-select")).to_be_visible()
+    playwright.expect(page.locator("#provider-status")).to_contain_text("Local is unavailable")
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    assert_local_controls(page)
+    page.locator("#prompt").fill("Keep this message local")
+    page.locator("#prompt").press("Enter")
+    playwright.expect(page.locator("#prompt")).to_have_value("Keep this message local")
+    assert state["posts"] == []
+    assert page.evaluate("localStorage.getItem('claude-web.provider')") == "local"
+    page.locator("#new-chat").click()
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    page.locator("#provider-select").select_option("claude")
+    playwright.expect(page.locator("#provider-status")).to_be_hidden()
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    playwright.expect(page.locator("#model-select")).to_have_value("claude-test")
+    page.locator("#prompt").fill("Use Claude explicitly")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    assert state["posts"][0][1]["provider"] == "claude"
+
+
+@pytest.mark.parametrize("switch_to_cloud", [False, True])
+@pytest.mark.parametrize("discovery_fails", [False, True])
+def test_pending_discovery_blocks_keyboard_submit_and_preserves_choice(ui, switch_to_cloud, discovery_fails):
+    page, state = ui
+    state["providers_pending"] = True
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'local')")
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#provider-select")).to_have_value("local")
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    playwright.expect(page.locator("#provider-status")).to_contain_text("Checking")
+    page.locator("#prompt").fill("Wait for my selected provider")
+    page.locator("#prompt").press("Enter")
+    playwright.expect(page.locator("#prompt")).to_have_value("Wait for my selected provider")
+    assert state["posts"] == []
+    if switch_to_cloud:
+        page.locator("#provider-select").select_option("claude")
+    assert state["pending_routes"]
+    for route in state["pending_routes"]:
+        route.fulfill(status=503 if discovery_fails else 200, json=state["providers"])
+    expected_provider = "claude" if switch_to_cloud else "local"
+    playwright.expect(page.locator("#provider-select")).to_have_value(expected_provider)
+    if discovery_fails and not switch_to_cloud:
+        playwright.expect(page.locator("#send")).to_be_disabled()
+        playwright.expect(page.locator("#provider-status")).to_contain_text("Local is unavailable")
+        assert state["posts"] == []
+    else:
+        playwright.expect(page.locator("#send")).to_be_enabled()
+        with page.expect_response("**/api/chat"):
+            page.locator("#prompt").press("Enter")
+        assert state["posts"][0][1]["provider"] == expected_provider
+        if not switch_to_cloud:
+            assert "account_slot" not in state["posts"][0][1]
+
+
+@pytest.mark.parametrize("pending", ["providers", "session"])
+def test_session_submit_waits_for_provider_and_saved_settings(ui, pending):
+    page, state = ui
+    session_routes = []
+    if pending == "providers":
+        state["providers_pending"] = True
+    else:
+        page.route("**/api/sessions/saved", lambda route: session_routes.append(route))
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    page.locator("#prompt").fill("Continue the saved local conversation")
+    page.locator("#prompt").press("Enter")
+    playwright.expect(page.locator("#prompt")).to_have_value("Continue the saved local conversation")
+    assert state["posts"] == []
+    routes = state["pending_routes"] if pending == "providers" else session_routes
+    assert routes
+    for route in routes:
+        route.fulfill(json=state["providers"] if pending == "providers" else state["session"])
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    playwright.expect(page.locator("#provider-select")).to_have_value("local")
+    playwright.expect(page.locator("#model-select")).to_have_value("gpt-oss:20b")
+    playwright.expect(page.locator("#local-effort-range")).to_have_attribute("aria-valuetext", "high")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    fields = state["posts"][0][1]
+    assert (fields["provider"], fields["model"], fields["effort"]) == ("local", "gpt-oss:20b", "high")
+    assert fields["session_id"] == "saved"
+    assert "account_slot" not in fields
+
+
+@pytest.mark.parametrize("pending", ["session", "providers", "codex_account", "session_error"])
+def test_new_local_chat_survives_abandoned_cloud_session_load(ui, pending):
+    page, state = ui
+    state["session"].update(provider="claude", model="claude-test")
+    routes = []
+    if pending == "providers":
+        state["providers_pending"] = True
+        routes = state["pending_routes"]
+    elif pending == "codex_account":
+        state["session"].update(provider="codex", account_slot="cred:1")
+        state["providers"]["providers"].append({
+            "key": "codex", "label": "Codex", "available": True,
+            "models": [{"key": "codex-test"}], "capabilities": CLOUD_CAPS,
+        })
+        page.route("**/api/providers?codex_account_slot=*", lambda route: routes.append(route))
+    else:
+        page.route("**/api/sessions/saved", lambda route: routes.append(route))
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'local')")
+    pending_url = {
+        "providers": "**/api/providers",
+        "codex_account": "**/api/providers?codex_account_slot=*",
+    }.get(pending, "**/api/sessions/saved")
+    with page.expect_request(pending_url):
+        page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    assert routes
+    page.locator("#new-chat").click()
+    page.locator("#provider-select").select_option("local")
+    payload = state["providers"] if pending in ("providers", "codex_account") else state["session"]
+    for route in routes:
+        route.fulfill(status=503 if pending == "session_error" else 200, json=payload)
+    # All mocked boot requests are now complete, including the abandoned load.
+    page.wait_for_load_state("networkidle")
+    playwright.expect(page.locator("#provider-select")).to_have_value("local")
+    playwright.expect(page.locator("#transcript")).to_be_empty()
+    playwright.expect(page.locator("#status")).not_to_contain_text("Could not load session")
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    page.locator("#prompt").fill("Start a new Local conversation")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    fields = state["posts"][0][1]
+    assert fields["provider"] == "local"
+    assert not fields.get("session_id")
+    assert "account_slot" not in fields
 
 
 @pytest.mark.parametrize("source,target", [("local", "claude"), ("claude", "local")])

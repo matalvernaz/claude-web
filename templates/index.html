@@ -211,7 +211,7 @@
           <div id="attachments" class="attachments" role="group" hidden aria-label="Attached images"></div>
           <div id="file-attachments" class="attachments file-attachments" hidden aria-label="Attached files"></div>
           <div class="row">
-            <button type="submit" id="send">Send</button>
+            <button type="submit" id="send" aria-describedby="provider-status" disabled>Send</button>
             <button type="button" id="stop" hidden>Stop</button>
             <label class="image-btn" for="attach-input">
               <span aria-hidden="true">📎</span> Attach
@@ -219,6 +219,7 @@
             </label>
             <span id="status" aria-hidden="true"></span>
           </div>
+          <div id="provider-status" role="status" aria-live="polite" aria-atomic="true">Checking AI provider availability…</div>
           <div id="queue-area" class="queue-area" role="group" hidden aria-label="Queued messages"></div>
         </form>
       </section>

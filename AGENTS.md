@@ -210,6 +210,17 @@ that provider. Switching between Local and a cloud provider requires a new chat.
 Model/effort changes respawn on the next message, since subagent defaults and
 thinking overrides are fixed in the child environment.
 
+Local respawns must await the old SDK driver's teardown before opening the same
+native JSONL again. `_supersede_run_for_switch` shields that teardown from request
+cancellation and does not cancel an already-closing driver a second time.
+
+CLI settings load after the inherited process environment and can override it.
+Local runs also pass the final scrubbed env through the explicit SDK `settings`
+overlay, after merging `child_env` and `sdk_options`. Preserve both layers so
+user/project/local settings cannot redirect inference or replace thinking controls.
+The browser likewise preserves the requested provider through discovery failures
+and blocks both button and keyboard submission while routing is unresolved.
+
 Ollama 0.16.1 ignores explicit disabled thinking through its Anthropic adapter;
 0.33.3 handles it. Claude Code 2.1.266 also rewrites/omits thinking for custom
 model names, so `sdk_options` preserves the request fields via
@@ -228,6 +239,14 @@ clamps these at 30 minutes) and `API_TIMEOUT_MS`. Those alone were not enough:
 the runtime's own fetch idle timeout stays on for non-Anthropic routes and cut
 silent connections at six minutes (verified with a fake slow server), so
 `API_FORCE_IDLE_TIMEOUT=false` is set too. Keep all of them when editing the env.
+
+`tests/test_local_cli_contract.py` exercises the installed CLI and real SDK
+handshake against loopback capture servers using options assembled by `/api/chat`.
+Opt in with `CLAUDE_WEB_TEST_LOCAL_CLI=1`; the silent-response case additionally
+requires `CLAUDE_WEB_TEST_LOCAL_SILENT_SECONDS=420` and takes at least seven minutes.
+Use these after CLI/SDK upgrades. The normal suite remains independent of an
+installed CLI. The Linux/Python 3.13 CI job installs Chromium and sets
+`CLAUDE_WEB_REQUIRE_BROWSER=1`, making missing browser coverage a failure there.
 
 ### Portability
 

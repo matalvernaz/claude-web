@@ -16,6 +16,7 @@
   const advisorToggleLabel = document.getElementById("advisor-toggle-label");
   const providerSelect = document.getElementById("provider-select");
   const providerSelectLabel = document.getElementById("provider-select-label");
+  const providerStatus = document.getElementById("provider-status");
   const accountSelect = document.getElementById("account-select");
   const permModeSelect = document.getElementById("permission-mode-select");
   const effortSelect = document.getElementById("effort-select");
@@ -185,6 +186,7 @@
     if (dataEl) {
       try { data = JSON.parse(dataEl.textContent); } catch (_) { data = []; }
     }
+    PROVIDERS.claude = { key: "claude", label: "Claude", models: data };
     for (const m of data) {
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
@@ -729,13 +731,46 @@
   // mid-chat provider switch: off → changing provider on a live chat starts a
   // new chat (the original behavior); on → it carries the conversation over.
   let providerSwitchEnabled = false;
+  let providersInitialized = false;
   // Provider that owns the active native session. This deliberately differs
   // from currentProvider() while a picker change is waiting to land on the
   // next message.
   let sessionProvider = null;
+  let sessionLoadGeneration = 0;
   let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
+  }
+  function selectProvider(provider) {
+    if (!providerSelect) return;
+    if (![...providerSelect.options].some((o) => o.value === provider)) {
+      const option = document.createElement("option");
+      option.value = provider;
+      option.textContent = (PROVIDERS[provider] || {}).label || assistantLabel(provider);
+      providerSelect.appendChild(option);
+    }
+    providerSelect.value = provider;
+    if (providerSelectLabel) {
+      providerSelectLabel.hidden = providerSelect.options.length < 2 && provider === "claude";
+    }
+  }
+  function providerBlockReason() {
+    if (!providersInitialized) return "Checking AI provider availability…";
+    if (sessionId && !sessionProvider) return "Loading conversation. Start a new chat if it cannot be loaded.";
+    const provider = currentProvider();
+    const details = PROVIDERS[provider];
+    if ((details && details.available === false) || (!details && provider !== "claude")) {
+      return assistantLabel(provider) + " is unavailable. Reload to retry or choose another provider.";
+    }
+    return "";
+  }
+  function syncProviderAvailability() {
+    const reason = providerBlockReason();
+    sendBtn.disabled = !!reason;
+    if (providerStatus) {
+      providerStatus.textContent = reason;
+      providerStatus.hidden = !reason;
+    }
   }
   // Display name of the active assistant, for turn-status strings and
   // announcements. Falls back to the picker's own label so a future third
@@ -963,49 +998,15 @@
     rebuildEffortOptions();
     syncAdvisorControl();
     renderContextMeter();
+    syncProviderAvailability();
   }
 
   async function initProviders() {
-    let payload = null;
-    try {
-      const r = await fetch("/api/providers");
-      if (r.ok) payload = await r.json();
-    } catch (_) { /* provider combo just stays hidden */ }
-    const provs = (payload && payload.providers) || [];
-    providerSwitchEnabled = !!(payload && payload.provider_switch);
-    for (const p of provs) ingestProvider(p);
-    const available = provs.filter((p) => p.available);
-    if (!providerSelect) return;
-    // The markup can't know whether the switch is enabled — that's server-side
-    // — and `title` is what a screen reader reads as this control's
-    // description. Left static it told the user switching starts a new chat,
-    // which is the opposite of what the switch path does, so the one feature
-    // built to make a mid-chat change safe read as the thing to avoid.
-    providerSelect.title = providerSwitchEnabled
-      ? "Which AI runs this conversation. Switching between Claude and Codex carries"
-        + " the conversation over on your next message. Switching to or from Local starts a new chat."
-      : "Which AI runs this conversation. Providers appear when configured and available."
-        + " Switching provider starts a new chat.";
-    if (available.length) {
-      providerSelect.innerHTML = "";
-      for (const p of available) {
-        const o = document.createElement("option");
-        o.value = p.key;
-        o.textContent = p.label;
-        providerSelect.appendChild(o);
-      }
-    }
-    if (providerSelectLabel) providerSelectLabel.hidden = available.length < 2;
     const saved = safeGet(localStorage, PROVIDER_KEY);
-    if (saved && [...providerSelect.options].some((o) => o.value === saved)) {
-      providerSelect.value = saved;
-    }
-    // A session pinned in the URL wins over the saved pick; loadSession
-    // realigns the picker from the session payload's provider field.
-    if (!sessionId) {
-      applyProviderUI(currentProvider());
-    }
-    providerSelect.addEventListener("change", () => {
+    selectProvider(["claude", "codex", "local"].includes(saved) ? saved : currentProvider());
+    syncProviderAvailability();
+    if (!sessionId) applyProviderUI(currentProvider());
+    providerSelect?.addEventListener("change", () => {
       const provider = currentProvider();
       safeSet(localStorage, PROVIDER_KEY, provider);
       const label = [...providerSelect.options].find((o) => o.value === provider);
@@ -1028,6 +1029,40 @@
       }
       applyProviderUI(provider);
     });
+    let payload = null;
+    try {
+      const r = await fetch("/api/providers");
+      if (r.ok) payload = await r.json();
+    } catch (_) { /* Keep the requested provider visible and require an explicit switch. */ }
+    const provs = (payload && payload.providers) || [];
+    providerSwitchEnabled = !!(payload && payload.provider_switch);
+    for (const p of provs) ingestProvider(p);
+    const available = provs.filter((p) => p.available);
+    if (providerSelect) {
+      providerSelect.title = providerSwitchEnabled
+        ? "Which AI runs this conversation. Switching between Claude and Codex carries"
+          + " the conversation over on your next message. Switching to or from Local starts a new chat."
+        : "Which AI runs this conversation. Providers appear when configured and available."
+          + " Switching provider starts a new chat.";
+      // Preserve changes made while discovery was pending, including a saved
+      // provider that is now unavailable. Availability never selects a fallback.
+      const requested = currentProvider();
+      if (available.length) {
+        providerSelect.innerHTML = "";
+        for (const p of available) {
+          const option = document.createElement("option");
+          option.value = p.key;
+          option.textContent = p.label;
+          providerSelect.appendChild(option);
+        }
+      }
+      selectProvider(requested);
+    }
+    providersInitialized = true;
+    // A session pinned in the URL wins over the saved pick; loadSession
+    // realigns the picker before the composer can submit.
+    if (!sessionId) applyProviderUI(currentProvider());
+    else syncProviderAvailability();
   }
   // Kept as a promise so a boot-time ?session= load can await the provider
   // list before realigning the picker — otherwise a codex session opened
@@ -1234,11 +1269,15 @@
   (async () => {
     let loaded = false;
     if (sessionId) {
+      const sessionLoad = loadSession(sessionId, sessionProject);
+      const loadGeneration = sessionLoadGeneration;
       try {
-        await loadSession(sessionId, sessionProject);
+        await sessionLoad;
+        if (loadGeneration !== sessionLoadGeneration) return;
         loaded = true;
         markActive(sessionId);
       } catch (err) {
+        if (loadGeneration !== sessionLoadGeneration) return;
         setStatus("Could not load session: " + err.message);
         announce("Could not load the session: " + err.message);
       }
@@ -1514,11 +1553,22 @@
   }
 
   async function loadSession(id, project) {
+    const loadGeneration = ++sessionLoadGeneration;
     const url = new URL(`/api/sessions/${encodeURIComponent(id)}`, location.origin);
     if (project) url.searchParams.set("project", project);
     const r = await fetch(url);
+    if (loadGeneration !== sessionLoadGeneration) return;
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
+    if (loadGeneration !== sessionLoadGeneration) return;
+    await providersReady;
+    if (loadGeneration !== sessionLoadGeneration) return;
+    const sessProvider = ["claude", "codex", "local"].includes(data.provider)
+      ? data.provider : "claude";
+    if (sessProvider === "codex" && data.account_slot) {
+      try { await refreshCodexProvider(data.account_slot); } catch (_) {}
+      if (loadGeneration !== sessionLoadGeneration) return;
+    }
     // Cancel any in-flight stream from the previous session — without this,
     // late SSE events can land in the newly-loaded transcript.
     if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
@@ -1539,24 +1589,12 @@
     // provider already matching the session still needs the DOM applied,
     // since initProviders skips the apply whenever a URL session is
     // present (it can't know the session's provider yet).
-    await providersReady;
-    const sessProvider = ["claude", "codex", "local"].includes(data.provider)
-      ? data.provider : "claude";
     sessionProvider = sessProvider;
-    if (providerSelect && ![...providerSelect.options].some((o) => o.value === sessProvider)) {
-      const option = document.createElement("option");
-      option.value = sessProvider;
-      option.textContent = (PROVIDERS[sessProvider] || {}).label || assistantLabel(sessProvider);
-      providerSelect.appendChild(option);
-      if (providerSelectLabel) providerSelectLabel.hidden = providerSelect.options.length < 2;
-    }
+    selectProvider(sessProvider);
     if (providerSelect
         && [...providerSelect.options].some((o) => o.value === sessProvider)) {
       providerSelect.value = sessProvider;
       safeSet(localStorage, PROVIDER_KEY, sessProvider);
-      if (sessProvider === "codex" && data.account_slot) {
-        try { await refreshCodexProvider(data.account_slot); } catch (_) {}
-      }
       applyProviderUI(sessProvider, data.account_slot || undefined);
       if (sessProvider === "local" && modelSelect && data.model) {
         const modelAvailable = [...modelSelect.options].some((o) => o.value === data.model);
@@ -2039,6 +2077,8 @@
   }
 
   newChatBtn.addEventListener("click", () => {
+    // A late session fetch must not restore the chat/provider being left.
+    sessionLoadGeneration++;
     sessionId = "";
     sessionProvider = null;
     // Clear the URL-pinned project so the picker takes over again. Without
@@ -2116,7 +2156,7 @@
       releaseWakeLock();
     }
     sendBtn.hidden = false;
-    sendBtn.disabled = false;
+    syncProviderAvailability();
     sendBtn.textContent = on ? "Queue" : "Send";
     stopBtn.hidden = !on;
   }
@@ -2313,6 +2353,11 @@
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const blocked = providerBlockReason();
+    if (blocked) {
+      announce(blocked);
+      return;
+    }
     if (slashMenu && !slashMenu.hidden) {
       // Tab/Enter through the slash menu went to the form for some reason —
       // ignore. The menu's own keyboard handler will accept the suggestion.

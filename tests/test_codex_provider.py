@@ -761,6 +761,11 @@ def test_api_providers_payload(client, monkeypatch):
     assert provs["codex"]["capabilities"]["permission_modes"] == [
         "default", "acceptEdits", "bypassPermissions",
     ]
+    # Every provider states the advisor outright rather than leaving the
+    # browser to read a missing key as false.
+    assert {k: p["capabilities"].get("advisor") for k, p in provs.items()} == {
+        "claude": True, "codex": False, "local": False,
+    }
 
 
 def test_api_providers_reports_switch_flag(client, monkeypatch):

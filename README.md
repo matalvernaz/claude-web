@@ -82,11 +82,31 @@ Ollama does not enforce Anthropic thinking-token budgets. Model and effort
 changes take effect on the next message through a restarted local process.
 
 Local sessions keep their provider when reopened. Switching between Local and a
-cloud provider starts a separate chat. Missing models or an unavailable server
+cloud provider starts a separate chat. A saved Local selection stays selected
+while provider discovery is pending or fails; sending is blocked until it is
+available or you explicitly select another provider. Missing models or an unavailable server
 produce an error; local runs never use the app's cloud-account failover or
 `CLAUDE_WEB_FALLBACK_MODEL`. Cloud model tags are rejected. Local inference does
 not make the whole assistant offline: configured MCP tools, hooks, and approved
 commands can still access external services.
+
+Local routing and thinking controls take precedence over conflicting CLI user,
+project, and local settings. Changing the model or effort waits for the previous
+local process to close before resuming the conversation.
+
+To check compatibility after upgrading the Claude CLI or SDK, run the optional
+tests against temporary loopback servers (no model inference or cloud requests):
+
+```bash
+CLAUDE_WEB_TEST_LOCAL_CLI=1 .venv/bin/pytest -q tests/test_local_cli_contract.py -k 'not silent'
+CLAUDE_WEB_TEST_LOCAL_CLI=1 CLAUDE_WEB_TEST_LOCAL_SILENT_SECONDS=420 .venv/bin/pytest -q tests/test_local_cli_contract.py -k silent
+```
+
+The second check holds a request silent for seven minutes to catch runtime idle
+timeouts. The ordinary suite skips these explicit compatibility checks. Browser
+regressions run with Chromium required in the Linux/Python 3.13 CI job; run them
+locally with `CLAUDE_WEB_REQUIRE_BROWSER=1 .venv/bin/pytest -q tests/test_local_ui.py`
+after installing Chromium with `python -m playwright install chromium`.
 
 ## Running from source (no Docker)
 

@@ -38,6 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+      - name: Install browser for UI regressions
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        run: python -m playwright install chromium --with-deps
       - name: Lint (ruff)
         # F (pyflakes) catches real undefined-name / unused-import / shadowing
         # bugs. B (bugbear) catches real footguns. E/W are PEP-8 style; we
@@ -50,6 +53,8 @@ jobs:
         # exempted tests/ and roundtable/ and they accumulated lint debt.
         run: ruff check . --select=F,E,W,B --ignore=E501,B008
       - name: Tests (pytest)
+        env:
+          CLAUDE_WEB_REQUIRE_BROWSER: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && '1' || '0' }}
         run: pytest -q
       - name: JS syntax check
         # `node --check` is the same command on every platform; the
