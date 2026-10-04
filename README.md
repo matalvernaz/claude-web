@@ -276,6 +276,7 @@ OpenAI has a separate slot set. The shared slot uses `$CODEX_HOME/auth.json` or 
 | `CODEX_HOME` | `$HOME/.codex` | Shared Codex configuration, rollout history, and optional host-level login. Bind-mount this in a container (`./codex-home:/home/claude/.codex`). |
 | `CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR` | `$HOME/.codex-homes` | Private per-user `auth.json` and Codex SQLite indexes. Bind-mount this too (`./codex-homes:/home/claude/.codex-homes`). |
 | `CLAUDE_WEB_CODEX_SHARED_ACCOUNT_LABEL` | `Shared OpenAI` | Display name for the host-level OpenAI slot. |
+| `CLAUDE_WEB_CODEX_AUTOUPDATE` | `true` | Keep the codex CLI current, since OpenAI only lists its newest models to newer CLIs. Only an npm install under a user-writable `--prefix` is updated; a release that drops an app-server method claude-web uses is rolled back. |
 
 Codex personal homes link only `sessions/` and user configuration such as `config.toml` and `skills/` back to `CODEX_HOME`. Authentication and SQLite files remain private. On an account change, claude-web interrupts any old writer, terminates that chat's app-server process, and resumes the same thread id under the new account in a fresh process. This avoids both a split chat and the corruption risk of opening one SQLite database through multiple symlink paths.
 

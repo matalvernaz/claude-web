@@ -70,6 +70,8 @@ os.environ["CLAUDE_WEB_CLI_AUTOUPDATE"] = "false"
 # instead loads a real CLI 2.1.289 list from the cache file app.py reads at
 # import, so tests see the same shape a host does after its first fetch.
 os.environ["CLAUDE_WEB_CLI_MODELS_FETCH"] = "false"
+# And the codex CLI updater, which would run npm against the host's install.
+os.environ["CLAUDE_WEB_CODEX_AUTOUPDATE"] = "false"
 # roundtable.core derives DB_PATH from this at import; point it at a temp dir
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.

@@ -7812,6 +7812,8 @@ async def _install_restart_machinery() -> None:
         asyncio.create_task(_cli_autoupdate_loop())
     if CLI_MODELS_FETCH:
         asyncio.create_task(_cli_models_loop())
+    if CODEX_AUTOUPDATE:
+        asyncio.create_task(_codex_autoupdate_loop())
     # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
     # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
     # can drive both without an OIDC session cookie.
@@ -8104,6 +8106,147 @@ async def _cli_models_loop() -> None:
             await _refresh_cli_models("timer")
         except Exception:
             log.exception("claude model list refresh failed")
+        await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
+
+
+# ─── Codex CLI auto-update ────────────────────────────────────────────────────
+# OpenAI lists models to the app-server by client version: gpt-6.1-sol was
+# invisible to codex 0.157.1 and appeared on 0.160.0 with nothing else changed.
+# So the codex CLI is kept current the way the claude CLI is, with one extra
+# guard: a release that drops an app-server method claude-web depends on
+# (codex_provider.REQUIRED_PROTOCOL) is rolled back. Only an npm install under
+# a user-writable --prefix is managed; anything else is left alone.
+CODEX_AUTOUPDATE = os.getenv("CLAUDE_WEB_CODEX_AUTOUPDATE", "true").lower() in (
+    "1", "true", "yes",
+)
+_CODEX_UPDATE_BOOT_DELAY_SECONDS = 150.0
+_CODEX_NPM_TIMEOUT_SECONDS = 600.0
+_CODEX_UPDATE_LOCK = asyncio.Lock()
+CODEX_UPDATE_STATE: dict[str, Any] = {
+    # never | current | updated | rolled_back | error | unmanaged | no_cli
+    "status": "never", "version": None, "previous_version": None,
+    "checked_at": None, "updated_at": None, "source": None, "detail": "",
+}
+_SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+async def _codex_proc(*args: str, timeout: float) -> tuple[int, str]:
+    """Run a command; ``(returncode, output tail)``, -1 on timeout or OSError."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except OSError as exc:
+        return -1, str(exc)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, f"{args[0]} timed out after {timeout:.0f}s"
+    return proc.returncode or 0, (out or b"").decode("utf-8", "replace").strip()[-1000:]
+
+
+def _semver(text: str) -> Optional[tuple[int, int, int]]:
+    m = _SEMVER_RE.search(text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+async def _recycle_stale_codex_servers(updated_at: float) -> list[str]:
+    """Close idle account servers started before the update, so the next model
+    list and login come from the new CLI. Chat servers (``:run:``) and
+    short-lived readers keep their binary until they end."""
+    closed = []
+    for key, inst in list(codex_provider.CodexAppServer._instances.items()):
+        if ":run:" in key or ":read:" in key or not inst.alive:
+            continue
+        if (inst.started_at or 0) >= updated_at or not inst.idle():
+            continue
+        await codex_provider.CodexAppServer.close_key(key)
+        closed.append(key)
+    if closed:
+        log.info("recycled codex app-servers after the CLI update: %s", closed)
+    return closed
+
+
+async def _run_codex_update(source: str) -> dict:
+    """One update pass (single-flight). Returns a CODEX_UPDATE_STATE snapshot."""
+    binary = codex_provider.codex_binary()
+    if not binary:
+        CODEX_UPDATE_STATE.update(status="no_cli", source=source, checked_at=time.time(),
+                                  detail="no codex CLI installed")
+        return dict(CODEX_UPDATE_STATE)
+    prefix = codex_provider.npm_prefix(binary)
+    npm = shutil.which("npm")
+    if prefix is None or npm is None:
+        CODEX_UPDATE_STATE.update(
+            status="unmanaged", source=source, checked_at=time.time(),
+            detail=("npm is not on PATH" if prefix is not None else
+                    f"{binary} is not a user npm install; update it the way it was installed"))
+        return dict(CODEX_UPDATE_STATE)
+    async with _CODEX_UPDATE_LOCK:
+        def finish(status: str, **fields: Any) -> dict:
+            CODEX_UPDATE_STATE.update(status=status, source=source,
+                                      checked_at=time.time(), **fields)
+            if status != "current":
+                log.log(logging.INFO if status == "updated" else logging.WARNING,
+                        "codex CLI update %s (via %s): %s", status, source,
+                        CODEX_UPDATE_STATE.get("detail"))
+            return dict(CODEX_UPDATE_STATE)
+
+        def notify(text: str) -> None:
+            if PUSHOVER_TOKEN and PUSHOVER_USER:
+                asyncio.create_task(asyncio.to_thread(
+                    _send_pushover_sync, SITE_TITLE, text))
+
+        _rc, out = await _codex_proc(binary, "--version", timeout=30)
+        before = _semver(out)
+        rc, out = await _codex_proc(npm, "view", "@openai/codex", "version", timeout=60)
+        latest_text = out.splitlines()[-1].strip() if rc == 0 and out else ""
+        latest = _semver(latest_text)
+        if before is None or latest is None:
+            return finish("error", detail=f"could not compare versions: {out[-300:]}")
+        before_text = ".".join(map(str, before))
+        if latest <= before:
+            return finish("current", version=before_text, detail="")
+        latest_text = ".".join(map(str, latest))
+        rc, out = await _codex_proc(
+            npm, "install", "-g", "--prefix", str(prefix), f"@openai/codex@{latest_text}",
+            timeout=_CODEX_NPM_TIMEOUT_SECONDS)
+        _rc, version_out = await _codex_proc(binary, "--version", timeout=30)
+        if rc != 0 or _semver(version_out) != latest:
+            return finish("error", version=before_text,
+                          detail=f"npm install {latest_text} failed: {out[-300:]}")
+        try:
+            missing = await codex_provider.missing_protocol_methods(binary)
+        except Exception as exc:  # noqa: BLE001 — an unreadable schema is a miss
+            missing = [f"(schema check failed: {exc})"]
+        if missing:
+            await _codex_proc(
+                npm, "install", "-g", "--prefix", str(prefix), f"@openai/codex@{before_text}",
+                timeout=_CODEX_NPM_TIMEOUT_SECONDS)
+            notify(f"Codex CLI {latest_text} was rolled back to {before_text}: it no "
+                   f"longer offers {', '.join(missing[:5])}.")
+            return finish("rolled_back", version=before_text,
+                          detail=f"{latest_text} lacks {', '.join(missing)}")
+        now = time.time()
+        notify(f"Codex CLI updated: {before_text} -> {latest_text}")
+        state = finish("updated", version=latest_text, previous_version=before_text,
+                       updated_at=now, detail="")
+    await _recycle_stale_codex_servers(now)
+    return state
+
+
+async def _codex_autoupdate_loop() -> None:
+    await asyncio.sleep(_CODEX_UPDATE_BOOT_DELAY_SECONDS)
+    while True:
+        try:
+            await _run_codex_update("timer")
+            # An account server that was busy at update time still runs the
+            # old CLI; retire it once it is idle.
+            if CODEX_UPDATE_STATE.get("updated_at"):
+                await _recycle_stale_codex_servers(CODEX_UPDATE_STATE["updated_at"])
+        except Exception:
+            log.exception("codex autoupdate pass failed")
         await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
 
 

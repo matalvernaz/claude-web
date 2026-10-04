@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -77,6 +78,13 @@ def approval_policy_for_mode(permission_mode: str) -> str:
 # first use; generous but bounded so a wedged server surfaces as an error
 # instead of a stuck driver.
 REQUEST_TIMEOUT_S = 60.0
+# How long model/list answers are reused. The list is filtered server-side by
+# client version and can grow without a CLI update, so it is not cached for
+# the life of a long-running process.
+MODELS_CACHE_TTL_S = 3600.0
+# A device-code login waits on the user typing a code on another device; an
+# account server that started one in this window is never recycled.
+LOGIN_GRACE_S = 1800.0
 # thread/read of a long session can return megabytes on one line; the
 # default StreamReader limit (64 KiB) would kill the reader with
 # LimitOverrunError.
@@ -129,6 +137,100 @@ def codex_binary() -> Optional[str]:
 
 def codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+
+
+# Every app-server method claude-web depends on, keyed by the schema file
+# (`codex app-server generate-json-schema`) that declares it. A CLI update that
+# drops one would break chats without an error, so the auto-updater checks
+# the new CLI against this list and rolls back on a miss.
+REQUIRED_PROTOCOL: dict[str, tuple[str, ...]] = {
+    "ClientRequest": (
+        "account/read", "account/usage/read", "account/rateLimits/read",
+        "account/logout", "account/login/start", "account/login/cancel",
+        "model/list", "thread/start", "thread/resume", "thread/read",
+        "thread/fork", "thread/delete", "thread/compact/start",
+        "thread/unsubscribe", "turn/start", "turn/steer", "turn/interrupt",
+    ),
+    "ServerRequest": (
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/tool/requestUserInput",
+    ),
+    "ServerNotification": (
+        "turn/started", "turn/completed", "turn/plan/updated",
+        "item/started", "item/completed", "item/agentMessage/delta",
+        "thread/tokenUsage/updated", "thread/compacted",
+        "account/login/completed",
+    ),
+}
+
+
+def _schema_methods(path: Path) -> set[str]:
+    """Method names a schema file declares (``properties.method`` enum/const)."""
+    found: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            method = (node.get("properties") or {}).get("method")
+            if isinstance(method, dict):
+                found.update(m for m in method.get("enum") or [] if isinstance(m, str))
+                if isinstance(method.get("const"), str):
+                    found.add(method["const"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(json.loads(Path(path).read_text(encoding="utf-8")))
+    return found
+
+
+def missing_from_schema_dir(directory: Path) -> list[str]:
+    """REQUIRED_PROTOCOL methods absent from a generated schema directory."""
+    missing: list[str] = []
+    for fname, methods in REQUIRED_PROTOCOL.items():
+        path = Path(directory) / f"{fname}.json"
+        have = _schema_methods(path) if path.exists() else set()
+        missing.extend(m for m in methods if m not in have)
+    return missing
+
+
+async def missing_protocol_methods(binary: str, timeout: float = 120.0) -> list[str]:
+    """Ask ``binary`` for its app-server schema and list what claude-web needs
+    that it no longer declares. Raises CodexError if the schema can't be read."""
+    with tempfile.TemporaryDirectory(prefix="codex-schema-") as out:
+        proc = await asyncio.create_subprocess_exec(
+            binary, "app-server", "generate-json-schema", "--experimental",
+            "--out", out,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise CodexError("schema dump timed out") from None
+        if proc.returncode != 0:
+            raise CodexError(
+                "schema dump failed: " + (err or b"").decode("utf-8", "replace")[-300:])
+        return missing_from_schema_dir(Path(out))
+
+
+def npm_prefix(binary: str) -> Optional[Path]:
+    """The ``npm --prefix`` a codex binary was installed under, or None.
+
+    Only a user-writable npm global install (``<prefix>/lib/node_modules/
+    @openai/codex``, the layout ``npm install -g --prefix ~/.local`` makes)
+    can be updated in place. A standalone binary, a root-owned global, or a
+    package manager's copy is left to whoever installed it.
+    """
+    real = Path(os.path.realpath(binary))
+    for parent in real.parents:
+        if parent.name == "node_modules" and parent.parent.name == "lib" and (
+                parent / "@openai" / "codex").is_dir():
+            return parent.parent.parent if os.access(parent, os.W_OK) else None
+    return None
 
 
 def availability(
@@ -220,8 +322,10 @@ class CodexAppServer:
             maxlen=STDERR_RING_LINES
         )
         self._models_cache: Optional[list[dict]] = None
+        self._models_cached_at = 0.0
         self._models_lock = asyncio.Lock()
         self._login_results: dict[str, dict] = {}
+        self._login_started_at = 0.0
         self.started_at: Optional[float] = None
 
     # -- lifecycle -------------------------------------------------------------
@@ -322,6 +426,13 @@ class CodexAppServer:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
 
+    def idle(self) -> bool:
+        """Nothing in flight: no request, no thread attached, no device-code
+        login waiting on the user. Only an idle server may be recycled."""
+        login_waiting = time.time() - self._login_started_at < LOGIN_GRACE_S
+        return not (self._pending or self._thread_queues
+                    or self._request_handlers or login_waiting)
+
     async def _start(self) -> None:
         binary = codex_binary()
         if not binary:
@@ -412,6 +523,8 @@ class CodexAppServer:
     ) -> Any:
         self._next_id += 1
         rid = self._next_id
+        if method == "account/login/start":
+            self._login_started_at = time.time()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         try:
@@ -606,9 +719,10 @@ class CodexAppServer:
         return dict(result) if result is not None else None
 
     async def models(self) -> list[dict]:
-        """model/list, cached for the life of this server process."""
+        """model/list, cached for MODELS_CACHE_TTL_S."""
         async with self._models_lock:
-            if self._models_cache is not None:
+            if (self._models_cache is not None
+                    and time.time() - self._models_cached_at < MODELS_CACHE_TTL_S):
                 return self._models_cache
             resp = await self.request("model/list", {})
             models = []
@@ -630,6 +744,7 @@ class CodexAppServer:
                     "is_default": bool(m.get("isDefault")),
                 })
             self._models_cache = models
+            self._models_cached_at = time.time()
             return models
 
     async def account_usage(self) -> dict:
