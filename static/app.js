@@ -3627,6 +3627,32 @@
       transcript.appendChild(article);
       maybeAutoScroll();
       announce(advisorNote);
+    } else if (obj.type === "model_notice") {
+      // The CLI moved this chat (or one turn, or a side task) onto another
+      // model, or the model declined outright: a safeguard refusal, an
+      // unavailable model, missing usage credits. The terminal shows a banner;
+      // here the CLI's full text stays in the transcript as the record and the
+      // short summary is spoken, because the full text runs long and names the
+      // new model mid-way.
+      // A refusal retracts the attempt that was streaming, so its provisional
+      // partial bubble goes, and the fallback model's reply starts a new
+      // article below this notice instead of continuing the one above it.
+      discardPartial(ctx);
+      ctx.currentAssistantBody = null;
+      const article = document.createElement("article");
+      article.className = "msg info";
+      const role = document.createElement("h3");
+      role.className = "role";
+      role.textContent = obj.title || "Model switched";
+      const body = document.createElement("p");
+      body.className = "info-body";
+      body.textContent = obj.message || obj.summary || "";
+      article.appendChild(role);
+      article.appendChild(body);
+      transcript.appendChild(article);
+      maybeAutoScroll();
+      announce(obj.summary || obj.message || "The model for this chat changed.");
+      markVisibleActivity();
     } else if (obj.type === "_overflow") {
       // The server's per-subscriber queue filled. When it tells us which idx
       // didn't fit, resume from exactly there: keep the dedup watermark and

@@ -13675,6 +13675,74 @@ def _looks_like_model_rejection(text: str) -> bool:
     )
 
 
+# System messages the CLI sends when the model answering a chat changes, or
+# declines, without the user asking. The official TUI shows each one as a
+# banner. Dropped here, the swap was silent: a safeguard refusal moved Fable
+# 5.1 and Opus 5 chats onto Opus 4.8 four times in September 2026 and the header
+# kept naming the model that was picked. Value: the notice's heading.
+_MODEL_NOTICE_TITLES = {
+    "model_refusal_fallback": "Model switched",
+    "model_fallback": "Model switched",
+    "model_consent_fallback": "Model switched",
+    "model_refusal_no_fallback": "Model declined",
+}
+
+
+def _model_notice_event(subtype: str, data: dict) -> Optional[dict]:
+    """Turn a CLI model-swap system message into a ``model_notice`` event.
+
+    ``message`` is the CLI's own ``content``: what the TUI shows, with the
+    refusal category and help link. ``summary`` is the short form the browser
+    speaks. The CLI's text runs to about sixty words with the new model named
+    in the middle, and the announcer gives one message five seconds before the
+    next may replace it. When ``content`` is missing the summary stands in for
+    it, so the swap is still said.
+    """
+    title = _MODEL_NOTICE_TITLES.get(subtype)
+    if title is None:
+        return None
+    original = data.get("original_model") or ""
+    fallback = data.get("fallback_model") or ""
+    # "session": the chat itself moved to the fallback model. "local": only a
+    # subagent or side question did. Older CLIs omit it; they meant session.
+    scope = data.get("scope") or "session"
+
+    def label(model_id: str, unknown: str) -> str:
+        # By key, not by scanning "model": fableplan also runs claude-opus-4-8
+        # and sits above it in the list, so a scan names the wrong entry.
+        if not model_id:
+            return unknown
+        entry = MODELS_BY_KEY.get(model_id)
+        return entry["label"] if entry else model_id
+
+    was = label(original, "The selected model")
+    now = label(fallback, "another model")
+    if subtype == "model_refusal_no_fallback":
+        summary = f"{was} declined to answer this message."
+    elif scope == "local":
+        summary = (f"A side task switched from {was} to {now}. "
+                   "This chat's model is unchanged.")
+    elif subtype == "model_fallback":
+        # Turn-scoped: the CLI tries the original model again next turn.
+        summary = f"{was} was unavailable, so this turn is on {now}."
+    elif subtype == "model_consent_fallback":
+        summary = f"{was} needs usage credits on this account. This chat is now on {now}."
+    else:
+        summary = f"{was}'s safeguards flagged a message. This chat is now on {now}."
+    content = data.get("content")
+    message = content if isinstance(content, str) and content.strip() else summary
+    return {
+        "type": "model_notice",
+        "subtype": subtype,
+        "title": title,
+        "summary": summary,
+        "message": message,
+        "original_model": original or None,
+        "fallback_model": fallback or None,
+        "scope": scope,
+    }
+
+
 def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]:
     """Translate one SDK message into one or more SSE-payload dicts.
 
@@ -13699,7 +13767,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 "model": data.get("model"),
                 "permissionMode": data.get("permissionMode"),
             }]
-        return []
+        notice = _model_notice_event(msg.subtype, msg.data or {})
+        return [notice] if notice is not None else []
     if isinstance(msg, RateLimitEvent):
         if run is not None and run.provider == "local":
             return []

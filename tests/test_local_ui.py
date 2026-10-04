@@ -92,7 +92,8 @@ def ui(browser):
                     }""")
                 request_route.fulfill(status=409, json={"error": state.get("conflict", "model_changed")})
             elif path == "/api/chat":
-                request_route.fulfill(content_type="text/event-stream", body='data: {"type":"result"}\n\n')
+                request_route.fulfill(content_type="text/event-stream",
+                                      body=state.get("chat_sse", 'data: {"type":"result"}\n\n'))
             else:
                 request_route.fulfill(json={})
         elif path == "/":
@@ -382,3 +383,51 @@ def test_local_settings_reach_live_send_and_fresh_run_after_conflict(ui, conflic
         assert fields["message"] == "Continue the work"
         assert "account_slot" not in fields
     assert state["posts"][1][1]["session_id"] == "saved"
+
+
+def test_model_notice_is_shown_spoken_and_splits_the_reply(ui):
+    # A safeguard refusal: the CLI retries on a fallback model and says so. The
+    # notice must be in the transcript, spoken, and sit between the refused
+    # attempt and the fallback model's reply rather than after both.
+    page, state = ui
+    summary = "Fable 5.1's safeguards flagged a message. This chat is now on Opus 4.8."
+    full = ("Fable 5.1's safeguards flagged this message. Our intentionally broad "
+            "safeguards can sometimes flag legitimate coding and cybersecurity "
+            "tasks. Switched to Opus 4.8.\n\nDetails: `[cyber]`")
+    events = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "First attempt"}]}},
+        {"type": "model_notice", "subtype": "model_refusal_fallback", "title": "Model switched",
+         "summary": summary, "message": full, "original_model": "claude-fable-5-1",
+         "fallback_model": "claude-opus-4-8", "scope": "session"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "Fallback answer"}]}},
+        {"type": "result"},
+    ]
+    state["chat_sse"] = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+    page.add_init_script("""
+        window.__announced = [];
+        document.addEventListener('DOMContentLoaded', () => {
+            const el = document.getElementById('status-announcer');
+            new MutationObserver(() => {
+                if (el.textContent) window.__announced.push(el.textContent);
+            }).observe(el, {childList: true, characterData: true, subtree: true});
+        });
+    """)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Audit this binary")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+
+    notice = page.locator("#transcript article.msg.info", has_text="Switched to Opus 4.8")
+    playwright.expect(notice).to_have_count(1)
+    playwright.expect(notice.get_by_role("heading")).to_have_text("Model switched")
+    playwright.expect(page.locator("#transcript")).to_contain_text("Fallback answer")
+    texts = page.locator("#transcript article").all_text_contents()
+    first = next(i for i, t in enumerate(texts) if "First attempt" in t)
+    note = next(i for i, t in enumerate(texts) if "Switched to Opus 4.8" in t)
+    reply = next(i for i, t in enumerate(texts) if "Fallback answer" in t)
+    assert first < note < reply
+    assert "Fallback answer" not in texts[first]
+    page.wait_for_function(
+        "summary => window.__announced.includes(summary)", arg=summary, timeout=15000,
+    )
