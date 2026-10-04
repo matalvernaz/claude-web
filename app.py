@@ -1407,6 +1407,18 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
                         # for Bash so the extra payload is export-only cost.
                         entry["input"] = {"command": inp.get("command")}
                     msgs.append(entry)
+        elif kind == "system" and obj.get("subtype") in _MODEL_NOTICE_TITLES:
+            # The CLI writes its model-switch banner into the transcript, so a
+            # reopened chat can show it where it happened. The jsonl copy is
+            # camelCase; the stdout copy _model_notice_event reads is not.
+            notice = _model_notice_event(obj["subtype"], {
+                "content": obj.get("content"),
+                "original_model": obj.get("originalModel"),
+                "fallback_model": obj.get("fallbackModel"),
+                "scope": obj.get("scope"),
+            })
+            msgs.append({"role": "notice", "title": notice["title"],
+                         "text": notice["message"]})
     return msgs
 
 
@@ -1509,6 +1521,11 @@ def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]
             out.append("## Claude")
             out.append("")
             out.append(m.get("text", ""))
+            out.append("")
+        elif role == "notice":
+            lines = (m.get("text") or "").splitlines() or [""]
+            out.append(f"> **{m.get('title') or 'Notice'}:** {lines[0]}")
+            out.extend(f"> {ln}" if ln else ">" for ln in lines[1:])
             out.append("")
         elif role == "tool_use":
             name = m.get("name", "?")
@@ -6728,6 +6745,8 @@ def _flatten_transcript_for_advisor(msgs: list[dict]) -> str:
         elif role == "tool_result":
             tag = "error" if m.get("is_error") else "result"
             lines.append(f"[tool {tag}: {m.get('text', '')}]")
+        elif role == "notice":
+            lines.append(f"[{m.get('title', 'Notice')}: {m.get('text', '')}]")
     body = "\n\n".join(lines)
     if len(body) > _ADVISOR_TRANSCRIPT_CHAR_CAP:
         # Keep the tail — the recent turns are what needs reviewing — and flag

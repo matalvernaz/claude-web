@@ -431,3 +431,23 @@ def test_model_notice_is_shown_spoken_and_splits_the_reply(ui):
     page.wait_for_function(
         "summary => window.__announced.includes(summary)", arg=summary, timeout=15000,
     )
+
+
+def test_reopened_chat_shows_past_model_notices(ui):
+    page, state = ui
+    state["session"] = {"provider": "claude", "model": "claude-test", "messages": [
+        {"role": "user", "text": "Audit this binary"},
+        {"role": "notice", "title": "Model switched",
+         "text": "Fable 5.1's safeguards flagged this message. Switched to Opus 4.8."},
+        {"role": "assistant", "text": "Here is the audit."},
+    ]}
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/?session=saved")
+
+    notice = page.locator("#transcript article.msg.info", has_text="Switched to Opus 4.8")
+    playwright.expect(notice).to_have_count(1)
+    playwright.expect(notice.get_by_role("heading")).to_have_text("Model switched")
+    texts = page.locator("#transcript article").all_text_contents()
+    assert [i for i, t in enumerate(texts) if "Audit this binary" in t][0] \
+        < [i for i, t in enumerate(texts) if "Switched to Opus 4.8" in t][0] \
+        < [i for i, t in enumerate(texts) if "Here is the audit." in t][0]

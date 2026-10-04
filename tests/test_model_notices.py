@@ -138,7 +138,90 @@ def test_model_notice_is_rendered_and_spoken() -> None:
     start = source.index('obj.type === "model_notice"')
     block = source[start:source.index("} else if", start)]
 
-    assert 'className = "msg info"' in block
     # The short summary is what gets spoken; the CLI's full text is the record.
+    assert "appendNotice(obj.title" in block
+    assert "obj.message" in block[:block.index("announce(")]
     assert "announce(obj.summary" in block
-    assert "body.textContent = obj.message" in block
+
+    helper = source[source.index("function appendNotice("):]
+    helper = helper[:helper.index("\n  }\n")]
+    assert 'className = "msg info"' in helper
+
+
+# ── Reopened chats ────────────────────────────────────────────────────────────
+# The live notice only reaches a browser that was watching. Reopening the chat
+# later rebuilds it from the session jsonl, which the CLI writes the switch
+# into as a system line (camelCase fields there, unlike the stdout copy).
+
+def _write_session(lines: list[dict]) -> str:
+    import json
+    import uuid
+
+    sid = str(uuid.uuid4())
+    path = app_module._sessions_dir(app_module.PROJECTS[0]) / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    return sid
+
+
+def _jsonl_refusal_fallback() -> dict:
+    # Shape copied from a real 2026-09-30 transcript line.
+    return {
+        "type": "system", "subtype": "model_refusal_fallback",
+        "content": _REFUSAL_TEXT, "level": "warning", "trigger": "refusal",
+        "direction": "retry", "scope": "session",
+        "originalModel": "claude-fable-5-1", "fallbackModel": "claude-opus-4-8",
+        "apiRefusalCategory": "cyber", "isMeta": False, "uuid": "d0ff",
+    }
+
+
+def _jsonl_session() -> list[dict]:
+    return [
+        {"type": "user", "message": {"role": "user", "content": "Audit this binary"}},
+        _jsonl_refusal_fallback(),
+        {"type": "system", "subtype": "local_command", "content": "<command-name>/advisor</command-name>"},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Here is the audit."},
+        ]}},
+    ]
+
+
+def test_reopened_chat_keeps_the_model_notice_in_place() -> None:
+    sid = _write_session(_jsonl_session())
+
+    msgs = app_module.session_transcript(sid)
+
+    assert [m["role"] for m in msgs] == ["user", "notice", "assistant"]
+    notice = msgs[1]
+    assert notice["title"] == "Model switched"
+    assert notice["text"] == _REFUSAL_TEXT
+
+
+def test_reopened_notice_without_text_still_names_both_models() -> None:
+    line = _jsonl_refusal_fallback()
+    line.pop("content")
+    sid = _write_session([line])
+
+    (notice,) = app_module.session_transcript(sid)
+
+    assert "Fable 5.1" in notice["text"] and "Opus 4.8" in notice["text"]
+
+
+def test_markdown_export_includes_the_model_notice() -> None:
+    sid = _write_session(_jsonl_session())
+
+    md = app_module.session_to_markdown(sid)
+
+    assert "Model switched" in md
+    assert "Switched to Opus 4.8" in md
+    assert md.index("Audit this binary") < md.index("Model switched") < md.index("Here is the audit.")
+
+
+def test_history_repaint_renders_notices() -> None:
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8",
+    )
+    start = source.index('m.role === "notice"')
+    block = source[start:source.index("} else if", start)]
+
+    assert "appendNotice(" in block

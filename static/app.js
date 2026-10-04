@@ -1653,6 +1653,8 @@
         }
       } else if (m.role === "tool_result") {
         insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
+      } else if (m.role === "notice") {
+        appendNotice(m.title || "Notice", m.text || "");
       }
     }
     // Force-scroll on session load — we just replaced the entire transcript.
@@ -1742,6 +1744,24 @@
       (ctx.partialBody.closest("article") || ctx.partialBody).remove();
       ctx.partialBody = null;
     }
+  }
+
+  // A notice in the transcript: a heading over one paragraph, the shape the
+  // other info articles use. Shared by the live model_notice event and a
+  // reopened chat's "notice" rows, so both read the same under a screen reader.
+  function appendNotice(title, text) {
+    const article = document.createElement("article");
+    article.className = "msg info";
+    const role = document.createElement("h3");
+    role.className = "role";
+    role.textContent = title;
+    const body = document.createElement("p");
+    body.className = "info-body";
+    body.textContent = text;
+    article.appendChild(role);
+    article.appendChild(body);
+    transcript.appendChild(article);
+    return article;
   }
 
   function appendMessage(role, text) {
@@ -3639,17 +3659,7 @@
       // article below this notice instead of continuing the one above it.
       discardPartial(ctx);
       ctx.currentAssistantBody = null;
-      const article = document.createElement("article");
-      article.className = "msg info";
-      const role = document.createElement("h3");
-      role.className = "role";
-      role.textContent = obj.title || "Model switched";
-      const body = document.createElement("p");
-      body.className = "info-body";
-      body.textContent = obj.message || obj.summary || "";
-      article.appendChild(role);
-      article.appendChild(body);
-      transcript.appendChild(article);
+      appendNotice(obj.title || "Model switched", obj.message || obj.summary || "");
       maybeAutoScroll();
       announce(obj.summary || obj.message || "The model for this chat changed.");
       markVisibleActivity();
