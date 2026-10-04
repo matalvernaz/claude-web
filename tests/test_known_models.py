@@ -51,7 +51,7 @@ def test_every_entry_is_fully_specified() -> None:
 
 
 def test_context_windows_match_the_cli_model_catalog() -> None:
-    # Read out of the CLI's own model catalog (`claude` 2.1.280 binary, the
+    # Read out of the CLI's own model catalog (`claude` 2.1.289 binary, the
     # `context: {window: …}` field). The context meter and the threshold
     # announcements divide by this, so an inflated value silences the warning
     # that a session is about to overflow.
@@ -61,6 +61,7 @@ def test_context_windows_match_the_cli_model_catalog() -> None:
         "claude-fable-5-1": 1000000,
         "claude-fable-5": 1000000,
         "claude-opus-4-8": 1000000,
+        "claude-sonnet-5-5": 1000000,
         "claude-sonnet-5": 1000000,
         "claude-sonnet-4-6": 200000,
         "claude-haiku-4-5": 200000,
@@ -75,6 +76,36 @@ def test_context_windows_match_the_cli_model_catalog() -> None:
         expected = catalog.get(m["model"])
         if expected is not None and not m.get("betas"):
             assert m["context"] == expected, f"{m['key'] or '(default)'}: {m['model']}"
+
+
+def test_advisor_ranks_match_the_cli_model_catalog() -> None:
+    # `advisor_rank` from the same catalog (2.1.289). The CLI renumbered every
+    # rank between 2.1.280 and 2.1.289 (Fable 5.1 went from 5 to 9). That alone
+    # changed no answer, but a model added at its new rank under the old
+    # ceiling would silently lose the advisor checkbox. Only the absolute
+    # numbers moved; the CLI's rule (advisor rank >= 2 and >= the executor's)
+    # did not.
+    catalog = {
+        "claude-fable-5-1": 9,
+        "claude-fable-5": 8,
+        "claude-opus-5-5": 7,
+        "claude-opus-5": 7,
+        "claude-sonnet-5-5": 6,
+        "claude-opus-4-8": 5,
+        "claude-opus-4-7": 5,
+        "claude-sonnet-5": 4,
+        "claude-sonnet-4-6": 2,
+        "claude-haiku-4-5": 1,
+    }
+    for m in KNOWN_MODELS:
+        if m.get("plan_model"):
+            # A split entry advertises the higher of its halves; see
+            # test_fableplan_rank_is_the_higher_of_its_two_halves.
+            expected = max(catalog[m["model"]], catalog[m["plan_model"]])
+        else:
+            expected = catalog[m["model"]]
+        assert m["advisor_rank"] == expected, f"{m['key'] or '(default)'}: {m['model']}"
+    assert app_module._ADVISOR_MODEL_RANK == catalog[app_module.ADVISOR_MODEL]
 
 
 def test_no_model_appears_twice_in_the_picker() -> None:
@@ -116,6 +147,15 @@ def test_new_5_5_generation_is_offered() -> None:
     assert sonnet5["model"] == "claude-sonnet-5"
     assert sonnet5["efforts"] == app_module.EFFORT_LEVELS
     assert not _spawn_only(sonnet5)
+
+    # Sonnet 5.5 is what the CLI's `sonnet` alias names from 2.1.289 on.
+    sonnet55 = app_module.MODELS_BY_KEY.get("claude-sonnet-5-5") or {}
+    assert sonnet55, "claude-sonnet-5-5 missing from KNOWN_MODELS"
+    assert sonnet55["model"] == "claude-sonnet-5-5"
+    assert sonnet55["efforts"] == app_module.EFFORT_LEVELS
+    assert not _spawn_only(sonnet55)
+    assert app_module.model_supports_advisor("claude-sonnet-5-5")
+    assert app_module._model_families_for_key("claude-sonnet-5-5") == {"sonnet"}
 
 
 def test_default_entry_tracks_the_cli_opus_alias() -> None:

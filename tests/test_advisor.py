@@ -36,7 +36,7 @@ def test_no_entry_carries_its_own_advisor() -> None:
 
 def test_model_supports_advisor_follows_the_cli_rank_rule() -> None:
     # The CLI allows an advisor when the executor has a rank at all and the
-    # advisor's rank is at least the executor's. Fable 5.1 is rank 5, the top,
+    # advisor's rank is at least the executor's. Fable 5.1 is rank 9, the top,
     # so every ranked model qualifies.
     for m in app_module.KNOWN_MODELS:
         rank = m.get("advisor_rank")

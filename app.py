@@ -500,40 +500,48 @@ EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
 # and is the highest rank the entry can run at: a split-model entry takes the
 # max of its two halves, because the CLI drops the advisor the moment the run
 # switches to a half that outranks it. None means the catalog gives the model
-# no rank at all, and the CLI then refuses any advisor for it.
+# no rank at all, and the CLI then refuses any advisor for it. The numbers are
+# the 2.1.289 catalog's: the CLI renumbered them all since 2.1.280, so compare
+# them only with each other and with _ADVISOR_MODEL_RANK, never with a number
+# remembered from an older catalog.
 KNOWN_MODELS = [
     # "model" here is never spawned with (an empty key sends no --model at all,
     # so the CLI picks its own default); it names the model the CLI would pick,
     # which is what _model_families_for_key reads to size the entitlement check.
-    # Keep it tracking the CLI's `opus` alias — 2.1.280 moved that to Opus 5.5.
+    # Keep it tracking the CLI's `opus` alias — 2.1.280 moved that to Opus 5.5,
+    # and 2.1.289 still names it.
     {"key": "", "model": "claude-opus-5-5", "label": "Default", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 7},
     # Opus 5.5 is the CLI's default Opus as of 2.1.280 — 1M context, cheaper than
     # Opus 5 ($4/$20 per Mtok vs $5/$25) and the only model here whose catalog
     # default effort is "medium" rather than "high".
     {"key": "claude-opus-5-5", "model": "claude-opus-5-5", "label": "Opus 5.5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 4},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 7},
     {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 7},
     {"key": "claude-fable-5-1", "model": "claude-fable-5-1", "label": "Fable 5.1", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 5},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 9},
     {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 8},
     # Split-model entry: "plan_model" runs while the run is in plan mode,
     # "model" the rest of the time (the CLI's opusplan pattern, pointed at
     # Fable). _sync_plan_model drives the swap on plan enter/approve. Switchable
-    # mid-chat (no betas), so it stays in the top block. advisor_rank is 5, the
+    # mid-chat (no betas), so it stays in the top block. advisor_rank is 8, the
     # Fable 5 half, not the Opus 4.8 one: an advisor valid only for Opus 4.8
     # would be silently dropped the moment the run entered plan mode.
     {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
      "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 8},
     {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 4},
+     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
     {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
-     "efforts": [], "advisor_rank": 4},
+     "efforts": [], "advisor_rank": 5},
+    # Sonnet 5.5 is the CLI's `sonnet` alias as of 2.1.289: 1M context, 128K
+    # output, and like Opus 5.5 a catalog default effort of "medium".
+    {"key": "claude-sonnet-5-5", "model": "claude-sonnet-5-5", "label": "Sonnet 5.5", "context": 1000000,
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 6},
     {"key": "claude-sonnet-5", "model": "claude-sonnet-5", "label": "Sonnet 5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 3},
+     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 4},
     # 200K, not 1M: the CLI's model catalog gives Sonnet 4.6 a 200000-token
     # window (only Sonnet 5 went to 1M). The meter and the context-threshold
     # announcements read this number, so an inflated one silences the warning.
@@ -547,16 +555,17 @@ KNOWN_MODELS = [
     # live here too; it no longer does, because it can now be toggled on a
     # live CLI.
     {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
-     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": [], "advisor_rank": 4},
+     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": [], "advisor_rank": 5},
 ]
 
 # The model claude-web attaches when the advisor is on. The CLI accepts any
 # model whose catalog advisor_rank is both >= 2 and >= the executor's; Fable
-# 5.1 sits at the top rank, so it can advise every model in the picker and
-# there is nothing left to choose between. That is why the advisor is a
-# checkbox and not a second model picker.
+# 5.1 sits at the top rank (9 in the 2.1.289 catalog, tied only with Mythos
+# 5.1, which this install cannot run), so it can advise every model in the
+# picker and there is nothing left to choose between. That is why the advisor
+# is a checkbox and not a second model picker.
 ADVISOR_MODEL = "claude-fable-5-1"
-_ADVISOR_MODEL_RANK = 5
+_ADVISOR_MODEL_RANK = 9
 
 # Picker keys retired when the advisor became its own control. Each mapped to
 # one executor/advisor pair; they still arrive from a browser whose
