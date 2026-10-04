@@ -141,15 +141,25 @@ _anthropic = anthropic.Anthropic(api_key=_anthropic_key, max_retries=0) if _anth
 # ─── Participant registry ────────────────────────────────────────────────
 
 # Provider-agnostic short names. Adding a new entry here is enough; no
-# tool signatures need to change. Pinned aliases (latest, etc.) so a
-# provider model bump applies automatically without redeploy. The
-# ``label`` shown in transcripts and to participants is intentionally
-# distinct from the model id — a roundtable participant identifies
-# itself by role ("Gemini Pro"), not by version string. The KEYS are
-# likewise stable caller-facing handles, not model-version promises:
-# "gpt-5-mini" deliberately stays put across mini bumps (currently
-# gpt-5.6-luna, the fast/affordable tier of the 5.6 series), so don't
-# rename a key on a model refresh — change only the "model" value.
+# tool signatures need to change. The KEYS are stable caller-facing handles,
+# not model-version promises: "gpt-5" outlived GPT-5 and now runs the newest
+# Sol, so never rename a key on a model refresh. Each entry runs its
+# provider's newest model without a redeploy:
+#   - Gemini: Google's rolling ``-latest`` aliases.
+#   - Claude: the CLI's family aliases (opus / sonnet / fable), resolved by
+#     the subscription CLI on every call; the API transport looks up the
+#     newest listed id of the family (_anthropic_api_model).
+#   - OpenAI: no aliases exist, so ``family`` names the durable tier
+#     (sol / luna / terra / astra) and _openai_latest picks the newest
+#     ``gpt-<version>-<tier>`` the key can list. ``model`` is the fallback
+#     when that listing fails.
+# ``CLAUDE_ROUNDTABLE_MODEL_<KEY>`` (e.g. CLAUDE_ROUNDTABLE_MODEL_GPT_5)
+# pins one participant to an exact id.
+#
+# The ``label`` is shown in transcripts and is how a participant is told who
+# it is, so it names a role ("GPT Sol"), never a version. Speakers are stored
+# by label, so a renamed participant lists its old labels in
+# ``former_labels`` and still recognises its own earlier turns.
 PARTICIPANTS: dict[str, dict] = {
     "gemini-flash": {
         "provider": "gemini",
@@ -163,35 +173,156 @@ PARTICIPANTS: dict[str, dict] = {
     },
     "gpt-5-mini": {
         "provider": "openai",
-        "model": "gpt-5.6-luna",
-        "label": "GPT-5 Mini",
+        "family": "luna",
+        "model": "gpt-6-luna",
+        "label": "GPT Luna",
+        "former_labels": ["GPT-5 Mini"],
     },
     "gpt-5-terra": {
         "provider": "openai",
+        "family": "terra",
         "model": "gpt-5.6-terra",
-        "label": "GPT-5 Terra",
+        "label": "GPT Terra",
+        "former_labels": ["GPT-5 Terra"],
     },
     "gpt-5": {
         "provider": "openai",
-        "model": "gpt-5.6-sol",
-        "label": "GPT-5",
+        "family": "sol",
+        "model": "gpt-6.1-sol",
+        "label": "GPT Sol",
+        "former_labels": ["GPT-5"],
+    },
+    # OpenAI's frontier tier: slower and pricier than Sol, for the hardest
+    # questions. Not in any default panel.
+    "gpt-astra": {
+        "provider": "openai",
+        "family": "astra",
+        "model": "gpt-6-astra",
+        "label": "GPT Astra",
     },
     "claude-sonnet": {
         "provider": "anthropic",
-        "model": "claude-sonnet-4-6",
+        "model": "sonnet",
         "label": "Claude Sonnet",
     },
     "claude-opus": {
         "provider": "anthropic",
-        "model": "claude-opus-4-8",
+        "model": "opus",
         "label": "Claude Opus",
     },
     "claude-fable": {
         "provider": "anthropic",
-        "model": "claude-fable-5",
+        "model": "fable",
         "label": "Claude Fable",
     },
 }
+
+# Every label a participant has spoken under, for _format_transcript's
+# "(you)" tag.
+_LABEL_ALIASES: dict[str, frozenset] = {
+    info["label"]: frozenset([info["label"], *info.get("former_labels", [])])
+    for info in PARTICIPANTS.values()
+}
+
+
+# ─── Newest model per provider family ─────────────────────────────────────
+# Listings are cached for _LATEST_TTL_SEC. A failed listing keeps the last
+# good answer (or the registry's pinned id) and is retried after
+# _LATEST_RETRY_SEC rather than on every call.
+_LATEST_TTL_SEC = float(os.environ.get("CLAUDE_ROUNDTABLE_LATEST_TTL_SEC", "21600"))
+_LATEST_RETRY_SEC = 300.0
+_LATEST_LIST_TIMEOUT_SEC = 15.0
+_LATEST_LOCK = threading.Lock()
+_OPENAI_LATEST: dict = {"at": 0.0, "by_family": {}}
+_ANTHROPIC_LATEST: dict = {"at": 0.0, "by_family": {}}
+# Only bare tier ids: gpt-6.1-sol, never gpt-6.1-sol-2026-09-30 (a frozen
+# snapshot), gpt-5.5-pro or a -chat-latest variant, which behave differently.
+_OPENAI_TIER_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?-(sol|luna|terra|astra)$")
+# The CLI's family aliases, and the ids the API transport falls back to when
+# it cannot list models.
+_ANTHROPIC_ALIAS_FALLBACK = {
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "fable": "claude-fable-5-1",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def _refresh_latest(cache: dict, list_ids) -> None:
+    """Refill ``cache`` from ``list_ids()`` when stale. Caller holds the lock."""
+    now = time.time()
+    if now - cache["at"] < _LATEST_TTL_SEC:
+        return
+    try:
+        by_family = list_ids()
+    except Exception as exc:  # noqa: BLE001 — a listing outage must not fail a turn
+        logger.warning("model listing failed, keeping the last answer: %s", exc)
+        cache["at"] = now - _LATEST_TTL_SEC + _LATEST_RETRY_SEC
+        return
+    cache.update(at=now, by_family=by_family)
+
+
+def _openai_latest(family: str) -> Optional[str]:
+    """Newest bare ``gpt-<version>-<family>`` id the OpenAI key can list."""
+    if _openai is None:
+        return None
+
+    def _list() -> dict:
+        best: dict = {}
+        # A short timeout: this runs on the request path, and the client's
+        # default would hold a turn for minutes if the listing hangs.
+        for model in _openai.models.list(timeout=_LATEST_LIST_TIMEOUT_SEC):
+            m = _OPENAI_TIER_RE.match(getattr(model, "id", "") or "")
+            if m:
+                version = (int(m.group(1)), int(m.group(2) or 0))
+                if m.group(3) not in best or version > best[m.group(3)][0]:
+                    best[m.group(3)] = (version, m.group(0))
+        return {fam: mid for fam, (_v, mid) in best.items()}
+
+    with _LATEST_LOCK:
+        _refresh_latest(_OPENAI_LATEST, _list)
+        return _OPENAI_LATEST["by_family"].get(family)
+
+
+def _anthropic_api_model(model: str) -> str:
+    """A concrete id for the Messages API, which has no family aliases.
+
+    The CLI transports take ``opus`` / ``sonnet`` / ``fable`` as they are.
+    The API needs an id: the newest listed one of the family, else the
+    pinned fallback. Anything that isn't an alias passes through.
+    """
+    if model not in _ANTHROPIC_ALIAS_FALLBACK:
+        return model
+    if _anthropic is not None:
+        def _list() -> dict:
+            newest: dict = {}
+            for item in _anthropic.models.list(limit=100, timeout=_LATEST_LIST_TIMEOUT_SEC):
+                mid = getattr(item, "id", "") or ""
+                created = str(getattr(item, "created_at", "") or "")
+                for family in _ANTHROPIC_ALIAS_FALLBACK:
+                    if mid.startswith(f"claude-{family}-") and (
+                            family not in newest or created > newest[family][0]):
+                        newest[family] = (created, mid)
+            return {fam: mid for fam, (_c, mid) in newest.items()}
+
+        with _LATEST_LOCK:
+            _refresh_latest(_ANTHROPIC_LATEST, _list)
+            found = _ANTHROPIC_LATEST["by_family"].get(model)
+        if found:
+            return found
+    return _ANTHROPIC_ALIAS_FALLBACK[model]
+
+
+def _participant_model(key: str, info: dict) -> str:
+    """The model id a participant runs right now (see the registry comment)."""
+    pinned = os.environ.get(
+        "CLAUDE_ROUNDTABLE_MODEL_" + re.sub(r"[^A-Z0-9]", "_", key.upper()), "",
+    ).strip()
+    if pinned:
+        return pinned
+    if info["provider"] == "openai" and info.get("family"):
+        return _openai_latest(info["family"]) or info["model"]
+    return info["model"]
 
 
 def _participant_provider_available(name: str) -> bool:
@@ -574,11 +705,12 @@ def _format_transcript(
     turn ends and the next begins, even when content contains
     arbitrary user-supplied text.
     """
+    own = _LABEL_ALIASES.get(for_participant_label, frozenset([for_participant_label]))
     lines: list[str] = []
     for m in messages:
         speaker = m["speaker"]
         tag = f"[{speaker}]"
-        if speaker == for_participant_label:
+        if speaker in own:
             tag = f"[{speaker} (you)]"
         lines.append(f"{tag}:\n{m['content']}")
     return "\n\n".join(lines)
@@ -825,6 +957,14 @@ PROVIDER_RETRY_BASE_SEC = float(
 PROVIDER_WALL_TIMEOUT_SEC = float(
     os.environ.get("CLAUDE_ROUNDTABLE_PROVIDER_WALL_TIMEOUT_SEC", "900")
 )
+# Whole-turn timeout for a Claude panellist working with repo tools: many
+# model calls and file reads, not one request, so PROVIDER_TIMEOUT_SEC (300 s)
+# cut working reviews short. Kept just under the wall cap so this fires first
+# and the turn keeps what it had.
+_TOOLS_TURN_TIMEOUT_SEC = float(os.environ.get(
+    "CLAUDE_ROUNDTABLE_TOOLS_TIMEOUT_SEC",
+    str(max(60.0, PROVIDER_WALL_TIMEOUT_SEC - 30.0)),
+))
 
 
 class ProviderWallTimeout(Exception):
@@ -1328,18 +1468,21 @@ _ANTHROPIC_MAX_TOKENS = int(
 )
 _ANTHROPIC_MAX_TOKENS_BY_EFFORT = {"low": 8192, "medium": 16384, "high": 32768}
 
-# Models that accept the Messages-API ``output_config.effort`` knob. The
-# feature shipped with Opus 4.8; Sonnet 4.6 predates it and isn't known to
-# accept it, so we gate rather than risk a 400. Extend as models gain it.
-# (The CLI transport handles effort itself via ``--effort`` and isn't gated
-# here — this gate only guards the SDK Messages path.)
-_ANTHROPIC_EFFORT_MODELS = ("opus-4-8",)
+# Models that do NOT accept the Messages-API ``output_config.effort`` knob,
+# from the CLI's own model catalog (2.1.289: effort is a capability of
+# Sonnet 4.6 and every model since). Listing the old ones rather than the new
+# means a model released next month gets effort without a code change. (The
+# CLI transport passes ``--effort`` itself; this only guards the SDK path.)
+_ANTHROPIC_NO_EFFORT_MODELS = (
+    "claude-3-", "claude-haiku-4-5", "claude-opus-4-0", "claude-opus-4-1",
+    "claude-opus-4-5", "claude-sonnet-4-0", "claude-sonnet-4-5",
+)
 
 
 def _anthropic_supports_effort(model: str) -> bool:
     """True if ``model`` accepts the Messages-API ``output_config.effort``."""
-    m = model.lower()
-    return any(tag in m for tag in _ANTHROPIC_EFFORT_MODELS)
+    m = _anthropic_api_model(model).lower()
+    return not any(m.startswith(tag) for tag in _ANTHROPIC_NO_EFFORT_MODELS)
 
 
 def _call_anthropic(
@@ -1377,6 +1520,8 @@ def _call_anthropic(
     — see the inline note. Cache hits surface as ``cached_tokens`` in the
     logged usage.
     """
+    # The Messages API has no family aliases; the registry's are CLI ones.
+    model = _anthropic_api_model(model)
     # Prompt caching: mark the stable prefix (system prompt + the transcript
     # so far) with ephemeral cache_control breakpoints. Anthropic matches the
     # longest previously-cached prefix, so as the transcript grows each turn
@@ -1704,6 +1849,12 @@ PermissionCallback = Callable[
 ]
 
 
+# Agent-loop turns a Claude panellist gets on a repo-bound thread. One turn is
+# one model call, usually one tool call, so reading five files and answering
+# takes about a dozen.
+_CLAUDE_MAX_TURNS = int(os.environ.get("CLAUDE_ROUNDTABLE_CLAUDE_MAX_TURNS", "40"))
+
+
 @dataclasses.dataclass
 class ToolUseContext:
     """Caller-provided context that turns on real tool use for Anthropic
@@ -1735,12 +1886,13 @@ class ToolUseContext:
     audits would pass ``["Read", "Grep", "Glob"]``).
 
     ``max_turns`` caps the agent loop so a runaway exploration can't
-    burn unbounded subscription quota / tokens.
+    burn unbounded subscription quota / tokens. It was 8, and Claude
+    panellists hit it mid-read on nearly every repo-bound review.
     """
     permission_callback: PermissionCallback
     working_directory: Optional[Union[str, Path]] = None
     allowed_tools: Optional[list[str]] = None
-    max_turns: int = 8
+    max_turns: int = _CLAUDE_MAX_TURNS
 
 
 # ─── Thread-bound repo context (Goal 4) ──────────────────────────────────
@@ -2065,14 +2217,33 @@ def _call_anthropic_sdk_with_tools(
             "session_id": "roundtable-turn",
         }
 
-    async def _drive() -> str:
-        text_parts: list[str] = []
-        async for msg in sdk.query(prompt=_prompt_iter(), options=options):
-            if isinstance(msg, sdk.AssistantMessage):
-                for blk in msg.content:
-                    if isinstance(blk, sdk.TextBlock):
-                        text_parts.append(blk.text)
-        return "\n".join(text_parts).strip()
+    # The answer is the CLI's final result: the panellist's last message.
+    # Joining every text block, as this used to, put each "Let me read X
+    # first" between tool calls into the transcript as if it were findings.
+    state: dict = {}
+    result_cls = getattr(sdk, "ResultMessage", None)
+
+    async def _drive() -> None:
+        try:
+            async for msg in sdk.query(prompt=_prompt_iter(), options=options):
+                if isinstance(msg, sdk.AssistantMessage):
+                    text = "\n".join(
+                        blk.text for blk in msg.content
+                        if isinstance(blk, sdk.TextBlock)
+                    ).strip()
+                    if text:
+                        state["last"] = text
+                elif result_cls is not None and isinstance(msg, result_cls):
+                    if getattr(msg, "is_error", False):
+                        state["capped"] = getattr(msg, "subtype", "") == "error_max_turns"
+                    elif isinstance(getattr(msg, "result", None), str):
+                        state["result"] = msg.result.strip()
+        except Exception:
+            # Past the turn cap the CLI sends an error result, then exits
+            # non-zero, which the SDK raises ("Reached maximum number of
+            # turns"). What the panellist found by then is still worth having.
+            if not (state.get("capped") and state.get("last")):
+                raise
 
     def _do_call() -> str:
         # One event loop per call. _call_anthropic_sdk_with_tools is
@@ -2080,7 +2251,27 @@ def _call_anthropic_sdk_with_tools(
         # ThreadPoolExecutor; roundtable_ask itself runs in whichever
         # thread the caller dispatched on). asyncio.run() creates and
         # tears down the loop cleanly, leaving no state behind.
-        return asyncio.run(asyncio.wait_for(_drive(), timeout=PROVIDER_TIMEOUT_SEC))
+        state.clear()
+        try:
+            asyncio.run(asyncio.wait_for(_drive(), timeout=_TOOLS_TURN_TIMEOUT_SEC))
+        except TimeoutError:
+            # Never retried: the same turn would run out of time again, and
+            # the retry discarded a review that was getting somewhere.
+            if state.get("last"):
+                return (f"{state['last']}\n\n[{participant_label} stopped at the "
+                        f"{_TOOLS_TURN_TIMEOUT_SEC:.0f}s time limit; this was its "
+                        "last message, not a finished answer.]")
+            raise ProviderWallTimeout(
+                f"anthropic-sdk-tools/{model} answered nothing within "
+                f"{_TOOLS_TURN_TIMEOUT_SEC:.0f}s (CLAUDE_ROUNDTABLE_TOOLS_TIMEOUT_SEC)"
+            ) from None
+        if state.get("result"):
+            return state["result"]
+        if state.get("capped"):
+            return (f"{state['last']}\n\n[{participant_label} stopped at the "
+                    f"{tool_use_context.max_turns}-turn limit before finishing; this "
+                    "was its last message.]")
+        return state.get("last", "")
 
     out = _provider_call(f"anthropic-sdk-tools/{model}", _do_call)
     # TODO(usage): the agent SDK surfaces usage on ResultMessage; capture it
@@ -2906,7 +3097,8 @@ def _resolve_participant(participant: str) -> dict:
             f"Participant {key!r} uses provider {info['provider']!r} "
             f"which has no API key configured."
         )
-    return info
+    # A copy with today's model; the registry keeps the pinned fallback.
+    return {**info, "model": _participant_model(key, info)}
 
 
 _VALID_EFFORTS = {"low", "medium", "high"}
@@ -3932,6 +4124,7 @@ def _call_anthropic_structured_api(
     turn trades thinking for schema enforcement (``effort`` still scales
     ``max_tokens``).
     """
+    model = _anthropic_api_model(model)
     user_msg = transcript
     if instruction:
         user_msg += f"\n\n[orchestrator]:\n{instruction}"
@@ -4885,18 +5078,21 @@ def roundtable_close(thread_id: int) -> dict:
 def roundtable_participants() -> dict:
     """List the participants the server knows how to route to.
 
-    Each entry includes the provider, model id, display label, and a
-    flag for whether the matching API key was configured at startup.
-    Useful when the caller needs to pick a participant from a known
-    list (instead of memorising the keys above).
+    Each entry includes the provider, the model id it runs today (the
+    newest of its family, see the registry), display label, and a flag for
+    whether the matching API key was configured at startup. Useful when the
+    caller needs to pick a participant from a known list (instead of
+    memorising the keys above).
     """
-    return {
-        name: {
+    out = {}
+    for name, info in PARTICIPANTS.items():
+        available = _participant_provider_available(name)
+        out[name] = {
             **info,
-            "available": _participant_provider_available(name),
+            "model": _participant_model(name, info) if available else info["model"],
+            "available": available,
         }
-        for name, info in PARTICIPANTS.items()
-    }
+    return out
 
 
 # ─── High-level coding workflows ────────────────────────────────────────
@@ -5087,6 +5283,12 @@ _CODING_REVIEW_SCHEMA = {
 }
 
 
+# The tool budget the coding brief states. A stated budget is what got Claude
+# panellists to answer instead of exploring until the turn cap (10-04 field
+# note); the hard cap is _CLAUDE_MAX_TURNS.
+_TOOL_BUDGET_HINT = int(os.environ.get("CLAUDE_ROUNDTABLE_TOOL_BUDGET_HINT", "15"))
+
+
 def _coding_task_profile(task: str) -> tuple[str, dict]:
     key = (task or "general").strip().lower()
     profile = _CODING_TASK_PROFILES.get(key)
@@ -5131,6 +5333,9 @@ def roundtable_coding_panel_prompt(task: str, participants: list[str]) -> str:
         "Shared contract:\n"
         "- Inspect the bound repository or attached artifacts before making "
         "claims about the code.\n"
+        f"- With repository tools, budget about {_TOOL_BUDGET_HINT} tool calls: "
+        "read the files and functions the task names, not the whole tree, and "
+        "answer once you have the evidence.\n"
         "- Cite repository-relative file:line locations for code-specific claims.\n"
         "- Distinguish evidence from inference and say what would resolve any "
         "remaining uncertainty.\n"
@@ -5259,7 +5464,10 @@ def roundtable_coding_synthesis_prompt(
 
 
 def _default_coding_panel(synthesizer: str) -> list[str]:
-    preferred = ["gemini-pro", "gpt-5"]
+    # GPT and Gemini for independent views, plus a Claude reviewer: in the
+    # September and October 2026 reviews the Claude panellists found the real
+    # defects, and they run free on the subscription.
+    preferred = ["gpt-5", "claude-sonnet", "gemini-pro"]
     panel = [
         name for name in preferred
         if name != synthesizer and _participant_provider_available(name)

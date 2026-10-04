@@ -68,7 +68,7 @@ def test_panel_prompt_assigns_distinct_task_lenses(monkeypatch):
     prompt = core.roundtable_coding_panel_prompt("debug", ["gemini-pro", "gpt-5"])
     assert "Coding workflow: Debug" in prompt
     assert "Gemini Pro: Root-cause investigator" in prompt
-    assert "GPT-5: Hypothesis falsifier" in prompt
+    assert "GPT Sol: Hypothesis falsifier" in prompt
     assert "Do not merge" in prompt
 
 

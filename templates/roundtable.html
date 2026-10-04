@@ -160,14 +160,16 @@
           <details class="assistant-advanced-knobs">
             <summary>Override panel</summary>
             <p class="hint">
-              By default: <code>gemini-pro</code> + <code>gpt-5</code> as
-              the paid panel, <code>claude-opus</code> as the synthesizer.
-              Override below to use a different lineup.
+              By default: <code>gpt-5</code> (newest GPT Sol),
+              <code>claude-sonnet</code> and <code>gemini-pro</code> as the
+              panel, <code>claude-opus</code> as the synthesizer. Every
+              participant runs its provider's newest model. Override below to
+              use a different lineup.
             </p>
             <p class="action-form-row">
               <label for="override-participants">Panel</label>
               <input type="text" id="override-participants"
-                placeholder="e.g. gemini-pro,gpt-5-mini" autocomplete="off">
+                placeholder="e.g. gpt-5,gpt-astra,gemini-pro" autocomplete="off">
             </p>
             <p class="action-form-row">
               <label for="override-synthesizer">Synthesizer</label>
@@ -175,7 +177,7 @@
                 <option value="">claude-opus (default)</option>
                 <option value="claude-sonnet">claude-sonnet (faster)</option>
                 <option value="claude-opus">claude-opus</option>
-                <option value="claude-fable">claude-fable (access-gated)</option>
+                <option value="claude-fable">claude-fable (most capable; may need usage credits)</option>
               </select>
             </p>
             <div id="review-options" class="assistant-review-options" hidden>

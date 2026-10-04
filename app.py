@@ -16866,14 +16866,15 @@ async def api_roundtable_close(
     return result
 
 
-# Default panel composition for the assistant view. Picked so the cost
-# story is "two paid providers diverse enough to disagree, plus Claude
-# as the free synthesizer via the subscription CLI." Override per-request
-# via the form's `participants` and `synthesizer` fields. If a default
-# isn't available (no API key for that provider), it's silently dropped
-# at request time — the orchestrator never tries to call a participant
-# that can't answer.
-_ASSISTANT_DEFAULT_PANEL = ["gemini-pro", "gpt-5"]
+# Default panel composition for the assistant view: two paid providers
+# diverse enough to disagree, plus a Claude reviewer, with Claude as the
+# synthesizer. Both Claude seats run free on the subscription CLI, and in the
+# September and October 2026 reviews the Claude panellists were the ones who
+# found the real defects. Override per-request via the form's `participants`
+# and `synthesizer` fields. If a default isn't available (no API key for
+# that provider), it's silently dropped at request time — the orchestrator
+# never tries to call a participant that can't answer.
+_ASSISTANT_DEFAULT_PANEL = ["gpt-5", "claude-sonnet", "gemini-pro"]
 _ASSISTANT_DEFAULT_SYNTHESIZER = "claude-opus"
 
 # How much of the prompt to keep when deriving the auto-generated thread
