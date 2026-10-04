@@ -64,13 +64,19 @@ def ui(browser):
         "posts": [], "initial_local": False, "providers_error": False,
         "providers_pending": False, "pending_routes": [],
     }
-    html = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("index.html").render(
-        site_title="Test chat", asset_version=lambda _: "test", models=[cloud_model],
-        models_json=json.dumps([cloud_model]), effort_levels=["low", "high"],
-        account={"active": "shared", "shared_label": "Shared", "credentials": []},
-        personalities_payload={"active": 1, "personalities": [{"id": 1, "name": "Default"}]},
-        sessions=[], multi_project=False,
-    )
+    template = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("index.html")
+
+    def render_html():
+        # Rendered per request so a test can swap in a real Claude model list
+        # (state["claude_models"]) before it loads the page.
+        models = state.get("claude_models") or [cloud_model]
+        return template.render(
+            site_title="Test chat", asset_version=lambda _: "test", models=models,
+            models_json=json.dumps(models), effort_levels=["low", "high"],
+            account={"active": "shared", "shared_label": "Shared", "credentials": []},
+            personalities_payload={"active": 1, "personalities": [{"id": 1, "name": "Default"}]},
+            sessions=[], multi_project=False,
+        )
 
     def route(request_route):
         request = request_route.request
@@ -97,6 +103,7 @@ def ui(browser):
             else:
                 request_route.fulfill(json={})
         elif path == "/":
+            html = render_html()
             body = html.replace('<option value="claude" selected>Claude</option>',
                                 '<option value="local" selected>Local</option>') if state["initial_local"] else html
             request_route.fulfill(content_type="text/html", body=body)
@@ -451,3 +458,56 @@ def test_reopened_chat_shows_past_model_notices(ui):
     assert [i for i, t in enumerate(texts) if "Audit this binary" in t][0] \
         < [i for i, t in enumerate(texts) if "Switched to Opus 4.8" in t][0] \
         < [i for i, t in enumerate(texts) if "Here is the audit." in t][0]
+
+
+def _use_real_claude_models(state):
+    import app as app_module
+
+    models = app_module._models_payload()
+    state["claude_models"] = models
+    state["providers"]["providers"][0]["models"] = models
+    return models
+
+
+@pytest.mark.parametrize("saved, expected, advisor", [
+    # An explicit id the opus alias row now covers.
+    ("claude-opus-5-5", "opus", None),
+    # A retired advisor combo: its executor, then the alias, advisor on.
+    ("opus55-fable51-advisor", "opus", "1"),
+    ("claude-opus-4-7-1m", "claude-opus-4-7", None),
+    # The CLI resolves Haiku to a dated id; the saved bare id still matches.
+    ("claude-haiku-4-5", "haiku", None),
+    ("claude-sonnet-4-6", "claude-sonnet-4-6", None),
+])
+def test_saved_claude_pick_follows_the_cli_list(ui, saved, expected, advisor):
+    page, state = ui
+    _use_real_claude_models(state)
+    page.add_init_script(
+        "localStorage.setItem('claude-web.provider', 'claude');"
+        f"localStorage.setItem('claude-web.model', {json.dumps(saved)});"
+    )
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#model-select")).to_have_value(expected)
+    assert page.evaluate("localStorage.getItem('claude-web.model')") == expected
+    if advisor:
+        assert page.evaluate("localStorage.getItem('claude-web.advisor')") == advisor
+
+
+def test_context_meter_takes_the_window_from_the_turn(ui):
+    # Nothing in the picker knows a window until a turn reports one; the
+    # result carries it by model id and the meter must use it straight away.
+    page, state = ui
+    _use_real_claude_models(state)
+    state["chat_sse"] = "data: " + json.dumps({
+        "type": "result", "input_tokens": 500000,
+        "context_windows": {"claude-opus-5-5": 1000000, "claude-haiku-4-5": 200000},
+    }) + "\n\n"
+    page.add_init_script(
+        "localStorage.setItem('claude-web.provider', 'claude');"
+        "localStorage.setItem('claude-web.model', 'opus');"
+    )
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("How full is the context?")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    playwright.expect(page.locator("#context-text")).to_have_text("500.0k / 1000.0k (50%)")

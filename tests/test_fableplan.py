@@ -40,9 +40,10 @@ ENTRY = app_module.MODELS_BY_KEY.get("fableplan") or {}
 # ─── KNOWN_MODELS invariants ────────────────────────────────────────────────
 
 def test_fableplan_entry_exists_with_split_models() -> None:
+    # Both halves are aliases, so the split tracks the newest Fable and Opus.
     assert ENTRY, "fableplan missing from KNOWN_MODELS"
-    assert ENTRY["model"] == "claude-opus-4-8"
-    assert ENTRY["plan_model"] == "claude-fable-5"
+    assert ENTRY["model"] == "opus"
+    assert ENTRY["plan_model"] == "fable"
 
 
 def test_fableplan_betas_match_default_entry() -> None:
@@ -68,16 +69,18 @@ def test_sync_swaps_to_plan_model_and_back() -> None:
     run = _stub_run("fableplan", "plan", client)
 
     asyncio.run(app_module._sync_plan_model(run))
-    assert client.calls == ["claude-fable-5"]
-    assert run.live_sdk_model == "claude-fable-5"
+    assert client.calls == ["fable"]
+    assert run.live_sdk_model == "fable"
     assert run.events[-1]["type"] == "plan_model"
     assert run.events[-1]["active"] is True
+    assert run.events[-1]["label"] == "Planning on Fable 5.1."
 
     run.permission_mode = "acceptEdits"
     asyncio.run(app_module._sync_plan_model(run))
-    assert client.calls == ["claude-fable-5", "claude-opus-4-8"]
-    assert run.live_sdk_model == "claude-opus-4-8"
+    assert client.calls == ["fable", "opus"]
+    assert run.live_sdk_model == "opus"
     assert run.events[-1]["active"] is False
+    assert run.events[-1]["label"] == "Back on Opus 5.5."
 
 
 def test_sync_is_idempotent_per_state() -> None:
@@ -85,7 +88,7 @@ def test_sync_is_idempotent_per_state() -> None:
     run = _stub_run("fableplan", "plan", client)
     asyncio.run(app_module._sync_plan_model(run))
     asyncio.run(app_module._sync_plan_model(run))
-    assert client.calls == ["claude-fable-5"]
+    assert client.calls == ["fable"]
     assert len(run.events) == 1
 
 

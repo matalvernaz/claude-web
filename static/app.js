@@ -82,6 +82,42 @@
     "opus5-fable51-advisor": "claude-opus-5",
     "opus55-fable51-advisor": "claude-opus-5-5",
   };
+  // Rows retired for other reasons. Opus 4.7's 1M window used to need a beta
+  // and its own row; the CLI now runs it at 1M natively. Mirrors the server's
+  // RETIRED_MODEL_KEYS.
+  const RETIRED_MODEL_KEYS = {
+    "claude-opus-4-7-1m": "claude-opus-4-7",
+  };
+  // claude-haiku-4-5-20251001 and claude-haiku-4-5 compare equal: the CLI
+  // resolves Haiku to a dated id and every other model to a bare one.
+  function canonicalModelId(id) {
+    return String(id || "").trim().toLowerCase()
+      .replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+  }
+  // Map a saved Claude pick onto today's picker, mirroring resolve_model_key()
+  // on the server. The picker is the CLI's own list, so a saved explicit id
+  // ("claude-opus-5-5") is no longer an option once the opus alias row covers
+  // it, and the plain restore would drop it to Default without a word. In
+  // order: a current value; a retired advisor combo or row; the alias row the
+  // id now resolves to; the newest model of its family. Null when none fits.
+  function resolveSavedModel(saved, models) {
+    if (saved === null || saved === undefined) return null;
+    const values = new Set((models || []).map((m) => m.key || ""));
+    let key = String(saved);
+    if (LEGACY_MODEL_KEYS[key]) key = LEGACY_MODEL_KEYS[key];
+    if (RETIRED_MODEL_KEYS[key]) key = RETIRED_MODEL_KEYS[key];
+    if (values.has(key)) return key;
+    const canon = canonicalModelId(key);
+    const row = (models || []).find((m) => m.key && m.key !== "fableplan"
+      && m.resolved && canonicalModelId(m.resolved) === canon);
+    if (row) return row.key;
+    if (canon.startsWith("claude-")) {
+      for (const family of ["opus", "fable", "sonnet", "haiku"]) {
+        if (`-${canon}-`.includes(`-${family}-`) && values.has(family)) return family;
+      }
+    }
+    return null;
+  }
 
   // One-shot flag armed by /fork: the next send branches the conversation
   // into a new session (server passes fork_session=True) instead of
@@ -160,13 +196,16 @@
   let stallWatchdogHandle = null;
 
   // Per-model context windows for the meter; null = unknown / hide bar.
-  // Keyed on the picker value (which is the variant key, not the raw SDK
-  // model id) so "claude-opus-4-7-1m" resolves to the 1M window even though
-  // the underlying model id is plain "claude-opus-4-7". Sourced from the
-  // server's KNOWN_MODELS so this list can't drift from what's offered in
-  // the dropdown. Read from a <script type="application/json"> tag instead
-  // of a global so a strict CSP without 'unsafe-inline' for scripts works.
+  // Keyed on the picker value. Claude's list carries a window only once a
+  // turn has reported one, so the authoritative source is CONTEXT_BY_ID below,
+  // filled from each turn's usage. Read from a <script type="application/json">
+  // tag instead of a global so a strict CSP without 'unsafe-inline' for
+  // scripts works.
   const MODEL_CONTEXT = {};
+  // The model id each picker value runs today ("opus" -> "claude-opus-5-5"),
+  // and windows by canonical model id as turns report them.
+  const MODEL_RESOLVED = {};
+  const CONTEXT_BY_ID = {};
   // Effort levels each picker value accepts, keyed like MODEL_CONTEXT
   // (including the "" default entry). Empty/missing = model has no effort
   // knob and the effort picker hides itself.
@@ -189,6 +228,7 @@
     PROVIDERS.claude = { key: "claude", label: "Claude", models: data };
     for (const m of data) {
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
+      if (m.resolved) MODEL_RESOLVED[m.key || ""] = m.resolved;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
       MODEL_BETAS[m.key || ""] = m.betas || [];
       MODEL_ADVISOR_OK[m.key || ""] = !!m.advisor_ok;
@@ -583,7 +623,10 @@
       // Old combo key: keep the executor it named and turn the advisor on,
       // which is what that entry meant.
       safeSet(localStorage, ADVISOR_KEY, "1");
-      savedModel = LEGACY_MODEL_KEYS[savedModel];
+    }
+    const mapped = resolveSavedModel(savedModel, PROVIDERS.claude && PROVIDERS.claude.models);
+    if (mapped !== null && mapped !== savedModel) {
+      savedModel = mapped;
       safeSet(localStorage, MODEL_KEY, savedModel);
     }
     if (savedModel !== null && [...modelSelect.options].some((o) => o.value === savedModel)) {
@@ -804,6 +847,7 @@
     PROVIDERS[provider.key] = provider;
     for (const m of provider.models || []) {
       if (m.key && m.context) MODEL_CONTEXT[m.key] = m.context;
+      if (m.resolved) MODEL_RESOLVED[m.key || ""] = m.resolved;
       MODEL_EFFORTS[m.key || ""] = m.efforts || [];
       MODEL_BETAS[m.key || ""] = m.betas || [];
       MODEL_ADVISOR_OK[m.key || ""] = !!m.advisor_ok;
@@ -873,7 +917,14 @@
       o.textContent = m.label || m.key || "Default";
       modelSelect.appendChild(o);
     }
-    const saved = safeGet(localStorage, modelKeyFor(provider));
+    let saved = safeGet(localStorage, modelKeyFor(provider));
+    if (provider === "claude") {
+      const mapped = resolveSavedModel(saved, models);
+      if (mapped !== null && mapped !== saved) {
+        saved = mapped;
+        safeSet(localStorage, modelKeyFor(provider), saved);
+      }
+    }
     if (saved !== null && [...modelSelect.options].some((o) => o.value === saved)) {
       modelSelect.value = saved;
     } else if (provider !== "claude") {
@@ -3828,6 +3879,12 @@
     } else if (obj.type === "result") {
       discardPartial(ctx);
       ctx.lastResult = obj;
+      // The windows this turn's models really have, by canonical id. The
+      // meter picks the one its picker row resolves to, so a model released
+      // after this page loaded still gets an accurate percentage.
+      for (const [id, window] of Object.entries(obj.context_windows || {})) {
+        if (window > 0) CONTEXT_BY_ID[canonicalModelId(id)] = window;
+      }
       if (typeof obj.input_tokens === "number") {
         lastInputTokens = obj.input_tokens;
         renderContextMeter();
@@ -4093,7 +4150,9 @@
   function renderContextMeter() {
     if (!contextMeter) return;
     const model = (modelSelect && modelSelect.value) || lastSeenModel;
-    const max = model && MODEL_CONTEXT[model];
+    const resolved = MODEL_RESOLVED[(modelSelect && modelSelect.value) || ""] || lastSeenModel;
+    const max = (resolved && CONTEXT_BY_ID[canonicalModelId(resolved)])
+      || (model && MODEL_CONTEXT[model]);
     if (!lastInputTokens) {
       contextMeter.hidden = true;
       return;

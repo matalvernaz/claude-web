@@ -19,7 +19,9 @@ from tests.test_fableplan import _FakeClient, _stub_run
 
 
 def test_advisor_is_one_model_not_a_set_of_combo_entries() -> None:
-    assert app_module.ADVISOR_MODEL == "claude-fable-5-1"
+    # The Fable alias: the CLI resolves it to the newest Fable, so the advisor
+    # moves forward with the CLI the way the picker's alias rows do.
+    assert app_module.ADVISOR_MODEL == "fable"
     # The advisor must also be pickable as a main model, so "consult Fable"
     # and "run on Fable" are not two different vocabularies.
     assert app_module.ADVISOR_MODEL in {
@@ -34,29 +36,14 @@ def test_no_entry_carries_its_own_advisor() -> None:
         assert "advisor_model" not in m, m["key"]
 
 
-def test_model_supports_advisor_follows_the_cli_rank_rule() -> None:
-    # The CLI allows an advisor when the executor has a rank at all and the
-    # advisor's rank is at least the executor's. Fable 5.1 is rank 9, the top,
-    # so every ranked model qualifies.
+def test_every_picker_entry_takes_the_advisor() -> None:
+    # The CLI allows an advisor ranked at or above the executor. Fable is the
+    # catalog's top family, so the advisor fits every model the CLI offers,
+    # fableplan's Fable half included.
     for m in app_module.KNOWN_MODELS:
-        rank = m.get("advisor_rank")
-        expected = rank is not None and rank <= app_module._ADVISOR_MODEL_RANK
-        assert app_module.model_supports_advisor(m["key"]) is expected, m["key"]
+        assert app_module.model_supports_advisor(m["key"]), m["key"]
     # An unknown key reads as "no advisor" rather than raising.
     assert app_module.model_supports_advisor("not-a-model") is False
-
-
-def test_fableplan_rank_is_the_higher_of_its_two_halves() -> None:
-    # The CLI drops the advisor the moment the run switches to a half that
-    # outranks it, and it does so silently — so the entry has to advertise the
-    # stricter of the two, not the model it spends most of its time on.
-    entry = app_module.MODELS_BY_KEY["fableplan"]
-    halves = {entry["model"], entry["plan_model"]}
-    ranks = {
-        m["advisor_rank"] for m in app_module.KNOWN_MODELS
-        if m["key"] and m["model"] in halves and m.get("advisor_rank")
-    }
-    assert entry["advisor_rank"] == max(ranks)
 
 
 def test_every_retired_combo_key_still_resolves() -> None:
@@ -64,12 +51,13 @@ def test_every_retired_combo_key_still_resolves() -> None:
     # from run rows already in state.db. Dropping one 400s a real user's next
     # message, so each must land on a live entry with the advisor on.
     assert app_module.LEGACY_MODEL_KEYS, "the legacy map must not be emptied"
-    for legacy, (target, advisor) in app_module.LEGACY_MODEL_KEYS.items():
+    for legacy, (_target, advisor) in app_module.LEGACY_MODEL_KEYS.items():
         assert legacy not in app_module.MODELS_BY_KEY, legacy
-        assert target in app_module.MODELS_BY_KEY, legacy
         assert advisor is True, legacy
-        assert app_module.resolve_model_key(legacy) == (target, True)
-        assert app_module.model_supports_advisor(target), legacy
+        key, on = app_module.resolve_model_key(legacy)
+        assert key in app_module.MODELS_BY_KEY, legacy
+        assert on is True, legacy
+        assert app_module.model_supports_advisor(key), legacy
 
 
 def test_current_keys_resolve_to_themselves_with_no_advisor() -> None:
@@ -80,7 +68,7 @@ def test_current_keys_resolve_to_themselves_with_no_advisor() -> None:
 def test_models_payload_carries_advisor_availability() -> None:
     payload = {m["key"]: m for m in app_module._models_payload()}
     assert payload[""]["advisor_ok"] is True
-    assert payload["claude-opus-5-5"]["advisor_ok"] is True
+    assert payload["opus"]["advisor_ok"] is True
     # The old per-entry advisor id is gone; the browser reads a boolean.
     assert "advisor" not in payload[""]
     assert payload[""]["betas"] == []
@@ -119,11 +107,11 @@ def test_split_model_entry_still_drives_plan_model_swaps() -> None:
     run = _stub_run("fableplan", "plan", client)
 
     asyncio.run(app_module._sync_plan_model(run))
-    assert client.calls == ["claude-fable-5"]
+    assert client.calls == ["fable"]
 
     run.permission_mode = "acceptEdits"
     asyncio.run(app_module._sync_plan_model(run))
-    assert client.calls == ["claude-fable-5", "claude-opus-4-8"]
+    assert client.calls == ["fable", "opus"]
 
 
 # ─── advisor consent refusal at spawn ───────────────────────────────────────

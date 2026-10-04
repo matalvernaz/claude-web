@@ -69,6 +69,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 import auth
 import claude_cli
+import claude_models
 import codex_provider
 import local_provider
 import conversation_replay
@@ -463,116 +464,46 @@ MAX_FILES_PER_TURN = 10
 MAX_MESSAGE_BYTES = int(os.getenv("CLAUDE_WEB_MAX_MESSAGE_BYTES", str(1 * 1024 * 1024)))
 STATIC_DIR = Path(__file__).parent / "static"
 
-# Models exposed in the UI dropdown. The form sends `key`; the server maps
-# that to (`model`, `betas`). Opus 4.8 ships with the 1M context window by
-# default on the API and needs no beta flag. Opus 4.7's 1M variant is kept
-# as a separate option because that model gates 1M behind a beta. The empty
-# key ("" → "Default") pins Opus 4.8 explicitly so the dropdown's default
-# does not silently fall back to whatever the CLI happens to choose.
-# Fable 5 is a real model (1M context, 128K output, all effort levels). Its
-# availability is access-gated upstream and was suspended 2026-06-12 by a US
-# government directive; while suspended, picking it makes the CLI return a
-# model-not-available error that the run lifecycle now surfaces as a failed
-# turn (see _looks_like_model_rejection) instead of a silent reply.
+# The Claude model picker comes from the installed CLI (claude_models.py):
+# the same rows its own /model picker shows, aliases first. An alias row
+# ("opus", "fable", "sonnet", "haiku") reaches the CLI as the alias, so it
+# runs the newest model of the family even before the list is refreshed, and
+# the refresh (at boot, after every CLI update, and on the update timer) only
+# changes the labels and the older explicit-id rows. The empty key is the
+# CLI's default and spawns with no --model at all.
 #
-# `efforts` lists the values accepted for the SDK's `effort` option (the
-# CLI's --effort flag). Opus 5, Opus 4.8, and Fable 5 accept the full set;
-# earlier models aren't known to accept it, so those entries stay empty
-# rather than risk a 400.
+# EFFORT_LEVELS is only the initial effort <select>; app.js rebuilds it per
+# model from each entry's own `efforts`, which also come from the CLI.
 EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]
-# Order matters: this list drives the header picker (server-rendered options
-# in index.html AND the JS rebuild in app.js, both via _models_payload()).
-# Every switchable model comes first, then the spawn-only block last. Under a
-# screen reader a collapsed <select> fires "change" on each option arrowed
-# through, and switchKey() (app.js) reverts a mid-chat switch to a spawn-only
-# entry — so a non-switchable entry sitting between two switchable ones bounces
-# the selection back and traps AT/keyboard users before they reach the model
-# they wanted. Keeping the spawn-only entries contiguous at the bottom removes
-# every such crossing for the common models.
-#
+
 # The advisor is NOT a model here. It used to be: every executor/advisor pair
 # was its own entry, so the picker carried the same model twice and adding one
 # advisor doubled the list. It is now an independent on/off (see ADVISOR_MODEL
 # and the "advisor" field on /api/chat), which is also what the CLI models it
 # as -- one flag, switchable mid-session since 2.1.260.
-#
-# "advisor_rank" mirrors the rank the CLI's own model catalog gives each model,
-# and is the highest rank the entry can run at: a split-model entry takes the
-# max of its two halves, because the CLI drops the advisor the moment the run
-# switches to a half that outranks it. None means the catalog gives the model
-# no rank at all, and the CLI then refuses any advisor for it. The numbers are
-# the 2.1.289 catalog's: the CLI renumbered them all since 2.1.280, so compare
-# them only with each other and with _ADVISOR_MODEL_RANK, never with a number
-# remembered from an older catalog.
-KNOWN_MODELS = [
-    # "model" here is never spawned with (an empty key sends no --model at all,
-    # so the CLI picks its own default); it names the model the CLI would pick,
-    # which is what _model_families_for_key reads to size the entitlement check.
-    # Keep it tracking the CLI's `opus` alias — 2.1.280 moved that to Opus 5.5,
-    # and 2.1.289 still names it.
-    {"key": "", "model": "claude-opus-5-5", "label": "Default", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 7},
-    # Opus 5.5 is the CLI's default Opus as of 2.1.280 — 1M context, cheaper than
-    # Opus 5 ($4/$20 per Mtok vs $5/$25) and the only model here whose catalog
-    # default effort is "medium" rather than "high".
-    {"key": "claude-opus-5-5", "model": "claude-opus-5-5", "label": "Opus 5.5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 7},
-    {"key": "claude-opus-5", "model": "claude-opus-5", "label": "Opus 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 7},
-    {"key": "claude-fable-5-1", "model": "claude-fable-5-1", "label": "Fable 5.1", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 9},
-    {"key": "claude-fable-5", "model": "claude-fable-5", "label": "Fable 5", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 8},
-    # Split-model entry: "plan_model" runs while the run is in plan mode,
-    # "model" the rest of the time (the CLI's opusplan pattern, pointed at
-    # Fable). _sync_plan_model drives the swap on plan enter/approve. Switchable
-    # mid-chat (no betas), so it stays in the top block. advisor_rank is 8, the
-    # Fable 5 half, not the Opus 4.8 one: an advisor valid only for Opus 4.8
-    # would be silently dropped the moment the run entered plan mode.
-    {"key": "fableplan", "model": "claude-opus-4-8", "plan_model": "claude-fable-5",
-     "label": "Fableplan (Fable 5 plans, Opus 4.8 builds)", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 8},
-    {"key": "claude-opus-4-8", "model": "claude-opus-4-8", "label": "Opus 4.8", "context": 1000000, "betas": [],
-     "efforts": EFFORT_LEVELS, "advisor_rank": 5},
-    {"key": "claude-opus-4-7", "model": "claude-opus-4-7", "label": "Opus 4.7", "context": 200000, "betas": [],
-     "efforts": [], "advisor_rank": 5},
-    # Sonnet 5.5 is the CLI's `sonnet` alias as of 2.1.289: 1M context, 128K
-    # output, and like Opus 5.5 a catalog default effort of "medium".
-    {"key": "claude-sonnet-5-5", "model": "claude-sonnet-5-5", "label": "Sonnet 5.5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 6},
-    {"key": "claude-sonnet-5", "model": "claude-sonnet-5", "label": "Sonnet 5", "context": 1000000,
-     "betas": [], "efforts": EFFORT_LEVELS, "advisor_rank": 4},
-    # 200K, not 1M: the CLI's model catalog gives Sonnet 4.6 a 200000-token
-    # window (only Sonnet 5 went to 1M). The meter and the context-threshold
-    # announcements read this number, so an inflated one silences the warning.
-    {"key": "claude-sonnet-4-6", "model": "claude-sonnet-4-6", "label": "Sonnet 4.6", "context": 200000, "betas": [],
-     "efforts": [], "advisor_rank": 2},
-    {"key": "claude-haiku-4-5", "model": "claude-haiku-4-5", "label": "Haiku 4.5", "context": 200000, "betas": [],
-     "efforts": [], "advisor_rank": 1},
-    # ─── Spawn-only block (kept last; see the module comment above) ───────────
-    # Request betas only apply at spawn, so switchKey() refuses a mid-chat
-    # switch across any of these and reverts the picker. The advisor used to
-    # live here too; it no longer does, because it can now be toggled on a
-    # live CLI.
-    {"key": "claude-opus-4-7-1m", "model": "claude-opus-4-7", "label": "Opus 4.7 (1M context)",
-     "context": 1000000, "betas": ["context-1m-2025-08-07"], "efforts": [], "advisor_rank": 5},
-]
+CLI_MODELS_CACHE = USAGE_DIR / "cli_models.json"
+# Context windows seen in turn results (modelUsage[*].contextWindow), keyed by
+# canonical model id. The CLI's model list carries no window, and the meter
+# needs one before a model's first turn in a page.
+MODEL_CONTEXT_CACHE = USAGE_DIR / "model_context.json"
 
-# The model claude-web attaches when the advisor is on. The CLI accepts any
-# model whose catalog advisor_rank is both >= 2 and >= the executor's; Fable
-# 5.1 sits at the top rank (9 in the 2.1.289 catalog, tied only with Mythos
-# 5.1, which this install cannot run), so it can advise every model in the
-# picker and there is nothing left to choose between. That is why the advisor
+# Rebuilt in place by _apply_cli_model_rows, never rebound, so every module
+# that did `from app import KNOWN_MODELS` and every call site sees a refresh.
+KNOWN_MODELS: list[dict] = []
+MODELS_BY_KEY: dict[str, dict] = {}
+
+# The advisor claude-web attaches when the checkbox is on: the Fable alias,
+# which the CLI resolves to the newest Fable. Fable is the catalog's "best"
+# family, ranked at or above every model the picker offers, so it can advise
+# any of them and there is nothing to choose between. That is why the advisor
 # is a checkbox and not a second model picker.
-ADVISOR_MODEL = "claude-fable-5-1"
-_ADVISOR_MODEL_RANK = 9
+ADVISOR_MODEL = "fable"
 
 # Picker keys retired when the advisor became its own control. Each mapped to
 # one executor/advisor pair; they still arrive from a browser whose
 # localStorage predates the change, and from run rows already in state.db, so
 # every path that reads a model key resolves them first rather than 400ing.
-# The three that named Fable 5 resolve to the Fable 5.1 advisor: it is the only
-# advisor offered now, and it outranks the one they asked for.
+# Their targets are old explicit ids, resolved onward by resolve_model_key.
 LEGACY_MODEL_KEYS = {
     "opus-fable-advisor": ("claude-opus-4-8", True),
     "fableplan-advisor": ("fableplan", True),
@@ -580,8 +511,61 @@ LEGACY_MODEL_KEYS = {
     "opus5-fable51-advisor": ("claude-opus-5", True),
     "opus55-fable51-advisor": ("claude-opus-5-5", True),
 }
+# Keys retired for other reasons. Opus 4.7's 1M window used to need a beta and
+# its own picker row; the CLI now runs it at 1M natively.
+RETIRED_MODEL_KEYS = {"claude-opus-4-7-1m": "claude-opus-4-7"}
 
-MODELS_BY_KEY = {m["key"]: m for m in KNOWN_MODELS}
+
+def _observed_context_windows() -> dict:
+    try:
+        data = json.loads(MODEL_CONTEXT_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_cli_model_rows(rows: list) -> None:
+    """Rebuild KNOWN_MODELS / MODELS_BY_KEY from the CLI's picker rows."""
+    entries = claude_models.build_entries(rows, _observed_context_windows())
+    KNOWN_MODELS[:] = entries
+    MODELS_BY_KEY.clear()
+    MODELS_BY_KEY.update({m["key"]: m for m in entries})
+
+
+_apply_cli_model_rows((claude_models.load_cache(CLI_MODELS_CACHE) or {}).get("rows") or [])
+
+
+def _note_context_windows(model_usage: Any) -> dict[str, int]:
+    """Record every window a turn's usage reports; return them by canonical id.
+
+    A result lists each model the turn used (the chat's own, the advisor, the
+    small model the CLI runs housekeeping on), each with its true window, so
+    every entry is safe to keep. The browser picks the one for its picker row.
+    """
+    windows: dict[str, int] = {}
+    for model_id, usage in (model_usage or {}).items():
+        if not isinstance(usage, dict):
+            continue
+        window = usage.get("contextWindow")
+        canon = claude_models.canonical_model_id(usage.get("canonicalModel") or model_id)
+        if isinstance(window, int) and window > 0 and canon:
+            windows[canon] = window
+    if windows:
+        known = _observed_context_windows()
+        if any(known.get(k) != v for k, v in windows.items()):
+            known.update(windows)
+            try:
+                MODEL_CONTEXT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                tmp = MODEL_CONTEXT_CACHE.with_suffix(".tmp")
+                tmp.write_text(json.dumps(known), encoding="utf-8")
+                os.replace(tmp, MODEL_CONTEXT_CACHE)
+            except OSError as exc:
+                log.warning("could not record context windows: %s", exc)
+            for entry in KNOWN_MODELS:
+                window = known.get(claude_models.canonical_model_id(entry.get("resolved") or ""))
+                if window:
+                    entry["context"] = window
+    return windows
 
 
 def _form_flag(value: str) -> bool:
@@ -590,39 +574,59 @@ def _form_flag(value: str) -> bool:
 
 
 def model_supports_advisor(model_key: str) -> bool:
-    """Whether ADVISOR_MODEL is a legal advisor for ``model_key``.
+    """Whether the advisor checkbox applies to ``model_key``.
 
-    Mirrors the CLI's own gate: the executor must carry a rank at all, and the
-    advisor's rank must be at least the executor's. An unknown key reads as
-    "no advisor" rather than raising, so a stale key can only cost the
-    checkbox, never the turn.
+    Every picker entry qualifies: the advisor is the Fable alias, which the CLI
+    ranks at or above every model it offers. An unknown key reads as "no
+    advisor" rather than raising, so a stale key can only cost the checkbox,
+    never the turn.
     """
-    rank = (MODELS_BY_KEY.get(model_key or "") or {}).get("advisor_rank")
-    return rank is not None and rank <= _ADVISOR_MODEL_RANK
+    return (model_key or "") in MODELS_BY_KEY
 
 
 def resolve_model_key(model_key: str) -> tuple[str, bool]:
-    """Split a picker value into ``(model_key, advisor_on)``.
+    """Turn any model key a browser or a stored run might carry into
+    ``(current picker key, advisor_on)``.
 
-    Current keys pass through with advisor off; a retired combo key (see
-    LEGACY_MODEL_KEYS) resolves to the executor it named with the advisor on.
+    In order: a current key passes through; a retired advisor combo becomes
+    its executor with the advisor on; a retired key becomes its replacement;
+    an explicit id the picker now covers with an alias row (a saved
+    ``claude-opus-5-5`` once the ``opus`` row resolves to it) becomes that
+    row; an id the CLI no longer lists falls to its family's alias, the newest
+    model of that family. Anything else comes back unchanged for the caller to
+    reject.
     """
-    legacy = LEGACY_MODEL_KEYS.get(model_key or "")
-    if legacy is None:
-        return (model_key or "", False)
-    return legacy
+    key = (model_key or "").strip()
+    advisor = False
+    if key in LEGACY_MODEL_KEYS:
+        key, advisor = LEGACY_MODEL_KEYS[key]
+    key = RETIRED_MODEL_KEYS.get(key, key)
+    if not key or key in MODELS_BY_KEY:
+        return key, advisor
+    canon = claude_models.canonical_model_id(key)
+    for entry in KNOWN_MODELS:
+        if entry["key"] and entry["key"] == entry["model"] and (
+                claude_models.canonical_model_id(entry.get("resolved") or "") == canon):
+            return entry["key"], advisor
+    if canon.startswith("claude-"):
+        for family in claude_models.FAMILY_ALIASES:
+            if f"-{family}-" in f"{canon}-" and family in MODELS_BY_KEY:
+                return family, advisor
+    return key, advisor
 
 
 def _models_payload() -> list[dict]:
     """Client-visible slice of KNOWN_MODELS (the index page's models-data tag).
 
-    ``advisor_ok`` drives whether the advisor checkbox is offered for the
-    entry; ``betas`` still drives the mid-chat switch refusal, which the
-    advisor no longer needs.
+    ``resolved`` lets the browser map a saved explicit id onto the alias row
+    that now covers it, and pick its context window out of a turn's usage.
+    ``advisor_ok`` drives whether the advisor checkbox is offered; ``betas``
+    still drives the mid-chat switch refusal (no current entry has any).
     """
     return [
         {"key": m["key"], "label": m["label"], "context": m.get("context"),
          "efforts": m.get("efforts") or [], "betas": m.get("betas") or [],
+         "resolved": m.get("resolved") or "",
          "advisor_ok": model_supports_advisor(m["key"])}
         for m in KNOWN_MODELS
     ]
@@ -7806,6 +7810,8 @@ async def _install_restart_machinery() -> None:
     asyncio.create_task(_periodic_gc_loop())
     if CLI_AUTOUPDATE:
         asyncio.create_task(_cli_autoupdate_loop())
+    if CLI_MODELS_FETCH:
+        asyncio.create_task(_cli_models_loop())
     # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
     # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
     # can drive both without an OIDC session cookie.
@@ -8010,6 +8016,8 @@ async def _run_cli_update(source: str) -> dict:
                 updated_at=time.time(), previous_version=before)
             log.info("claude CLI updated %s -> %s (via %s)",
                      before, after, source)
+            if CLI_MODELS_FETCH:
+                asyncio.create_task(_refresh_cli_models("cli-update"))
             if PUSHOVER_TOKEN and PUSHOVER_USER:
                 asyncio.create_task(asyncio.to_thread(
                     _send_pushover_sync, SITE_TITLE,
@@ -8034,6 +8042,68 @@ async def _cli_autoupdate_loop() -> None:
             await _run_cli_update("timer")
         except Exception:
             log.exception("cli autoupdate pass failed")
+        await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
+
+
+# ─── Claude model list ────────────────────────────────────────────────────────
+# Re-read from the CLI at boot, after every CLI update, and on the update
+# timer: the CLI can change its picker without a new version (the server can
+# curate it), so a version check alone would miss changes.
+CLI_MODELS_FETCH = os.getenv("CLAUDE_WEB_CLI_MODELS_FETCH", "true").lower() in (
+    "1", "true", "yes",
+)
+_CLI_MODELS_BOOT_DELAY_SECONDS = 5.0
+_CLI_MODELS_LOCK = asyncio.Lock()
+CLI_MODELS_STATE: dict[str, Any] = {
+    "status": "never",   # never | ok | error | no_cli
+    "version": None, "count": 0, "fetched_at": None, "source": None, "detail": "",
+}
+
+
+async def _refresh_cli_models(source: str) -> dict:
+    """Fetch the CLI's picker rows and rebuild KNOWN_MODELS from them.
+
+    Asks as the shared account; a per-user slot entitled to fewer models is
+    still the failover layer's business, as it was with the hand-kept list.
+    A failed fetch keeps whatever list is already loaded.
+    """
+    cli = claude_cli.resolve()
+    if not cli:
+        CLI_MODELS_STATE.update(status="no_cli", source=source,
+                                detail="no claude CLI to ask")
+        return dict(CLI_MODELS_STATE)
+    async with _CLI_MODELS_LOCK:
+        try:
+            rows = await claude_models.fetch_rows(
+                cli, cwd=USAGE_DIR, env={"CLAUDE_CONFIG_DIR": str(CLAUDE_HOME)})
+        except Exception as exc:  # noqa: BLE001 — keep serving the old list
+            log.warning("claude model list fetch failed (via %s): %s", source, exc)
+            CLI_MODELS_STATE.update(status="error", source=source, detail=str(exc))
+            return dict(CLI_MODELS_STATE)
+        rows = claude_models.usable_rows(rows)
+        if not rows:
+            CLI_MODELS_STATE.update(status="error", source=source,
+                                    detail="the CLI listed no models")
+            return dict(CLI_MODELS_STATE)
+        version = await _cli_version_line(cli)
+        claude_models.save_cache(CLI_MODELS_CACHE, rows, version)
+        before = [m["label"] for m in KNOWN_MODELS]
+        _apply_cli_model_rows(rows)
+        after = [m["label"] for m in KNOWN_MODELS]
+        if before != after:
+            log.info("model picker now %s (claude %s, via %s)", after, version, source)
+        CLI_MODELS_STATE.update(status="ok", version=version, count=len(rows),
+                                fetched_at=time.time(), source=source, detail="")
+        return dict(CLI_MODELS_STATE)
+
+
+async def _cli_models_loop() -> None:
+    await asyncio.sleep(_CLI_MODELS_BOOT_DELAY_SECONDS)
+    while True:
+        try:
+            await _refresh_cli_models("timer")
+        except Exception:
+            log.exception("claude model list refresh failed")
         await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
 
 
@@ -13727,11 +13797,17 @@ def _model_notice_event(subtype: str, data: dict) -> Optional[dict]:
     scope = data.get("scope") or "session"
 
     def label(model_id: str, unknown: str) -> str:
-        # By key, not by scanning "model": fableplan also runs claude-opus-4-8
-        # and sits above it in the list, so a scan names the wrong entry.
+        # A key first, then the id an alias row runs today ("claude-fable-5-1"
+        # is the "fable" row). Never by scanning "model": fableplan also runs
+        # the Opus alias and would name the wrong entry.
         if not model_id:
             return unknown
         entry = MODELS_BY_KEY.get(model_id)
+        if entry is None:
+            canon = claude_models.canonical_model_id(model_id)
+            entry = next((m for m in KNOWN_MODELS if m["key"] and m["key"] == m["model"]
+                          and claude_models.canonical_model_id(m.get("resolved") or "") == canon),
+                         None)
         return entry["label"] if entry else model_id
 
     was = label(original, "The selected model")
@@ -14054,6 +14130,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "cache_5m_input_tokens": creation.get("ephemeral_5m_input_tokens"),
             "cache_1h_input_tokens": creation.get("ephemeral_1h_input_tokens"),
             "permission_denials": [_denial_dict(d) for d in (msg.permission_denials or [])],
+            # Every window the turn's usage reports, by canonical model id; the
+            # browser takes the one its picker row resolves to for the meter.
+            "context_windows": {} if is_local else _note_context_windows(
+                getattr(msg, "model_usage", None)),
         }]
         # The bundled CLI reports an unusable model (no access / suspended /
         # typo) as a normal assistant turn with is_error=True — which renders

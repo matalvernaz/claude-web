@@ -66,6 +66,10 @@ os.environ["CLAUDE_WEB_CSRF_STRICT"] = "false"
 # Keep TestClient startup from spawning the real `claude update` timer loop;
 # the CLI-update tests call _run_cli_update directly against a fake binary.
 os.environ["CLAUDE_WEB_CLI_AUTOUPDATE"] = "false"
+# Nor the model-list fetch, which would start the host's real CLI. The picker
+# instead loads a real CLI 2.1.289 list from the cache file app.py reads at
+# import, so tests see the same shape a host does after its first fetch.
+os.environ["CLAUDE_WEB_CLI_MODELS_FETCH"] = "false"
 # roundtable.core derives DB_PATH from this at import; point it at a temp dir
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.
@@ -85,6 +89,10 @@ for d in (
     os.environ["CODEX_HOME"],
 ):
     os.makedirs(d, exist_ok=True)
+shutil.copyfile(
+    os.path.join(os.path.dirname(__file__), "fixtures", "cli_models_2.1.289.json"),
+    os.path.join(os.environ["CLAUDE_WEB_STATE_DIR"], "cli_models.json"),
+)
 
 
 import pytest  # noqa: E402 — the env block above must run before any app import
