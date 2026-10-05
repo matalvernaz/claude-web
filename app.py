@@ -435,8 +435,12 @@ def _scrubbed_child_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
 
 # The codex app-server child builds a full replacement environment, so it can
 # delete these outright rather than blank them. Share the resolved list so the
-# CLAUDE_WEB_CHILD_ENV_SCRUB knob covers both providers.
-codex_provider.SCRUB_ENV_NAMES = list(CHILD_ENV_SCRUB)
+# CLAUDE_WEB_CHILD_ENV_SCRUB knob covers both providers. Codex never talks to
+# Anthropic, so the shared slot's Claude credentials go too; they stay out of
+# CHILD_ENV_SCRUB itself because a shared-slot Claude run needs them.
+codex_provider.SCRUB_ENV_NAMES = list(CHILD_ENV_SCRUB) + [
+    "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+]
 
 # Cap how many synth-message turns can chain off background tool notifications
 # before we stop and wait for the human. Prevents a notification-emitting tool

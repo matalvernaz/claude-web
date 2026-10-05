@@ -248,3 +248,34 @@ async def test_an_unreadable_result_is_kept_for_diagnosis(fake_setup_token, tmp_
     assert "Something unexpected" in dump.read_text()
     assert oct(dump.stat().st_mode & 0o777) == "0o600"
     await sf.cancel_flow("tok-odd")
+
+
+async def test_sign_out_of_a_personal_slot_never_carries_the_shared_credentials(fresh_setup_flow, tmp_path, monkeypatch) -> None:
+    sf = fresh_setup_flow
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", _TOKEN)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-shared")
+    seen = {}
+
+    class _Done:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        seen["env"] = kwargs["env"]
+        return _Done()
+
+    monkeypatch.setattr(sf.asyncio, "create_subprocess_exec", fake_exec)
+    home = tmp_path / "slot"
+    home.mkdir()
+    sf.save_oauth_token(_TOKEN, home=home)
+    await sf.sign_out(home)
+    assert seen["args"][1:] == ("auth", "logout")
+    assert seen["env"]["CLAUDE_CONFIG_DIR"] == str(home)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in seen["env"]
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert not sf.oauth_token_path(home).exists()
+    # The shared slot's own variables are untouched by a personal sign-out.
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == _TOKEN

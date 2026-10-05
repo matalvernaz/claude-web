@@ -54,7 +54,11 @@ def test_codex_scrub_list_shared_with_app() -> None:
     """app.py hands its resolved list to codex_provider so the
     CLAUDE_WEB_CHILD_ENV_SCRUB knob covers both providers, not just Claude."""
     assert "SESSION_SECRET" in codex_provider.SCRUB_ENV_NAMES
-    assert list(codex_provider.SCRUB_ENV_NAMES) == list(app_module.CHILD_ENV_SCRUB)
+    # Codex also drops the shared Claude credentials, which a Claude run
+    # needs and so cannot be in CHILD_ENV_SCRUB itself.
+    assert list(codex_provider.SCRUB_ENV_NAMES) == list(app_module.CHILD_ENV_SCRUB) + [
+        "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+    ]
 
 
 # ─── SSE replay / terminal delivery ──────────────────────────────────────

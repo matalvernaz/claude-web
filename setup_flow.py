@@ -310,6 +310,10 @@ async def sign_out(home: Optional[Path] = None) -> None:
     try:
         env = dict(os.environ)
         env["CLAUDE_CONFIG_DIR"] = str(target_home)
+        # Log out of this home's own sign-in only, never through the shared
+        # slot's key or long-lived token sitting in the process env.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         proc = await asyncio.create_subprocess_exec(
             _resolve_claude_cli(), "auth", "logout",
             stdin=asyncio.subprocess.DEVNULL,

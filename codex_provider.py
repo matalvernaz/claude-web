@@ -105,6 +105,9 @@ SCRUB_ENV_NAMES: list[str] = [
     "OIDC_CLIENT_ID",
     "CLAUDE_WEB_PUSHOVER_TOKEN",
     "CLAUDE_WEB_PUSHOVER_USER",
+    # The shared Claude slot's credentials; an OpenAI process has no use for them.
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
 ]
 
 # Tool names the approval bridge presents to the existing permission UI.
