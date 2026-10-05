@@ -5545,8 +5545,8 @@
       announce("API-key account: no plan limits");
       return;
     }
-    if (live.mode === "oauth_token" && live.error === "no_token") {
-      return fail("This account runs on a long-lived token. Live plan limits also need the four-week sign-in; add one from the accounts page if you want them here.");
+    if (live.error === "usage_needs_sign_in") {
+      return fail("Live plan percentages aren't available for an account running on a long-lived token: Anthropic's usage service only answers a four-week sign-in, and messages no longer refresh one. The window status above comes from this account's most recent message. To see percentages here, sign the account in the four-week way as well from the accounts page.");
     }
     if ((live.mode !== "oauth" && live.mode !== "oauth_token") || live.error === "no_token") {
       return fail("No Claude subscription credentials on this account.");

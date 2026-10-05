@@ -15997,6 +15997,15 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     if info.get("mode") not in ("oauth", "oauth_token"):
         return base
     token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    lapsed = not token or (expires_at is not None and expires_at / 1000 <= time.time())
+    if lapsed and info.get("mode") == "oauth_token":
+        # The year-long token runs the account but cannot read usage:
+        # Anthropic's usage endpoint wants the profile scope, which only
+        # the four-week sign-in carries (verified 2026-10-05: 403
+        # "scope requirement user:profile"). Runs on the year token also
+        # never refresh that sign-in's bearer, so "send a message to
+        # refresh it" would be false advice here.
+        return {**base, "error": "usage_needs_sign_in"}
     if not token:
         return {**base, "error": "no_token"}
     if expires_at is not None and expires_at / 1000 <= time.time():
@@ -16033,6 +16042,14 @@ async def api_usage_request(
             detail="usage requests require Claude subscription credentials",
         )
     token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    lapsed = not token or (expires_at is not None and expires_at / 1000 <= time.time())
+    if lapsed and info.get("mode") == "oauth_token":
+        raise HTTPException(
+            status_code=409,
+            detail="This account runs on a long-lived token, which cannot talk "
+                   "to Anthropic's usage service. Add a four-week sign-in to "
+                   "request more usage.",
+        )
     if not token:
         raise HTTPException(status_code=409, detail="Claude OAuth token is missing")
     if expires_at is not None and expires_at / 1000 <= time.time():

@@ -1263,17 +1263,25 @@ async def test_api_usage_live_long_lived_token_slot_still_reads_its_sign_in(monk
     assert "bearer-secret-xyz" not in str(out)
 
 
-async def test_api_usage_live_long_lived_token_slot_without_a_sign_in_says_so(monkeypatch) -> None:
+@pytest.mark.parametrize("bearer", [
+    ("", None),                 # token-only slot, never had a sign-in
+    ("tok", 1000),              # sign-in lapsed hours ago; nothing refreshes it now
+])
+async def test_api_usage_live_long_lived_token_slot_without_a_live_sign_in_says_so(monkeypatch, bearer) -> None:
+    """Anthropic's usage endpoint demands the profile scope the year token
+    lacks (403 on 2026-10-05), and runs on the year token never refresh the
+    four-week bearer, so the old "send a message to refresh it" advice must
+    not appear for these slots."""
     monkeypatch.setattr(app_module.setup_flow, "whoami",
                         lambda home=None: {"mode": "oauth_token", "minted_at": 1})
-    monkeypatch.setattr(app_module, "_read_oauth_token", lambda home: ("", None))
+    monkeypatch.setattr(app_module, "_read_oauth_token", lambda home: bearer)
 
     async def boom(token):
-        raise AssertionError("nothing to call Anthropic with")
+        raise AssertionError("nothing usable to call Anthropic with")
     monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
     req = SimpleNamespace(query_params={})
     out = await app_module.api_usage_live(req, {"sub": "user-live-yearly-only"})
-    assert out == {"slot": "shared", "mode": "oauth_token", "error": "no_token"}
+    assert out == {"slot": "shared", "mode": "oauth_token", "error": "usage_needs_sign_in"}
 
 
 async def test_api_usage_live_expired_token_skips_fetch(monkeypatch) -> None:
