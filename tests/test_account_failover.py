@@ -76,6 +76,20 @@ def _spent_window(overage: str = "rejected") -> dict:
     }
 
 
+def _lapsed_window() -> dict:
+    """A spent window whose reset has passed: it describes nothing any more."""
+    window = _spent_window()
+    window["resetsAt"] = time.time() - 600
+    return window
+
+
+def _age_entitlement(slot: str, age_seconds: float) -> None:
+    """Back-date a slot's cached entitlement reading, as an idle slot's is."""
+    data = app_module._entitlement_cache()
+    data["slots"][slot]["fetched_at"] = int(time.time() - age_seconds)
+    app_module._write_entitlement_cache(data)
+
+
 @pytest.fixture(autouse=True)
 def _clean_caches():
     """Each test starts with empty caches and no failover rows.
@@ -135,8 +149,13 @@ def test_scoped_bucket_marks_a_slot_entitled() -> None:
     ) == app_module._ENTITLEMENT_PROVEN
 
 
-def test_missing_bucket_is_unknown_not_denied() -> None:
-    """The whole design turns on this: absence must not become a refusal."""
+def test_missing_bucket_is_unmetered_not_denied() -> None:
+    """The whole design turns on this: absence must not become a refusal.
+
+    A fresh reading without the bucket is still evidence the plan lacks the
+    model (a Pro account's Fable refusal is a 429 that records no denial),
+    so it ranks below "never looked" — but never as a refusal.
+    """
     app_module._save_entitlements(
         "cred:2", _profile("default_claude_max_5x", "team_tier_1"),
         _usage([_fable_bucket()]),
@@ -146,7 +165,7 @@ def test_missing_bucket_is_unknown_not_denied() -> None:
     )
     gated = app_module._gated_families(["cred:2", "cred:3"])
     rank = app_module._slot_entitlement_rank("cred:3", {"fable"}, gated)
-    assert rank == app_module._ENTITLEMENT_UNKNOWN
+    assert rank == app_module._ENTITLEMENT_UNMETERED
     assert rank != app_module._ENTITLEMENT_DENIED
 
 
@@ -176,7 +195,7 @@ def test_spent_scoped_bucket_is_not_proof_of_usable_access() -> None:
     gated = app_module._gated_families(["cred:2"])
     assert app_module._slot_entitlement_rank(
         "cred:2", {"fable"}, gated,
-    ) == app_module._ENTITLEMENT_UNKNOWN
+    ) == app_module._ENTITLEMENT_EXHAUSTED
 
 
 def test_observed_rejection_is_the_only_hard_denial() -> None:
@@ -203,6 +222,11 @@ def test_expired_entitlement_read_is_ignored() -> None:
     app_module._write_entitlement_cache(data)
     assert app_module._load_entitlement("cred:2") is None
     assert app_module._gated_families(["cred:2"]) == set()
+    # Against a family some other slot meters, an expired reading is "never
+    # looked", which is distinct from "looked and found no bucket".
+    assert app_module._slot_entitlement_rank(
+        "cred:2", {"fable"}, {"fable"},
+    ) == app_module._ENTITLEMENT_UNSEEN
 
 
 # ─── plan-window health ───────────────────────────────────────────────────
@@ -467,6 +491,143 @@ def test_offer_is_withheld_when_the_alternative_is_also_spent(slots) -> None:
     assert offer is None
 
 
+# ─── "never looked" is not "can't" (hit 2026-09-14, again 2026-10-05) ─────
+
+
+def test_picked_slot_with_an_expired_reading_is_tried_not_passed_over(slots) -> None:
+    """The state as hit on 2026-10-05 01:48. Alex picked for Fable: its
+    entitlement reading 27 h old, its token lapsed (so the usage dialog could
+    not refresh the reading), its last plan window long since reset. Shared:
+    read fresh, healthy. The ranker scored "never looked" below "proven" and
+    moved the turn without ever asking Alex. Spawning is the only probe left
+    for an idle slot, so the pick has to run.
+    """
+    _enable([slots["alex"], slots["office"]])
+    app_module._save_entitlements(
+        slots["alex"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket(percent=24)]),
+    )
+    _age_entitlement(slots["alex"], app_module._ENTITLEMENT_TTL_SECONDS + 3 * 3600)
+    app_module._save_entitlements(
+        slots["office"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket(percent=65)]),
+    )
+    _write_rate_limit(slots["alex"], _lapsed_window(), age_seconds=26 * 3600)
+    _write_rate_limit(slots["office"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["alex"], "claude-fable-5-1",
+    )
+    assert chosen == slots["alex"]
+    assert sub is None
+
+
+def test_picked_unseen_slot_stays_when_the_proven_sibling_is_spent(slots) -> None:
+    """2026-09-14 21:22: the proven sibling's window had been observed spent,
+    yet it won on entitlement before its health was ever compared, and a
+    working account was moved onto a demonstrably dead one."""
+    _enable([slots["alex"], slots["office"]])
+    app_module._save_entitlements(
+        slots["office"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket(percent=84)]),
+    )
+    _write_rate_limit(slots["office"], _spent_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["alex"], "claude-fable-5-1",
+    )
+    assert chosen == slots["alex"]
+    assert sub is None
+
+
+def test_spent_pick_moves_to_an_unseen_sibling(slots) -> None:
+    """The mirror: an observed spent window is exactly what must move a pick,
+    and an unchecked sibling is a better bet than a dead one."""
+    _enable([slots["office"], slots["alex"]])
+    app_module._save_entitlements(
+        slots["office"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket()]),
+    )
+    _write_rate_limit(slots["office"], _spent_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["office"], "claude-fable-5-1",
+    )
+    assert chosen == slots["alex"]
+    assert sub["reason"] == "plan_limit"
+
+
+def test_unmetered_pick_still_diverts_to_an_unchecked_entitled_sibling(slots) -> None:
+    """Pins the Pro + Fable protection explicitly. A fresh reading with no
+    Fable bucket is the only signal that a Pro account can't run Fable (its
+    refusal is a 429 that records no denial), so it must keep diverting even
+    when the entitled sibling's window hasn't been observed lately. Until now
+    this held only because that sibling happened to have a fresh window."""
+    _seed_real_shapes(slots)
+    _enable([slots["personal"], slots["alex"]])
+    _write_rate_limit(slots["personal"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "claude-fable-5-1",
+    )
+    assert chosen == slots["alex"]
+    assert sub["reason"] == "model_unavailable"
+
+
+def test_unseen_sibling_is_a_better_destination_than_an_unmetered_one(slots) -> None:
+    """A fresh reading without the bucket is evidence against; no reading is
+    no evidence. When the pick is spent, send the turn to the unknown."""
+    _enable([slots["personal"], slots["office"], slots["alex"]])
+    app_module._save_entitlements(
+        slots["personal"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket()]),
+    )
+    app_module._save_entitlements(
+        slots["office"], _profile("default_raven", "team_standard"), _usage([]),
+    )
+    _write_rate_limit(slots["personal"], _spent_window())
+    _write_rate_limit(slots["office"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "claude-fable-5-1",
+    )
+    assert chosen == slots["alex"]
+    assert sub["reason"] == "plan_limit"
+
+
+def test_exhausted_bucket_is_a_plan_limit_not_a_missing_model(slots) -> None:
+    """A Fable bucket at 100% is entitlement without capacity; the move it
+    causes is a limit, and must not be announced as "can't run this model"."""
+    _enable([slots["alex"], slots["office"]])
+    app_module._save_entitlements(
+        slots["alex"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket(percent=100)]),
+    )
+    app_module._save_entitlements(
+        slots["office"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket(percent=10)]),
+    )
+    _write_rate_limit(slots["alex"], _healthy_window())
+    _write_rate_limit(slots["office"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["alex"], "claude-fable-5-1",
+    )
+    assert chosen == slots["office"]
+    assert sub["reason"] == "plan_limit"
+
+
+def test_offer_names_an_unseen_slot_when_the_proven_one_is_spent(slots) -> None:
+    """The post-hoc offer used to rank a proven-but-spent slot first and then
+    withhold the offer entirely; the unchecked one is worth offering."""
+    _enable([slots["personal"], slots["office"], slots["alex"]])
+    app_module._save_entitlements(
+        slots["office"], _profile("default_claude_max_5x", "team_tier_1"),
+        _usage([_fable_bucket()]),
+    )
+    _write_rate_limit(slots["personal"], _spent_window())
+    _write_rate_limit(slots["office"], _spent_window())
+    offer = app_module._failover_offer(
+        SUB, slots["personal"], "claude-fable-5-1", "plan_limit",
+    )
+    assert offer is not None
+    assert offer["to_slot"] == slots["alex"]
+
+
 def test_ring_is_pruned_when_its_credential_is_deleted(slots) -> None:
     _enable([slots["personal"], slots["alex"]])
     assert slots["alex"] in app_module._failover_ring(SUB)
@@ -536,7 +697,10 @@ def test_failover_rows_describe_state_in_words(client) -> None:
         "has room", "not checked recently",
         "plan spent, credits available", "plan spent",
     }
-    assert row["can_run_model"] in {"yes", "unknown", "no"}
+    assert row["can_run_model"] in {
+        "yes", "not checked recently", "no allowance on this plan",
+        "allowance spent", "no",
+    }
 
 
 def test_run_records_the_requested_slot_separately() -> None:

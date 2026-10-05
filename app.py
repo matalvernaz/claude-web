@@ -14542,7 +14542,16 @@ _MODEL_FAMILY_TOKENS = frozenset({"fable", "opus", "sonnet", "haiku", "mythos"})
 
 # Ranked slot states. Lower sorts better; the numbers are only meaningful
 # relative to each other.
-_ENTITLEMENT_PROVEN, _ENTITLEMENT_UNKNOWN, _ENTITLEMENT_DENIED = 0, 1, 3
+#
+# Entitlement, from the bottom: an observed refusal; a scoped bucket seen at
+# 100% with its reset still ahead; a fresh reading with no bucket for the
+# family (the plan doesn't carry it — the only signal there is that a Pro seat
+# can't run Fable, whose refusal is a 429 that records no denial); no fresh
+# reading at all; a bucket with room. UNSEEN and UNMETERED used to share one
+# "unknown", which let "never looked" lose to "proven" and divert a healthy,
+# never-asked slot onto a dead one (2026-09-14, 2026-10-05).
+(_ENTITLEMENT_PROVEN, _ENTITLEMENT_UNSEEN, _ENTITLEMENT_UNMETERED,
+ _ENTITLEMENT_EXHAUSTED, _ENTITLEMENT_DENIED) = 0, 1, 2, 3, 4
 _HEALTH_FREE, _HEALTH_UNKNOWN, _HEALTH_PAYABLE, _HEALTH_SPENT = 0, 1, 2, 4
 
 _SPEND_POLICIES = frozenset({"free_first", "prefer_current"})
@@ -14558,7 +14567,9 @@ _HEALTH_STATE_NAMES = {
 }
 _ENTITLEMENT_STATE_NAMES = {
     _ENTITLEMENT_PROVEN: "yes",
-    _ENTITLEMENT_UNKNOWN: "unknown",
+    _ENTITLEMENT_UNSEEN: "not checked recently",
+    _ENTITLEMENT_UNMETERED: "no allowance on this plan",
+    _ENTITLEMENT_EXHAUSTED: "allowance spent",
     _ENTITLEMENT_DENIED: "no",
 }
 
@@ -14739,9 +14750,14 @@ def _load_rate_limit_entry(slot: str) -> Optional[dict]:
 def _slot_entitlement_rank(slot: str, required: set[str], gated: set[str]) -> int:
     """Rank ``slot`` on its ability to run the required model families.
 
-    ``_ENTITLEMENT_DENIED`` only for an observed refusal. A scoped bucket that
-    is itself spent (100% with a future reset) is not proof of usable access,
-    so it falls back to unknown rather than counting as proven.
+    ``_ENTITLEMENT_DENIED`` only for an observed refusal. Below that, the rank
+    says how much the cache actually knows. A fresh reading whose bucket for
+    the family is spent (100% with a future reset) is entitlement without
+    capacity. A fresh reading with no bucket at all is the plan not carrying
+    the family. No fresh reading is no evidence either way: an idle slot's
+    reading ages out and its OAuth token lapses, after which ``api_usage_live``
+    can't refresh it, so "never looked" has to stay distinct from "looked and
+    found nothing". The worst family wins.
     """
     if not required:
         return _ENTITLEMENT_PROVEN
@@ -14753,17 +14769,19 @@ def _slot_entitlement_rank(slot: str, required: set[str], gated: set[str]) -> in
         return _ENTITLEMENT_PROVEN
     entry = _load_entitlement(slot)
     if not entry:
-        return _ENTITLEMENT_UNKNOWN
+        return _ENTITLEMENT_UNSEEN
     scoped = entry.get("scoped") or {}
+    rank = _ENTITLEMENT_PROVEN
     for fam in needed:
         bucket = scoped.get(fam)
         if not isinstance(bucket, dict):
-            return _ENTITLEMENT_UNKNOWN
+            rank = max(rank, _ENTITLEMENT_UNMETERED)
+            continue
         percent = bucket.get("percent")
         resets_at = bucket.get("resets_at")
         if isinstance(percent, (int, float)) and percent >= 100 and _reset_pending(resets_at):
-            return _ENTITLEMENT_UNKNOWN
-    return _ENTITLEMENT_PROVEN
+            rank = max(rank, _ENTITLEMENT_EXHAUSTED)
+    return rank
 
 
 def _reset_pending(resets_at) -> bool:
@@ -14814,6 +14832,19 @@ def _slot_health_rank(slot: str) -> int:
     if time.time() - captured > _HEALTH_FRESH_SECONDS:
         return _HEALTH_UNKNOWN
     return _HEALTH_FREE
+
+
+def _demonstrably_unusable(entitlement: int, health: int) -> bool:
+    """True when a slot has been *observed* unable to serve the turn.
+
+    Two observations qualify: the credential refused the model family
+    (``_note_model_denial``), or its plan window was seen spent with no
+    credits behind it. Both self-expire — the denial after its TTL, the
+    window at its ``resetsAt``. Everything else the ranking knows is
+    inference from usage buckets and cache age, and inference only orders
+    slots; it never disqualifies one.
+    """
+    return entitlement == _ENTITLEMENT_DENIED or health == _HEALTH_SPENT
 
 
 _FAILOVER_DEFAULTS = {"enabled": False, "spend_policy": "free_first", "include_all": True}
@@ -14986,8 +15017,20 @@ def _select_account_slot(
     ring_rank = {slot: i for i, slot in enumerate(ring)}
 
     def key(slot: str) -> tuple:
+        entitlement = _slot_entitlement_rank(slot, required, gated)
         health = _slot_health_rank(slot)
         if slot == requested_slot:
+            if entitlement == _ENTITLEMENT_UNSEEN:
+                # No fresh reading means "not observed lately", not "can't
+                # serve". An idle slot's reading ages out and its token lapses,
+                # after which the usage dialog can't refresh it either — the
+                # only probe left is spawning on it. Losing to a sibling that
+                # was merely read more recently diverts every turn away from
+                # the picked slot, which is exactly what keeps it unread; it
+                # could never leave unseen (2026-09-14, 2026-10-05). A fresh
+                # reading with no bucket (UNMETERED) is real evidence that the
+                # plan lacks the model and still moves; so does a spent bucket.
+                entitlement = _ENTITLEMENT_PROVEN
             if settings["spend_policy"] == "prefer_current":
                 # The user asked to stay put and pay rather than move. Treat a
                 # payable window as free so it can't be outranked; _gate_overage
@@ -15002,7 +15045,11 @@ def _select_account_slot(
                 # spent or payable window is real evidence and still moves.
                 health = _HEALTH_FREE
         return (
-            _slot_entitlement_rank(slot, required, gated),
+            # Observed-unusable first, so a slot seen dead can't win on a
+            # better entitlement reading: on 2026-09-14 shared was proven and
+            # spent, Alex unread, and shared won before health was compared.
+            1 if _demonstrably_unusable(entitlement, health) else 0,
+            entitlement,
             health,
             0 if slot == requested_slot else 1,
             ring_rank.get(slot, len(ring)),
@@ -15012,7 +15059,18 @@ def _select_account_slot(
     if best == requested_slot:
         return requested_slot, None
     from_key, to_key = key(requested_slot), key(best)
-    reason = "model_unavailable" if to_key[0] < from_key[0] else "plan_limit"
+    # Name the first term that decided it. "model_unavailable" is reserved for
+    # the two entitlement verdicts that are about the model (a refusal, or a
+    # plan with no allowance for it); a spent window or a spent bucket is a
+    # limit, whatever the sibling's reading looks like.
+    if to_key[0] < from_key[0]:
+        reason = ("model_unavailable" if from_key[1] == _ENTITLEMENT_DENIED
+                  else "plan_limit")
+    elif to_key[1] < from_key[1]:
+        reason = ("plan_limit" if from_key[1] == _ENTITLEMENT_EXHAUSTED
+                  else "model_unavailable")
+    else:
+        reason = "plan_limit"
     return best, {
         "from_slot": requested_slot,
         "to_slot": best,
@@ -15100,15 +15158,21 @@ def _failover_offer(
     ring_rank = {slot: i for i, slot in enumerate(ring)}
 
     def key(slot: str) -> tuple:
+        entitlement = _slot_entitlement_rank(slot, required, gated)
+        health = _slot_health_rank(slot)
         return (
-            _slot_entitlement_rank(slot, required, gated),
-            _slot_health_rank(slot),
+            # Same order as _select_account_slot: a slot observed dead sorts
+            # last however well its entitlement read, so an unread sibling is
+            # offered ahead of a proven-but-spent one instead of the proven
+            # one winning and the offer then being withheld.
+            1 if _demonstrably_unusable(entitlement, health) else 0,
+            entitlement,
+            health,
             ring_rank.get(slot, len(ring_rank)),
         )
 
     best = min(candidates, key=key)
-    ent, health, _ = key(best)
-    if ent == _ENTITLEMENT_DENIED or health == _HEALTH_SPENT:
+    if key(best)[0]:
         # Everything left is known to be unusable. Say so rather than sending
         # the user to an account that will fail the same way.
         return None
