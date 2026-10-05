@@ -78,13 +78,26 @@ _CODE_INPUT = (
 _ENTER_CODE_RE = re.compile(
     r"enter (?:the |your |a )?(?:verification |sign.in |login |one.time )?code", re.IGNORECASE,
 )
-_SUBMIT_CODE_RE = re.compile(r"^\s*(?:continue|verify|submit|sign in|log in|confirm)\s*$", re.IGNORECASE)
+_SUBMIT_CODE_RE = re.compile(
+    r"^\s*(?:continue|verify(?: [a-z]+)*|submit|sign in|log in|confirm)\s*$", re.IGNORECASE,
+)
 _CONSENT_BUTTON_RE = re.compile(r"^\s*(?:authorize|allow|approve|confirm|continue)\s*$", re.IGNORECASE)
 _VERIFY_TEXT_RE = re.compile(
     r"verify your browser|verify you are (?:a )?human|verify you are not a bot", re.IGNORECASE,
 )
 _CAPTCHA_FRAME_RE = re.compile(
     r"arkoselabs|funcaptcha|hcaptcha|recaptcha|challenges\.cloudflare\.com", re.IGNORECASE,
+)
+# The puzzle itself lives in a frame with no telling URL (seen 2026-10-05
+# after the verification code: "Find all sports and exercise equipment").
+_PUZZLE_TEXT_RE = re.compile(
+    r"find all |select all |click the .{0,40} that |verify you are|verify your browser",
+    re.IGNORECASE,
+)
+_HANDOFF = (
+    "claude.ai asked the server's browser to prove it is human. Open the "
+    "Claude sign-in page below in your own browser instead, and paste the "
+    "code it gives you here."
 )
 
 
@@ -385,13 +398,33 @@ async def _enter_verification_code(page, code: str, debug: _Debug) -> bool:
         if "/login" not in (urlparse(page.url).path or ""):
             await debug.snap(page, "after code")
             return True
+        if await _challenge_showing(page):
+            # Not a wrong code: the right code gets a puzzle here too.
+            await debug.snap(page, "bot check after code")
+            raise AutoSigninError(_HANDOFF)
         await asyncio.sleep(0.5)
     await debug.snap(page, "code not accepted")
     return False
 
 
 def _captcha_frames(page) -> bool:
-    return any(_CAPTCHA_FRAME_RE.search(f.url or "") for f in page.frames)
+    # The hCaptcha loader frame sits on the login page from the start, so a
+    # known URL alone is not a challenge; the words in a frame are.
+    return any(_CAPTCHA_FRAME_RE.search(f.url or "") for f in page.frames
+               if "newassets.hcaptcha.com" not in (f.url or ""))
+
+
+async def _challenge_showing(page) -> bool:
+    if _captcha_frames(page):
+        return True
+    for frame in page.frames:
+        try:
+            text = await frame.locator("body").inner_text(timeout=1000)
+        except Exception:  # noqa: BLE001 - detached or still loading
+            continue
+        if _PUZZLE_TEXT_RE.search(text) or (frame is page.main_frame and _VERIFY_TEXT_RE.search(text)):
+            return True
+    return False
 
 
 async def _wait_for_authorization(page, callback_prefix: str, debug: _Debug) -> None:
@@ -411,19 +444,11 @@ async def _wait_for_authorization(page, callback_prefix: str, debug: _Debug) -> 
         if page.url != seen:
             seen = page.url
             await debug.snap(page, "authorize")
-        try:
-            body = await page.locator("body").inner_text(timeout=2000)
-        except Exception:  # noqa: BLE001 - mid-navigation
-            body = ""
-        if _captcha_frames(page) or _VERIFY_TEXT_RE.search(body):
+        if await _challenge_showing(page):
             challenged_at = challenged_at or time.monotonic()
             if time.monotonic() - challenged_at >= CAPTCHA_GRACE_S:
                 await debug.snap(page, "bot check")
-                raise AutoSigninError(
-                    "claude.ai asked the server's browser to prove it is human. "
-                    "Open the Claude sign-in page below in your own browser "
-                    "instead, and paste the code it gives you here."
-                )
+                raise AutoSigninError(_HANDOFF)
         else:
             challenged_at = None
         if time.monotonic() >= deadline:

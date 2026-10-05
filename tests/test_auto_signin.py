@@ -349,6 +349,32 @@ async def test_the_browser_types_the_code_into_one_field_or_six_boxes(field_html
             await browser.close()
 
 
+async def test_a_puzzle_after_the_code_is_handed_to_the_person_not_called_a_wrong_code(monkeypatch):
+    pw = pytest.importorskip("playwright.async_api")
+    monkeypatch.setattr(auto_signin, "VERIFICATION_ACCEPT_S", 5)
+    # What claude.ai did on 2026-10-05: the hCaptcha loader frame is there
+    # from the start; "Verify email address" then opens a puzzle in a frame
+    # with no telling URL, and the page stays on /login.
+    login_html = """<body><input id="c"><button id="go">Verify email address</button>
+      <iframe src="https://newassets.hcaptcha.com/captcha/v1/loader.js"></iframe>
+      <script>document.getElementById('go').onclick = () => {
+        const f = document.createElement('iframe');
+        f.srcdoc = '<p>Find all sports and exercise equipment</p><button>Skip</button>';
+        document.body.appendChild(f);
+      };</script></body>"""
+    async with pw.async_playwright() as manager:
+        browser, page = await _page(pw, manager)
+        try:
+            await _route_claude(page, login_html, "<body>unused</body>")
+            await page.route("https://newassets.hcaptcha.com/**",
+                             lambda route: route.fulfill(content_type="text/html", body="<body></body>"))
+            await page.goto("https://claude.ai/login?returnTo=x")
+            with pytest.raises(auto_signin.AutoSigninError, match="your own browser"):
+                await auto_signin._enter_verification_code(page, "100760", auto_signin._Debug())
+        finally:
+            await browser.close()
+
+
 async def test_a_code_claude_keeps_on_the_login_page_counts_as_refused(monkeypatch):
     pw = pytest.importorskip("playwright.async_api")
     monkeypatch.setattr(auto_signin, "VERIFICATION_ACCEPT_S", 1)
