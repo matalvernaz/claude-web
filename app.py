@@ -15991,7 +15991,10 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     home = _credential_home_path(sub, cred_id) if cred_id is not None else None
     info = await asyncio.to_thread(setup_flow.whoami, home)
     base = {"slot": slot, "mode": info.get("mode"), "error": None}
-    if info.get("mode") != "oauth":
+    # A slot running on a long-lived token still reads its limits through
+    # the four-week sign-in's bearer when it has one; the token itself
+    # lacks the profile scope the usage endpoint wants.
+    if info.get("mode") not in ("oauth", "oauth_token"):
         return base
     token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
     if not token:
@@ -16024,7 +16027,7 @@ async def api_usage_request(
     cred_id = _parse_cred_active(slot)
     home = _credential_home_path(sub, cred_id) if cred_id is not None else None
     info = await asyncio.to_thread(setup_flow.whoami, home)
-    if info.get("mode") != "oauth":
+    if info.get("mode") not in ("oauth", "oauth_token"):
         raise HTTPException(
             status_code=400,
             detail="usage requests require Claude subscription credentials",

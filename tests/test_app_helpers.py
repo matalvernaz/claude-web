@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1238,6 +1239,41 @@ async def test_api_usage_live_api_key_slot_short_circuits(monkeypatch) -> None:
     req = SimpleNamespace(query_params={})
     out = await app_module.api_usage_live(req, {"sub": "user-live-key"})
     assert out == {"slot": "shared", "mode": "api_key", "error": None}
+
+
+async def test_api_usage_live_long_lived_token_slot_still_reads_its_sign_in(monkeypatch) -> None:
+    """The year-long token can't read usage itself, so the slot's four-week
+    sign-in bearer is used when there is one, exactly as before the token."""
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "oauth_token", "minted_at": 1})
+    monkeypatch.setattr(app_module, "_read_oauth_token",
+                        lambda home: ("bearer-secret-xyz", (time.time() + 3600) * 1000))
+    seen = {}
+
+    async def fetch(token):
+        seen["token"] = token
+        return ({"account": {"email": "x"}}, {"limits": []}, None)
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", fetch)
+    monkeypatch.setattr(app_module, "_save_entitlements", lambda *a, **k: None)
+    req = SimpleNamespace(query_params={})
+    out = await app_module.api_usage_live(req, {"sub": "user-live-yearly"})
+    assert seen["token"] == "bearer-secret-xyz"
+    assert out["mode"] == "oauth_token"
+    assert out["error"] is None
+    assert "bearer-secret-xyz" not in str(out)
+
+
+async def test_api_usage_live_long_lived_token_slot_without_a_sign_in_says_so(monkeypatch) -> None:
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "oauth_token", "minted_at": 1})
+    monkeypatch.setattr(app_module, "_read_oauth_token", lambda home: ("", None))
+
+    async def boom(token):
+        raise AssertionError("nothing to call Anthropic with")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    req = SimpleNamespace(query_params={})
+    out = await app_module.api_usage_live(req, {"sub": "user-live-yearly-only"})
+    assert out == {"slot": "shared", "mode": "oauth_token", "error": "no_token"}
 
 
 async def test_api_usage_live_expired_token_skips_fetch(monkeypatch) -> None:

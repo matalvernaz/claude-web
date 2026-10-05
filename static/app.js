@@ -5545,7 +5545,10 @@
       announce("API-key account: no plan limits");
       return;
     }
-    if (live.mode !== "oauth" || live.error === "no_token") {
+    if (live.mode === "oauth_token" && live.error === "no_token") {
+      return fail("This account runs on a long-lived token. Live plan limits also need the four-week sign-in; add one from the accounts page if you want them here.");
+    }
+    if ((live.mode !== "oauth" && live.mode !== "oauth_token") || live.error === "no_token") {
       return fail("No Claude subscription credentials on this account.");
     }
     if (live.error === "token_expired" || live.error === "token_rejected") {
