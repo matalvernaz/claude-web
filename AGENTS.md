@@ -97,6 +97,17 @@ Tests in `tests/test_app_helpers.py` (`test_identity_env_for_*`, `test_resolve_a
 
 `_flows: dict[str, OAuthFlowState]` is keyed by `'shared'` or `'cred:<sub>:<id>'`, so an admin re-authing the shared CLI and a user setting up their personal slot can't trample each other. The CLI subprocess is spawned with `CLAUDE_CONFIG_DIR=home` and **`ANTHROPIC_API_KEY` stripped from the child env** so a shared-slot API key doesn't short-circuit a per-credential OAuth login.
 
+Variant `token` runs `claude setup-token` instead of `auth login`
+(`setup_flow._drive_token`). That command draws a TUI and prints nothing on pipes, so
+it gets a pty with a 220-column window; the token it prints is saved to
+`<home>/.claude_oauth_token` (0600) and reaches the CLI as `CLAUDE_CODE_OAUTH_TOKEN`:
+process-wide for the shared slot (`load_oauth_token_into_env`, like the API key),
+per run for personal slots (`_resolve_account_for_run`, which blanks it for slots
+without one so the shared token can't mask their `.credentials.json`). Login and
+setup-token subprocesses strip it. `whoami` reports `oauth_token` with `minted_at`;
+the token has no readable expiry and lacks `user:profile`, so usage reads still go
+through `.credentials.json` where one exists.
+
 The server-browser sign-in (`auto_signin.run_signin`) stores its task on the same
 state (`auto_task`): retry, cancel, sign-out and a pasted long code stop it along
 with its mailbox subprocess. The browser asks claude.ai to send the email and parks

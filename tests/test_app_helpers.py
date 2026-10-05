@@ -1775,3 +1775,32 @@ def test_subagent_message_is_never_read_as_the_interrupt_echo() -> None:
     echo.between_turns = True
     app_module._apply_turn_state(echo, UserMessage(content=[]), [])
     assert echo.between_turns is True
+
+
+def test_resolve_account_passes_a_slot_long_lived_token_and_blanks_it_elsewhere(tmp_path, monkeypatch) -> None:
+    """A slot minted with `claude setup-token` runs on CLAUDE_CODE_OAUTH_TOKEN.
+    Every other personal slot blanks that variable, the way ANTHROPIC_API_KEY
+    is blanked, so the shared slot's token can't mask the slot's own
+    .credentials.json; an API-key slot blanks it too."""
+    sub = "acct-token-u1"
+    user = {"sub": sub, "email": "u1@example.com", "name": "User One"}
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-" + "s" * 80)
+    token_slot, token_home = _make_owned_credential(monkeypatch, tmp_path, sub, "Yearly")
+    (token_home / ".credentials.json").unlink()
+    (token_home / ".claude_oauth_token").write_text("sk-ant-oat01-" + "p" * 80, encoding="utf-8")
+    plain_slot, _plain_home = _make_owned_credential(monkeypatch, tmp_path, sub, "Monthly")
+    key_slot, key_home = _make_owned_credential(monkeypatch, tmp_path, sub, "Metered")
+    (key_home / ".anthropic_api_key").write_text("sk-ant-api03-" + "k" * 80, encoding="utf-8")
+
+    yearly = app_module._resolve_account_for_run(user, override_slot=token_slot)
+    assert yearly["slot"] == token_slot
+    assert yearly["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-" + "p" * 80
+    assert yearly["env"]["ANTHROPIC_API_KEY"] == ""
+
+    monthly = app_module._resolve_account_for_run(user, override_slot=plain_slot)
+    assert monthly["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert monthly["env"]["ANTHROPIC_API_KEY"] == ""
+
+    metered = app_module._resolve_account_for_run(user, override_slot=key_slot)
+    assert metered["env"]["ANTHROPIC_API_KEY"].startswith("sk-ant-api03-")
+    assert metered["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == ""

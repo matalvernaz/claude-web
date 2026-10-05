@@ -42,7 +42,7 @@
           <li class="cred-item" data-cred-id="{{ c.id }}">
             <span class="cred-label">{{ c.label }}</span>
             <span class="cred-meta">
-              {% if c.configured %}Signed in{% else %}Not signed in{% endif %}
+              {% if c.configured %}Signed in{% if c.credential_mode == "oauth_token" %} with a long-lived token{% if c.token_minted_on %} since {{ c.token_minted_on }}{% endif %}{% endif %}{% else %}Not signed in{% endif %}
               {% if c.auto_email %}
                 — sign-in link via {{ c.auto_email }}
               {% endif %}
@@ -123,6 +123,10 @@
           <p class="radio-row">
             <input type="radio" id="variant-claudeai" name="variant" value="claudeai" checked>
             <label for="variant-claudeai">Claude subscription (claude.ai)</label>
+          </p>
+          <p class="radio-row">
+            <input type="radio" id="variant-token" name="variant" value="token">
+            <label for="variant-token">Claude subscription, long-lived token (about a year; the sign-in above lasts about four weeks)</label>
           </p>
           <p class="radio-row">
             <input type="radio" id="variant-console" name="variant" value="console">

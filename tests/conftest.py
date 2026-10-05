@@ -42,6 +42,8 @@ for var in (
     # A session run inside the service inherits its .env; the sign-in tests
     # must not write snapshots into the live debug directory.
     "CLAUDE_WEB_SIGNIN_DEBUG_DIR",
+    # The shared slot's long-lived token lives in the service env once set.
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
     "CLAUDE_WEB_OLLAMA_URL",

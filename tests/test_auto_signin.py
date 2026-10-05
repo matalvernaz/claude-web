@@ -170,7 +170,10 @@ def _slot_flow(app, setup_flow, monkeypatch, tmp_path, key):
     monkeypatch.setenv(auto_signin.ENV_MAILBOX_CMD, "unused-test-wrapper")
     monkeypatch.setattr(setup_flow, "_flows", {key: state})
 
-    async def start(*a, **kw):
+    async def start(variant, *a, **kw):
+        # The dance costs the person the same either way, so it mints the
+        # year-long token rather than a four-week sign-in.
+        assert variant == "token"
         return state
 
     monkeypatch.setattr(setup_flow, "start_oauth", start)

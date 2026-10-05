@@ -264,6 +264,13 @@ The schema is stable — keys are always set, only their values are empty when t
 
 Claude defaults to the deployment-wide shared account in `$CLAUDE_HOME/.credentials.json`. Personal Claude homes mirror `CLAUDE_HOME`, with only the credential files kept private. The transcript JSONL is therefore the same file under every slot, so a credential change can resume the current conversation.
 
+A claude.ai sign-in lasts about four weeks from the moment you authorize, however
+much it is used. Pick "long-lived token" in the sign-in form instead and the same
+browser steps mint a token that lasts about a year (`claude setup-token`); the slot
+then runs on `CLAUDE_CODE_OAUTH_TOKEN` and never needs the four-week refresh. The
+token carries only the inference scope, so claude.ai-side extras tied to the
+account (hosted connectors, plugin sync) may not work on such a slot.
+
 Slots with `auto_email` configured get a "Get sign-in link" button when the host
 sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. A server-side browser asks claude.ai to send
 the sign-in email and waits on the login page; the mailbox reader picks the link

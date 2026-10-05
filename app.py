@@ -1013,6 +1013,7 @@ auth.install_routes(app)
 # Pull a persisted Anthropic API key (from a previous /setup api-key submission)
 # into the env so the SDK and CLI both see it without a container restart.
 setup_flow.load_api_key_into_env()
+setup_flow.load_oauth_token_into_env()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -5645,18 +5646,17 @@ def _resolve_account_for_run(
                     **identity_env,
                     "CLAUDE_CONFIG_DIR": str(home),
                 }
-                # An API key in the per-credential home overrides the
-                # shared-slot ANTHROPIC_API_KEY for this run.
+                # A credential in the per-credential home overrides the
+                # shared slot's for this run. A blank unmasks whatever the
+                # shared slot put in the process env (an API key, a
+                # long-lived token) so the CLI falls through to this home's
+                # .credentials.json.
                 try:
                     key = (home / ".anthropic_api_key").read_text(encoding="utf-8").strip()
                 except FileNotFoundError:
                     key = ""
-                if key:
-                    env["ANTHROPIC_API_KEY"] = key
-                else:
-                    # Prevent a shared ANTHROPIC_API_KEY from masking the
-                    # per-credential OAuth token.
-                    env["ANTHROPIC_API_KEY"] = ""
+                env["ANTHROPIC_API_KEY"] = key
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = "" if key else setup_flow.read_oauth_token(home)
                 return {
                     "slot": active,
                     "env": env,
@@ -9338,6 +9338,14 @@ def _account_payload(user: dict) -> dict:
     for c in creds:
         c["configured"] = _credential_is_configured(sub, c["id"])
         c["auto_signin_available"] = bool(auto_available and c.get("auto_email"))
+        who = setup_flow.whoami(_credential_home_path(sub, c["id"]))
+        c["credential_mode"] = who.get("mode")
+        minted = who.get("minted_at")
+        if minted:
+            t = time.localtime(minted)
+            c["token_minted_on"] = f"{t.tm_mday} {time.strftime('%b %Y', t)}"
+        else:
+            c["token_minted_on"] = None
     return {
         # The OIDC subject — useful for support and debugging.
         "user_sub": sub,
@@ -9593,8 +9601,8 @@ async def api_credentials_oauth_start(
     _require_owned_credential(sub, cred_id)
     body = await request.json()
     variant = body.get("variant", "claudeai")
-    if variant not in ("claudeai", "console"):
-        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    if variant not in ("claudeai", "token", "console"):
+        raise HTTPException(400, "variant must be 'claudeai', 'token' or 'console'")
     home = _ensure_credential_home(sub, cred_id)
     state = await setup_flow.start_oauth(
         variant,
@@ -9636,7 +9644,9 @@ async def api_credentials_oauth_auto_signin(
     # start_oauth cancels any prior flow for this key and returns once the
     # OAuth URL is known (or the driver has failed early). We only proceed
     # into the browser dance if that URL made it out.
-    state = await setup_flow.start_oauth("claudeai", flow_key=flow_key, home=home)
+    # The dance is the same as a sign-in, so make it mint the year-long
+    # token rather than a four-week session.
+    state = await setup_flow.start_oauth("token", flow_key=flow_key, home=home)
     if state.status not in ("awaiting_code",) or not state.url:
         return state.to_public()
 
@@ -9828,8 +9838,8 @@ async def api_shared_oauth_start(
     _require_shared_reauth(user)
     body = await request.json()
     variant = body.get("variant", "claudeai")
-    if variant not in ("claudeai", "console"):
-        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    if variant not in ("claudeai", "token", "console"):
+        raise HTTPException(400, "variant must be 'claudeai', 'token' or 'console'")
     state = await setup_flow.start_oauth(variant)
     log.info("shared re-auth started by %s", user.get("email") or user.get("sub"))
     return state.to_public()
@@ -16224,8 +16234,8 @@ async def api_setup_oauth_start(
     _require_setup_access(user)
     body = await request.json()
     variant = body.get("variant", "claudeai")
-    if variant not in ("claudeai", "console"):
-        raise HTTPException(400, "variant must be 'claudeai' or 'console'")
+    if variant not in ("claudeai", "token", "console"):
+        raise HTTPException(400, "variant must be 'claudeai', 'token' or 'console'")
     state = await setup_flow.start_oauth(variant)
     return state.to_public()
 
