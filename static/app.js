@@ -1696,6 +1696,8 @@
         if (m.file_count) appendFilePlaceholder(body, m.file_count);
       } else if (m.role === "assistant") {
         appendMessage("assistant", m.text);
+      } else if (m.role === "async_question") {
+        renderAsyncQuestion({ ...m, session_id: id }, false);
       } else if (m.role === "tool_use") {
         if ((m.name === "Edit" || m.name === "Write") && m.input) {
           insertDiffMessage(m.name, m.input);
@@ -2652,6 +2654,7 @@
       }
       // The existing SSE stream will deliver the new turn's events; nothing
       // else to do here. setStreaming(false) happens on the next result.
+      if (entry.onAccepted) entry.onAccepted();
       return { ok: true, mode: "injected" };
     } catch (err) {
       if (err.name === "AbortError") {
@@ -2806,6 +2809,7 @@
         // so a screen-reader user hears why instead of a bare status code.
         throw new Error(detail || ("HTTP " + r.status));
       }
+      if (entry.onAccepted) entry.onAccepted();
       await drainStream(r, gen);
       ok = true;
     } catch (err) {
@@ -3592,6 +3596,10 @@
       renderPermissionCard(obj);
       enqueuePermRequest("permission", obj);
       markVisibleActivity();
+    } else if (obj.type === "async_question") {
+      ctx.currentAssistantBody = null;
+      renderAsyncQuestion(obj);
+      markVisibleActivity();
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
       announce(
@@ -4377,7 +4385,7 @@
   }
 
   function entryLabel(entry) {
-    if (entry.kind === "question") return "Claude's question";
+    if (entry.kind === "question") return assistantLabel(entry.req.provider) + "'s question";
     if (entry.kind === "plan") return "plan review";
     return entry.req.tool;
   }
@@ -4902,6 +4910,38 @@
     if (hadFocus && !permDialog?.open) restoreFocusAfterCard(summary);
   }
 
+  function renderAsyncQuestion(req, notify = true) {
+    if (findRequestCard(req.id)) return;
+    renderQuestionCard({ ...req, async: true });
+    if (notify && !req.closed) {
+      announce("Codex has a question. You can answer while it continues working.", { urgent: true });
+      playCue("permission");
+      enqueuePermRequest("question", { ...req, async: true });
+    }
+  }
+
+  function sendAsyncQuestionAnswer(req, answers) {
+    if (!req.session_id || req.session_id !== sessionId || currentProvider() !== "codex") {
+      return Promise.reject(new Error("Open the conversation that asked this question to answer it."));
+    }
+    const blocked = providerBlockReason();
+    if (blocked) return Promise.reject(new Error(blocked));
+    const text = "Answers to your questions:\n\n" + Object.entries(answers)
+      .map(([q, a]) => `${q}\n${Array.isArray(a) ? a.join(", ") : a}`).join("\n\n");
+    // Use the same delivery path as the composer, but steer immediately:
+    // queuing until the turn ends would defeat a question asked mid-work.
+    // Resolve on HTTP acceptance, not when the new response finishes.
+    return new Promise((resolve, reject) => {
+      const entry = { text, images: [], files: [], queue_id: newQueueId(),
+        originRunId: currentRunId, onAccepted: resolve };
+      const send = currentRunId ? sendInExistingRun(entry) : sendOne(entry);
+      send.then((result) => {
+        if (result === true || (result && result.ok)) resolve();
+        else reject(new Error("The answer could not be sent. Try again."));
+      }).catch(reject);
+    });
+  }
+
   // AskUserQuestion → accessible form. Each question is a <fieldset>/<legend>
   // with radio (single-select) or checkbox (multiSelect) options plus an
   // "Other" free-text row. Selections post back keyed by question text, the
@@ -4912,11 +4952,12 @@
     card.setAttribute("role", "group");
     card.dataset.requestId = req.id || "";
     card.dataset.state = "pending";
+    if (req.async) card.dataset.asyncQuestion = "true";
     const headingId = `q-heading-${req.id || Math.random().toString(36).slice(2)}`;
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = assistantLabel(req.provider) + " is asking";
+    heading.textContent = assistantLabel(req.provider) + (req.closed ? " asked" : " is asking");
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
 
@@ -4941,6 +4982,7 @@
         input.name = groupName;
         input.id = `${groupName}-${oi}`;
         input.value = opt.label;
+        if (req.async && oi === 0) input.checked = true;
         const label = document.createElement("label");
         label.setAttribute("for", input.id);
         label.textContent = opt.description ? `${opt.label} — ${opt.description}` : opt.label;
@@ -4986,9 +5028,14 @@
     skip.textContent = "Skip";
     actions.appendChild(submit);
     actions.appendChild(skip);
-    form.appendChild(actions);
+    if (!req.closed) form.appendChild(actions);
     card.appendChild(form);
     transcript.appendChild(card);
+    if (req.closed) {
+      card.dataset.state = "resolved";
+      card.querySelectorAll("input").forEach((input) => { input.disabled = true; });
+      return;
+    }
     maybeAutoScroll(true);
     // Skip the inline focus move when the approval modal will host this
     // card moments later — double focus reads twice on a screen reader.
@@ -5032,7 +5079,8 @@
         // gets the same signal the Skip button sends, instead of an empty
         // `answer` payload while the UI claims "Question skipped".
         if (entries.length) {
-          await postDecision(req.id, "answer", { answers });
+          if (req.async) await sendAsyncQuestionAnswer(req, answers);
+          else await postDecision(req.id, "answer", { answers });
           // Never echo a secret answer back into the transcript summary.
           const secretByText = {};
           fieldMeta.forEach((fm) => {
@@ -5042,13 +5090,13 @@
           replaceCardWithSummary(card,
             `Answered — ${entries.map(([k, v]) => `${k}: ${secretByText[k] ? "•••" : (Array.isArray(v) ? v.join(", ") : v)}`).join("; ")}`);
         } else {
-          await postDecision(req.id, "dismiss", null);
+          if (!req.async) await postDecision(req.id, "dismiss", null);
           replaceCardWithSummary(card, "Question skipped");
         }
       } catch (err) {
         unlock();
         setStatus("Failed to send answer: " + err.message);
-        announce("Failed to send answer. Claude is still waiting — try again.");
+        announce("Failed to send answer. Try again.");
       }
     });
     skip.addEventListener("click", async () => {
@@ -5056,12 +5104,12 @@
       card.dataset.state = "deciding";
       card.querySelectorAll("button, input").forEach((el) => (el.disabled = true));
       try {
-        await postDecision(req.id, "dismiss", null);
+        if (!req.async) await postDecision(req.id, "dismiss", null);
         replaceCardWithSummary(card, "Question skipped");
       } catch (err) {
         unlock();
         setStatus("Failed: " + err.message);
-        announce("Failed to skip the question. Claude is still waiting — try again.");
+        announce("Failed to skip the question. Try again.");
       }
     });
   }

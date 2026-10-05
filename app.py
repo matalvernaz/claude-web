@@ -5640,7 +5640,7 @@ def _resolve_account_for_run(
         cred = _get_credential(sub, cred_id)
         if cred:
             home = _ensure_credential_home(sub, cred_id)
-            if (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists():
+            if setup_flow.is_configured(home):
                 env: dict[str, str] = {
                     **identity_env,
                     "CLAUDE_CONFIG_DIR": str(home),
@@ -7735,6 +7735,11 @@ def _busy_runs() -> list[str]:
     live_panels = sum(1 for s in ASSISTANT_STREAMS.values() if not s.done)
     if live_panels:
         busy.append(f"roundtable-assistant×{live_panels}")
+    # An automatic sign-in partway through its browser dance is not a run,
+    # but a restart here discards it after the magic-link email was already
+    # sent (the 2026-10-05 03:28 attempt died to the 03:31 drain restart).
+    for key in setup_flow.active_auto_signins():
+        busy.append(f"auto-signin:{key}")
     return busy
 
 
@@ -9322,7 +9327,7 @@ async def api_permission(
 def _credential_is_configured(user_sub: str, cred_id: int) -> bool:
     """True if the credential's home has a usable OAuth token or API key."""
     home = _credential_home_path(user_sub, cred_id)
-    return (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists()
+    return setup_flow.is_configured(home)
 
 
 def _account_payload(user: dict) -> dict:
@@ -9650,22 +9655,24 @@ async def api_credentials_oauth_auto_signin(
             )
         except auto_signin.AutoSigninError as e:
             state.stage = None
-            await setup_flow.cancel_flow(flow_key=flow_key)
-            # Overwrite the vague "cancelled" verdict cancel_flow set with
-            # the specific failure the user needs to see.
-            current = setup_flow.current_flow(flow_key)
-            if current is not None:
-                current.status = "failed"
-                current.error = str(e)
+            # Keep the CLI's PKCE exchange alive so the same link/code form
+            # can finish in the user's browser (e.g. Cloudflare verification).
+            # A replaced attempt must never cancel or overwrite its successor.
+            if setup_flow.current_flow(flow_key) is state:
+                state.error = str(e)
         except Exception as e:  # noqa: BLE001
-            logging.getLogger("claude-web").exception("auto_signin driver crashed")
-            await setup_flow.cancel_flow(flow_key=flow_key)
-            current = setup_flow.current_flow(flow_key)
-            if current is not None:
-                current.status = "failed"
-                current.error = f"auto-signin driver crashed: {e}"
+            # Browser errors can embed OAuth URLs and their secrets. Keep
+            # the exception type for diagnosis, never the raw traceback.
+            log.warning("auto_signin failed (%s)", type(e).__name__)
+            state.stage = None
+            if setup_flow.current_flow(flow_key) is state:
+                state.error = (
+                    "Automatic sign-in could not finish. Open the sign-in "
+                    "link below to continue in your browser."
+                )
 
-    asyncio.create_task(_driver())
+    state.stage = "launching browser"
+    state.auto_task = asyncio.create_task(_driver())
     return state.to_public()
 
 
@@ -9835,6 +9842,7 @@ async def api_credentials_signout(
     sub = user.get("sub")
     _require_owned_credential(sub, cred_id)
     home = _credential_home_path(sub, cred_id)
+    await setup_flow.cancel_flow(flow_key=_credential_flow_key(sub, cred_id))
     await setup_flow.sign_out(home)
     if _user_active_slot(sub) == f"cred:{cred_id}":
         _set_user_active(sub, "shared")
@@ -14983,7 +14991,7 @@ def _slot_has_credentials(user_sub: Optional[str], slot: str) -> bool:
     if cred_id is None or not user_sub:
         return False
     home = _credential_home_path(user_sub, cred_id)
-    return (home / ".credentials.json").exists() or (home / ".anthropic_api_key").exists()
+    return setup_flow.is_configured(home)
 
 
 def _select_account_slot(

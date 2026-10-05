@@ -123,7 +123,17 @@ def is_configured(home: Optional[Path] = None) -> bool:
         return True
     if home is None and API_KEY_FILE.exists():
         return True
-    return credentials_path(home).exists()
+    try:
+        data = json.loads(credentials_path(home).read_text(encoding="utf-8"))
+        oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        # A lapsed access token with a refresh token is still usable. The
+        # CLI also leaves a metadata-only file after revoking credentials;
+        # file existence alone incorrectly labels that slot signed in.
+        return isinstance(oauth, dict) and bool(
+            oauth.get("accessToken") or oauth.get("refreshToken")
+        )
+    except (OSError, ValueError):
+        return False
 
 
 def whoami(home: Optional[Path] = None) -> dict:
@@ -288,6 +298,7 @@ class OAuthFlowState:
     error: Optional[str] = None
     proc: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
     driver_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    auto_task: Optional[asyncio.Task] = field(default=None, repr=False)
     code_event: asyncio.Event = field(default_factory=asyncio.Event)
     code: Optional[str] = None
     # Set by auto_signin.run_auto_signin as it moves through the browser
@@ -427,7 +438,7 @@ async def _drive(state: OAuthFlowState) -> None:
         if state.status == "cancelled":
             return
 
-        if rc == 0 and credentials_path(state.home).exists():
+        if rc == 0 and is_configured(state.home):
             state.status = "done"
             return
 
@@ -458,6 +469,8 @@ async def start_oauth(
     target_home = home or CLAUDE_HOME
     async with _flow_lock:
         prior = _flows.get(flow_key)
+        if prior:
+            await _cancel_auto_task(prior)
         if prior and prior.status in ("starting", "awaiting_code", "exchanging"):
             prior.status = "cancelled"
             prior.code_event.set()
@@ -506,6 +519,7 @@ async def cancel_flow(flow_key: str = SHARED_FLOW_KEY) -> None:
     flow = _flows.get(flow_key)
     if flow is None:
         return
+    await _cancel_auto_task(flow)
     if flow.status in ("done", "failed", "cancelled"):
         return
     flow.status = "cancelled"
@@ -513,3 +527,23 @@ async def cancel_flow(flow_key: str = SHARED_FLOW_KEY) -> None:
     # _drive's finally clause will _kill_and_reap the subprocess; we don't
     # need to do it here. But the driver may be blocked on stdin/code_event
     # await — set the event (already done) and let it unwind.
+
+
+async def _cancel_auto_task(flow: OAuthFlowState) -> None:
+    task = flow.auto_task
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def active_auto_signins() -> list[str]:
+    """Flow keys whose automatic sign-in is still driving a browser or a
+    mailbox read. A restart in that window throws the attempt away after
+    the sign-in email has already gone out."""
+    return [
+        key for key, flow in _flows.items()
+        if flow.auto_task is not None and not flow.auto_task.done()
+    ]

@@ -326,7 +326,9 @@ def _make_owned_credential(monkeypatch, tmp_path, sub: str, label: str):
     monkeypatch.setattr(app_module, "PERSONAL_HOMES_DIR", tmp_path / "personal-homes")
     cred_id = app_module._insert_credential_row(app_module._state_db(), sub, label)
     home = app_module._ensure_credential_home(sub, cred_id)
-    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    (home / ".credentials.json").write_text(
+        '{"claudeAiOauth":{"accessToken":"test-token"}}', encoding="utf-8",
+    )
     return f"cred:{cred_id}", home
 
 

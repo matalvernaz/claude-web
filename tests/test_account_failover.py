@@ -281,7 +281,9 @@ def slots():
     for name in ("personal", "alex", "office"):
         cred = app_module._create_credential(SUB, f"failover-{name}")
         home = app_module._ensure_credential_home(SUB, cred["id"])
-        (home / ".credentials.json").write_text("{}", encoding="utf-8")
+        (home / ".credentials.json").write_text(
+            '{"claudeAiOauth":{"accessToken":"test-token"}}', encoding="utf-8",
+        )
         made[name] = f"cred:{cred['id']}"
     yield made
     for slot in made.values():
@@ -774,7 +776,9 @@ def alex_slot():
     """One extra subscription slot for the anonymous caller, with creds on disk."""
     cred = app_module._create_credential(ANON, "failover-alex")
     home = app_module._ensure_credential_home(ANON, cred["id"])
-    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    (home / ".credentials.json").write_text(
+        '{"claudeAiOauth":{"accessToken":"test-token"}}', encoding="utf-8",
+    )
     slot = f"cred:{cred['id']}"
     app_module._set_failover_settings(ANON, True, "free_first", include_all=True)
     yield slot
@@ -789,7 +793,9 @@ def office_slot(alex_slot):
     """A second extra slot, after Alex in the implicit shared-then-creds ring."""
     cred = app_module._create_credential(ANON, "failover-office")
     home = app_module._ensure_credential_home(ANON, cred["id"])
-    (home / ".credentials.json").write_text("{}", encoding="utf-8")
+    (home / ".credentials.json").write_text(
+        '{"claudeAiOauth":{"accessToken":"test-token"}}', encoding="utf-8",
+    )
     yield f"cred:{cred['id']}"
     app_module._state_db().execute(
         "DELETE FROM user_credential WHERE user_sub = ? AND id = ?",

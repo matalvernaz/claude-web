@@ -848,9 +848,15 @@ def item_events(item: dict, *, completed: bool, session_id: Optional[str],
     if itype == "agentMessage":
         if not completed:
             return []  # deltas carry the interim text
-        return [_assistant_event(
+        events = [_assistant_event(
             [{"type": "text", "text": item.get("text") or ""}], session_id,
         )]
+        question = async_question_event(item, session_id)
+        if question:
+            if not item.get("text"):
+                events.clear()
+            events.append(question)
+        return events
 
     if itype == "reasoning":
         if not completed:
@@ -1055,6 +1061,33 @@ def plan_todos(plan: Any) -> list[dict]:
     return todos
 
 
+def async_question_event(item: dict, session_id: Optional[str]) -> Optional[dict]:
+    """Nonblocking questions arrive on agentMessage, not a server request.
+
+    Their answers are ordinary user input (turn/steer or turn/start). There
+    is no pending JSON-RPC request to resolve, even after the turn completes.
+    """
+    questions = []
+    for q in item.get("questions") or []:
+        if not isinstance(q, dict) or not isinstance(q.get("title"), str):
+            continue
+        if not q["title"].strip():
+            continue
+        questions.append({
+            "question": q["title"],
+            "options": [{"label": o, "description": ""}
+                        for o in q.get("options") or [] if isinstance(o, str)],
+            "multiSelect": False,
+        })
+    if not questions:
+        return None
+    return {
+        "type": "async_question", "id": f"codex-async:{item['id']}",
+        "provider": "codex", "session_id": session_id,
+        "questions": questions,
+    }
+
+
 def question_cards(params: dict) -> list[dict]:
     """item/tool/requestUserInput questions → the question_request card list
     the frontend already renders for AskUserQuestion. codex questions are
@@ -1153,6 +1186,9 @@ def thread_transcript(thread: dict, preview_cap: int) -> list[dict]:
                 text = item.get("text") or ""
                 if text:
                     msgs.append({"role": "assistant", "text": text})
+                question = async_question_event(item, thread.get("id"))
+                if question:
+                    msgs.append({"role": "async_question", **question})
                 continue
             for ev in item_events(item, completed=False, session_id=None,
                                   preview_cap=preview_cap):
@@ -1177,4 +1213,12 @@ def thread_transcript(thread: dict, preview_cap: int) -> list[dict]:
                     elif blk.get("type") == "text" and blk.get("text"):
                         msgs.append({"role": "assistant",
                                      "text": blk["text"]})
+    # A later user message has already moved the conversation on. Preserve
+    # the earlier question as history instead of presenting a stale form.
+    later_user = False
+    for msg in reversed(msgs):
+        if msg["role"] == "user":
+            later_user = True
+        elif msg["role"] == "async_question":
+            msg["closed"] = later_user
     return msgs

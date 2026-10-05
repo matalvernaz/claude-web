@@ -57,6 +57,42 @@ def test_agent_message_started_emits_nothing():
     ) == []
 
 
+def test_async_questions_are_answerable_events_even_without_message_text():
+    item = {"type": "agentMessage", "id": "q-message", "text": "",
+            "questions": [{"title": "Which account?", "options": ["Alex", "Office"]},
+                          {"title": "What failed?", "options": None}]}
+    events = codex_provider.item_events(
+        item, completed=True, session_id="thread-q", preview_cap=CAP,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event["type"] == "async_question"
+    assert event["session_id"] == "thread-q"
+    assert event["provider"] == "codex"
+    assert event["questions"][0]["question"] == "Which account?"
+    assert event["questions"][0]["options"][1]["label"] == "Office"
+    assert event["questions"][1]["options"] == []
+    assert codex_provider.item_events(
+        item, completed=False, session_id="thread-q", preview_cap=CAP,
+    ) == []
+
+
+def test_async_questions_survive_reopen_and_older_questions_become_history():
+    def question(qid):
+        return {"type": "agentMessage", "id": qid, "text": "",
+                "questions": [{"title": qid, "options": ["A", "B"]}]}
+
+    thread = {"id": "thread-q", "turns": [{"items": [question("old")]},
+              {"items": [{"type": "userMessage", "id": "reply", "content": [
+                  {"type": "text", "text": "Here is my answer"}]}, question("new")]}]}
+    history = codex_provider.thread_transcript(thread, CAP)
+    questions = [m for m in history if m["role"] == "async_question"]
+    assert len(questions) == 2
+    assert questions[0]["closed"] is True
+    assert questions[1]["closed"] is False
+    assert questions[1]["session_id"] == "thread-q"
+
+
 def test_reasoning_completed_becomes_thinking_block():
     evs = codex_provider.item_events(
         {"type": "reasoning", "id": "r1", "text": "pondering"},

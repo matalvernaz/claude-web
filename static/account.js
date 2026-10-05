@@ -125,6 +125,7 @@
         oauthStart.disabled = true;
         break;
       case "awaiting_code":
+        if (flow.error && !auto) showError(oauthError, flow.error);
         setText(
           oauthStatus,
           auto

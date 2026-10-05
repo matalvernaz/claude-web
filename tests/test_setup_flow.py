@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import importlib
+import json
 
 import pytest
 
@@ -34,6 +35,26 @@ def test_is_configured_true_with_env_var(fresh_setup_flow, monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert fresh_setup_flow.is_configured() is True
     assert fresh_setup_flow.whoami() == {"mode": "api_key"}
+
+
+@pytest.mark.parametrize("oauth, configured", [
+    ({"accessToken": "", "refreshToken": "", "expiresAt": 0,
+      "subscriptionType": "team"}, False),
+    ({"accessToken": "expired", "refreshToken": "refresh", "expiresAt": 1}, True),
+    ({"accessToken": "", "refreshToken": "refresh", "expiresAt": 1}, True),
+    ({}, False),
+])
+def test_configured_requires_tokens_but_does_not_reject_refreshable_expiry(
+    fresh_setup_flow, oauth, configured,
+):
+    fresh_setup_flow.credentials_path().write_text(json.dumps({"claudeAiOauth": oauth}))
+    assert fresh_setup_flow.is_configured() is configured
+
+
+@pytest.mark.parametrize("contents", ["{broken", "[]", "null", '{}'])
+def test_invalid_credential_file_is_not_signed_in(fresh_setup_flow, contents):
+    fresh_setup_flow.credentials_path().write_text(contents)
+    assert fresh_setup_flow.is_configured() is False
 
 
 # Realistic-looking key shape (sk-ant- + 90 url-safe chars). The format

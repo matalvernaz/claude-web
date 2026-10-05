@@ -90,6 +90,9 @@ def ui(browser):
                       for part in message.iter_parts()}
             state["posts"].append((path, fields))
             if path.startswith("/api/chat/send/"):
+                if state.get("send_ok"):
+                    request_route.fulfill(json={"ok": True})
+                    return
                 if state.get("change_settings_during_send"):
                     page.evaluate("""() => {
                         const model = document.getElementById('model-select');
@@ -137,6 +140,150 @@ def assert_local_controls(page):
     for selector in ("#effort-select-label", "#account-select", "#failover-toggle", "#manage-accounts", "#show-usage"):
         playwright.expect(page.locator(selector)).to_be_hidden()
     playwright.expect(page.locator("#permission-mode-select")).to_have_value("default")
+
+
+def _codex_question_session(page, state, *, live=False, closed=False):
+    state["providers"]["providers"].append({
+        "key": "codex", "label": "Codex", "available": True,
+        "models": [{"key": "gpt-test", "label": "GPT", "efforts": []}],
+        "capabilities": CLOUD_CAPS,
+    })
+    state["session"] = {"provider": "codex", "messages": [{
+        "role": "async_question", "type": "async_question", "id": "codex-async:q1",
+        "provider": "codex", "session_id": "saved", "closed": closed,
+        "questions": [{"question": "Which account?", "options": [
+            {"label": "Alex"}, {"label": "Office"}]}],
+    }]}
+    if live:
+        state["send_ok"] = True
+        state["session"]["live_run"] = {
+            "run_id": "codex-run", "active": True, "between_turns": False,
+        }
+        page.add_init_script("""(() => {
+          const realFetch = window.fetch;
+          window.fetch = (url, opts) => String(url).includes('/api/chat/stream/codex-run')
+            ? Promise.resolve(new Response(new ReadableStream({start() {}}),
+                {headers: {'Content-Type': 'text/event-stream'}}))
+            : realFetch(url, opts);
+        })();""")
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator(".question-fieldset legend")).to_have_text("Which account?")
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_codex_async_question_can_be_answered_during_or_after_a_turn(ui, live):
+    page, state = ui
+    _codex_question_session(page, state, live=live)
+    assert state["posts"] == []  # preselection never submits itself
+    playwright.expect(page.get_by_role("radio", name="Alex", exact=True)).to_be_checked()
+    page.get_by_role("radio", name="Office", exact=True).check()
+    page.get_by_role("button", name="Submit answers", exact=True).click()
+    playwright.expect(page.locator(".permission-resolved")).to_contain_text("Which account?: Office")
+    assert len(state["posts"]) == 1
+    path, payload = state["posts"][0]
+    assert path == ("/api/chat/send/codex-run" if live else "/api/chat")
+    assert payload["provider"] == "codex"
+    assert "Which account?\nOffice" in payload["message"].replace("\r\n", "\n")
+    if not live:
+        assert payload["session_id"] == "saved"
+
+
+def test_codex_async_question_accepts_free_text_and_retries_a_failed_send(ui):
+    page, state = ui
+    _codex_question_session(page, state)
+    page.get_by_role("textbox", name="Other answer for: Which account?").fill("The account labelled Alex")
+    page.route("**/api/chat", lambda route: route.fulfill(status=503, json={"detail": "Unavailable"}))
+    page.get_by_role("button", name="Submit answers", exact=True).click()
+    playwright.expect(page.get_by_role("button", name="Submit answers", exact=True)).to_be_enabled()
+    playwright.expect(page.get_by_role("textbox", name="Other answer for: Which account?")).to_have_value("The account labelled Alex")
+    page.unroute("**/api/chat")
+    page.get_by_role("button", name="Submit answers", exact=True).click()
+    playwright.expect(page.locator(".permission-resolved")).to_contain_text("The account labelled Alex")
+    assert "The account labelled Alex" in state["posts"][0][1]["message"]
+
+
+def test_codex_async_question_skip_needs_no_pending_rpc_and_old_questions_are_readonly(ui):
+    page, state = ui
+    _codex_question_session(page, state)
+    page.get_by_role("button", name="Skip", exact=True).click()
+    playwright.expect(page.locator(".permission-resolved")).to_have_text("Question skipped")
+    assert state["posts"] == []
+    state["session"]["messages"][0]["closed"] = True
+    page.reload()
+    playwright.expect(page.get_by_role("radio", name="Alex", exact=True)).to_be_disabled()
+    playwright.expect(page.get_by_role("button", name="Submit answers", exact=True)).to_have_count(0)
+
+
+def test_codex_question_from_live_stream_stays_answerable_after_result(ui):
+    page, state = ui
+    _codex_question_session(page, state)
+    question = dict(state["session"]["messages"][0])
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "saved", "provider": "codex"},
+        question, {"type": "result"},
+    ]
+    state["session"]["messages"] = []
+    state["chat_sse"] = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+    page.reload()
+    page.locator("#prompt").fill("Help me sign in")
+    page.locator("#send").click()
+    playwright.expect(page.get_by_role("radio", name="Alex", exact=True)).to_be_visible()
+    state["chat_sse"] = 'data: {"type":"result"}\n\n'
+    page.get_by_role("radio", name="Office", exact=True).check()
+    page.get_by_role("button", name="Submit answers", exact=True).click()
+    playwright.expect(page.locator(".permission-resolved")).to_contain_text("Which account?: Office")
+    assert len(state["posts"]) == 2
+    assert state["posts"][1][0] == "/api/chat"
+    assert state["posts"][1][1]["session_id"] == "saved"
+
+
+def test_automatic_signin_failure_exposes_the_existing_link_and_code_form(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    state = {"code": None}
+    flow = {"status": "awaiting_code", "url": "https://claude.ai/oauth?state=test",
+            "stage": None, "error": "Browser security verification did not finish automatically."}
+    template = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("account.html")
+    html = template.render(
+        asset_version=lambda _: "test", user={"sub": "test"},
+        account={"shared_label": "Shared", "credentials": [{
+            "id": 2, "label": "Alex", "configured": False,
+            "auto_email": "test@example.com", "auto_signin_available": True,
+        }]}, codex_account={"credentials": []},
+    )
+
+    def route(request_route):
+        request = request_route.request
+        path = urlparse(request.url).path
+        if path == "/account":
+            request_route.fulfill(content_type="text/html", body=html)
+        elif path.startswith("/static/"):
+            asset = ROOT / path.lstrip("/")
+            request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
+        elif path.endswith("/oauth/auto_signin"):
+            request_route.fulfill(json={**flow, "stage": "launching browser", "error": None})
+        elif path.endswith("/status"):
+            request_route.fulfill(json={"flow": flow, "credential": {"configured": False}})
+        elif path.endswith("/oauth/code"):
+            state["code"] = request.post_data_json["code"]
+            request_route.fulfill(json={"flow": {"status": "done"}, "configured": True})
+        else:
+            request_route.fulfill(json={})
+
+    page.route("**/*", route)
+    page.on("dialog", lambda dialog: dialog.accept())
+    try:
+        page.goto("http://account-ui.test/account")
+        page.get_by_role("button", name="Sign in (auto)", exact=True).click()
+        playwright.expect(page.locator("#oauth-error")).to_contain_text("did not finish automatically")
+        playwright.expect(page.get_by_role("link", name="Open the Claude sign-in page")).to_have_attribute("href", flow["url"])
+        playwright.expect(page.locator("#oauth-code")).to_be_visible()
+        page.locator("#oauth-code").fill("test-code#test-state")
+        page.get_by_role("button", name="Finish sign-in", exact=True).click()
+        page.wait_for_load_state()
+        assert state["code"] == "test-code#test-state"
+    finally:
+        context.close()
 
 
 def test_local_boot_and_keyboard_effort_follow_model_capabilities(ui):

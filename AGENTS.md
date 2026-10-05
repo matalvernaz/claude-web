@@ -97,6 +97,15 @@ Tests in `tests/test_app_helpers.py` (`test_identity_env_for_*`, `test_resolve_a
 
 `_flows: dict[str, OAuthFlowState]` is keyed by `'shared'` or `'cred:<sub>:<id>'`, so an admin re-authing the shared CLI and a user setting up their personal slot can't trample each other. The CLI subprocess is spawned with `CLAUDE_CONFIG_DIR=home` and **`ANTHROPIC_API_KEY` stripped from the child env** so a shared-slot API key doesn't short-circuit a per-credential OAuth login.
 
+Automatic sign-in stores its browser task on the same state (`auto_task`): retry,
+cancel and sign-out stop it along with its mailbox subprocess. Browser failures
+leave an `awaiting_code` CLI alive and expose its link/code form for manual recovery.
+Email submission can lead to Cloudflare's `challenge_redirect` instead of sending
+mail; confirm the email-sent page before polling. Do not log raw browser exceptions,
+which can include OAuth secrets. `setup_flow.is_configured(home)` checks for nonempty
+access/refresh tokens, including expired but refreshable credentials; file existence
+alone also matches revoked, metadata-only credential files.
+
 ### Usage log split
 
 `usage.jsonl` rows carry `account_slot` (`'shared'` or `'personal'`) and `owner_sub`. `/api/usage` reports shared spend aggregated across all users (one bill) and personal spend filtered to just the requesting user. Pre-tagging rows are treated as shared.
@@ -189,6 +198,13 @@ The canonical roundtable package is vendored under `roundtable/` in this reposit
 - **Cost picture**: normal task = 1 GPT Sol call + 1 Gemini Pro call (paid) + a Claude Sonnet panellist and a Claude Opus synthesis (subscription in CLI transport mode). Verified review adds up to `CLAUDE_ROUNDTABLE_REVIEW_MAX_FINDINGS` verifier calls; the default verifier is the selected Claude synthesiser with `transport=auto`.
 
 ### Codex provider (OpenAI)
+
+Codex also emits nonblocking questions in `agentMessage.questions` (title + string
+options), independently of `item/tool/requestUserInput`. Preserve these as
+`async_question` events and transcript rows. Their answers use ordinary user input
+through `turn/steer` or `turn/start`, never `/api/permission`/a pending RPC. The card
+remains answerable after turn completion and on reopen; a later user message makes
+older questions read-only history. Keep blocking question handling separate.
 
 The header has an AI-provider picker next to the model picker. It stays hidden until `/api/providers` reports a second available provider; "Codex (OpenAI)" appears when the `codex` CLI is on PATH (or `CLAUDE_WEB_CODEX_BIN`) **and** either `~/.codex/auth.json` exists (`codex login`) or `OPENAI_API_KEY` is set in the service env. Providers are fixed per conversation — switching the picker with a chat open starts a new chat; models switch mid-chat freely (Codex takes the model per turn).
 

@@ -7,7 +7,7 @@ The generic flow this module drives:
   1. ``setup_flow.start_oauth`` spawns ``claude auth login``; the
      subprocess prints an ``https://claude.com/cai/oauth/authorize?...``
      URL and blocks on stdin for the paste-back code.
-  2. This module launches headless chromium, navigates to that URL,
+  2. This module launches Chromium, navigates to that URL,
      enters the configured email, and triggers a magic-link email.
   3. It shells out to ``CLAUDE_WEB_MAILBOX_POLL_CMD`` (argv: email,
      after-epoch, timeout-seconds), which blocks until a fresh
@@ -34,7 +34,13 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import signal
+import socket
+import sys
+import tempfile
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 from urllib.parse import parse_qs, urlparse
@@ -43,6 +49,7 @@ log = logging.getLogger("claude-web.auto_signin")
 
 
 ENV_MAILBOX_CMD = "CLAUDE_WEB_MAILBOX_POLL_CMD"
+ENV_BROWSER = "CLAUDE_WEB_SIGNIN_BROWSER"
 
 # Bounds. Not env-configurable — pushing them higher rarely helps and
 # usually just papers over a genuine breakage.
@@ -69,12 +76,23 @@ async def _poll_mailbox(email: str, after_epoch: int, timeout_s: int) -> str:
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=(os.name == "posix"),
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 15)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 15)
     except asyncio.TimeoutError:
-        proc.kill()
         raise AutoSigninError("mailbox poll wrapper hung past its own timeout") from None
+    finally:
+        # Cancelling an attempt must also stop a shell wrapper's ssh/pwsh
+        # children; otherwise retries leave mailbox readers running.
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif proc.returncode is None:
+            proc.kill()
+        await proc.wait()
     if proc.returncode == 0:
         url = (out or b"").decode("utf-8", errors="replace").strip()
         if url.startswith("https://claude.ai/magic-link#"):
@@ -84,9 +102,8 @@ async def _poll_mailbox(email: str, after_epoch: int, timeout_s: int) -> str:
         )
     if proc.returncode == 1:
         raise AutoSigninError("no magic-link email arrived within the timeout")
-    tail = (err or b"").decode("utf-8", errors="replace").strip()[:200]
     raise AutoSigninError(
-        f"mailbox poll wrapper exited {proc.returncode}: {tail or '<no stderr>'}"
+        f"mailbox poll wrapper failed (exit {proc.returncode})"
     )
 
 
@@ -122,6 +139,123 @@ def _paste_from_page_text(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+async def _wait_for_email_sent(page) -> None:
+    """Don't start reading mail until the website confirms it sent mail.
+
+    Submitting the email can redirect to Cloudflare instead. Give automatic
+    browser verification time to finish before offering manual recovery.
+    """
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    try:
+        await page.wait_for_function(r"""() => {
+          const text = document.body?.innerText || '';
+          return /check your (?:email|inbox)|click the link sent to|we.ve sent (?:you )?(?:an email|a (?:sign.in|magic|login) link)|enter (?:the |your )?(?:verification|sign.in|login) code/i.test(text);
+        }""", timeout=EMAIL_SEND_TIMEOUT_S * 1000)
+    except PWTimeout:
+        body = await page.locator("body").inner_text(timeout=5000)
+        if ("challenge_redirect" in urlparse(page.url).path or re.search(
+            r"security verification|verify you are (?:a )?human|verify you are not a bot",
+            body, re.IGNORECASE,
+        )):
+            raise AutoSigninError(
+                "Claude's browser security verification did not finish automatically. "
+                "No sign-in email was confirmed. You can open the sign-in link below "
+                "to finish in your browser, then paste the returned code here."
+            ) from None
+        raise AutoSigninError(
+            "Claude did not confirm sending a sign-in email. "
+            "Open the sign-in link below to continue in your browser."
+        ) from None
+
+
+async def _stop_browser_process(proc) -> None:
+    if proc is None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        elif proc.returncode is None:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+
+
+@asynccontextmanager
+async def _browser_context(pw):
+    """Drive an ordinary Chromium process through its loopback CDP port.
+
+    The default automation launch stalled at Claude's security check, even
+    headed; a normal installed Chromium launch completed that same check.
+    Keep the browser's real user agent and default flags. On a Linux server,
+    Xvfb supplies a display when installed; otherwise use headless Chromium.
+    Each attempt gets a private, temporary profile, never an operator's one.
+    """
+    browser = proc = display_proc = None
+    with tempfile.TemporaryDirectory(prefix="claude-web-signin-") as profile:
+        try:
+            env = dict(os.environ)
+            headless = sys.platform.startswith("linux") and not env.get("DISPLAY")
+            xvfb = shutil.which("Xvfb") if headless else None
+            if xvfb:
+                display_proc = await asyncio.create_subprocess_exec(
+                    xvfb, "-displayfd", "1", "-screen", "0", "1280x900x24", "-nolisten", "tcp",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                display = (await asyncio.wait_for(display_proc.stdout.readline(), 10)).strip()
+                if not display.isdigit():
+                    raise AutoSigninError("Could not start the sign-in browser's display")
+                env["DISPLAY"] = ":" + display.decode("ascii")
+                headless = False
+            binary = (os.environ.get(ENV_BROWSER) or shutil.which("chromium")
+                      or shutil.which("chromium-browser") or shutil.which("google-chrome")
+                      or pw.chromium.executable_path)
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            args = [binary, f"--user-data-dir={profile}", f"--remote-debugging-port={port}",
+                    "--remote-debugging-address=127.0.0.1", "--no-first-run", "--no-default-browser-check"]
+            if headless:
+                args.append("--headless=new")
+            proc = await asyncio.create_subprocess_exec(
+                *args, "about:blank", env=env,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=(os.name == "posix"),
+            )
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and proc.returncode is None:
+                try:
+                    browser = await pw.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{port}", timeout=1000,
+                    )
+                    break
+                except Exception:
+                    await asyncio.sleep(0.1)
+            if browser is None:
+                raise AutoSigninError("Could not start the sign-in browser")
+            yield browser.contexts[0]
+        finally:
+            if browser is not None:
+                try:
+                    await asyncio.wait_for(browser.close(), 5)
+                except Exception:
+                    pass
+            await _stop_browser_process(proc)
+            await _stop_browser_process(display_proc)
+
+
 async def _run_browser_flow(
     oauth_url: str,
     email: str,
@@ -132,15 +266,7 @@ async def _run_browser_flow(
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        try:
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-            )
+        async with _browser_context(pw) as ctx:
             page = await ctx.new_page()
 
             on_stage("opening sign-in page")
@@ -172,6 +298,9 @@ async def _run_browser_flow(
             # click and Enter work. Enter is more resilient to label
             # rewording.
             await email_input.press("Enter")
+
+            on_stage("confirming email was sent")
+            await _wait_for_email_sent(page)
 
             on_stage("waiting for magic-link email")
             magic_link = await poll_mailbox(send_epoch, MAILBOX_POLL_TIMEOUT_S)
@@ -209,8 +338,6 @@ async def _run_browser_flow(
                     "paste-back code"
                 )
             return _CodeResult(paste=paste)
-        finally:
-            await browser.close()
 
 
 async def run_auto_signin(
@@ -235,7 +362,4 @@ async def run_auto_signin(
     if state.status == "done":
         on_stage("done")
         return
-    raise AutoSigninError(
-        f"CLI rejected the paste-back code (state={state.status!r}): "
-        f"{(state.error or '')[:200]}"
-    )
+    raise AutoSigninError("Claude could not exchange the sign-in code. Start sign-in again.")

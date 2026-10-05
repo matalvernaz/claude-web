@@ -264,12 +264,24 @@ The schema is stable — keys are always set, only their values are empty when t
 
 Claude defaults to the deployment-wide shared account in `$CLAUDE_HOME/.credentials.json`. Personal Claude homes mirror `CLAUDE_HOME`, with only the credential files kept private. The transcript JSONL is therefore the same file under every slot, so a credential change can resume the current conversation.
 
+Slots with `auto_email` configured can use automatic Claude sign-in when the host
+sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. The browser confirms an email was sent before
+the mailbox reader starts. If Claude requires browser security verification,
+the account page keeps the sign-in link and code form available so you can finish
+in your own browser. Cancelling or retrying stops the previous automation.
+An OAuth file with empty tokens is shown as signed out; an expired access token
+with a refresh token still counts as configured.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `CLAUDE_WEB_PERSONAL_HOMES_DIR` | `$HOME/.claude-homes` | Where per-user personal `CLAUDE_CONFIG_DIR` directories are created. Bind-mount this in your compose so personal credentials survive container rebuilds (`./claude-homes:/home/claude/.claude-homes`). |
 | `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` | `Shared` | Display name for the shared slot in the UI. Set this per deployment, e.g. `Office`, `Team`, `Workspace`. |
 
 OpenAI has a separate slot set. The shared slot uses `$CODEX_HOME/auth.json` or `OPENAI_API_KEY`; personal slots use Codex's ChatGPT device-code flow and support subscription plans such as Plus and Pro.
+
+Codex questions offer suggested answers and free text. You can answer while Codex
+keeps working or after its response finishes; reopening the conversation restores
+unanswered question forms. Submitting sends the answer to that conversation.
 
 | Variable | Default | Notes |
 |---|---|---|

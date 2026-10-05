@@ -1,5 +1,7 @@
 """Drain-restart machinery: busy detection, gating, request/cancel."""
 
+import pytest
+
 # test_csrf re-imports app with CSRF strict baked in, and module caching can
 # leak that into later test files. A matching Origin passes in both modes.
 _ORIGIN = {"Origin": "http://testserver"}
@@ -106,3 +108,35 @@ def test_admin_restart_endpoint(client):
         assert app_module.RESTART_STATE["pending"] is False
     finally:
         app_module.cancel_restart()
+
+
+async def test_automatic_signin_in_flight_counts_as_busy(client, monkeypatch):
+    import asyncio
+
+    import app as app_module
+    import setup_flow
+
+    app_module.ACTIVE_RUNS.clear()
+    live = setup_flow.OAuthFlowState(
+        variant="claudeai", flow_key="cred:x:2", status="awaiting_code")
+    live.auto_task = asyncio.create_task(asyncio.sleep(60))
+    finished = setup_flow.OAuthFlowState(
+        variant="claudeai", flow_key="cred:x:3", status="done")
+    finished.auto_task = asyncio.create_task(asyncio.sleep(0))
+    await finished.auto_task
+    manual = setup_flow.OAuthFlowState(
+        variant="claudeai", flow_key="cred:x:4", status="awaiting_code")
+    monkeypatch.setattr(setup_flow, "_flows", {
+        "cred:x:2": live, "cred:x:3": finished, "cred:x:4": manual,
+    })
+    try:
+        # The browser is mid-dance on cred:x:2; a restart now would throw
+        # the attempt away after its sign-in email already went out.
+        assert app_module._busy_runs() == ["auto-signin:cred:x:2"]
+        live.auto_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await live.auto_task
+        assert app_module._busy_runs() == []
+    finally:
+        if not live.auto_task.done():
+            live.auto_task.cancel()
