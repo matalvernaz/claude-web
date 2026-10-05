@@ -875,9 +875,10 @@ def test_follow_up_never_tears_down_a_turn_in_flight(client, alex_slot) -> None:
 
 
 def test_follow_up_ignores_entitlement_inference_for_a_live_run(client, alex_slot) -> None:
-    """Alex meters Fable and shared has no fresh read: the ranker prefers Alex
-    on inference alone. That may steer a fresh spawn, but must not kill a
-    live CLI — nothing has been observed about shared."""
+    """Alex meters Fable and shared has no fresh read. Whatever the ranker
+    makes of that for a fresh spawn (since 18928f7 the unread pick stands;
+    before, Alex won on inference), it must not kill a live CLI: nothing has
+    been observed about shared."""
     _write_rate_limit("shared", _healthy_window())
     app_module._save_entitlements(
         alex_slot, _profile("default_claude_max_5x", "team_tier_1"),
