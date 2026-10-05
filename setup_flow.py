@@ -310,6 +310,11 @@ class OAuthFlowState:
     # accounts page: claude.ai wants a person to open it. Only meaningful
     # while awaiting_code, since the code it leads to goes to this CLI.
     magic_link: Optional[str] = None
+    # True while the driver's browser waits for the short code claude.ai
+    # shows whoever opens magic_link elsewhere; the page shows the code form.
+    awaiting_verification: bool = False
+    verification_code: Optional[str] = field(default=None, repr=False)
+    verification_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def to_public(self) -> dict:
         return {
@@ -319,6 +324,7 @@ class OAuthFlowState:
             "error": self.error,
             "stage": self.stage,
             "magic_link": self.magic_link,
+            "awaiting_verification": self.awaiting_verification,
         }
 
 

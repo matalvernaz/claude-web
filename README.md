@@ -266,13 +266,18 @@ Claude defaults to the deployment-wide shared account in `$CLAUDE_HOME/.credenti
 
 Slots with `auto_email` configured get a "Get sign-in link" button when the host
 sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. A server-side browser asks claude.ai to send
-the sign-in email, the mailbox reader picks the link out of it, and the account
-page shows that link next to the code form. Open the link in your own browser
-(claude.ai wants a person for that step), click Authorize, and paste the code
-back. If the email can't be requested, the page falls back to the ordinary
-sign-in link and code form. Cancelling or retrying stops the previous request.
-An OAuth file with empty tokens is shown as signed out; an expired access token
-with a refresh token still counts as configured.
+the sign-in email and waits on the login page; the mailbox reader picks the link
+out of the email and the account page shows it. Open the link in your own
+browser: because the email was requested elsewhere, claude.ai shows you a short
+verification code instead of signing you in. Type it into the account page and
+the server browser finishes the sign-in and the authorization itself. The
+browser never opens the link (claude.ai meets it with a puzzle). If anything
+fails, the page falls back to the ordinary sign-in link and long-code form.
+Cancelling or retrying stops the previous request. Set
+`CLAUDE_WEB_SIGNIN_DEBUG_DIR` to keep per-stage page text and screenshots
+(URLs stripped of query and fragment) in a private directory when claude.ai's
+pages change. An OAuth file with empty tokens is shown as signed out; an expired
+access token with a refresh token still counts as configured.
 
 | Variable | Default | Notes |
 |---|---|---|

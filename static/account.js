@@ -27,6 +27,9 @@
   const oauthUrl = $("oauth-url");
   const oauthMagicBlock = $("oauth-magic-link-block");
   const oauthMagicLink = $("oauth-magic-link");
+  const verificationForm = $("oauth-verification-form");
+  const verificationInput = $("oauth-verification-code");
+  const verificationSubmit = $("oauth-verification-submit");
   const oauthCodeForm = $("oauth-code-form");
   const oauthCodeInput = $("oauth-code");
   const oauthCodeSubmit = $("oauth-code-submit");
@@ -60,7 +63,11 @@
   function show(el) { if (el) el.hidden = false; }
   function hide(el) { if (el) el.hidden = true; }
   function setText(el, text) { if (el) el.textContent = text || ""; }
-  function showError(el, msg) { setText(el, msg); show(el); }
+  function showError(el, msg) {
+    // Polls repeat the same text; rewriting an alert's text re-announces it.
+    if (el && el.textContent !== (msg || "")) setText(el, msg);
+    show(el);
+  }
 
   function clearOauthState() {
     lastOauthFlowStatus = null;
@@ -69,6 +76,8 @@
     hide(oauthProgress);
     hide(oauthLinkBlock);
     hide(oauthMagicBlock);
+    hide(verificationForm);
+    if (verificationInput) verificationInput.value = "";
     setText(oauthError, "");
     hide(oauthError);
     oauthStart.disabled = false;
@@ -135,6 +144,15 @@
     } else {
       hide(oauthMagicBlock);
     }
+    // The server's browser is parked on the login page until the person
+    // types the short code claude.ai showed them at the link.
+    const needsCode = !!link && !!flow.awaiting_verification;
+    if (needsCode) {
+      show(verificationForm);
+      verificationSubmit.disabled = false;
+    } else {
+      hide(verificationForm);
+    }
     switch (flow.status) {
       case "starting":
         setText(oauthStatus, "Starting sign-in… (this can take a few seconds)");
@@ -142,13 +160,13 @@
         oauthStart.disabled = true;
         break;
       case "awaiting_code":
-        if (flow.error && !auto) showError(oauthError, flow.error);
+        if (flow.error && (!auto || needsCode)) showError(oauthError, flow.error);
         setText(
           oauthStatus,
-          auto
-            ? "Requesting a sign-in link: " + flow.stage + "…"
-            : link
-              ? "Your sign-in link is ready. Open it in your own browser, click Authorize, then paste the code below."
+          needsCode
+            ? "Your sign-in link is ready. Open it in your own browser; claude.ai shows a short verification code there. Type it below and press Continue."
+            : auto
+              ? "Signing in: " + flow.stage + "…"
               : "Waiting for the auth code from your browser."
         );
         show(oauthProgress);
@@ -162,7 +180,7 @@
         setText(
           oauthStatus,
           auto
-            ? "Requesting a sign-in link: " + flow.stage + "…"
+            ? "Signing in: " + flow.stage + "…"
             : "Exchanging code with Anthropic…"
         );
         show(oauthProgress);
@@ -293,6 +311,35 @@
     });
   }
 
+  if (verificationForm) {
+    verificationForm.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      if (activeCredId == null) return;
+      const code = (verificationInput.value || "").trim();
+      if (!code) return;
+      setText(oauthError, "");
+      hide(oauthError);
+      verificationSubmit.disabled = true;
+      setText(oauthStatus, "Sending your code to the sign-in browser…");
+      try {
+        const r = await fetch(credUrl(activeCredId, "oauth/verification_code"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+        verificationInput.value = "";
+        hide(verificationForm);
+        startPolling(activeCredId);
+      } catch (e) {
+        showError(oauthError, "Could not send the code: " + e.message);
+        verificationSubmit.disabled = false;
+        if (verificationInput) verificationInput.focus();
+      }
+    });
+  }
+
   if (oauthCancel) {
     oauthCancel.addEventListener("click", async () => {
       if (activeCredId == null) return;
@@ -392,7 +439,8 @@
         const email = btn.getAttribute("data-auto-email") || "";
         if (!confirm(
               "Request a sign-in link for \"" + label + "\" via " + email + "? "
-              + "One email goes to that address; the link appears here when it arrives."
+              + "One email goes to that address; the link appears here when it arrives, "
+              + "and you type the code claude.ai shows you back into this page."
             )) return;
         openSignin(credId, label);
         setText(oauthStatus, "Requesting a sign-in link…");

@@ -97,18 +97,24 @@ Tests in `tests/test_app_helpers.py` (`test_identity_env_for_*`, `test_resolve_a
 
 `_flows: dict[str, OAuthFlowState]` is keyed by `'shared'` or `'cred:<sub>:<id>'`, so an admin re-authing the shared CLI and a user setting up their personal slot can't trample each other. The CLI subprocess is spawned with `CLAUDE_CONFIG_DIR=home` and **`ANTHROPIC_API_KEY` stripped from the child env** so a shared-slot API key doesn't short-circuit a per-credential OAuth login.
 
-The sign-in link request stores its browser task on the same state (`auto_task`):
-retry, cancel, sign-out and a pasted code stop it along with its mailbox subprocess.
-The browser only asks claude.ai to send the email; the link lands in
-`OAuthFlowState.magic_link` for the owner's page and is never opened server-side
-(the magic-link page served an Arkose puzzle to the automated browser on
-2026-10-05). Failures leave an `awaiting_code` CLI alive and expose its link/code
-form for manual recovery. Email submission can lead to Cloudflare's
-`challenge_redirect` instead of sending mail; confirm the email-sent page before
-polling. Do not log raw browser exceptions, which can include OAuth secrets, and
-never log the link. `setup_flow.is_configured(home)` checks for nonempty
-access/refresh tokens, including expired but refreshable credentials; file existence
-alone also matches revoked, metadata-only credential files.
+The server-browser sign-in (`auto_signin.run_signin`) stores its task on the same
+state (`auto_task`): retry, cancel, sign-out and a pasted long code stop it along
+with its mailbox subprocess. The browser asks claude.ai to send the email and parks
+on the login page; the link lands in `OAuthFlowState.magic_link` for the owner's
+page and is never opened server-side (the magic-link page served an Arkose puzzle
+to the automated browser on 2026-10-05). Opened in another browser, the link shows
+a short verification code; `/oauth/verification_code` hands it to the parked browser
+(`awaiting_verification` + `verification_event`), which types it, presses Authorize
+on the consent page, and reads `code#state` off the callback URL for
+`submit_code`. A refused code re-arms the wait with `error` set, up to three tries.
+Failures leave an `awaiting_code` CLI alive and expose the manual link/code form.
+Email submission can lead to Cloudflare's `challenge_redirect` instead of sending
+mail; confirm the email-sent page before polling. Do not log raw browser
+exceptions, which can include OAuth secrets, and never log the link.
+`CLAUDE_WEB_SIGNIN_DEBUG_DIR` keeps per-stage page text and screenshots for the
+pages only reachable with a person present. `setup_flow.is_configured(home)`
+checks for nonempty access/refresh tokens, including expired but refreshable
+credentials; file existence alone also matches revoked, metadata-only credential files.
 
 ### Usage log split
 

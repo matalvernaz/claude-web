@@ -9609,15 +9609,16 @@ async def api_credentials_oauth_auto_signin(
     cred_id: int,
     user: dict = Depends(auth.require_user),
 ):
-    """Request a sign-in link for this slot (see auto_signin.py).
+    """Sign this slot in through a server-side browser (see auto_signin.py).
 
     Only valid for a slot with ``auto_email`` set AND when the host has
     ``CLAUDE_WEB_MAILBOX_POLL_CMD`` configured. Returns immediately with
-    the started flow state; the browser dance and mailbox poll run in a
-    background task that updates the same ``OAuthFlowState`` the manual
-    flow uses. The frontend polls ``/status`` for progress (``flow.stage``)
-    and then shows ``flow.magic_link`` beside the code form, so the person
-    opens the link themselves and pastes the code back.
+    the started flow state; the browser dance runs in a background task
+    that updates the same ``OAuthFlowState`` the manual flow uses. The
+    frontend polls ``/status``: ``flow.stage`` for progress, then
+    ``flow.magic_link`` for the person to open elsewhere, then
+    ``flow.awaiting_verification`` while the browser waits for the short
+    code they read there (``/oauth/verification_code``).
     """
     sub = user.get("sub")
     cred = _require_owned_credential(sub, cred_id)
@@ -9651,19 +9652,46 @@ async def api_credentials_oauth_auto_signin(
         return (setup_flow.current_flow(flow_key) is state
                 and state.status == "awaiting_code")
 
+    def _magic_link(link: str) -> None:
+        # The owner's own single-use login link, for their accounts page
+        # only; claude.ai wants a person to open it. Never logged.
+        if _still_waiting():
+            state.magic_link = link
+
+    async def _wait_for_code() -> str:
+        state.awaiting_verification = True
+        try:
+            await state.verification_event.wait()
+        finally:
+            state.awaiting_verification = False
+        state.verification_event.clear()
+        return state.verification_code or ""
+
+    def _rejected(message: str) -> None:
+        if _still_waiting():
+            state.error = message
+
     async def _driver() -> None:
         try:
             _stage("launching browser")
-            link = await auto_signin.request_magic_link(
+            paste = await auto_signin.run_signin(
                 oauth_url=state.url,
                 email=email,
                 on_stage=_stage,
+                on_magic_link=_magic_link,
+                wait_for_verification_code=_wait_for_code,
+                on_code_rejected=_rejected,
             )
-            if _still_waiting():
-                # The owner's own single-use login link, for their accounts
-                # page only; claude.ai wants a person to open it. Not logged.
-                state.magic_link = link
-                state.stage = None
+            if not _still_waiting():
+                return
+            _stage("exchanging code")
+            result = await setup_flow.submit_code(paste, flow_key=flow_key)
+            state.stage = None
+            if result.status != "done" and _still_waiting():
+                state.error = (
+                    "Claude could not exchange the sign-in code. Click Get "
+                    "sign-in link to start again."
+                )
         except auto_signin.AutoSigninError as e:
             state.stage = None
             # Keep the CLI's PKCE exchange alive so the manual link/code
@@ -9677,12 +9705,42 @@ async def api_credentials_oauth_auto_signin(
             state.stage = None
             if _still_waiting():
                 state.error = (
-                    "Could not request a sign-in link. Open the Claude "
+                    "The sign-in browser hit an error. Open the Claude "
                     "sign-in page below in your own browser instead."
                 )
 
     state.stage = "launching browser"
     state.auto_task = asyncio.create_task(_driver())
+    return state.to_public()
+
+
+@app.post("/api/account/credentials/{cred_id}/oauth/verification_code")
+async def api_credentials_oauth_verification_code(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """The short code claude.ai shows whoever opens the sign-in link in a
+    browser other than the server's; the server's browser types it. This
+    is not ``/oauth/code``, which is the CLI's paste-back and stops the
+    browser driver."""
+    sub = user.get("sub")
+    _require_owned_credential(sub, cred_id)
+    body = await request.json()
+    code = re.sub(r"\s+", "", str(body.get("code") or ""))
+    if not code:
+        raise HTTPException(400, "code is required")
+    if len(code) > 32:
+        raise HTTPException(400, "that is not a verification code")
+    state = setup_flow.current_flow(_credential_flow_key(sub, cred_id))
+    if (state is None or state.status != "awaiting_code"
+            or not state.awaiting_verification):
+        raise HTTPException(409, "no sign-in link is waiting for a verification code")
+    state.verification_code = code
+    state.error = None
+    # Hide the form at once; the driver sets this again if the code bounces.
+    state.awaiting_verification = False
+    state.verification_event.set()
     return state.to_public()
 
 

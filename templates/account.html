@@ -138,13 +138,27 @@
       <div id="oauth-progress" hidden>
         <p id="oauth-status" role="status" aria-live="polite"></p>
 
-        <div id="oauth-link-block" hidden>
-          <p id="oauth-magic-link-block" hidden>
+        <div id="oauth-magic-link-block" hidden>
+          <p>
             <a id="oauth-magic-link" href="#" target="_blank" rel="noopener noreferrer">Open your sign-in link</a>
             (opens in a new tab). This is the link from the email claude.ai
-            just sent; it works for about 10 minutes. Click Authorize there,
-            then paste the code it shows you below.
+            just sent; it works for about 10 minutes. Because the email was
+            requested from this server, claude.ai shows you a short
+            verification code there instead of signing you in. Type that
+            code below and this page finishes the sign-in for you.
           </p>
+          <form id="oauth-verification-form" hidden>
+            <p>
+              <label for="oauth-verification-code">Verification code from claude.ai</label><br>
+              <input type="text" id="oauth-verification-code" name="code" inputmode="numeric" autocomplete="one-time-code" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+            </p>
+            <p>
+              <button type="submit" id="oauth-verification-submit">Continue</button>
+            </p>
+          </form>
+        </div>
+
+        <div id="oauth-link-block" hidden>
           <p>
             <a id="oauth-url" href="#" target="_blank" rel="noopener noreferrer">Open the Claude sign-in page</a>
             (opens in a new tab)

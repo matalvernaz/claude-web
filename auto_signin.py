@@ -1,29 +1,37 @@
-"""Fetch a claude.ai sign-in link for a credential slot that has an
-``auto_email`` configured and a ``CLAUDE_WEB_MAILBOX_POLL_CMD`` on the
-host.
+"""Sign a credential slot in through a server-side browser, with the person
+supplying the one thing it cannot get itself. Needs ``auto_email`` on the
+slot and ``CLAUDE_WEB_MAILBOX_POLL_CMD`` on the host.
 
-The flow this module drives:
+The flow:
 
   1. ``setup_flow.start_oauth`` spawns ``claude auth login``; the
      subprocess prints an ``https://claude.com/cai/oauth/authorize?...``
      URL and blocks on stdin for the paste-back code.
   2. This module launches Chromium, navigates to that URL, enters the
      configured email, and asks claude.ai to send its magic-link email.
-     The browser closes once the page confirms the email went out.
+     The browser stays open on the login page.
   3. It shells out to ``CLAUDE_WEB_MAILBOX_POLL_CMD`` (argv: email,
      after-epoch, timeout-seconds), which blocks until a fresh
      ``https://claude.ai/magic-link#...`` arrives in the target
      mailbox and prints it on stdout.
-  4. The link goes back to the caller, who shows it on the person's
-     accounts page. They open it in their own browser, click Authorize,
-     and paste the code claude.com shows into the same form the manual
-     flow uses; ``setup_flow.submit_code`` finishes the CLI's PKCE
-     exchange.
+  4. The link is shown to the person on their accounts page. Opened in
+     any browser other than the one that asked for it, claude.ai shows a
+     short verification code instead of signing in. The person types
+     that code into claude-web.
+  5. The server browser enters the code on its login page, lands on the
+     OAuth consent page, presses Authorize, and reads ``code#state`` off
+     the ``platform.claude.com/oauth/code/callback`` URL for
+     ``setup_flow.submit_code``.
 
 The browser never opens the magic link itself. On 2026-10-05 that page
 answered the automated browser with an Arkose puzzle and, two minutes
 later, "Couldn't verify your browser", while the login page's own check
-passed. Nothing here tries to beat that check; a person gets the link.
+passed. Nothing here tries to beat that check.
+
+With ``CLAUDE_WEB_SIGNIN_DEBUG_DIR`` set, each stage writes the page's
+text (URLs stripped of query and fragment) and a screenshot under it.
+The pages after the person's code can only be reached with the person,
+so that is how they get fixed when claude.ai changes them.
 """
 
 from __future__ import annotations
@@ -40,21 +48,44 @@ import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from typing import Callable
-from urllib.parse import urlparse
+from pathlib import Path
+from typing import Awaitable, Callable, Optional
+from urllib.parse import parse_qs, urlparse
 
 log = logging.getLogger("claude-web.auto_signin")
 
 
 ENV_MAILBOX_CMD = "CLAUDE_WEB_MAILBOX_POLL_CMD"
 ENV_BROWSER = "CLAUDE_WEB_SIGNIN_BROWSER"
+ENV_DEBUG_DIR = "CLAUDE_WEB_SIGNIN_DEBUG_DIR"
 
 # Bounds. Not env-configurable — pushing them higher rarely helps and
-# usually just papers over a genuine breakage.
+# usually just papers over a genuine breakage. The CLI gives the whole
+# dance 600 s from its sign-in URL (setup_flow.CODE_TIMEOUT_SECONDS).
 EMAIL_SEND_TIMEOUT_S = 60          # entering email + submitting the form
 MAILBOX_POLL_TIMEOUT_S = 120       # from send-magic-link to inbox arrival
+VERIFICATION_WAIT_S = 420          # the person opens the link and types the code
+VERIFICATION_ACCEPT_S = 20         # login page leaves /login after a good code
+VERIFICATION_TRIES = 3             # typos are read off a screen
+AUTHORIZE_TIMEOUT_S = 90           # consent page → callback URL
+CAPTCHA_GRACE_S = 8                # a silent check may still clear; a puzzle won't
 
 _EMAIL_INPUT = 'input[type="email"], input[name="email"], input[id="email"]'
+_CODE_INPUT = (
+    'input:visible:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+    ':not([type="submit"]):not([type="button"]):not([type="email"])'
+)
+_ENTER_CODE_RE = re.compile(
+    r"enter (?:the |your |a )?(?:verification |sign.in |login |one.time )?code", re.IGNORECASE,
+)
+_SUBMIT_CODE_RE = re.compile(r"^\s*(?:continue|verify|submit|sign in|log in|confirm)\s*$", re.IGNORECASE)
+_CONSENT_BUTTON_RE = re.compile(r"^\s*(?:authorize|allow|approve|confirm|continue)\s*$", re.IGNORECASE)
+_VERIFY_TEXT_RE = re.compile(
+    r"verify your browser|verify you are (?:a )?human|verify you are not a bot", re.IGNORECASE,
+)
+_CAPTCHA_FRAME_RE = re.compile(
+    r"arkoselabs|funcaptcha|hcaptcha|recaptcha|challenges\.cloudflare\.com", re.IGNORECASE,
+)
 
 
 class AutoSigninError(RuntimeError):
@@ -223,61 +254,246 @@ async def _browser_context(pw):
             await _stop_browser_process(display_proc)
 
 
-async def _request_email(
-    oauth_url: str,
-    email: str,
-    on_stage: Callable[[str], None],
-) -> int:
+class _Debug:
+    """Per-stage page text and screenshots, only under CLAUDE_WEB_SIGNIN_DEBUG_DIR."""
+
+    def __init__(self) -> None:
+        root = os.environ.get(ENV_DEBUG_DIR, "").strip()
+        self.dir: Optional[Path] = None
+        self.n = 0
+        if root:
+            base = Path(root)
+            base.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.dir = base / time.strftime("%Y%m%d-%H%M%S")
+            self.dir.mkdir(mode=0o700, exist_ok=True)
+
+    async def snap(self, page, tag: str) -> None:
+        if self.dir is None:
+            return
+        self.n += 1
+        stem = self.dir / f"{self.n:02d}-{re.sub(r'[^a-z0-9]+', '-', tag.lower()).strip('-')}"
+        try:
+            u = urlparse(page.url)
+            frames = sorted({urlparse(f.url).netloc for f in page.frames if f.url})
+            try:
+                text = await page.locator("body").inner_text(timeout=2000)
+            except Exception:  # noqa: BLE001 - mid-navigation
+                text = ""
+            stem.with_suffix(".txt").write_text(
+                f"{u.scheme}://{u.netloc}{u.path}\nframes: {frames}\n\n{text[:4000]}\n",
+                encoding="utf-8",
+            )
+            await page.screenshot(path=str(stem.with_suffix(".png")))
+        except Exception as e:  # noqa: BLE001 - diagnostics never fail the flow
+            log.debug("signin debug snapshot failed: %s", type(e).__name__)
+
+
+def _callback_prefix(oauth_url: str) -> str:
+    """Where the consent page sends the browser once the person authorizes."""
+    q = parse_qs(urlparse(oauth_url).query or "")
+    return (q.get("redirect_uri") or ["https://platform.claude.com/oauth/code/callback"])[0]
+
+
+def _paste_from_callback_url(callback_url: str) -> Optional[str]:
+    """``…/oauth/code/callback?code=A&state=V`` is the paste-back ``A#V``."""
+    try:
+        u = urlparse(callback_url)
+    except ValueError:
+        return None
+    if "oauth/code/callback" not in (u.path or ""):
+        return None
+    q = parse_qs(u.query or "")
+    code = (q.get("code") or [None])[0]
+    state = (q.get("state") or [None])[0]
+    return f"{code}#{state}" if code and state else None
+
+
+async def _request_email(page, oauth_url: str, email: str, on_stage, debug: _Debug) -> int:
     """Drive the login page until it confirms a sign-in email was sent.
 
     Returns the epoch taken just before the send, so the mailbox poll can
     skip anything left over from an earlier attempt.
     """
-    # Import lazily so a claude-web install without playwright still boots.
-    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+    from playwright.async_api import TimeoutError as PWTimeout
 
-    async with async_playwright() as pw:
-        async with _browser_context(pw) as ctx:
-            page = await ctx.new_page()
+    on_stage("opening sign-in page")
+    # Cloudflare's JS challenge can take a few seconds; wait_until
+    # 'domcontentloaded' before we start hunting for the form.
+    await page.goto(oauth_url, wait_until="domcontentloaded", timeout=45000)
+    try:
+        await page.wait_for_selector(_EMAIL_INPUT, timeout=EMAIL_SEND_TIMEOUT_S * 1000)
+    except PWTimeout:
+        await debug.snap(page, "no email field")
+        raise AutoSigninError(
+            "sign-in email field never appeared (Cloudflare or "
+            "Anthropic UI changed?)"
+        ) from None
 
-            on_stage("opening sign-in page")
-            # Cloudflare's JS challenge can take a few seconds; wait_until
-            # 'domcontentloaded' before we start hunting for the form.
-            await page.goto(oauth_url, wait_until="domcontentloaded", timeout=45000)
-            try:
-                await page.wait_for_selector(
-                    _EMAIL_INPUT, timeout=EMAIL_SEND_TIMEOUT_S * 1000,
-                )
-            except PWTimeout:
+    on_stage("submitting email")
+    send_epoch = int(time.time())
+    email_input = page.locator(_EMAIL_INPUT).first
+    await email_input.fill(email)
+    # Anthropic's sign-in has a "Continue with email" button; both
+    # click and Enter work. Enter is more resilient to label
+    # rewording.
+    await email_input.press("Enter")
+
+    on_stage("confirming email was sent")
+    try:
+        await _wait_for_email_sent(page)
+    finally:
+        await debug.snap(page, "after email")
+    return send_epoch
+
+
+async def _click_first_visible(locator) -> bool:
+    try:
+        if await locator.count() and await locator.first.is_visible():
+            await locator.first.click(timeout=5000)
+            return True
+    except Exception:  # noqa: BLE001 - gone or covered mid-click; the caller looks again
+        pass
+    return False
+
+
+async def _enter_verification_code(page, code: str, debug: _Debug) -> bool:
+    """Type the person's code into the login page.
+
+    True once the page has left /login (claude.ai accepted it); False if it
+    is still there after VERIFICATION_ACCEPT_S, which is what a wrong code
+    looks like. Typing through the keyboard works for one field and for a
+    row of one-character boxes alike.
+    """
+    if not await _click_first_visible(page.get_by_role("button", name=_ENTER_CODE_RE)):
+        await _click_first_visible(page.get_by_text(_ENTER_CODE_RE))
+    field = page.locator(_CODE_INPUT).first
+    try:
+        await field.wait_for(state="visible", timeout=10000)
+    except Exception:  # noqa: BLE001
+        await debug.snap(page, "no code field")
+        raise AutoSigninError(
+            "The login page offered nowhere to type the verification code. "
+            "Open the Claude sign-in page below in your own browser instead."
+        ) from None
+    await field.click()
+    await page.keyboard.type(code, delay=40)
+    await debug.snap(page, "code typed")
+    await page.keyboard.press("Enter")
+    await _click_first_visible(page.get_by_role("button", name=_SUBMIT_CODE_RE))
+    deadline = time.monotonic() + VERIFICATION_ACCEPT_S
+    while time.monotonic() < deadline:
+        if "/login" not in (urlparse(page.url).path or ""):
+            await debug.snap(page, "after code")
+            return True
+        await asyncio.sleep(0.5)
+    await debug.snap(page, "code not accepted")
+    return False
+
+
+def _captcha_frames(page) -> bool:
+    return any(_CAPTCHA_FRAME_RE.search(f.url or "") for f in page.frames)
+
+
+async def _wait_for_authorization(page, callback_prefix: str, debug: _Debug) -> None:
+    """From the signed-in login page to the OAuth callback URL.
+
+    claude.ai returns to the authorize page, where a consent button sends
+    the browser on to the callback. A bot check here is handed to the
+    person, never attempted.
+    """
+    deadline = time.monotonic() + AUTHORIZE_TIMEOUT_S
+    challenged_at: Optional[float] = None
+    seen: Optional[str] = None
+    while True:
+        if page.url.startswith(callback_prefix):
+            await debug.snap(page, "callback")
+            return
+        if page.url != seen:
+            seen = page.url
+            await debug.snap(page, "authorize")
+        try:
+            body = await page.locator("body").inner_text(timeout=2000)
+        except Exception:  # noqa: BLE001 - mid-navigation
+            body = ""
+        if _captcha_frames(page) or _VERIFY_TEXT_RE.search(body):
+            challenged_at = challenged_at or time.monotonic()
+            if time.monotonic() - challenged_at >= CAPTCHA_GRACE_S:
+                await debug.snap(page, "bot check")
                 raise AutoSigninError(
-                    "sign-in email field never appeared (Cloudflare or "
-                    "Anthropic UI changed?)"
-                ) from None
-
-            on_stage("submitting email")
-            send_epoch = int(time.time())
-            email_input = page.locator(_EMAIL_INPUT).first
-            await email_input.fill(email)
-            # Anthropic's sign-in has a "Continue with email" button; both
-            # click and Enter work. Enter is more resilient to label
-            # rewording.
-            await email_input.press("Enter")
-
-            on_stage("confirming email was sent")
-            await _wait_for_email_sent(page)
-            return send_epoch
+                    "claude.ai asked the server's browser to prove it is human. "
+                    "Open the Claude sign-in page below in your own browser "
+                    "instead, and paste the code it gives you here."
+                )
+        else:
+            challenged_at = None
+        if time.monotonic() >= deadline:
+            await debug.snap(page, "authorize timeout")
+            raise AutoSigninError(
+                "The sign-in did not reach the authorization code in time. "
+                "Open the Claude sign-in page below in your own browser instead."
+            )
+        await _click_first_visible(page.get_by_role("button", name=_CONSENT_BUTTON_RE))
+        await asyncio.sleep(1)
 
 
-async def request_magic_link(
+async def _await_code(wait: Callable[[], Awaitable[str]]) -> str:
+    try:
+        code = await asyncio.wait_for(wait(), timeout=VERIFICATION_WAIT_S)
+    except asyncio.TimeoutError:
+        raise AutoSigninError(
+            "No verification code was entered in time and the sign-in link has "
+            "expired. Click Get sign-in link to start again."
+        ) from None
+    code = re.sub(r"\s+", "", code or "")
+    if not code:
+        raise AutoSigninError("The verification code was empty. Click Get sign-in link to start again.")
+    return code
+
+
+async def run_signin(
     oauth_url: str,
     email: str,
     on_stage: Callable[[str], None],
+    on_magic_link: Callable[[str], None],
+    wait_for_verification_code: Callable[[], Awaitable[str]],
+    on_code_rejected: Callable[[str], None],
 ) -> str:
-    """Ask claude.ai for a sign-in email and return the link it contains.
+    """Sign the slot in and return the CLI's paste-back ``code#state``.
 
-    Raises AutoSigninError on any failure the caller should surface; does
-    not swallow subprocess/mail failures.
+    ``on_magic_link`` receives the emailed link for the person to open;
+    ``wait_for_verification_code`` resolves with the short code they read
+    there; ``on_code_rejected`` reports a code claude.ai refused, after
+    which the wait runs again. Raises AutoSigninError with a message safe
+    to show the caller; does not swallow subprocess/mail failures.
     """
-    send_epoch = await _request_email(oauth_url, email, on_stage)
-    on_stage("waiting for the sign-in email")
-    return await _poll_mailbox(email, send_epoch, MAILBOX_POLL_TIMEOUT_S)
+    # Import lazily so a claude-web install without playwright still boots.
+    from playwright.async_api import async_playwright
+
+    debug = _Debug()
+    async with async_playwright() as pw:
+        async with _browser_context(pw) as ctx:
+            page = await ctx.new_page()
+            send_epoch = await _request_email(page, oauth_url, email, on_stage, debug)
+            on_stage("waiting for the sign-in email")
+            on_magic_link(await _poll_mailbox(email, send_epoch, MAILBOX_POLL_TIMEOUT_S))
+            for _ in range(VERIFICATION_TRIES):
+                on_stage("waiting for your verification code")
+                code = await _await_code(wait_for_verification_code)
+                on_stage("signing in with your code")
+                if await _enter_verification_code(page, code, debug):
+                    break
+                on_code_rejected("claude.ai did not accept that code. Check it and try again.")
+            else:
+                raise AutoSigninError(
+                    "claude.ai did not accept the verification code three times. "
+                    "Click Get sign-in link to start again."
+                )
+            on_stage("authorizing claude-web")
+            await _wait_for_authorization(page, _callback_prefix(oauth_url), debug)
+            paste = _paste_from_callback_url(page.url)
+            if not paste:
+                raise AutoSigninError(
+                    "Reached claude.com's callback page but could not read the code "
+                    "from it. Open the Claude sign-in page below in your own browser instead."
+                )
+            return paste
