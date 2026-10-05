@@ -270,10 +270,12 @@ browser steps mint a token that lasts about a year (`claude setup-token`); the s
 then runs on `CLAUDE_CODE_OAUTH_TOKEN` and never needs the four-week refresh. The
 token carries only the inference scope, so claude.ai-side extras tied to the
 account (hosted connectors, plugin sync) may not work on such a slot, and the
-Usage dialog cannot fetch live plan percentages for it (Anthropic's usage service
-requires the profile scope); it shows the window status reported by the account's
-most recent message instead. Keep a four-week sign-in on the slot as well if you
-want the percentages.
+Usage dialog cannot query Anthropic's usage service for it (that needs the
+profile scope). The dialog's plan-window table does not depend on that: Anthropic
+answers every message with its window headers, the CLI relays them, and the
+dialog shows the 5-hour and 7-day percentages and reset times from the account's
+most recent message. Only the per-model weekly buckets and the extra-usage
+balance need a four-week sign-in on the slot as well.
 
 Slots with `auto_email` configured get a "Get sign-in link" button when the host
 sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. A server-side browser asks claude.ai to send

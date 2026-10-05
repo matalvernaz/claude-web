@@ -5428,16 +5428,36 @@
       <div id="usage-live"><p class="usage-note">Checking Anthropic for live limits…</p></div>`;
 
     if (rl) {
-      const reset = rl.resetsAt ? new Date(rl.resetsAt * 1000) : null;
-      const resetText = reset ? `${reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} (${humanIn(reset)})` : "—";
+      // Anthropic answers every message with its window headers, and the CLI
+      // relays them as rate_limit_info. That reading needs no usage-API
+      // scope, so it is the plan picture an account on a long-lived token
+      // still gets; it is only as fresh as the account's last message.
+      const fmtReset = (sec) => {
+        const d = sec ? new Date(sec * 1000) : null;
+        return d && !isNaN(d) ? `${d.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })} (${humanIn(d)})` : "—";
+      };
+      const captured = data.rate_limit.captured_at ? new Date(data.rate_limit.captured_at * 1000) : null;
+      const asOf = captured && !isNaN(captured)
+        ? `as of this account's last message, ${captured.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`
+        : "as of this account's last message";
+      const windows = rl.unifiedWindows && typeof rl.unifiedWindows === "object"
+        ? Object.entries(rl.unifiedWindows) : [];
+      html += `<h4>Plan windows <span class="usage-note">(${htmlEscape(asOf)})</span></h4>`;
+      if (windows.length) {
+        html += `<table><thead><tr><th>Window</th><th>Used</th><th>Resets</th></tr></thead><tbody>`;
+        for (const [key, w] of windows) {
+          const pct = w && typeof w.utilization === "number" ? `${Math.round(w.utilization * 100)}%` : "—";
+          html += `<tr><td>${htmlEscape(planWindowLabel(key))}</td><td>${pct}</td><td>${fmtReset(w && w.resetsAt)}</td></tr>`;
+        }
+        html += `</tbody></table>`;
+      }
       html += `<div class="summary">
-        <strong>Rate limit (${htmlEscape(rl.rateLimitType || "")})</strong><br>
-        <span>Status: ${htmlEscape(rl.status || "—")}</span>
-        <span>Resets: ${resetText}</span>
-        ${rl.overageStatus ? `<span>Overage: ${htmlEscape(rl.overageStatus)}</span>` : ""}
+        <span>Status: ${htmlEscape(rl.status || "—")}${rl.rateLimitType ? ` (${htmlEscape(planWindowLabel(rl.rateLimitType))} window)` : ""}</span>
+        ${!windows.length ? `<span>Resets: ${fmtReset(rl.resetsAt)}</span>` : ""}
+        ${rl.overageStatus ? `<span>Extra usage: ${htmlEscape(rl.overageStatus)}${rl.overageDisabledReason ? ` (${htmlEscape(String(rl.overageDisabledReason).replace(/_/g, " "))})` : ""}</span>` : ""}
       </div>`;
     } else {
-      html += `<div class="summary"><em>No rate-limit info captured yet — send one message and reopen.</em></div>`;
+      html += `<div class="summary"><em>No plan reading captured yet — send one message on this account and reopen.</em></div>`;
     }
 
     html += `<h3 class="usage-section">Today</h3>`;
@@ -5546,7 +5566,7 @@
       return;
     }
     if (live.error === "usage_needs_sign_in") {
-      return fail("Live plan percentages aren't available for an account running on a long-lived token: Anthropic's usage service only answers a four-week sign-in, and messages no longer refresh one. The window status above comes from this account's most recent message. To see percentages here, sign the account in the four-week way as well from the accounts page.");
+      return fail("Anthropic's usage service only answers a four-week sign-in, and this account runs on a long-lived token, so the per-model buckets and extra-usage balance can't be fetched. The plan windows below come from the account's most recent message and need no sign-in.");
     }
     if ((live.mode !== "oauth" && live.mode !== "oauth_token") || live.error === "no_token") {
       return fail("No Claude subscription credentials on this account.");
@@ -5661,6 +5681,16 @@
     html += `<p class="usage-note">${totals.turns || 0} turns over `
       + `${days.length} active day${days.length === 1 ? "" : "s"}${totalCost}.</p>`;
     usageBody.insertAdjacentHTML("beforeend", html);
+  }
+
+  function planWindowLabel(key) {
+    return ({
+      five_hour: "5-hour",
+      seven_day: "7-day",
+      seven_day_overage_included: "7-day incl. extra usage",
+      seven_day_opus: "7-day Opus",
+      seven_day_sonnet: "7-day Sonnet",
+    })[key] || String(key || "").replace(/_/g, " ");
   }
 
   function humanIn(date) {

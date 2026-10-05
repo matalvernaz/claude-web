@@ -750,3 +750,46 @@ def test_context_meter_takes_the_window_from_the_turn(ui):
     with page.expect_response("**/api/chat"):
         page.locator("#send").click()
     playwright.expect(page.locator("#context-text")).to_have_text("500.0k / 1000.0k (50%)")
+
+
+def test_usage_dialog_shows_plan_windows_from_the_last_message_on_a_token_slot(ui):
+    """An account on a year-long token can't query Anthropic's usage service,
+    but every message brings back the window headers; the dialog renders
+    those (as of the last message) instead of claiming the token expired."""
+    page, state = ui
+    usage = {
+        "today": {"turns": 3, "cost_usd": 0, "cache_hit_pct": None, "has_billed_usage": False},
+        "currency": "USD", "usd_rate": 1,
+        "rate_limit": {
+            "captured_at": 1791218280,
+            "info": {
+                "status": "allowed", "rateLimitType": "five_hour", "resetsAt": 1791259200,
+                "overageStatus": "rejected", "overageDisabledReason": "out_of_credits",
+                "unifiedWindows": {
+                    "five_hour": {"utilization": 0.4, "resetsAt": 1791259200},
+                    "seven_day": {"utilization": 0.36, "resetsAt": 1791612000},
+                    "seven_day_overage_included": {"utilization": 0.38, "resetsAt": 1791612000},
+                },
+            },
+        },
+    }
+    page.route("**/api/usage?*", lambda r: r.fulfill(json=usage))
+    page.route("**/api/usage/history*", lambda r: r.fulfill(json={}))
+    page.route("**/api/usage/live?*", lambda r: r.fulfill(
+        json={"slot": "shared", "mode": "oauth_token", "error": "usage_needs_sign_in"}))
+    page.goto("http://local-ui.test/")
+    page.locator("#show-usage").click()
+    body = page.locator("#usage-body")
+    playwright.expect(body).to_contain_text("Plan windows")
+    playwright.expect(body).to_contain_text("as of this account's last message")
+    rows = body.locator("table tbody tr")
+    playwright.expect(rows).to_have_count(3)
+    playwright.expect(rows.nth(0)).to_contain_text("5-hour")
+    playwright.expect(rows.nth(0)).to_contain_text("40%")
+    playwright.expect(rows.nth(1)).to_contain_text("7-day")
+    playwright.expect(rows.nth(1)).to_contain_text("36%")
+    playwright.expect(rows.nth(2)).to_contain_text("7-day incl. extra usage")
+    playwright.expect(body).to_contain_text("Extra usage: rejected (out of credits)")
+    live = page.locator("#usage-live")
+    playwright.expect(live).to_contain_text("plan windows below come from the account's most recent message")
+    playwright.expect(body).not_to_contain_text("session token is expired")
