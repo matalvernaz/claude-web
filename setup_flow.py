@@ -301,11 +301,15 @@ class OAuthFlowState:
     auto_task: Optional[asyncio.Task] = field(default=None, repr=False)
     code_event: asyncio.Event = field(default_factory=asyncio.Event)
     code: Optional[str] = None
-    # Set by auto_signin.run_auto_signin as it moves through the browser
-    # dance; None for a manually-driven flow. Purely cosmetic — the UI
-    # renders it under the existing status line so users can see what the
-    # background driver is doing.
+    # Set by the auto_signin driver as it moves through the browser dance;
+    # None for a manually-driven flow. Purely cosmetic — the UI renders it
+    # under the existing status line so users can see what the background
+    # driver is doing.
     stage: Optional[str] = None
+    # The sign-in link read from the slot's mailbox, for the owner's
+    # accounts page: claude.ai wants a person to open it. Only meaningful
+    # while awaiting_code, since the code it leads to goes to this CLI.
+    magic_link: Optional[str] = None
 
     def to_public(self) -> dict:
         return {
@@ -314,6 +318,7 @@ class OAuthFlowState:
             "url": self.url,
             "error": self.error,
             "stage": self.stage,
+            "magic_link": self.magic_link,
         }
 
 
@@ -505,6 +510,9 @@ async def submit_code(code: str, *, flow_key: str = SHARED_FLOW_KEY) -> OAuthFlo
         raise RuntimeError("no flow in progress")
     if flow.status != "awaiting_code":
         raise RuntimeError(f"flow is in status {flow.status!r}, not awaiting_code")
+    # A person pasting the code has taken over from the link request; stop
+    # its browser or mailbox reader so nothing races the exchange.
+    await _cancel_auto_task(flow)
     flow.code = code
     flow.code_event.set()
     deadline = EXCHANGE_TIMEOUT_SECONDS + 5

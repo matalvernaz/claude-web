@@ -264,11 +264,13 @@ The schema is stable — keys are always set, only their values are empty when t
 
 Claude defaults to the deployment-wide shared account in `$CLAUDE_HOME/.credentials.json`. Personal Claude homes mirror `CLAUDE_HOME`, with only the credential files kept private. The transcript JSONL is therefore the same file under every slot, so a credential change can resume the current conversation.
 
-Slots with `auto_email` configured can use automatic Claude sign-in when the host
-sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. The browser confirms an email was sent before
-the mailbox reader starts. If Claude requires browser security verification,
-the account page keeps the sign-in link and code form available so you can finish
-in your own browser. Cancelling or retrying stops the previous automation.
+Slots with `auto_email` configured get a "Get sign-in link" button when the host
+sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. A server-side browser asks claude.ai to send
+the sign-in email, the mailbox reader picks the link out of it, and the account
+page shows that link next to the code form. Open the link in your own browser
+(claude.ai wants a person for that step), click Authorize, and paste the code
+back. If the email can't be requested, the page falls back to the ordinary
+sign-in link and code form. Cancelling or retrying stops the previous request.
 An OAuth file with empty tokens is shown as signed out; an expired access token
 with a refresh token still counts as configured.
 

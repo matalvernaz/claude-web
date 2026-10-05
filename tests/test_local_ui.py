@@ -237,12 +237,9 @@ def test_codex_question_from_live_stream_stays_answerable_after_result(ui):
     assert state["posts"][1][1]["session_id"] == "saved"
 
 
-def test_automatic_signin_failure_exposes_the_existing_link_and_code_form(browser):
-    context = browser.new_context()
-    page = context.new_page()
-    state = {"code": None}
-    flow = {"status": "awaiting_code", "url": "https://claude.ai/oauth?state=test",
-            "stage": None, "error": "Browser security verification did not finish automatically."}
+def _account_page_with_link_request(page, state, flow):
+    """Serve /account for one slot whose link request answers with ``flow``
+    on every status poll; a pasted code lands in ``state["code"]``."""
     template = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("account.html")
     html = template.render(
         asset_version=lambda _: "test", user={"sub": "test"},
@@ -261,8 +258,12 @@ def test_automatic_signin_failure_exposes_the_existing_link_and_code_form(browse
             asset = ROOT / path.lstrip("/")
             request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
         elif path.endswith("/oauth/auto_signin"):
-            request_route.fulfill(json={**flow, "stage": "launching browser", "error": None})
+            request_route.fulfill(json={**flow, "stage": "launching browser", "error": None,
+                                        "magic_link": None})
         elif path.endswith("/status"):
+            state["polls"] = state.get("polls", 0) + 1
+            if state.get("on_poll"):
+                state["on_poll"](state["polls"])
             request_route.fulfill(json={"flow": flow, "credential": {"configured": False}})
         elif path.endswith("/oauth/code"):
             state["code"] = request.post_data_json["code"]
@@ -272,11 +273,54 @@ def test_automatic_signin_failure_exposes_the_existing_link_and_code_form(browse
 
     page.route("**/*", route)
     page.on("dialog", lambda dialog: dialog.accept())
+    page.goto("http://account-ui.test/account")
+    page.get_by_role("button", name="Get sign-in link", exact=True).click()
+
+
+def test_automatic_signin_failure_exposes_the_existing_link_and_code_form(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    state = {"code": None}
+    flow = {"status": "awaiting_code", "url": "https://claude.ai/oauth?state=test",
+            "stage": None, "error": "Browser security verification did not finish automatically.",
+            "magic_link": None}
     try:
-        page.goto("http://account-ui.test/account")
-        page.get_by_role("button", name="Sign in (auto)", exact=True).click()
+        _account_page_with_link_request(page, state, flow)
         playwright.expect(page.locator("#oauth-error")).to_contain_text("did not finish automatically")
         playwright.expect(page.get_by_role("link", name="Open the Claude sign-in page")).to_have_attribute("href", flow["url"])
+        playwright.expect(page.locator("#oauth-magic-link-block")).to_be_hidden()
+        playwright.expect(page.locator("#oauth-code")).to_be_visible()
+        page.locator("#oauth-code").fill("test-code#test-state")
+        page.get_by_role("button", name="Finish sign-in", exact=True).click()
+        page.wait_for_load_state()
+        assert state["code"] == "test-code#test-state"
+    finally:
+        context.close()
+
+
+def test_a_received_sign_in_link_is_offered_with_the_code_form(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    flow = {"status": "awaiting_code", "url": "https://claude.ai/oauth?state=test",
+            "stage": "waiting for the sign-in email", "error": None, "magic_link": None}
+    state = {"code": None}
+
+    def on_poll(n):
+        # The first poll still shows progress; the link lands on the second.
+        if n >= 2:
+            flow.update(stage=None, magic_link="https://claude.ai/magic-link#token")
+
+    state["on_poll"] = on_poll
+    try:
+        _account_page_with_link_request(page, state, flow)
+        playwright.expect(page.locator("#oauth-status")).to_contain_text("waiting for the sign-in email")
+        playwright.expect(page.locator("#oauth-magic-link-block")).to_be_hidden()
+        link = page.get_by_role("link", name="Open your sign-in link")
+        playwright.expect(link).to_have_attribute("href", "https://claude.ai/magic-link#token", timeout=10000)
+        playwright.expect(page.locator("#oauth-status")).to_contain_text("Your sign-in link is ready")
+        # A screen-reader user lands on the link when it arrives, and the
+        # code form sits right under it for the paste-back.
+        assert page.evaluate("document.activeElement.id") == "oauth-magic-link"
         playwright.expect(page.locator("#oauth-code")).to_be_visible()
         page.locator("#oauth-code").fill("test-code#test-state")
         page.get_by_role("button", name="Finish sign-in", exact=True).click()

@@ -44,7 +44,7 @@
             <span class="cred-meta">
               {% if c.configured %}Signed in{% else %}Not signed in{% endif %}
               {% if c.auto_email %}
-                — auto sign-in via {{ c.auto_email }}
+                — sign-in link via {{ c.auto_email }}
               {% endif %}
             </span>
             <span class="cred-actions">
@@ -53,7 +53,7 @@
                         data-cred-id="{{ c.id }}"
                         data-auto-email="{{ c.auto_email }}"
                         data-label="{{ c.label }}">
-                  {% if c.configured %}Sign in again (auto){% else %}Sign in (auto){% endif %}
+                  {% if c.configured %}Get a new sign-in link{% else %}Get sign-in link{% endif %}
                 </button>
               {% endif %}
               {% if not c.configured %}
@@ -139,6 +139,12 @@
         <p id="oauth-status" role="status" aria-live="polite"></p>
 
         <div id="oauth-link-block" hidden>
+          <p id="oauth-magic-link-block" hidden>
+            <a id="oauth-magic-link" href="#" target="_blank" rel="noopener noreferrer">Open your sign-in link</a>
+            (opens in a new tab). This is the link from the email claude.ai
+            just sent; it works for about 10 minutes. Click Authorize there,
+            then paste the code it shows you below.
+          </p>
           <p>
             <a id="oauth-url" href="#" target="_blank" rel="noopener noreferrer">Open the Claude sign-in page</a>
             (opens in a new tab)

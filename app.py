@@ -9609,14 +9609,15 @@ async def api_credentials_oauth_auto_signin(
     cred_id: int,
     user: dict = Depends(auth.require_user),
 ):
-    """Kick off the fully-automated sign-in flow (see auto_signin.py).
+    """Request a sign-in link for this slot (see auto_signin.py).
 
     Only valid for a slot with ``auto_email`` set AND when the host has
     ``CLAUDE_WEB_MAILBOX_POLL_CMD`` configured. Returns immediately with
-    the started flow state; the browser dance, mailbox poll, and code
-    submission all run in a background task that updates the same
-    ``OAuthFlowState`` the manual flow uses. The frontend polls
-    ``/status`` for progress (``flow.stage``) and terminal state.
+    the started flow state; the browser dance and mailbox poll run in a
+    background task that updates the same ``OAuthFlowState`` the manual
+    flow uses. The frontend polls ``/status`` for progress (``flow.stage``)
+    and then shows ``flow.magic_link`` beside the code form, so the person
+    opens the link themselves and pastes the code back.
     """
     sub = user.get("sub")
     cred = _require_owned_credential(sub, cred_id)
@@ -9644,31 +9645,40 @@ async def api_credentials_oauth_auto_signin(
             "auto_signin flow_key=%s stage=%s", flow_key, msg
         )
 
+    def _still_waiting() -> bool:
+        # A replaced attempt must never overwrite its successor, and a code
+        # the person already pasted must not be undone by a late result.
+        return (setup_flow.current_flow(flow_key) is state
+                and state.status == "awaiting_code")
+
     async def _driver() -> None:
         try:
             _stage("launching browser")
-            await auto_signin.run_auto_signin(
+            link = await auto_signin.request_magic_link(
                 oauth_url=state.url,
                 email=email,
-                flow_key=flow_key,
                 on_stage=_stage,
             )
+            if _still_waiting():
+                # The owner's own single-use login link, for their accounts
+                # page only; claude.ai wants a person to open it. Not logged.
+                state.magic_link = link
+                state.stage = None
         except auto_signin.AutoSigninError as e:
             state.stage = None
-            # Keep the CLI's PKCE exchange alive so the same link/code form
-            # can finish in the user's browser (e.g. Cloudflare verification).
-            # A replaced attempt must never cancel or overwrite its successor.
-            if setup_flow.current_flow(flow_key) is state:
+            # Keep the CLI's PKCE exchange alive so the manual link/code
+            # form can still finish the same flow.
+            if _still_waiting():
                 state.error = str(e)
         except Exception as e:  # noqa: BLE001
             # Browser errors can embed OAuth URLs and their secrets. Keep
             # the exception type for diagnosis, never the raw traceback.
             log.warning("auto_signin failed (%s)", type(e).__name__)
             state.stage = None
-            if setup_flow.current_flow(flow_key) is state:
+            if _still_waiting():
                 state.error = (
-                    "Automatic sign-in could not finish. Open the sign-in "
-                    "link below to continue in your browser."
+                    "Could not request a sign-in link. Open the Claude "
+                    "sign-in page below in your own browser instead."
                 )
 
     state.stage = "launching browser"

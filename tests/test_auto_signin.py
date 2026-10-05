@@ -1,4 +1,5 @@
-"""Automatic sign-in must hand browser challenges back to the user safely."""
+"""The sign-in link request: the browser only asks for the email, the link
+is handed to the person, and every failure leaves the manual form usable."""
 import asyncio
 import os
 import shlex
@@ -99,7 +100,7 @@ async def test_challenge_keeps_the_same_cli_flow_available_for_manual_login(clie
         raise auto_signin.AutoSigninError("Browser verification required. Open the sign-in link.")
 
     monkeypatch.setattr(setup_flow, "start_oauth", start)
-    monkeypatch.setattr(auto_signin, "run_auto_signin", challenge)
+    monkeypatch.setattr(auto_signin, "request_magic_link", challenge)
     initial = await app.api_credentials_oauth_auto_signin(2, user={"sub": "test"})
     assert initial["stage"] == "launching browser"
     await state.auto_task
@@ -150,8 +151,76 @@ async def test_browser_exception_does_not_expose_oauth_url(client, monkeypatch, 
         raise RuntimeError("goto https://claude.ai/oauth?code=SECRET_VERIFIER")
 
     monkeypatch.setattr(setup_flow, "start_oauth", start)
-    monkeypatch.setattr(auto_signin, "run_auto_signin", crash)
+    monkeypatch.setattr(auto_signin, "request_magic_link", crash)
     await app.api_credentials_oauth_auto_signin(2, user={"sub": "test"})
     await state.auto_task
     assert state.status == "awaiting_code"
     assert "SECRET_VERIFIER" not in state.error + caplog.text
+
+
+async def test_a_received_link_is_shown_while_the_cli_keeps_waiting_for_the_code(
+    client, monkeypatch, tmp_path,
+):
+    import app
+    import setup_flow
+
+    state = setup_flow.OAuthFlowState(
+        variant="claudeai", flow_key="link-test", home=tmp_path,
+        status="awaiting_code", url="https://claude.ai/oauth?state=test",
+    )
+    monkeypatch.setattr(app, "_require_owned_credential", lambda *a: {"auto_email": "test@example.com"})
+    monkeypatch.setattr(app, "_ensure_credential_home", lambda *a: tmp_path)
+    monkeypatch.setattr(app, "_credential_flow_key", lambda *a: "link-test")
+    monkeypatch.setenv(auto_signin.ENV_MAILBOX_CMD, "unused-test-wrapper")
+    monkeypatch.setattr(setup_flow, "_flows", {"link-test": state})
+
+    async def start(*a, **kw):
+        return state
+
+    stages = []
+
+    async def deliver(*, oauth_url, email, on_stage):
+        on_stage("waiting for the sign-in email")
+        return "https://claude.ai/magic-link#token"
+
+    monkeypatch.setattr(setup_flow, "start_oauth", start)
+    monkeypatch.setattr(auto_signin, "request_magic_link", deliver)
+    initial = await app.api_credentials_oauth_auto_signin(2, user={"sub": "test"})
+    assert initial["stage"] == "launching browser"
+    assert initial["magic_link"] is None
+    await state.auto_task
+    # The browser is done; the link is for the person, and the CLI is still
+    # the one waiting for the code it leads to.
+    public = state.to_public()
+    assert public["magic_link"] == "https://claude.ai/magic-link#token"
+    assert public["status"] == "awaiting_code"
+    assert public["stage"] is None
+    assert public["error"] is None
+    assert state.code_event.is_set() is False
+
+
+async def test_pasting_the_code_stops_a_mailbox_read_still_in_progress(monkeypatch, tmp_path):
+    import setup_flow
+
+    state = setup_flow.OAuthFlowState(
+        variant="claudeai", flow_key="paste-test", home=tmp_path, status="awaiting_code")
+    stopped = asyncio.Event()
+
+    async def reader():
+        try:
+            await asyncio.Future()
+        finally:
+            stopped.set()
+
+    async def fake_drive():
+        await state.code_event.wait()
+        state.status = "done"
+
+    state.auto_task = asyncio.create_task(reader())
+    state.driver_task = asyncio.create_task(fake_drive())
+    monkeypatch.setattr(setup_flow, "_flows", {"paste-test": state})
+    await asyncio.sleep(0)
+    result = await setup_flow.submit_code("code#verifier", flow_key="paste-test")
+    assert result.status == "done"
+    assert stopped.is_set()
+    assert state.auto_task.cancelled()

@@ -25,6 +25,8 @@
   const oauthStatus = $("oauth-status");
   const oauthLinkBlock = $("oauth-link-block");
   const oauthUrl = $("oauth-url");
+  const oauthMagicBlock = $("oauth-magic-link-block");
+  const oauthMagicLink = $("oauth-magic-link");
   const oauthCodeForm = $("oauth-code-form");
   const oauthCodeInput = $("oauth-code");
   const oauthCodeSubmit = $("oauth-code-submit");
@@ -51,6 +53,7 @@
   let pollHandle = null;
   let pollInFlight = false;
   let lastOauthFlowStatus = null;
+  let lastMagicLink = null;
   const POLL_MS = 1500;
   const ACTIVE_STATUSES = new Set(["starting", "awaiting_code", "exchanging"]);
 
@@ -61,9 +64,11 @@
 
   function clearOauthState() {
     lastOauthFlowStatus = null;
+    lastMagicLink = null;
     setText(oauthStatus, "");
     hide(oauthProgress);
     hide(oauthLinkBlock);
+    hide(oauthMagicBlock);
     setText(oauthError, "");
     hide(oauthError);
     oauthStart.disabled = false;
@@ -118,6 +123,18 @@
       oauthUrl.href = flow.url;
       if (!auto) show(oauthLinkBlock); else hide(oauthLinkBlock);
     }
+    // The link read from the slot's mailbox. claude.ai wants a person to
+    // open it, so it is offered rather than followed, and it only means
+    // anything while the CLI is still waiting for the code it leads to.
+    const link = flow.status === "awaiting_code" ? (flow.magic_link || "") : "";
+    const linkArrived = !!link && link !== lastMagicLink;
+    lastMagicLink = link || null;
+    if (link) {
+      oauthMagicLink.href = link;
+      show(oauthMagicBlock);
+    } else {
+      hide(oauthMagicBlock);
+    }
     switch (flow.status) {
       case "starting":
         setText(oauthStatus, "Starting sign-in… (this can take a few seconds)");
@@ -129,19 +146,23 @@
         setText(
           oauthStatus,
           auto
-            ? "Signing in automatically: " + flow.stage + "…"
-            : "Waiting for the auth code from your browser."
+            ? "Requesting a sign-in link: " + flow.stage + "…"
+            : link
+              ? "Your sign-in link is ready. Open it in your own browser, click Authorize, then paste the code below."
+              : "Waiting for the auth code from your browser."
         );
         show(oauthProgress);
         oauthStart.disabled = true;
         oauthCodeSubmit.disabled = false;
-        if (statusChanged && !auto && oauthUrl) oauthUrl.focus();
+        // Land on whichever link the person needs next, once, when it appears.
+        if (linkArrived && oauthMagicLink) oauthMagicLink.focus();
+        else if (statusChanged && !auto && !link && oauthUrl) oauthUrl.focus();
         break;
       case "exchanging":
         setText(
           oauthStatus,
           auto
-            ? "Signing in automatically: " + flow.stage + "…"
+            ? "Requesting a sign-in link: " + flow.stage + "…"
             : "Exchanging code with Anthropic…"
         );
         show(oauthProgress);
@@ -370,11 +391,11 @@
           || (btn.closest(".cred-item")?.querySelector(".cred-label")?.textContent ?? "");
         const email = btn.getAttribute("data-auto-email") || "";
         if (!confirm(
-              "Automatically sign in \"" + label + "\" via " + email + "? "
-              + "This will send one magic-link email to that address."
+              "Request a sign-in link for \"" + label + "\" via " + email + "? "
+              + "One email goes to that address; the link appears here when it arrives."
             )) return;
         openSignin(credId, label);
-        setText(oauthStatus, "Starting auto sign-in…");
+        setText(oauthStatus, "Requesting a sign-in link…");
         show(oauthProgress);
         oauthStart.disabled = true;
         hide(oauthLinkBlock);
@@ -386,7 +407,7 @@
           applyFlowState(data, () => onCredConfigured(credId));
           if (ACTIVE_STATUSES.has(data.status)) startPolling(credId);
         } catch (e) {
-          showError(oauthError, "Auto sign-in failed to start: " + e.message);
+          showError(oauthError, "Could not request a sign-in link: " + e.message);
           oauthStart.disabled = false;
         } finally {
           btn.disabled = false;
