@@ -106,7 +106,15 @@ per run for personal slots (`_resolve_account_for_run`, which blanks it for slot
 without one so the shared token can't mask their `.credentials.json`). Login and
 setup-token subprocesses strip it. `whoami` reports `oauth_token` with `minted_at`;
 the token has no readable expiry and lacks `user:profile`, so usage reads still go
-through `.credentials.json` where one exists.
+through `.credentials.json` where one exists. Runs on the token never refresh that
+file's eight-hour bearer, so the usage endpoints do (`_usage_bearer` →
+`_refresh_sign_in_bearer`): for a token slot with a lapsed bearer and a refresh
+token not yet past `refreshTokenExpiresAt`, they run `claude_models.fetch_rows`
+(the SDK initialize handshake, no prompt, `--no-session-persistence`) with
+`CLAUDE_CONFIG_DIR` set to the slot and `CLAUDE_CODE_OAUTH_TOKEN` blanked; the CLI
+refreshes and rotates the token itself during startup (verified 2026-10-06). One
+attempt per home at a time (asyncio lock), and a failed attempt is not repeated
+for ten minutes. Plain sign-in slots are still never refreshed by the app.
 
 The server-browser sign-in (`auto_signin.run_signin`) stores its task on the same
 state (`auto_task`): retry, cancel, sign-out and a pasted long code stop it along

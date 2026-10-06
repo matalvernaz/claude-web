@@ -5566,7 +5566,7 @@
       return;
     }
     if (live.error === "usage_needs_sign_in") {
-      return fail("Anthropic's usage service only answers a four-week sign-in, and this account runs on a long-lived token, so the per-model buckets and extra-usage balance can't be fetched. The plan windows below come from the account's most recent message and need no sign-in.");
+      return fail("Anthropic's usage service only answers a four-week sign-in, and this account's has ended or it never had one, so the per-model buckets, Fable's included, and the extra-usage balance can't be fetched. The plan windows below come from the account's most recent message.");
     }
     if ((live.mode !== "oauth" && live.mode !== "oauth_token") || live.error === "no_token") {
       return fail("No Claude subscription credentials on this account.");
@@ -5611,6 +5611,14 @@
       html += `</tbody></table>`;
     } else {
       html += `<p class="usage-note">Anthropic returned no limit data.</p>`;
+    }
+    if (live.mode === "oauth_token" && live.sign_in_expires_at) {
+      // A long-lived-token account reads these through its four-week
+      // sign-in, which claude-web keeps refreshed but cannot extend.
+      const ends = new Date(live.sign_in_expires_at * 1000);
+      if (!isNaN(ends)) {
+        html += `<p class="usage-note">These limits come from this account's four-week sign-in, which ends ${htmlEscape(ends.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }))}. After that, only the plan windows below remain.</p>`;
+      }
     }
 
     if (live.extra_usage) {

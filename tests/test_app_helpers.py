@@ -1275,6 +1275,9 @@ async def test_api_usage_live_long_lived_token_slot_without_a_live_sign_in_says_
     monkeypatch.setattr(app_module.setup_flow, "whoami",
                         lambda home=None: {"mode": "oauth_token", "minted_at": 1})
     monkeypatch.setattr(app_module, "_read_oauth_token", lambda home: bearer)
+    # No four-week sign-in left to refresh.
+    monkeypatch.setattr(app_module, "_read_sign_in_horizon", lambda home: None)
+    monkeypatch.setattr(app_module, "_SIGN_IN_REFRESH_TRIED", {})
 
     async def boom(token):
         raise AssertionError("nothing usable to call Anthropic with")
@@ -1282,6 +1285,135 @@ async def test_api_usage_live_long_lived_token_slot_without_a_live_sign_in_says_
     req = SimpleNamespace(query_params={})
     out = await app_module.api_usage_live(req, {"sub": "user-live-yearly-only"})
     assert out == {"slot": "shared", "mode": "oauth_token", "error": "usage_needs_sign_in"}
+
+
+def _token_slot_with_lapsed_sign_in(monkeypatch, *, horizon_ms, refresh_works=True,
+                                    handshake_delay=0.0):
+    """A long-lived-token slot whose four-week bearer lapsed hours ago. The
+    stand-in for the CLI handshake does what the real CLI did on 2026-10-06:
+    rewrites the bearer with an eight-hour one (or fails, if told to)."""
+    monkeypatch.setattr(app_module, "_SIGN_IN_REFRESH_LOCKS", {})
+    monkeypatch.setattr(app_module, "_SIGN_IN_REFRESH_TRIED", {})
+    monkeypatch.setattr(app_module.setup_flow, "whoami",
+                        lambda home=None: {"mode": "oauth_token", "minted_at": 1})
+    bearer = {"token": "stale-bearer", "expires": 1000.0}
+    monkeypatch.setattr(app_module, "_read_oauth_token",
+                        lambda home: (bearer["token"], bearer["expires"]))
+    monkeypatch.setattr(app_module, "_read_sign_in_horizon", lambda home: horizon_ms)
+    monkeypatch.setattr(app_module.claude_cli, "resolve", lambda: "/fake/claude")
+    calls = []
+
+    async def handshake(cli, *, cwd, env=None, timeout=90.0):
+        calls.append(dict(env or {}))
+        if handshake_delay:
+            await asyncio.sleep(handshake_delay)
+        if not refresh_works:
+            raise RuntimeError("cli exited")
+        bearer.update(token="fresh-bearer", expires=(time.time() + 8 * 3600) * 1000)
+        return []
+    monkeypatch.setattr(app_module.claude_models, "fetch_rows", handshake)
+    return bearer, calls
+
+
+async def test_usage_refreshes_a_token_slots_lapsed_sign_in_through_the_cli(monkeypatch) -> None:
+    horizon = (time.time() + 20 * 86400) * 1000
+    _bearer, calls = _token_slot_with_lapsed_sign_in(monkeypatch, horizon_ms=horizon)
+    seen = {}
+
+    async def fetch(token):
+        seen["token"] = token
+        return ({"account": {"email": "x"}},
+                {"limits": [{"kind": "weekly_scoped", "percent": 57,
+                             "scope": {"model": {"display_name": "Fable"}}}]}, None)
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", fetch)
+    monkeypatch.setattr(app_module, "_save_entitlements", lambda *a, **k: None)
+    out = await app_module.api_usage_live(SimpleNamespace(query_params={}), {"sub": "user-refresh"})
+    assert len(calls) == 1
+    # The CLI must sign in from the home's own file, not a long-lived token.
+    assert calls[0]["CLAUDE_CONFIG_DIR"] == str(app_module.CLAUDE_HOME)
+    assert calls[0]["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert calls[0]["ANTHROPIC_API_KEY"] == ""
+    assert seen["token"] == "fresh-bearer"
+    assert out["error"] is None
+    assert [lim["label"] for lim in out["limits"]] == ["Week — Fable"]
+    assert out["sign_in_expires_at"] == int(horizon / 1000)
+    assert "fresh-bearer" not in str(out)
+
+
+async def test_usage_does_not_launch_the_cli_once_the_sign_in_has_ended(monkeypatch) -> None:
+    _bearer, calls = _token_slot_with_lapsed_sign_in(
+        monkeypatch, horizon_ms=(time.time() - 60) * 1000)
+
+    async def boom(token):
+        raise AssertionError("no usable bearer to call Anthropic with")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    out = await app_module.api_usage_live(SimpleNamespace(query_params={}), {"sub": "user-ended"})
+    assert calls == []
+    assert out["error"] == "usage_needs_sign_in"
+
+
+async def test_a_failed_refresh_is_not_retried_on_every_dialog_open(monkeypatch) -> None:
+    _bearer, calls = _token_slot_with_lapsed_sign_in(
+        monkeypatch, horizon_ms=(time.time() + 86400) * 1000, refresh_works=False)
+
+    async def boom(token):
+        raise AssertionError("no usable bearer to call Anthropic with")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    for _ in range(3):
+        out = await app_module.api_usage_live(SimpleNamespace(query_params={}), {"sub": "user-failing"})
+        assert out["error"] == "usage_needs_sign_in"
+    assert len(calls) == 1
+
+
+async def test_concurrent_dialogs_share_one_refresh(monkeypatch) -> None:
+    """Two refreshes racing on one file would spend the same refresh token
+    twice; Anthropic rotates it on use."""
+    _bearer, calls = _token_slot_with_lapsed_sign_in(
+        monkeypatch, horizon_ms=(time.time() + 86400) * 1000, handshake_delay=0.2)
+    tokens = []
+
+    async def fetch(token):
+        tokens.append(token)
+        return ({}, {"limits": []}, None)
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", fetch)
+    monkeypatch.setattr(app_module, "_save_entitlements", lambda *a, **k: None)
+    await asyncio.gather(*(
+        app_module.api_usage_live(SimpleNamespace(query_params={}), {"sub": "user-race"})
+        for _ in range(3)
+    ))
+    assert len(calls) == 1
+    assert tokens == ["fresh-bearer"] * 3
+
+
+async def test_a_plain_sign_in_slot_is_still_left_to_its_runs(monkeypatch) -> None:
+    _bearer, calls = _token_slot_with_lapsed_sign_in(
+        monkeypatch, horizon_ms=(time.time() + 86400) * 1000)
+    monkeypatch.setattr(app_module.setup_flow, "whoami", lambda home=None: {"mode": "oauth"})
+
+    async def boom(token):
+        raise AssertionError("must not call Anthropic with an expired token")
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", boom)
+    out = await app_module.api_usage_live(SimpleNamespace(query_params={}), {"sub": "user-plain"})
+    assert calls == []
+    assert out["error"] == "token_expired"
+
+
+async def test_api_usage_request_refreshes_a_token_slots_sign_in(monkeypatch) -> None:
+    _bearer, calls = _token_slot_with_lapsed_sign_in(
+        monkeypatch, horizon_ms=(time.time() + 86400) * 1000)
+
+    async def fake_fetch(token):
+        assert token == "fresh-bearer"
+        return ({"organization": {"organization_type": "claude_team"}}, {"extra_usage": {}}, None)
+
+    async def fake_request(token, profile, usage):
+        assert token == "fresh-bearer"
+        return {"status": "sent", "message": "Request sent."}
+    monkeypatch.setattr(app_module, "_fetch_anthropic_live_usage", fake_fetch)
+    monkeypatch.setattr(app_module, "_request_anthropic_usage_credits", fake_request)
+    out = await app_module.api_usage_request(slot="shared", user={"sub": "usage-request-refresh"})
+    assert out == {"status": "sent", "message": "Request sent."}
+    assert len(calls) == 1
 
 
 async def test_api_usage_live_expired_token_skips_fetch(monkeypatch) -> None:

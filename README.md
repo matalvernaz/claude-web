@@ -274,8 +274,12 @@ Usage dialog cannot query Anthropic's usage service for it (that needs the
 profile scope). The dialog's plan-window table does not depend on that: Anthropic
 answers every message with its window headers, the CLI relays them, and the
 dialog shows the 5-hour and 7-day percentages and reset times from the account's
-most recent message. Only the per-model weekly buckets and the extra-usage
-balance need a four-week sign-in on the slot as well.
+most recent message. The per-model weekly buckets (Fable's, for one) and the
+extra-usage balance need a four-week sign-in on the slot as well. Runs on the
+long-lived token never refresh that sign-in's eight-hour key, so opening Usage
+does: claude-web starts the CLI for a prompt-free handshake on the slot (nothing
+billed, no session file), and the CLI refreshes the key itself. That keeps the
+buckets available until the four-week sign-in ends, which the dialog names.
 
 Slots with `auto_email` configured get a "Get sign-in link" button when the host
 sets `CLAUDE_WEB_MAILBOX_POLL_CMD`. A server-side browser asks claude.ai to send

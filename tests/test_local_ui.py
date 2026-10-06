@@ -793,3 +793,25 @@ def test_usage_dialog_shows_plan_windows_from_the_last_message_on_a_token_slot(u
     live = page.locator("#usage-live")
     playwright.expect(live).to_contain_text("plan windows below come from the account's most recent message")
     playwright.expect(body).not_to_contain_text("session token is expired")
+
+
+
+def test_usage_dialog_says_when_a_token_accounts_model_limits_stop(ui):
+    page, state = ui
+    usage = {"today": {"turns": 0, "has_billed_usage": False}, "currency": "USD", "usd_rate": 1,
+             "rate_limit": None}
+    page.route("**/api/usage?*", lambda r: r.fulfill(json=usage))
+    page.route("**/api/usage/history*", lambda r: r.fulfill(json={}))
+    page.route("**/api/usage/live?*", lambda r: r.fulfill(json={
+        "slot": "shared", "mode": "oauth_token", "error": None,
+        "account": {"email": "x"}, "organization": {},
+        "limits": [{"label": "Week — Fable", "percent": 57, "resets_at": "2026-10-10T05:59:59+00:00"}],
+        "extra_usage": None, "sign_in_expires_at": 1793706573,
+    }))
+    page.goto("http://local-ui.test/")
+    page.locator("#show-usage").click()
+    live = page.locator("#usage-live")
+    playwright.expect(live).to_contain_text("Week — Fable")
+    playwright.expect(live).to_contain_text("57%")
+    playwright.expect(live).to_contain_text("four-week sign-in, which ends")
+    playwright.expect(live).to_contain_text("Nov")

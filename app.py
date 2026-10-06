@@ -15675,6 +15675,97 @@ def _read_oauth_token(home: Optional[Path]) -> tuple[Optional[str], Optional[int
     return token, expires if isinstance(expires, (int, float)) else None
 
 
+def _read_sign_in_horizon(home: Optional[Path]) -> Optional[float]:
+    """When a slot's four-week sign-in ends (ms epoch), or None without one.
+
+    That is the refresh token's own expiry; refreshing never moves it.
+    """
+    try:
+        data = json.loads(
+            setup_flow.credentials_path(home).read_text(encoding="utf-8"),
+        )
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return None
+    horizon = oauth.get("refreshTokenExpiresAt")
+    return float(horizon) if isinstance(horizon, (int, float)) else None
+
+
+def _bearer_lapsed(token: Optional[str], expires_at: Optional[float]) -> bool:
+    return not token or (expires_at is not None and expires_at / 1000 <= time.time())
+
+
+SIGN_IN_REFRESH_TIMEOUT_SECONDS = 45
+_SIGN_IN_REFRESH_RETRY_SECONDS = 600
+_SIGN_IN_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
+_SIGN_IN_REFRESH_TRIED: dict[str, float] = {}
+
+
+async def _refresh_sign_in_bearer(slot: str, home: Optional[Path]) -> bool:
+    """Have the CLI refresh a long-lived-token slot's four-week bearer.
+
+    Runs on a long-lived token never touch the four-week sign-in, so its
+    eight-hour access token lapses and stays lapsed, and with it the only
+    credential Anthropic's usage service accepts (the Fable bucket lives
+    there). The CLI refreshes an expired access token while it starts up,
+    so the prompt-free handshake the model-list fetch uses is enough:
+    nothing is billed, no session file is written, and the CLI rotates the
+    refresh token and writes the file itself, as any other CLI process on
+    this home would. Returns True once the bearer is fresh.
+
+    One attempt at a time per home, and a failed one isn't repeated for ten
+    minutes, so reopening the dialog can't stack CLI launches.
+    """
+    horizon = _read_sign_in_horizon(home)
+    if horizon is None or horizon / 1000 <= time.time():
+        return False
+    target = home or CLAUDE_HOME
+    key = str(target)
+    lock = _SIGN_IN_REFRESH_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+        if not _bearer_lapsed(token, expires_at):
+            return True  # refreshed by the request this one waited behind
+        last = _SIGN_IN_REFRESH_TRIED.get(key)
+        if last is not None and time.monotonic() - last < _SIGN_IN_REFRESH_RETRY_SECONDS:
+            return False
+        _SIGN_IN_REFRESH_TRIED[key] = time.monotonic()
+        cli = claude_cli.resolve()
+        if not cli:
+            return False
+        env = _scrubbed_child_env({
+            "CLAUDE_CONFIG_DIR": str(target),
+            # Blank, so the CLI signs in from this home's .credentials.json
+            # rather than a long-lived token (the shared one is in the
+            # service env).
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": "",
+        })
+        try:
+            await claude_models.fetch_rows(
+                cli, cwd=USAGE_DIR, env=env, timeout=SIGN_IN_REFRESH_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - the re-read below decides
+            log.warning("sign-in refresh for %s failed (%s)", slot, type(exc).__name__)
+        token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+        return not _bearer_lapsed(token, expires_at)
+
+
+async def _usage_bearer(
+    slot: str, home: Optional[Path], mode: Optional[str],
+) -> tuple[Optional[str], Optional[float]]:
+    """The bearer the usage endpoints send. A long-lived-token slot gets its
+    lapsed four-week bearer refreshed first; a plain sign-in slot is left to
+    its runs, which refresh it, as before."""
+    token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    if mode == "oauth_token" and _bearer_lapsed(token, expires_at):
+        if await _refresh_sign_in_bearer(slot, home):
+            token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
+    return token, expires_at
+
+
 async def _fetch_anthropic_live_usage(
     token: str,
 ) -> tuple[Optional[dict], Optional[dict], Optional[str]]:
@@ -15978,10 +16069,11 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     OAuth bearer is read server-side and used for the outbound call only —
     it never appears in the response.
 
-    Deliberately no token refresh here: Anthropic rotates refresh tokens on
-    use, so refreshing from this handler could invalidate the copy the CLI
-    holds and sign the slot out. A stale token is reported as an error
-    instead; any run on the slot refreshes it as a side effect.
+    A plain sign-in slot's stale bearer is reported, not refreshed: its runs
+    refresh it as a side effect. A slot on a long-lived token has nothing
+    that refreshes its four-week bearer, so ``_usage_bearer`` asks the CLI
+    to, through a prompt-free handshake; the CLI rotates the refresh token
+    and writes the file itself.
     """
     slot = request.query_params.get("slot") or "shared"
     sub = user.get("sub")
@@ -15996,15 +16088,14 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     # lacks the profile scope the usage endpoint wants.
     if info.get("mode") not in ("oauth", "oauth_token"):
         return base
-    token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
-    lapsed = not token or (expires_at is not None and expires_at / 1000 <= time.time())
-    if lapsed and info.get("mode") == "oauth_token":
+    token, expires_at = await _usage_bearer(slot, home, info.get("mode"))
+    if _bearer_lapsed(token, expires_at) and info.get("mode") == "oauth_token":
         # The year-long token runs the account but cannot read usage:
-        # Anthropic's usage endpoint wants the profile scope, which only
-        # the four-week sign-in carries (verified 2026-10-05: 403
-        # "scope requirement user:profile"). Runs on the year token also
-        # never refresh that sign-in's bearer, so "send a message to
-        # refresh it" would be false advice here.
+        # Anthropic's usage endpoint wants the profile scope, which only the
+        # four-week sign-in carries (verified 2026-10-05: 403 "scope
+        # requirement user:profile"). Reaching here means that sign-in has
+        # ended, never existed, or could not be refreshed, so "send a
+        # message to refresh it" would be false advice.
         return {**base, "error": "usage_needs_sign_in"}
     if not token:
         return {**base, "error": "no_token"}
@@ -16016,12 +16107,17 @@ async def api_usage_live(request: Request, user: dict = Depends(auth.require_use
     # observed without spawning a CLI on it, and it costs no extra Anthropic
     # traffic here.
     _save_entitlements(slot, profile, usage)
-    return {
+    out = {
         **base,
         **_shape_live_usage(profile, usage),
         "error": err,
         "fetched_at": int(time.time()),
     }
+    if info.get("mode") == "oauth_token":
+        # The per-model buckets stop when the four-week sign-in ends.
+        horizon = await asyncio.to_thread(_read_sign_in_horizon, home)
+        out["sign_in_expires_at"] = int(horizon / 1000) if horizon else None
+    return out
 
 
 @app.post("/api/usage/request")
@@ -16041,14 +16137,13 @@ async def api_usage_request(
             status_code=400,
             detail="usage requests require Claude subscription credentials",
         )
-    token, expires_at = await asyncio.to_thread(_read_oauth_token, home)
-    lapsed = not token or (expires_at is not None and expires_at / 1000 <= time.time())
-    if lapsed and info.get("mode") == "oauth_token":
+    token, expires_at = await _usage_bearer(slot, home, info.get("mode"))
+    if _bearer_lapsed(token, expires_at) and info.get("mode") == "oauth_token":
         raise HTTPException(
             status_code=409,
             detail="This account runs on a long-lived token, which cannot talk "
-                   "to Anthropic's usage service. Add a four-week sign-in to "
-                   "request more usage.",
+                   "to Anthropic's usage service, and its four-week sign-in has "
+                   "ended. A new four-week sign-in is needed to request more usage.",
         )
     if not token:
         raise HTTPException(status_code=409, detail="Claude OAuth token is missing")
