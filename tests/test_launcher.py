@@ -90,6 +90,30 @@ def test_portable_accounts_never_listen_on_the_network_by_default(launcher, tmp_
     assert calls[0][0] == "127.0.0.1"
 
 
+def test_direct_portable_exe_finds_bundled_git_without_a_batch_launcher(launcher, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", {"PATH": "existing-tools"})
+    monkeypatch.setattr(sys, "platform", "win32")
+    (tmp_path / "portable-data").mkdir()
+    git = tmp_path / "tools" / "git"
+    for name in ("bin", "cmd", "usr/bin"):
+        (git / name).mkdir(parents=True)
+    bash = git / "bin" / "bash.exe"
+    bash.write_bytes(b"test executable")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert launcher._configure_portable_data()
+    assert os.environ["CLAUDE_CODE_GIT_BASH_PATH"] == str(bash)
+    assert os.environ["PATH"].split(os.pathsep) == [
+        str(git / "cmd"), str(git / "usr/bin"), "existing-tools",
+    ]
+    # Reinitializing does not grow PATH or override an explicitly chosen Bash.
+    os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = "custom-bash"
+    launcher._configure_portable_data()
+    assert os.environ["CLAUDE_CODE_GIT_BASH_PATH"] == "custom-bash"
+    assert os.environ["PATH"].split(os.pathsep).count(str(git / "cmd")) == 1
+
+
 def test_load_dotenv_reads_kv_from_binary_dir(launcher, tmp_path) -> None:
     (tmp_path / ".env").write_text(textwrap.dedent("""
         # comment line

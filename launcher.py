@@ -170,6 +170,16 @@ def _configure_portable_data() -> bool:
     codex = _binary_dir() / "tools" / ("codex.exe" if os.name == "nt" else "codex")
     if codex.is_file():
         os.environ.setdefault("CLAUDE_WEB_CODEX_BIN", str(codex))
+    # Portable Git must also work when the exe is opened directly, without
+    # a batch launcher setting up Bash and PATH first.
+    git = _binary_dir() / "tools" / "git"
+    bash = git / "bin" / "bash.exe"
+    if sys.platform == "win32" and bash.is_file():
+        os.environ.setdefault("CLAUDE_CODE_GIT_BASH_PATH", str(bash))
+        search_path = os.environ.get("PATH", "").split(os.pathsep)
+        bundled_paths = [str(p) for p in (git / "cmd", git / "usr" / "bin")
+                         if p.is_dir() and str(p) not in search_path]
+        os.environ["PATH"] = os.pathsep.join(bundled_paths + search_path)
     return True
 
 
