@@ -127,6 +127,27 @@ async def _assert_replacement(state, old_run, request):
     )
 
 
+async def test_runs_accept_cli_messages_larger_than_the_sdk_default(delayed_sdk):
+    """One tool result carrying a screenshot is over the SDK's 1 MiB default
+    per message ("JSON message exceeded maximum buffer size of 1048576
+    bytes"), which killed the run; runs start with the larger limit."""
+    await _start(delayed_sdk)
+    options = delayed_sdk["captures"][0][0]
+    assert options.max_buffer_size == app_module.SDK_MAX_BUFFER_BYTES
+    assert options.max_buffer_size >= 64 << 20
+
+
+def test_sdk_buffer_limit_setting(monkeypatch):
+    monkeypatch.setenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", "8")
+    assert app_module._sdk_max_buffer_bytes() == 8 << 20
+    monkeypatch.setenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", "0.1")
+    assert app_module._sdk_max_buffer_bytes() == 1 << 20, "never below the SDK default"
+    monkeypatch.setenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", "lots")
+    assert app_module._sdk_max_buffer_bytes() == 64 << 20
+    monkeypatch.delenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB")
+    assert app_module._sdk_max_buffer_bytes() == 64 << 20
+
+
 @pytest.mark.parametrize("settings", [{"effort": "off"}, {"model": "local-coder"}])
 async def test_chat_waits_for_local_sdk_close_before_resuming(delayed_sdk, settings):
     state = delayed_sdk
