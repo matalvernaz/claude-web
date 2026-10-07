@@ -154,7 +154,7 @@ Get-Content .env | ForEach-Object {
 uvicorn app:app --host 127.0.0.1 --port 3001
 ```
 
-- The per-user-credentials feature (`/account`) mirrors `CLAUDE_HOME` into per-user subdirectories using symlinks. On Windows, `os.symlink` requires either **Developer Mode** (Settings → Privacy & security → For developers → "Developer Mode") or an Administrator shell. If neither is available we fall back to NTFS junctions for directories and hardlinks for files, which works without privilege but only on NTFS volumes — the warning will appear in the log if a fallback also fails. The shared slot doesn't need any of this; only the multi-credential view does.
+- The per-user-credentials feature (`/account`) mirrors `CLAUDE_HOME` into per-user subdirectories using symlinks. On Windows, `os.symlink` requires either **Developer Mode** (Settings → Privacy & security → For developers → "Developer Mode") or an Administrator shell. If neither is available we fall back to NTFS junctions for directories and hardlinks for files, which works without privilege but only on NTFS volumes — the warning will appear in the log if a fallback also fails. The shared slot doesn't need any of this; only the multi-credential view does. `CLAUDE_HOME/projects` is created before the mirror is built, so every credential's `projects` is always a link to the one shared transcript store; an install whose credentials already have private `projects` directories (from a first chat that ran before the shared directory existed) is merged into the shared store on the next start.
 - Click-to-apply diffs in `/roundtable` shell out to GNU `patch`. It isn't installed by default on Windows; the route returns HTTP 501 with a clear message if it's missing. Install it via Git for Windows (it ships `usr\bin\patch.exe`) or any other GNU-utils bundle and the feature lights up.
 
 For a long-running install behind a reverse proxy, a systemd unit looks like:
@@ -423,7 +423,7 @@ The app sends `Content-Security-Policy: default-src 'self'; script-src 'self'; .
 
 Claude Code writes per-conversation transcripts to `$CLAUDE_HOME/projects/<sanitized-cwd>/<session-id>.jsonl`. claude-web reads the same files: nothing is duplicated, nothing is migrated. If you exec into the container and run `claude --resume <session-id>`, you'll resume the same conversation the browser was viewing.
 
-The "sanitized cwd" is the absolute path with `/` replaced by `-`. So `CLAUDE_PROJECT_DIR=/workspace` → `~/.claude/projects/-workspace/`.
+The "sanitized cwd" is the resolved absolute path with every character outside `A-Z`, `a-z`, `0-9` replaced by `-` — the rule the CLI and `claude_agent_sdk.project_key_for_directory` apply, including a hash suffix for paths over 200 characters. So `CLAUDE_PROJECT_DIR=/workspace` → `~/.claude/projects/-workspace/`, and a Windows path such as `C:\Users\me\My Project` → `C--Users-me-My-Project/`. Keys that earlier versions stored in `state.db` under their old rule (only `/`, `\` and `:` replaced) are rewritten to this form on startup.
 
 Run-level state (event log, permission requests, uploads) lives in a separate SQLite database at `$CLAUDE_WEB_STATE_DIR/state.db` so a `systemctl restart` doesn't lose an in-flight conversation. Anything in-flight at restart time (a partial tool call, a queued auto-fire) is gone, but the conversation jsonl on disk is intact.
 
