@@ -16,6 +16,13 @@ from urllib.request import urlopen
 
 
 def main() -> None:
+    # The app log is echoed to stdout, and the app logs non-ASCII (arrows in
+    # link messages). A redirected Windows stdout defaults to cp1252, which
+    # turned a passing smoke test into a UnicodeEncodeError on 2026-10-07.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     exe = Path(sys.argv[1]).resolve()
     root = exe.parent / "portable-data"
     root.mkdir()  # Refuse to run against an existing user's portable data.
