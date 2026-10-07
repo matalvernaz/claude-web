@@ -188,12 +188,13 @@ def legacy_exe(name: str, base: Path | None = None) -> Path | None:
     """The pre-versioned layouts: ``tools/codex.exe`` and a hand-extracted ``tools/git``."""
     root = base or tools_dir()
     if name == "codex":
-        exe = root / ("codex.exe" if os.name == "nt" else "codex")
+        # A POSIX portable copy carried a bare ``codex``; Windows ``codex.exe``.
+        candidates = [root / "codex.exe", root / "codex"]
     elif name == "git":
-        exe = root / "git" / "cmd" / "git.exe"
+        candidates = [root / "git" / "cmd" / "git.exe"]
     else:
         return None
-    return exe if exe.is_file() else None
+    return next((exe for exe in candidates if exe.is_file()), None)
 
 
 def resolve_exe(name: str, base: Path | None = None) -> tuple[Path | None, str | None]:
