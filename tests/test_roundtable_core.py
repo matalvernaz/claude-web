@@ -247,6 +247,13 @@ def test_sdk_tools_keeps_api_key_on_forced_api_transport(tmp_path, monkeypatch):
     assert "env" not in opts
 
 
+def test_sdk_tools_accept_messages_larger_than_the_sdk_default(tmp_path, monkeypatch):
+    """A tool result carrying an image is over the SDK's 1 MiB default."""
+    monkeypatch.delenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", raising=False)
+    opts = _sdk_tools_turn(monkeypatch, tmp_path, "auto")
+    assert opts.get("max_buffer_size") == 64 << 20
+
+
 # ─── DB-lock concurrency (reconstructs the deleted test_concurrency.py) ──
 
 def test_concurrent_posts_get_contiguous_indices():

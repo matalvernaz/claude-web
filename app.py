@@ -812,6 +812,26 @@ FILE_CHECKPOINTS_ENABLED = (
     not in ("false", "0", "no")
 )
 
+
+def _sdk_max_buffer_bytes() -> int:
+    """Largest single message the SDK accepts from the CLI's stdout.
+
+    The SDK's own limit is 1 MiB. One tool result that carries an image (a
+    screenshot read back for the model) or a large file outgrows it, and the
+    run then dies with "CLIJSONDecodeError: JSON message exceeded maximum
+    buffer size of 1048576 bytes". CLAUDE_WEB_SDK_MAX_BUFFER_MB sets the limit
+    for every SDK client this app starts; 64 MiB unless set, never below 1 MiB.
+    """
+    raw = os.getenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", "").strip()
+    try:
+        mib = float(raw) if raw else 64.0
+    except ValueError:
+        mib = 64.0
+    return max(1 << 20, int(mib * (1 << 20)))
+
+
+SDK_MAX_BUFFER_BYTES = _sdk_max_buffer_bytes()
+
 # Session/run IDs are SDK-generated UUIDs. Validate to keep path-traversal at
 # bay before using user input as a filename.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -6888,6 +6908,7 @@ def _build_advisor_mcp_server(run: "ActiveRun", account: dict, cwd: Any, advisor
             permission_mode="plan",
             env=_scrubbed_child_env(account.get("env")),
             cli_path=claude_cli.resolve(),
+            max_buffer_size=SDK_MAX_BUFFER_BYTES,
         )
         chunks: list[str] = []
         # The installed SDK builds its error text from `errors` alone, falling
@@ -12444,6 +12465,9 @@ async def api_chat(
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
+        # Screenshots and big files read by a tool exceed the SDK's 1 MiB
+        # default per message and kill the run (see _sdk_max_buffer_bytes).
+        max_buffer_size=SDK_MAX_BUFFER_BYTES,
         permission_mode=_init_permission_mode,
         can_use_tool=can_use_tool,
         setting_sources=["user", "project", "local"],
@@ -12833,6 +12857,15 @@ async def api_chat(
                                         "Claude CLI was killed mid-turn (SIGKILL — hard "
                                         "restart or out-of-memory). Resend your message "
                                         "to continue."
+                                    )
+                                elif "exceeded maximum buffer size" in exc_text:
+                                    summary = (
+                                        "One message from Claude Code was larger than "
+                                        f"claude-web's {SDK_MAX_BUFFER_BYTES / (1 << 20):g} MiB "
+                                        "limit (usually a tool result carrying a large image "
+                                        "or file), so the turn stopped. Raise "
+                                        "CLAUDE_WEB_SDK_MAX_BUFFER_MB in .env, restart "
+                                        "claude-web, and resend your message."
                                     )
                                 else:
                                     summary = _with_cli_reason(

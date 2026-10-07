@@ -2196,6 +2196,13 @@ def _call_anthropic_sdk_with_tools(
         # value as unset and falls back to OAuth.
         options_kwargs["env"] = {"ANTHROPIC_API_KEY": ""}
 
+    # One tool result carrying an image or a big file outgrows the SDK's 1 MiB
+    # per-message default and kills the call; same knob as the main app.
+    try:
+        _buffer_mib = float(os.getenv("CLAUDE_WEB_SDK_MAX_BUFFER_MB", "").strip() or 64)
+    except ValueError:
+        _buffer_mib = 64.0
+    options_kwargs["max_buffer_size"] = max(1 << 20, int(_buffer_mib * (1 << 20)))
     options = sdk.ClaudeAgentOptions(
         **{k: v for k, v in options_kwargs.items() if v is not None},
     )
