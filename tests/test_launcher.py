@@ -52,6 +52,44 @@ def test_binary_dir_is_executable_parent_when_frozen(launcher, tmp_path) -> None
     assert launcher._binary_dir() == tmp_path
 
 
+def test_portable_install_uses_executable_directory_from_another_cwd(launcher, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    root = tmp_path / "portable-data"
+    root.mkdir()
+    elsewhere = tmp_path / "shortcut-working-directory"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert launcher._configure_portable_data()
+    for key in ("CLAUDE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CLAUDE_WEB_STATE_DIR",
+                "CLAUDE_WEB_PERSONAL_HOMES_DIR", "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
+                "CLAUDE_PROJECT_DIR", "CLAUDE_ROUNDTABLE_STATE_DIR"):
+        path = Path(os.environ[key])
+        assert path.is_dir() and path.parent == root
+    assert os.environ["AUTH_MODE"] == "none"
+    assert os.environ["CLAUDE_WEB_UI_MODE"] == "browser"
+
+
+def test_portable_data_is_opt_in_and_respects_configuration(launcher, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", {"AUTH_MODE": "oidc", "CLAUDE_HOME": "custom-home"})
+    assert not launcher._configure_portable_data()
+    (tmp_path / "portable-data").mkdir()
+    assert launcher._configure_portable_data()
+    assert os.environ["AUTH_MODE"] == "oidc"
+    assert os.environ["CLAUDE_HOME"] == "custom-home"
+    monkeypatch.setattr(sys, "frozen", False)
+    assert not launcher._configure_portable_data()
+
+
+def test_portable_accounts_never_listen_on_the_network_by_default(launcher, tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    (tmp_path / "portable-data").mkdir()
+    monkeypatch.setattr(launcher, "_install_runtime_error_logger", lambda: None)
+    calls = []
+    monkeypatch.setattr(launcher, "_run_headless_mode", lambda *args: calls.append(args) or 0)
+    assert launcher._run(["--headless", "--host", "0.0.0.0"]) == 0
+    assert calls[0][0] == "127.0.0.1"
+
+
 def test_load_dotenv_reads_kv_from_binary_dir(launcher, tmp_path) -> None:
     (tmp_path / ".env").write_text(textwrap.dedent("""
         # comment line

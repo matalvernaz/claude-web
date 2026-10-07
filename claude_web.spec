@@ -27,6 +27,7 @@ def _skip_optional_cli(name: str) -> bool:
 
 
 hidden = []
+datas = []
 for pkg, filt in (
     ("claude_agent_sdk", None),
     ("anthropic", None),
@@ -57,7 +58,6 @@ except Exception:
 
 # Some SDKs ship data files (JSON schemas, prompt assets). Pull them in
 # alongside the .py modules so the frozen binary can still find them.
-datas = []
 for pkg in ("claude_agent_sdk", "anthropic", "google.genai", "openai", "mcp"):
     datas += collect_data_files(pkg)
 

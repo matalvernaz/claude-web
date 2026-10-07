@@ -185,6 +185,14 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
 
+      - name: Smoke-test portable accounts from another working directory
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          exe=dist/claude-web/claude-web
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          python scripts/smoke_portable.py "$exe"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:

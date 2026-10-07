@@ -140,6 +140,39 @@ def _looks_unconfigured() -> bool:
     return True
 
 
+def _configure_portable_data() -> bool:
+    """Keep a portable desktop install's accounts and history beside its exe.
+
+    Opt in by creating ``portable-data`` next to the frozen executable.
+    Resolve every path from the executable, never the shortcut's working
+    directory. Explicit configuration still takes precedence.
+    """
+    root = _binary_dir() / "portable-data"
+    if not _is_frozen() or not root.is_dir():
+        return False
+    paths = {
+        "CLAUDE_HOME": "claude",
+        "CLAUDE_CONFIG_DIR": "claude",
+        "CLAUDE_WEB_STATE_DIR": "state",
+        "CLAUDE_WEB_PERSONAL_HOMES_DIR": "claude-accounts",
+        "CODEX_HOME": "codex",
+        "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR": "codex-accounts",
+        "CLAUDE_ROUNDTABLE_STATE_DIR": "roundtable",
+        "CLAUDE_PROJECT_DIR": "workspace",
+    }
+    for key, directory in paths.items():
+        path = root / directory
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault(key, str(path))
+    os.environ.setdefault("AUTH_MODE", "none")
+    os.environ.setdefault("CLAUDE_WEB_UI_MODE", UI_BROWSER)
+    # An optional native Codex executable can travel with the portable copy.
+    codex = _binary_dir() / "tools" / ("codex.exe" if os.name == "nt" else "codex")
+    if codex.is_file():
+        os.environ.setdefault("CLAUDE_WEB_CODEX_BIN", str(codex))
+    return True
+
+
 def _print_first_run_banner(host: str, port: int, ui_mode: str) -> None:
     sample = _binary_dir() / ".env.example"
     setup_url = f"http://{host}:{port}/setup"
@@ -568,6 +601,11 @@ def _run(argv: list[str] | None) -> int:
     # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so a
     # post-import load would be ignored.
     loaded = _load_dotenv_files()
+    portable = _configure_portable_data()
+
+    if portable and os.environ.get("AUTH_MODE") == "none" and not _is_loopback_host(args.host):
+        print("Portable mode without authentication binds to 127.0.0.1.", flush=True)
+        args.host = "127.0.0.1"
 
     first_run = not loaded and _looks_unconfigured()
     ui_mode = _resolve_ui_mode(args, first_run)

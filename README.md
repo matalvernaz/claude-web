@@ -128,6 +128,14 @@ Then visit `http://localhost:3001/setup` (set `SESSION_COOKIE_INSECURE=true` and
 
 ### Running from source on Windows
 
+The standalone desktop bundle also supports a portable layout. Create a
+`portable-data` folder next to `claude-web.exe`; the launcher keeps Claude and
+OpenAI accounts, app state, conversations, and a workspace inside that folder.
+Double-clicking opens the app in your default browser, bound to localhost.
+Explicit environment or `.env` settings take precedence. Keep this folder private:
+it contains login credentials. An optional `tools/codex.exe` next to the executable
+enables the OpenAI provider without a separate CLI install.
+
 The same source install works on Windows; the prerequisites are the same (Python 3.11+, Node.js + the `claude` CLI), just expressed in PowerShell. Two Windows-specific notes:
 
 ```powershell
