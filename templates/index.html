@@ -24,6 +24,16 @@
     <pre id="cli-log" class="cli-banner__log" tabindex="0" aria-label="Install output" aria-live="off" aria-atomic="false" hidden></pre>
   </div>
 
+  <div id="update-banner" class="cli-banner update-banner" role="status" aria-live="polite" tabindex="-1" hidden>
+    <h2 class="cli-banner__title" id="update-banner-title">claude-web update</h2>
+    <p id="update-banner-msg"></p>
+    <div class="cli-banner__actions">
+      <button type="button" id="update-install-btn" hidden>Install update and restart</button>
+      <button type="button" id="update-later-btn">Later</button>
+      <a id="update-release-link" class="header-link" href="#" target="_blank" rel="noopener" hidden>Release notes</a>
+    </div>
+  </div>
+
   <header>
     <h1>{{ site_title }}</h1>
     <div class="header-actions">
@@ -247,5 +257,6 @@
   <script src="/static/purify.min.js?v={{ asset_version('purify.min.js') }}"></script>
   <script src="/static/app.js?v={{ asset_version('app.js') }}"></script>
   <script src="/static/cli-check.js?v={{ asset_version('cli-check.js') }}"></script>
+  <script src="/static/update-check.js?v={{ asset_version('update-check.js') }}"></script>
 </body>
 </html>

@@ -94,10 +94,59 @@ jobs:
             echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Stamp build identity
+        # self_update compares this against the repo's GitHub releases; a
+        # source checkout stays "dev" and never offers an update.
+        shell: bash
+        run: |
+          python - "${{ steps.tag.outputs.name }}" "${{ matrix.target }}" "${{ github.sha }}" <<'PY'
+          import datetime, pathlib, sys
+          tag, target, commit = sys.argv[1:4]
+          built = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          pathlib.Path("build_info.py").write_text(
+              f"VERSION = {tag!r}\nBUILT_AT = {built!r}\nCOMMIT = {commit!r}\nTARGET = {target!r}\n",
+              encoding="utf-8",
+          )
+          print(pathlib.Path("build_info.py").read_text(encoding="utf-8"))
+          PY
+
+      - uses: microsoft/setup-msbuild@v3
+        if: matrix.os == 'windows-latest'
+      - name: Build ZipExtractor.exe (self-update helper)
+        if: matrix.os == 'windows-latest'
+        # ravibpatel/AutoUpdater.NET's ZipExtractor (MIT), the helper Libation
+        # and the operator's other portable apps use: it waits for every
+        # claude-web process to exit, overlays the update zip on the install
+        # (portable-data is not in the zip, so it is untouched), and relaunches
+        # the exe. The upstream csproj targets net45, whose targeting pack is
+        # not on the runner; retarget to net48 (present on Win10 1803+). VS
+        # MSBuild, not `dotnet build`: the .NET SDK's resource pipeline errors
+        # on net48 WinForms .resx with non-string resources.
+        shell: pwsh
+        run: |
+          $tag = 'v1.9.2'
+          git clone --depth 1 --branch $tag https://github.com/ravibpatel/AutoUpdater.NET.git zipextractor_src
+          $csproj = 'zipextractor_src/ZipExtractor/ZipExtractor.csproj'
+          $text = Get-Content $csproj -Raw
+          $text = $text.Replace('<TargetFramework>net45</TargetFramework>', '<TargetFramework>net48</TargetFramework>')
+          $text = $text.Replace("'net45'", "'net48'")
+          Set-Content $csproj $text
+          msbuild $csproj /restore /p:Configuration=Release /p:SignAssembly=false /v:minimal
+          New-Item -ItemType Directory -Force -Path zipextractor_bin | Out-Null
+          Copy-Item zipextractor_src/AutoUpdater.NET/Resources/ZipExtractor.exe zipextractor_bin/
+          Get-ChildItem zipextractor_bin/
+
       - name: Build with PyInstaller
         # --clean wipes prior build caches so a stale hook doesn't
         # silently pin an old hidden-import list across releases.
         run: pyinstaller --clean --noconfirm claude_web.spec
+
+      - name: Bundle ZipExtractor.exe beside the exe
+        # self_update.can_self_replace() looks for it next to claude-web.exe;
+        # without it the app only reports that an update exists.
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: Copy-Item zipextractor_bin/ZipExtractor.exe dist/claude-web/
 
       - name: Check the bundled Claude CLI made it in
         # Without it, a user with no system claude install can't run a

@@ -1225,3 +1225,9 @@ nav#sessions-panel { overscroll-behavior: contain; }
   .image-btn { min-height: var(--tap-min-height); }
   #prompt { min-height: 5.5rem; }
 }
+
+/* App-update banner (portable Windows build): same shell as the CLI banner,
+   blue instead of amber because it is news, not a fault. */
+.update-banner { border-color: #7aa2f7; }
+.update-banner .cli-banner__title { color: #7aa2f7; }
+.update-banner .cli-banner__actions { align-items: center; }

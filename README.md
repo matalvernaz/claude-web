@@ -138,6 +138,20 @@ enables the OpenAI provider without a separate CLI install.
 If Portable Git is extracted into `tools/git`, the executable also finds its
 Git and Bash tools automatically. No batch launcher is needed.
 
+The Windows build updates itself. Every six hours (and on demand from the
+banner at the top of the chat page) it checks this repo's GitHub releases; a
+newer `vX.Y.Z` release is downloaded and verified in the background, then the
+app restarts into it as soon as no conversation is mid-turn, the same drain
+logic as the self-restart below. `ZipExtractor.exe` (ravibpatel/AutoUpdater.NET,
+built in the release workflow) performs the swap after the process exits and
+relaunches it with the same arguments; `portable-data`, `tools` and `.env` are
+not in the release zip and are never touched. The files the update changes are
+backed up first, and a swap that only half lands is rolled back on the next
+start. A copy built by hand from a branch (a `workflow_dispatch` run) updates
+to the first versioned release published after it was built. Set
+`CLAUDE_WEB_SELF_UPDATE=notify` to be asked first, or `off` to disable;
+`claude-web.exe --version` prints what is installed.
+
 The same source install works on Windows; the prerequisites are the same (Python 3.11+, Node.js + the `claude` CLI), just expressed in PowerShell. Two Windows-specific notes:
 
 ```powershell
@@ -217,6 +231,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `NO_SESSION_ALLOWLIST_TOOLS` | `Bash` | Tools where "Allow this session" is disabled because their signature is too coarse to be safe (e.g. allowing `echo` would also bless `echo "ok" && rm -rf ~`). Each call requires explicit per-call approval. |
 | `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-5`. A comma-separated list is tried in order, and the primary is retried at the start of each user turn. Unset = no fallback. |
 | `CLAUDE_WEB_CLI_MODELS_FETCH` | `true` | The model picker is the installed CLI's own `/model` list, read at boot, after each CLI update and every `CLAUDE_WEB_CLI_UPDATE_INTERVAL` seconds, and cached in the state dir. Its `opus` / `fable` / `sonnet` / `haiku` rows always run the newest model of the family. `false` keeps the cached list (or, with none, just those four rows). |
+| `CLAUDE_WEB_SELF_UPDATE` | `auto` | Portable Windows build only: `auto` downloads a newer GitHub release and restarts into it when no conversation is mid-turn, `notify` shows it with an Install button, `off` never checks. `CLAUDE_WEB_SELF_UPDATE_INTERVAL` (default 21600 s) sets the check cadence; `CLAUDE_WEB_SELF_UPDATE_PRERELEASE=true` also offers prereleases. |
 | `CLAUDE_WEB_MAX_BUDGET_USD` | `0` (off) | Hard per-run API-spend ceiling in USD. Only meaningful for API-key credentials — subscription turns report synthetic costs. |
 | `CLAUDE_WEB_PUSHOVER_TOKEN` / `CLAUDE_WEB_PUSHOVER_USER` | (unset) | When both are set, a Pushover notification fires when a turn finishes after running longer than `CLAUDE_WEB_NOTIFY_MIN_SECONDS` (default `120`) — for the walked-away-during-a-long-turn case the in-page earcons can't cover. |
 | `CLAUDE_WEB_FILE_CHECKPOINTS` | `true` | The CLI snapshots files before edits so `/rewind [n]` can restore them to before your nth-last message (only while the conversation's CLI is alive, and only between turns). Set `false` to skip the snapshot overhead. |
