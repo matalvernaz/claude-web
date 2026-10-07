@@ -240,7 +240,7 @@ async def test_an_unreadable_result_is_kept_for_diagnosis(fake_setup_token, tmp_
     monkeypatch.setenv("CLAUDE_WEB_SIGNIN_DEBUG_DIR", str(tmp_path / "debug"))
     monkeypatch.setattr(sf, "EXCHANGE_TIMEOUT_SECONDS", 2)
     home = tmp_path / "slot"
-    state = await sf.start_oauth("token", flow_key="tok-odd", home=home)
+    await sf.start_oauth("token", flow_key="tok-odd", home=home)
     result = await sf.submit_code("odd#code", flow_key="tok-odd")
     assert result.status == "failed"
     assert result.error == "claude setup-token printed no token"

@@ -14,6 +14,7 @@ claude-homes/
 claude-web-state/
 codex-home/
 codex-homes/
+portable-data/
 
 # PyInstaller build output (claude_web.spec). Native bundles for each
 # platform are produced in CI on tag push and attached to the release;

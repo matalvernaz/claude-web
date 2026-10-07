@@ -5339,7 +5339,7 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
         return home
     for entry in entries:
         # Per-credential files: must be real, not symlinked back to shared.
-        if entry.name in (".credentials.json", ".anthropic_api_key"):
+        if entry.name in (".credentials.json", ".anthropic_api_key", ".claude_oauth_token"):
             continue
         # Refuse to follow a symlink planted in CLAUDE_HOME. A shared-instance
         # deployment lets every signed-in user write here (via the Bash tool

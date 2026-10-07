@@ -250,6 +250,19 @@ def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypa
 # ─── path sanitiser portability ────────────────────────────────────────────
 
 
+def test_new_account_never_inherits_shared_login_files(tmp_path, monkeypatch):
+    shared = tmp_path / "claude"
+    shared.mkdir()
+    names = (".credentials.json", ".anthropic_api_key", ".claude_oauth_token")
+    for name in names:
+        (shared / name).write_text("shared-secret", encoding="utf-8")
+    monkeypatch.setattr(app_module, "CLAUDE_HOME", shared)
+    monkeypatch.setattr(app_module, "PERSONAL_HOMES_DIR", tmp_path / "accounts")
+    home = app_module._ensure_credential_home("local-user", 9)
+    for name in names:
+        assert not (home / name).exists()
+
+
 def test_sanitize_project_key_posix_path() -> None:
     """POSIX path produces the canonical `-` separator form (unchanged
     by the Windows-portability refactor)."""
