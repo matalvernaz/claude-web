@@ -135,6 +135,8 @@ Double-clicking opens the app in your default browser, bound to localhost.
 Explicit environment or `.env` settings take precedence. Keep this folder private:
 it contains login credentials. An optional `tools/codex.exe` next to the executable
 enables the OpenAI provider without a separate CLI install.
+If Portable Git is extracted into `tools/git`, the executable also finds its
+Git and Bash tools automatically. No batch launcher is needed.
 
 The same source install works on Windows; the prerequisites are the same (Python 3.11+, Node.js + the `claude` CLI), just expressed in PowerShell. Two Windows-specific notes:
 
