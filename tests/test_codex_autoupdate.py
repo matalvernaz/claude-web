@@ -75,6 +75,12 @@ async def test_the_schema_comes_from_the_cli_itself(tmp_path) -> None:
         encoding="utf-8",
     )
     fake.chmod(0o755)
+    if os.name == "nt":
+        # Windows does not execute a Python shebang. Keep a real child
+        # process in this test by launching the script through a cmd shim.
+        shim = tmp_path / "codex.cmd"
+        shim.write_text(f'@"{sys.executable}" "{fake}" %*\n', encoding="utf-8")
+        fake = shim
     assert await codex_provider.missing_protocol_methods(str(fake)) == [
         "item/fileChange/requestApproval"]
 
