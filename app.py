@@ -26,6 +26,7 @@ import signal
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -74,6 +75,8 @@ import claude_models
 import codex_provider
 import local_provider
 import conversation_replay
+import build_info
+import self_update
 import currency
 import setup_flow
 import auto_signin
@@ -7860,6 +7863,12 @@ async def _restart_watcher_loop() -> None:
             )
         else:
             log.info("restart drain complete — exiting for supervisor revive")
+        if not _launch_staged_update():
+            # The update helper could not be started. On the portable build
+            # there is no supervisor, so exiting now would just stop the app;
+            # stay up and let the operator retry instead.
+            cancel_restart()
+            continue
         os.kill(os.getpid(), signal.SIGTERM)
         return
 
@@ -7890,6 +7899,8 @@ async def _install_restart_machinery() -> None:
         asyncio.create_task(_cli_models_loop())
     if CODEX_AUTOUPDATE:
         asyncio.create_task(_codex_autoupdate_loop())
+    if SELF_UPDATE_ENABLED:
+        asyncio.create_task(_self_update_loop())
     # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
     # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
     # can drive both without an OIDC session cookie.
@@ -8123,6 +8134,143 @@ async def _cli_autoupdate_loop() -> None:
         await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
 
 
+# ─── App self-update (portable Windows build) ────────────────────────────────
+# The frozen Windows bundle cannot `claude update` itself the way the CLI can,
+# and a double-clicked exe has no systemd to revive it, so updating meant
+# downloading a zip and copying folders by hand. self_update.py (the same
+# ZipExtractor flow as the operator's other portable apps) checks GitHub
+# releases on a timer, stages the download while chats keep running, and
+# applies it through the drain-restart machinery: once no run is mid-turn the
+# helper is spawned, this process exits, and the helper overlays the install
+# and relaunches it. launcher.py applies a staged update the process never
+# got to (console closed first) and rolls back a half-applied one.
+SELF_UPDATE_MODE = os.getenv("CLAUDE_WEB_SELF_UPDATE", "auto").strip().lower() or "auto"
+if SELF_UPDATE_MODE in ("1", "true", "yes", "on"):
+    SELF_UPDATE_MODE = "auto"
+elif SELF_UPDATE_MODE in ("0", "false", "no"):
+    SELF_UPDATE_MODE = "off"
+if SELF_UPDATE_MODE not in ("auto", "notify", "off"):
+    log.warning("CLAUDE_WEB_SELF_UPDATE=%r is not auto/notify/off; using notify", SELF_UPDATE_MODE)
+    SELF_UPDATE_MODE = "notify"
+SELF_UPDATE_INTERVAL_SECONDS = int(
+    os.getenv("CLAUDE_WEB_SELF_UPDATE_INTERVAL", "21600") or 21600)
+SELF_UPDATE_PRERELEASE = os.getenv("CLAUDE_WEB_SELF_UPDATE_PRERELEASE", "").lower() in (
+    "1", "true", "yes",
+)
+# Only the frozen Windows build can swap itself; elsewhere the timer could
+# only ever say "available", which the release page already does better.
+SELF_UPDATE_ENABLED = SELF_UPDATE_MODE != "off" and self_update.can_self_replace()
+_SELF_UPDATE_BOOT_DELAY_SECONDS = 120.0
+_SELF_UPDATE_LOCK = asyncio.Lock()
+SELF_UPDATE_STATE: dict[str, Any] = {
+    # never | current | available | staging | staged | applying | error | disabled
+    "status": "never" if SELF_UPDATE_ENABLED else "disabled",
+    "mode": SELF_UPDATE_MODE,
+    "current_version": build_info.VERSION,
+    "built_at": build_info.BUILT_AT,
+    "can_self_replace": self_update.can_self_replace(),
+    "available": None,   # {tag, release_url, published_at, size, notes}
+    "staged_tag": None,
+    "checked_at": None,
+    "source": None,      # "timer" or "api:<email>"
+    "detail": "",
+}
+# The download that is waiting for an idle moment; applied by the restart
+# watcher, or by the launcher at the next start if the process ends first.
+_SELF_UPDATE_STAGED: Optional[self_update.Staged] = None
+
+
+def _self_update_public_info(info: dict) -> dict:
+    out = {k: info.get(k) for k in ("tag", "release_url", "published_at", "size")}
+    out["notes"] = (info.get("notes") or "")[:2000]
+    return out
+
+
+async def _run_self_update(source: str, *, install: bool = False) -> dict:
+    """Check GitHub once (single-flight) and record the outcome.
+
+    With ``install`` (the Install button) or in auto mode, a newer release is
+    downloaded and verified off the event loop, then a drain-restart is
+    requested; the watcher spawns the helper once no run is busy. Returns a
+    snapshot of SELF_UPDATE_STATE rather than raising: the timer loop and the
+    admin endpoints both want a status dict.
+    """
+    global _SELF_UPDATE_STAGED
+    async with _SELF_UPDATE_LOCK:
+        if _SELF_UPDATE_STAGED is not None:
+            # Already downloaded; the restart watcher (or next launch) applies it.
+            return dict(SELF_UPDATE_STATE)
+        try:
+            info = await asyncio.to_thread(
+                self_update.check_for_update, include_prerelease=SELF_UPDATE_PRERELEASE)
+        except Exception as e:
+            SELF_UPDATE_STATE.update(
+                status="error", detail=f"check failed: {e}", checked_at=time.time(),
+                source=source,
+            )
+            log.warning("self-update check failed (via %s): %s", source, e)
+            return dict(SELF_UPDATE_STATE)
+        SELF_UPDATE_STATE.update(checked_at=time.time(), source=source, detail="")
+        if info is None:
+            SELF_UPDATE_STATE.update(status="current", available=None)
+            return dict(SELF_UPDATE_STATE)
+        SELF_UPDATE_STATE.update(status="available", available=_self_update_public_info(info))
+        log.info("self-update: %s is available (running %s)", info["tag"], build_info.VERSION)
+        if not (install or SELF_UPDATE_MODE == "auto") or not self_update.can_self_replace():
+            return dict(SELF_UPDATE_STATE)
+        SELF_UPDATE_STATE.update(status="staging", staged_tag=info["tag"])
+        try:
+            staged = await asyncio.to_thread(self_update.stage_update, info)
+        except Exception as e:
+            SELF_UPDATE_STATE.update(
+                status="error", staged_tag=None, detail=f"download failed: {e}")
+            log.warning("self-update: staging %s failed: %s", info["tag"], e)
+            return dict(SELF_UPDATE_STATE)
+        _SELF_UPDATE_STAGED = staged
+        SELF_UPDATE_STATE.update(status="staged", staged_tag=staged.tag, detail="")
+        log.info("self-update: %s downloaded; restarting into it once no run is busy",
+                 staged.tag)
+        if PUSHOVER_TOKEN and PUSHOVER_USER:
+            asyncio.create_task(asyncio.to_thread(
+                _send_pushover_sync, SITE_TITLE,
+                f"claude-web {staged.tag} downloaded; restarting into it when idle"))
+        request_restart(f"self-update:{staged.tag}")
+        return dict(SELF_UPDATE_STATE)
+
+
+async def _self_update_loop() -> None:
+    """Check GitHub releases on a timer; in auto mode the update installs itself."""
+    await asyncio.sleep(_SELF_UPDATE_BOOT_DELAY_SECONDS)
+    while True:
+        try:
+            await _run_self_update("timer")
+        except Exception:
+            log.exception("self-update pass failed")
+        await asyncio.sleep(SELF_UPDATE_INTERVAL_SECONDS)
+
+
+def _launch_staged_update() -> bool:
+    """Spawn the helper for a staged update right before the drain-restart exits.
+
+    True when the helper is running or nothing was staged; False when applying
+    failed, so the watcher keeps the process alive instead of exiting into
+    nothing on a build with no supervisor.
+    """
+    global _SELF_UPDATE_STAGED
+    staged = _SELF_UPDATE_STAGED
+    if staged is None:
+        return True
+    try:
+        self_update.apply_staged(staged, argv=sys.argv[1:])
+    except Exception as e:
+        log.error("self-update: applying %s failed: %s", staged.tag, e)
+        _SELF_UPDATE_STAGED = None
+        SELF_UPDATE_STATE.update(status="error", staged_tag=None, detail=f"apply failed: {e}")
+        return False
+    SELF_UPDATE_STATE.update(status="applying")
+    return True
+
+
 # ─── Claude model list ────────────────────────────────────────────────────────
 # Re-read from the CLI at boot, after every CLI update, and on the update
 # timer: the CLI can change its picker without a new version (the server can
@@ -8343,6 +8491,38 @@ async def api_cli_update(user: dict = Depends(auth.require_user)):
     _require_cli_update_admin(user)
     return await _run_cli_update(
         f"api:{user.get('email') or user.get('sub') or '?'}")
+
+
+def _require_app_update_admin(user: dict) -> None:
+    """An app update restarts the whole process, so it is instance-wide."""
+    _require_global_config_admin(user, "app update")
+
+
+@app.get("/api/admin/update-app")
+async def api_app_update_status(user: dict = Depends(auth.require_user)):
+    _require_app_update_admin(user)
+    return dict(SELF_UPDATE_STATE)
+
+
+@app.post("/api/admin/update-app")
+async def api_app_update_check(user: dict = Depends(auth.require_user)):
+    """Check GitHub now. Stages and restarts only in auto mode."""
+    _require_app_update_admin(user)
+    if SELF_UPDATE_MODE == "off":
+        raise HTTPException(409, "self-update is off (CLAUDE_WEB_SELF_UPDATE=off)")
+    return await _run_self_update(
+        f"api:{user.get('email') or user.get('sub') or '?'}")
+
+
+@app.post("/api/admin/update-app/install")
+async def api_app_update_install(user: dict = Depends(auth.require_user)):
+    """Download the newest release and restart into it once no run is busy."""
+    _require_app_update_admin(user)
+    if not self_update.can_self_replace():
+        raise HTTPException(
+            409, "this build cannot update itself; download the release instead")
+    return await _run_self_update(
+        f"api:{user.get('email') or user.get('sub') or '?'}", install=True)
 
 
 # Per-session locks for /api/chat. The SDK only sets run.session_id once it

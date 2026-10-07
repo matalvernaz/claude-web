@@ -46,7 +46,7 @@ def main() -> None:
            if not k.startswith(("CLAUDE_", "CODEX_", "OIDC_", "SESSION_"))
            and k not in ("AUTH_MODE", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")}
     env.update(CLAUDE_WEB_CLI_AUTOUPDATE="false", CLAUDE_WEB_CODEX_AUTOUPDATE="false",
-               CLAUDE_WEB_CLI_MODELS_FETCH="false")
+               CLAUDE_WEB_CLI_MODELS_FETCH="false", CLAUDE_WEB_SELF_UPDATE="off")
     base = "http://127.0.0.1:38472"
     log = exe.parent.parent / "portable-smoke.log"
     with tempfile.TemporaryDirectory() as cwd, log.open("w", encoding="utf-8") as output:

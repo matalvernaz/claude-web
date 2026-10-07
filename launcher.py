@@ -49,7 +49,10 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 
+import build_info
 import claude_cli
+import self_update
+import upgrade_manager
 
 
 # The three UI modes are mutually exclusive. The launcher resolves which
@@ -342,6 +345,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--headless", dest="ui_mode", action="store_const", const=UI_HEADLESS,
         help="Alias for --no-browser.",
     )
+    p.add_argument(
+        "--version", action="version",
+        version="claude-web " + build_info.VERSION + (
+            f" ({build_info.TARGET}, {build_info.COMMIT[:7]})" if build_info.COMMIT
+            else " (source checkout)"
+        ),
+    )
     p.set_defaults(ui_mode=None)
     return p.parse_args(argv)
 
@@ -599,13 +609,54 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _settle_pending_update(argv: list[str]) -> bool:
+    """Roll back a half-applied update and launch a staged one, before app imports.
+
+    A previous process may have downloaded an update but never applied it
+    (the console window was closed before the drain-restart fired), or the
+    helper may have replaced only some files. ``upgrade_manager`` restores a
+    partial swap from its backup; ``self_update`` launches a staged one.
+    Returns True when the helper was launched, in which case the caller
+    exits so the helper can replace the files and relaunch us. Never raises:
+    an update problem must not stop the current version from starting.
+    """
+    try:
+        self_update.cleanup_stale_workdirs()
+        recovery = upgrade_manager.recover_pending_upgrade(_binary_dir())
+    except Exception as e:  # noqa: BLE001 — recovery is best-effort
+        print(f"\nNote: update recovery check failed ({e}); starting anyway.", flush=True)
+        recovery = None
+    if recovery is not None and recovery.rolled_back:
+        print("\n" + recovery.title + "\n" + recovery.message + "\n", flush=True)
+    try:
+        if self_update.apply_pending_staged(_binary_dir(), argv):
+            print(
+                "Applying the downloaded claude-web update; the app relaunches "
+                "itself when the files are in place.", flush=True,
+            )
+            return True
+    except Exception as e:  # noqa: BLE001 — never block startup on an update
+        print(
+            f"\nNote: could not apply the downloaded update ({e}); starting the "
+            "current version.", flush=True,
+        )
+    return False
+
+
 def _run(argv: list[str] | None) -> int:
-    args = _parse_args(list(sys.argv[1:] if argv is None else argv))
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    args = _parse_args(argv_list)
 
     # Capture runtime exceptions to a file the user can attach to a bug
     # report. Set up before importing app so the app's own logger writes
     # land in the file too.
     _install_runtime_error_logger()
+
+    # Settle any in-progress self-update before touching the app: a staged
+    # download gets applied (we exit and the helper relaunches us), a
+    # half-applied one gets rolled back.
+    if _is_frozen() and _settle_pending_update(argv_list):
+        return 0
 
     # Load `.env` BEFORE importing app — app.py reads many env vars at
     # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so a
