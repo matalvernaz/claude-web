@@ -242,11 +242,97 @@ jobs:
           [ -f "$exe.exe" ] && exe="$exe.exe"
           python scripts/smoke_portable.py "$exe"
 
+      - name: Bundle the CLIs the portable build carries (codex, Claude Code, Git)
+        if: matrix.os == 'windows-latest'
+        # portable_tools.py is the module the app's tools updater runs, so the
+        # -full zip ships exactly the layout it maintains: tools/<name>/<version>/
+        # plus a `current` marker. Codex comes as the official package (the
+        # code-mode host every tool call has needed since 0.160, and ripgrep),
+        # Claude Code from Anthropic's manifest-verified bucket, Git as
+        # PortableGit. GITHUB_TOKEN keeps the release lookups off the runner's
+        # shared unauthenticated rate limit. Runs after the lean zip is packaged
+        # and the smoke tests ran: that zip (the one the self-updater overlays)
+        # stays free of tools/, and the smoke tests' portable-data and logs are
+        # swept before anything else is archived.
+        shell: pwsh
+        timeout-minutes: 20
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Remove-Item -Recurse -Force dist/claude-web/portable-data, dist/claude-web/.claude-web-upgrade -ErrorAction SilentlyContinue
+          Remove-Item -Force dist/claude-web/*.log -ErrorAction SilentlyContinue
+          python portable_tools.py install --dest dist/claude-web/tools
+          python portable_tools.py status --dest dist/claude-web/tools
+
+      - name: Check the bundled CLIs run and the app picks them up
+        if: matrix.os == 'windows-latest'
+        # Each tool must report the version its directory is named for, the
+        # codex package must be complete, and a portable boot (portable-data
+        # present) must spawn the managed Claude CLI rather than the SDK's
+        # frozen copy.
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          tools=dist/claude-web/tools
+          for name in codex claude git; do
+            version=$(tr -d '\r\n' < "$tools/$name/current")
+            [ -n "$version" ] || { echo "::error::$name has no current version"; exit 1; }
+            echo "$name: $version"
+          done
+          codex="$tools/codex/$(tr -d '\r\n' < "$tools/codex/current")"
+          for f in bin/codex.exe bin/codex-code-mode-host.exe codex-path/rg.exe codex-package.json; do
+            [ -s "$codex/$f" ] || { echo "::error::codex package is missing $f"; exit 1; }
+          done
+          "$codex/bin/codex.exe" --version
+          "$tools/claude/$(tr -d '\r\n' < "$tools/claude/current")/claude.exe" --version
+          "$tools/git/$(tr -d '\r\n' < "$tools/git/current")/cmd/git.exe" --version
+          mkdir dist/claude-web/portable-data
+          base=http://127.0.0.1:38473
+          CLAUDE_WEB_TOOLS_AUTOUPDATE=false CLAUDE_WEB_SELF_UPDATE=off CLAUDE_WEB_CLI_AUTOUPDATE=false \
+          CLAUDE_WEB_CODEX_AUTOUPDATE=false CLAUDE_WEB_CLI_MODELS_FETCH=false \
+            dist/claude-web/claude-web.exe --headless --port 38473 > tools-smoke.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 90); do
+            curl -sf "$base/healthz" >/dev/null && break
+            sleep 1
+          done
+          curl -sf "$base/api/claude-cli/status" > tools-status.json || true
+          curl -sf "$base/api/admin/update-tools" > tools-update.json || true
+          kill "$pid" 2>/dev/null || true
+          cat tools-smoke.log
+          python - <<'PY'
+          import json, sys
+          status = json.load(open("tools-status.json"))
+          update = json.load(open("tools-update.json"))
+          print("cli:", status.get("cli_source"), status.get("cli_path"))
+          print("tools:", update.get("enabled"), update.get("tools_dir"))
+          ok = (status.get("cli_source") == "managed"
+                and "tools" in (status.get("cli_path") or "")
+                and update.get("tools_dir", "").endswith("tools"))
+          sys.exit(0 if ok else 1)
+          PY
+          rm -rf dist/claude-web/portable-data dist/claude-web/.claude-web-upgrade dist/claude-web/*.log
+
+      - name: Package archive with bundled CLIs (Windows)
+        if: matrix.os == 'windows-latest'
+        # 7-Zip rather than Compress-Archive: the tree is over a gigabyte
+        # and Compress-Archive is both slow and capped at 2 GB.
+        shell: pwsh
+        run: |
+          $archiveName = "claude-web-${{ steps.tag.outputs.name }}-${{ matrix.target }}-full.zip"
+          Push-Location dist
+          7z a -tzip -mx=5 "../$archiveName" claude-web | Select-Object -Last 3
+          Pop-Location
+          Get-Item $archiveName | Select-Object Name, Length
+          "ARCHIVE_FULL=$archiveName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: claude-web-${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE_FULL }}
           if-no-files-found: error
           retention-days: 14
 

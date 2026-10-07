@@ -414,3 +414,12 @@ def test_not_frozen_skips_settle(monkeypatch, tmp_path):
     monkeypatch.setenv("AUTH_MODE", "none")
     assert launcher_mod._run(["--headless"]) == 0
     assert os.environ["AUTH_MODE"] == "none"
+
+
+def test_select_asset_prefers_the_lean_zip_over_the_full_one():
+    full = {"name": "claude-web-v0.5.0-windows-x64-full.zip"}
+    lean = {"name": "claude-web-v0.5.0-windows-x64.zip"}
+    assert self_update.select_asset([full, lean]) is lean
+    # A release with only the full zip still updates.
+    assert self_update.select_asset([full, {"name": "claude-web-v0.5.0-linux-x64.tar.gz"}]) is full
+    assert self_update.select_asset([{"name": "claude-web-v0.5.0-macos-arm64.tar.gz"}]) is None

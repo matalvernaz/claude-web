@@ -21,6 +21,7 @@ def fake(monkeypatch, tmp_path):
     found: dict[str, str] = {}
     monkeypatch.setattr(claude_cli.shutil, "which", lambda name: found.get(name))
     monkeypatch.setattr(claude_cli, "_is_windows", lambda: False)
+    monkeypatch.setattr(claude_cli.portable_tools, "enabled", lambda: False)
     bundle = tmp_path / "sdk" / "_bundled"
     bundle.mkdir(parents=True)
     monkeypatch.setattr(claude_cli, "_bundled_dir", lambda: bundle)
@@ -180,3 +181,22 @@ def test_every_claude_spawn_goes_through_the_resolver():
         for name in ("app.py", "setup_flow.py", "launcher.py")
     }
     assert counts == {"app.py": 1, "setup_flow.py": 0, "launcher.py": 0}
+
+
+def test_the_portable_builds_managed_copy_wins_over_everything(fake, monkeypatch, tmp_path):
+    system = fake.bundled("claude-system")
+    fake.which["claude"] = system
+    bundled = fake.bundled()
+    assert claude_cli.find() == (system, claude_cli.SYSTEM)
+    managed = tmp_path / "tools" / "claude" / "2.1.292" / "claude.exe"
+    managed.parent.mkdir(parents=True)
+    managed.write_text("")
+    monkeypatch.setattr(claude_cli.portable_tools, "enabled", lambda: True)
+    monkeypatch.setattr(claude_cli.portable_tools, "managed_exe", lambda name: managed if name == "claude" else None)
+    assert claude_cli.find() == (str(managed), claude_cli.MANAGED)
+    assert claude_cli.resolve() == str(managed)
+    # Outside the portable build the module is never consulted.
+    monkeypatch.setattr(claude_cli.portable_tools, "enabled", lambda: False)
+    assert claude_cli.find() == (system, claude_cli.SYSTEM)
+    del fake.which["claude"]
+    assert claude_cli.find() == (bundled, claude_cli.BUNDLED)

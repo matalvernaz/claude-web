@@ -1,13 +1,16 @@
-"""Find the `claude` CLI to run: the machine's own install first, the SDK's
-bundled copy second.
+"""Find the `claude` CLI to run: the portable build's managed copy first, the
+machine's own install second, the SDK's bundled copy last.
 
-The installed CLI wins because it keeps itself current (and the app's update
-timer updates it); the copy vendored inside claude-agent-sdk is frozen at
-whatever the SDK shipped, and spawn flags newer than it die with "unknown
-option". But the bundled copy is the only CLI a desktop-binary user may have,
-so every place that runs `claude` falls back to it rather than reporting it
-missing. Before this, sign-in looked on PATH alone and failed on a fresh
-Windows machine even though the binary carried a working claude.exe.
+The managed copy (``tools/claude``, see portable_tools) is downloaded from
+Anthropic's release bucket and kept current by the app, so it is preferred
+wherever it exists. An installed CLI comes next because it keeps itself
+current (and the app's update timer updates it); the copy vendored inside
+claude-agent-sdk is frozen at whatever the SDK shipped, and spawn flags newer
+than it die with "unknown option". But the bundled copy is the only CLI a
+desktop-binary user may have, so every place that runs `claude` falls back to
+it rather than reporting it missing. Before this, sign-in looked on PATH
+alone and failed on a fresh Windows machine even though the binary carried a
+working claude.exe.
 
 On Windows an npm install puts a `claude.cmd` batch shim on PATH. The Agent SDK
 refuses to spawn batch scripts (cmd.exe re-parses their arguments, the
@@ -21,6 +24,9 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
+import portable_tools
+
+MANAGED = "managed"
 SYSTEM = "system"
 BUNDLED = "bundled"
 SHIM = "shim"
@@ -67,6 +73,14 @@ def bundled() -> Optional[str]:
     return str(path) if path.is_file() else None
 
 
+def managed() -> Optional[str]:
+    """The copy the portable build downloads and updates itself, if any."""
+    if not portable_tools.enabled():
+        return None
+    path = portable_tools.managed_exe("claude")
+    return str(path) if path is not None else None
+
+
 def system() -> Optional[str]:
     """A `claude` installed on this machine that can be spawned directly."""
     found = shutil.which("claude")
@@ -84,9 +98,12 @@ def system() -> Optional[str]:
 def find() -> tuple[Optional[str], Optional[str]]:
     """``(path, source)`` for the CLI to run; ``(None, None)`` when there is none.
 
-    ``source`` is SYSTEM, BUNDLED, or SHIM (Windows: only a batch shim or an
-    extensionless wrapper script was found).
+    ``source`` is MANAGED, SYSTEM, BUNDLED, or SHIM (Windows: only a batch
+    shim or an extensionless wrapper script was found).
     """
+    path = managed()
+    if path:
+        return path, MANAGED
     path = system()
     if path:
         return path, SYSTEM

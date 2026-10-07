@@ -7,8 +7,9 @@ unwrap its ``claude-web/`` folder into a flat zip, copy the helper to %TEMP%
 so it is not locked inside the install dir, record a rollback snapshot
 (``upgrade_manager``), spawn the helper, and exit. The helper waits for every
 ``claude-web`` process to end, overlays the zip onto the install directory
-(``portable-data/``, ``tools/`` and ``.env`` are not in the zip, so they are
-untouched) and relaunches the exe with the original arguments.
+(``portable-data/``, ``tools/`` and ``.env`` are not in the lean zip, so they
+are untouched; the ``-full`` zip with the bundled CLIs is for first installs)
+and relaunches the exe with the original arguments.
 
 Two halves, so the download can happen while chats are live and the swap only
 when they are not:
@@ -124,12 +125,22 @@ def _get_json(url: str):
 
 
 def select_asset(assets: list[dict]) -> dict | None:
-    """The Windows portable zip (``claude-web-<tag>-windows-x64.zip``), or ``None``."""
-    for asset in assets or []:
-        name = str(asset.get("name", "")).lower()
-        if name.endswith(".zip") and "windows" in name:
+    """The Windows portable zip (``claude-web-<tag>-windows-x64.zip``), or ``None``.
+
+    A release also carries a ``-full`` zip with the bundled CLIs for first
+    installs. An update overlays the lean one: ``tools/`` is already on disk
+    and kept current by the tools updater, so re-downloading it would only
+    add a few hundred megabytes to every app update.
+    """
+    windows_zips = [
+        asset for asset in assets or []
+        if str(asset.get("name", "")).lower().endswith(".zip")
+        and "windows" in str(asset.get("name", "")).lower()
+    ]
+    for asset in windows_zips:
+        if "full" not in str(asset.get("name", "")).lower():
             return asset
-    return None
+    return windows_zips[0] if windows_zips else None
 
 
 def check_for_update(
