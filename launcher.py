@@ -51,6 +51,7 @@ from urllib.request import urlopen
 
 import build_info
 import claude_cli
+import portable_tools
 import self_update
 import upgrade_manager
 
@@ -169,20 +170,28 @@ def _configure_portable_data() -> bool:
         os.environ.setdefault(key, str(path))
     os.environ.setdefault("AUTH_MODE", "none")
     os.environ.setdefault("CLAUDE_WEB_UI_MODE", UI_BROWSER)
-    # An optional native Codex executable can travel with the portable copy.
-    codex = _binary_dir() / "tools" / ("codex.exe" if os.name == "nt" else "codex")
-    if codex.is_file():
-        os.environ.setdefault("CLAUDE_WEB_CODEX_BIN", str(codex))
-    # Portable Git must also work when the exe is opened directly, without
-    # a batch launcher setting up Bash and PATH first.
-    git = _binary_dir() / "tools" / "git"
-    bash = git / "bin" / "bash.exe"
-    if sys.platform == "win32" and bash.is_file():
-        os.environ.setdefault("CLAUDE_CODE_GIT_BASH_PATH", str(bash))
-        search_path = os.environ.get("PATH", "").split(os.pathsep)
-        bundled_paths = [str(p) for p in (git / "cmd", git / "usr" / "bin")
-                         if p.is_dir() and str(p) not in search_path]
-        os.environ["PATH"] = os.pathsep.join(bundled_paths + search_path)
+    _configure_bundled_tools()
+    return True
+
+
+def _configure_bundled_tools() -> bool:
+    """Point the process at the CLIs the build carries in ``tools/``.
+
+    portable_tools manages that directory: it points CLAUDE_WEB_CODEX_BIN at
+    the active codex, and Portable Git's Bash and PATH entries at the active
+    Git, so the exe works when opened directly, without a batch launcher
+    setting them up first. Explicit settings for either are left alone. The
+    older flat layouts (tools/codex.exe, a hand-extracted tools/git) still
+    resolve. Runs for every frozen build, with or without portable-data: the
+    tools belong to the install, not to where the data lives.
+    """
+    tools = _binary_dir() / "tools"
+    if not (_is_frozen() or tools.is_dir()):
+        return False
+    os.environ.setdefault(portable_tools.TOOLS_DIR_ENV, str(tools))
+    portable_tools.apply_env("codex", tools)
+    if sys.platform == "win32":
+        portable_tools.apply_env("git", tools)
     return True
 
 
@@ -225,10 +234,17 @@ def _check_claude_cli() -> None:
     a claude.cmd shim the SDK refuses to run. Doesn't block.
     """
     _path, source = claude_cli.find()
-    if source == claude_cli.SYSTEM:
+    if source in (claude_cli.SYSTEM, claude_cli.MANAGED):
         return
     install = "    " + claude_cli.install_instructions() + "\n"
     if source == claude_cli.BUNDLED:
+        if portable_tools.enabled():
+            print(
+                "\nUsing the Claude Code CLI bundled with claude-web for now; a\n"
+                "  newer copy is downloaded into tools/ by the tools updater.",
+                flush=True,
+            )
+            return
         print(
             "\nUsing the Claude Code CLI bundled with claude-web. It doesn't\n"
             "  update itself; to stay current, install Claude Code:\n"
@@ -663,6 +679,8 @@ def _run(argv: list[str] | None) -> int:
     # post-import load would be ignored.
     loaded = _load_dotenv_files()
     portable = _configure_portable_data()
+    if not portable:
+        _configure_bundled_tools()
 
     if portable and os.environ.get("AUTH_MODE") == "none" and not _is_loopback_host(args.host):
         print("Portable mode without authentication binds to 127.0.0.1.", flush=True)

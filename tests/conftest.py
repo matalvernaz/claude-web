@@ -39,6 +39,10 @@ for var in (
     "CODEX_HOME",
     "CLAUDE_WEB_PERSONAL_HOMES_DIR",
     "CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR",
+    # A suite run from inside the portable build inherits its launcher's
+    # tool paths; the tools tests must see a hermetic environment.
+    "CLAUDE_WEB_CODEX_BIN",
+    "CLAUDE_CODE_GIT_BASH_PATH",
     # A session run inside the service inherits its .env; the sign-in tests
     # must not write snapshots into the live debug directory.
     "CLAUDE_WEB_SIGNIN_DEBUG_DIR",
@@ -77,6 +81,9 @@ os.environ["CLAUDE_WEB_CLI_AUTOUPDATE"] = "false"
 os.environ["CLAUDE_WEB_CLI_MODELS_FETCH"] = "false"
 # And the codex CLI updater, which would run npm against the host's install.
 os.environ["CLAUDE_WEB_CODEX_AUTOUPDATE"] = "false"
+# And the portable build's tools updater, which downloads from the vendors.
+os.environ["CLAUDE_WEB_TOOLS_AUTOUPDATE"] = "false"
+os.environ.pop("CLAUDE_WEB_TOOLS_DIR", None)
 # roundtable.core derives DB_PATH from this at import; point it at a temp dir
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.

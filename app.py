@@ -77,6 +77,7 @@ import local_provider
 import conversation_replay
 import build_info
 import self_update
+import portable_tools
 import currency
 import setup_flow
 import auto_signin
@@ -7922,6 +7923,8 @@ async def _install_restart_machinery() -> None:
         asyncio.create_task(_codex_autoupdate_loop())
     if SELF_UPDATE_ENABLED:
         asyncio.create_task(_self_update_loop())
+    if TOOLS_AUTOUPDATE:
+        asyncio.create_task(_tools_autoupdate_loop())
     # SIGUSR1 requests a drain-restart, SIGUSR2 cancels a pending one — the
     # signal-side mirror of POST/DELETE /api/admin/restart, so the host operator
     # can drive both without an OIDC session cookie.
@@ -8420,6 +8423,12 @@ async def _run_codex_update(source: str) -> dict:
         CODEX_UPDATE_STATE.update(status="no_cli", source=source, checked_at=time.time(),
                                   detail="no codex CLI installed")
         return dict(CODEX_UPDATE_STATE)
+    if portable_tools.enabled() and portable_tools.resolve_exe("codex")[0] == Path(binary):
+        # The portable build's copy: _run_tools_update keeps it current.
+        CODEX_UPDATE_STATE.update(
+            status="managed", source=source, checked_at=time.time(),
+            detail="kept current by the portable tools updater")
+        return dict(CODEX_UPDATE_STATE)
     prefix = codex_provider.npm_prefix(binary)
     npm = shutil.which("npm")
     if prefix is None or npm is None:
@@ -8495,6 +8504,173 @@ async def _codex_autoupdate_loop() -> None:
         await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
 
 
+# ─── Bundled tools update (portable Windows build) ───────────────────────────
+# The portable build carries its own codex, Claude Code and Git under tools/
+# (portable_tools.py). None of the updaters above reaches them: `claude update`
+# only knows the machine's own install, the codex updater only npm prefixes,
+# and the app zip deliberately leaves tools/ alone. This loop asks each
+# vendor's release feed on the CLI update cadence and installs a newer version
+# beside the running one: new spawns use it at once, processes in flight keep
+# the files they hold open, and old directories go once nothing uses them.
+TOOLS_AUTOUPDATE = (
+    os.getenv("CLAUDE_WEB_TOOLS_AUTOUPDATE", "true").lower() in ("1", "true", "yes")
+    and portable_tools.enabled()
+)
+TOOLS_MANAGED: tuple[str, ...] = tuple(
+    name.strip()
+    for name in os.getenv("CLAUDE_WEB_TOOLS", ",".join(portable_tools.TOOL_NAMES)).split(",")
+    if name.strip() in portable_tools.TOOL_NAMES
+)
+_TOOLS_UPDATE_BOOT_DELAY_SECONDS = 180.0
+_TOOLS_UPDATE_LOCK = asyncio.Lock()
+# A version that failed validation (the codex app-server schema check) is not
+# downloaded again until a newer one is published.
+_TOOLS_REJECTED: dict[str, str] = {}
+
+
+def _tools_state_blank() -> dict[str, Any]:
+    return {
+        # never | current | fallback | unmanaged | installing | updated | rejected | error
+        "status": "never", "version": None, "source": None, "latest": None,
+        "previous_version": None, "updated_at": None, "checked_at": None, "detail": "",
+    }
+
+
+TOOLS_UPDATE_STATE: dict[str, Any] = {
+    "enabled": TOOLS_AUTOUPDATE,
+    "managed": list(TOOLS_MANAGED),
+    "tools_dir": str(portable_tools.tools_dir()) if portable_tools.enabled() else None,
+    "checked_at": None,
+    "source": None,
+    "tools": {name: _tools_state_blank() for name in portable_tools.TOOL_NAMES},
+}
+
+
+def _tools_update_snapshot() -> dict:
+    out = dict(TOOLS_UPDATE_STATE)
+    out["tools"] = {name: dict(state) for name, state in TOOLS_UPDATE_STATE["tools"].items()}
+    return out
+
+
+def _tools_notify(text: str) -> None:
+    if PUSHOVER_TOKEN and PUSHOVER_USER:
+        asyncio.create_task(asyncio.to_thread(_send_pushover_sync, SITE_TITLE, text))
+
+
+async def _fallback_claude_version() -> tuple[Optional[str], Optional[str]]:
+    """Version and source of the CLI that runs while there is no managed copy."""
+    path, source = claude_cli.find()
+    if not path or source == claude_cli.MANAGED:
+        return None, None
+    return portable_tools.version_string(await _cli_version_line(path)), source
+
+
+def _codex_versions_in_use() -> set[str]:
+    """Managed codex versions some live app-server was started from; their
+    directories must survive cleanup until those servers end."""
+    versions: set[str] = set()
+    for inst in codex_provider.CodexAppServer._instances.values():
+        if inst.alive:
+            version = portable_tools.version_of_path("codex", getattr(inst, "binary", None))
+            if version:
+                versions.add(version)
+    return versions
+
+
+async def _update_one_tool(name: str, source: str) -> dict:
+    """Check one tool and install a newer release; a TOOLS_UPDATE_STATE entry."""
+    state = TOOLS_UPDATE_STATE["tools"][name]
+
+    def finish(status: str, **fields: Any) -> dict:
+        state.update(status=status, checked_at=time.time(), **fields)
+        if status not in ("current", "fallback", "unmanaged"):
+            log.log(logging.INFO if status == "updated" else logging.WARNING,
+                    "tool %s update %s (via %s): %s", name, status, source, state.get("detail"))
+        return dict(state)
+
+    if portable_tools.is_overridden(name):
+        return finish("unmanaged", detail="an explicit setting points outside tools/")
+    try:
+        info = await asyncio.to_thread(portable_tools.check, name)
+    except Exception as exc:  # noqa: BLE001 — a feed outage must not stop the loop
+        return finish("error", detail=f"check failed: {exc}")
+    candidate = info["latest"]
+    state.update(version=info["installed"], source=info["source"], latest=candidate.public())
+    if name == "claude" and info["installed"] is None:
+        # The SDK's bundled copy or a system install may already be current;
+        # a managed copy is only worth its download when it would be newer.
+        fallback_version, fallback_source = await _fallback_claude_version()
+        if fallback_version and not portable_tools.is_newer(candidate.version, fallback_version):
+            return finish("fallback", detail=f"{fallback_source} claude {fallback_version} is current")
+    if not info["due"]:
+        return finish("current", detail="")
+    if _TOOLS_REJECTED.get(name) == candidate.version:
+        return finish("rejected", detail=f"{candidate.label} failed validation earlier; "
+                                         "waiting for a newer release")
+    state.update(status="installing", detail=f"downloading {candidate.label}")
+    try:
+        directory = await asyncio.to_thread(portable_tools.install, name, candidate)
+    except Exception as exc:  # noqa: BLE001 — reported, retried on the next pass
+        _tools_notify(f"{name} {candidate.label} could not be installed: {exc}")
+        return finish("error", detail=f"install failed: {exc}")
+    if name == "codex":
+        exe = directory / portable_tools.EXE_REL["codex"]
+        try:
+            missing = await codex_provider.missing_protocol_methods(str(exe))
+        except Exception as exc:  # noqa: BLE001 — an unreadable schema is a miss
+            missing = [f"(schema check failed: {exc})"]
+        if missing:
+            await asyncio.to_thread(portable_tools.discard, "codex", candidate.version)
+            _TOOLS_REJECTED["codex"] = candidate.version
+            _tools_notify(f"Codex {candidate.label} was not activated: it no longer offers "
+                          f"{', '.join(missing[:5])}.")
+            return finish("rejected", detail=f"{candidate.label} lacks {', '.join(missing)}")
+    previous = info["installed"]
+    portable_tools.activate(name, candidate.version)
+    portable_tools.apply_env(name)
+    now = time.time()
+    if name == "codex":
+        # Idle account servers still run the old binary; retire them so the
+        # next model list and login come from the new one.
+        await _recycle_stale_codex_servers(now)
+    retired: list[str] = []
+    try:
+        retired = portable_tools.retire_legacy(name)
+        # A Git swap mid-turn could pull a DLL from under a running Bash tool.
+        if name != "git" or not _busy_runs():
+            portable_tools.cleanup(name, _codex_versions_in_use() if name == "codex" else None)
+    except Exception as exc:  # noqa: BLE001 — housekeeping only
+        log.warning("tool %s: cleanup after the update failed: %s", name, exc)
+    _tools_notify(f"{name} updated: {previous or 'none'} -> {candidate.version}")
+    return finish("updated", version=candidate.version, source="managed",
+                  previous_version=previous, updated_at=now,
+                  detail=f"retired {', '.join(retired)}" if retired else "")
+
+
+async def _run_tools_update(source: str, names: Optional[tuple[str, ...]] = None) -> dict:
+    """One pass over the managed tools (single-flight). A TOOLS_UPDATE_STATE snapshot."""
+    async with _TOOLS_UPDATE_LOCK:
+        for name in names or TOOLS_MANAGED:
+            try:
+                await _update_one_tool(name, source)
+            except Exception as exc:  # noqa: BLE001 — one tool must not block the others
+                log.exception("tool %s update pass failed", name)
+                TOOLS_UPDATE_STATE["tools"][name].update(
+                    status="error", checked_at=time.time(), detail=str(exc))
+        TOOLS_UPDATE_STATE.update(checked_at=time.time(), source=source)
+    return _tools_update_snapshot()
+
+
+async def _tools_autoupdate_loop() -> None:
+    await asyncio.sleep(_TOOLS_UPDATE_BOOT_DELAY_SECONDS)
+    while True:
+        try:
+            await _run_tools_update("timer")
+        except Exception:
+            log.exception("tools autoupdate pass failed")
+        await asyncio.sleep(CLI_UPDATE_INTERVAL_SECONDS)
+
+
 def _require_cli_update_admin(user: dict) -> None:
     """A CLI update swaps the binary every user's next run spawns, so it is
     instance-wide."""
@@ -8544,6 +8720,30 @@ async def api_app_update_install(user: dict = Depends(auth.require_user)):
             409, "this build cannot update itself; download the release instead")
     return await _run_self_update(
         f"api:{user.get('email') or user.get('sub') or '?'}", install=True)
+
+
+def _require_tools_update_admin(user: dict) -> None:
+    """A tools update changes what every user's next run spawns, so it is
+    instance-wide."""
+    _require_global_config_admin(user, "tools update")
+
+
+@app.get("/api/admin/update-tools")
+async def api_tools_update_status(user: dict = Depends(auth.require_user)):
+    _require_tools_update_admin(user)
+    out = _tools_update_snapshot()
+    out["on_disk"] = portable_tools.status() if portable_tools.enabled() else {}
+    return out
+
+
+@app.post("/api/admin/update-tools")
+async def api_tools_update(user: dict = Depends(auth.require_user)):
+    """Check the vendors now and install whatever is newer."""
+    _require_tools_update_admin(user)
+    if not portable_tools.enabled():
+        raise HTTPException(409, "this build has no managed tools directory")
+    return await _run_tools_update(
+        f"api:{user.get('email') or user.get('sub') or '?'}")
 
 
 # Per-session locks for /api/chat. The SDK only sets run.session_id once it

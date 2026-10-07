@@ -330,6 +330,9 @@ class CodexAppServer:
         self._login_results: dict[str, dict] = {}
         self._login_started_at = 0.0
         self.started_at: Optional[float] = None
+        # The executable this process was spawned from, so a tools update
+        # knows which version directories are still in use.
+        self.binary: Optional[str] = None
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -440,6 +443,7 @@ class CodexAppServer:
         binary = codex_binary()
         if not binary:
             raise CodexError("codex CLI not installed")
+        self.binary = binary
         command = [binary]
         child_env = os.environ.copy()
         for name in SCRUB_ENV_NAMES:

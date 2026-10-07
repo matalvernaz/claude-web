@@ -99,6 +99,7 @@ def test_direct_portable_exe_finds_bundled_git_without_a_batch_launcher(launcher
         (git / name).mkdir(parents=True)
     bash = git / "bin" / "bash.exe"
     bash.write_bytes(b"test executable")
+    (git / "cmd" / "git.exe").write_bytes(b"test executable")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
@@ -330,3 +331,18 @@ def test_utf8_output_tolerates_missing_streams(launcher, monkeypatch) -> None:
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
     launcher._utf8_output()
+
+
+def test_a_frozen_exe_without_portable_data_still_uses_its_bundled_tools(launcher, tmp_path, monkeypatch):
+    """The tools belong to the install, so a copy run with its own ~/.claude
+    (no portable-data folder) spawns them too."""
+    monkeypatch.setattr(os, "environ", {"PATH": "existing-tools"})
+    monkeypatch.setattr(sys, "platform", "win32")
+    codex = tmp_path / "tools" / "codex" / "0.160.1" / "bin" / "codex.exe"
+    codex.parent.mkdir(parents=True)
+    codex.write_bytes(b"exe")
+    (tmp_path / "tools" / "codex" / "current").write_text("0.160.1\n", encoding="utf-8")
+    assert launcher._configure_portable_data() is False  # no portable-data
+    assert launcher._configure_bundled_tools() is True
+    assert os.environ["CLAUDE_WEB_CODEX_BIN"] == str(codex)
+    assert os.environ["CLAUDE_WEB_TOOLS_DIR"] == str(tmp_path / "tools")

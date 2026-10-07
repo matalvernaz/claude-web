@@ -133,10 +133,20 @@ The standalone desktop bundle also supports a portable layout. Create a
 OpenAI accounts, app state, conversations, and a workspace inside that folder.
 Double-clicking opens the app in your default browser, bound to localhost.
 Explicit environment or `.env` settings take precedence. Keep this folder private:
-it contains login credentials. An optional `tools/codex.exe` next to the executable
-enables the OpenAI provider without a separate CLI install.
-If Portable Git is extracted into `tools/git`, the executable also finds its
-Git and Bash tools automatically. No batch launcher is needed.
+it contains login credentials.
+
+Download the `-full` zip from the release page for a first install. Besides the
+app it carries, under `tools/`, the three programs a chat needs, so nothing has
+to be installed on the machine: OpenAI's Codex CLI as the official package
+layout (with the code-mode host every Codex tool call runs through and
+ripgrep), Claude Code's native binary, and Portable Git for the CLI's Bash.
+Each lives in `tools/<name>/<version>/` with a `tools/<name>/current` marker,
+the layout `portable_tools.py` installs at build time and keeps current at run
+time. The lean zip without `tools/` is what the self-updater downloads; a copy
+unzipped from it fetches the three programs on its first update pass instead.
+The earlier hand-made layouts (`tools/codex.exe`, Portable Git extracted into
+`tools/git`) still work and are replaced by managed copies on the first pass.
+No batch launcher is needed.
 
 The Windows build updates itself. Every six hours (and on demand from the
 banner at the top of the chat page) it checks this repo's GitHub releases; a
@@ -151,6 +161,22 @@ start. A copy built by hand from a branch (a `workflow_dispatch` run) updates
 to the first versioned release published after it was built. Set
 `CLAUDE_WEB_SELF_UPDATE=notify` to be asked first, or `off` to disable;
 `claude-web.exe --version` prints what is installed.
+
+The bundled programs update on the same six-hour cadence
+(`CLAUDE_WEB_TOOLS_AUTOUPDATE`, default on; `CLAUDE_WEB_TOOLS` picks a subset
+of `codex,claude,git`). Each vendor's release feed is asked for its newest
+stable version: Codex from the openai/codex GitHub releases (package tarball,
+checked against the release digest and its SHA256SUMS), Claude Code from
+Anthropic's release bucket (checked against the version's manifest), Git from
+the git-for-windows releases. A newer version is unpacked beside the running
+one, checked (the program must report the expected version, and a Codex
+release must still offer every app-server method claude-web uses, else it is
+set aside until the next release), and then pointed at: new conversations
+spawn it at once, running ones keep the files they hold, and old directories
+are removed later. The previous version stays on disk as a manual rollback.
+`GET /api/admin/update-tools` reports the state; `POST` runs a pass now. The
+Agent SDK's bundled Claude CLI remains the fallback and a managed copy is only
+downloaded when it would be newer than whatever would run otherwise.
 
 The same source install works on Windows; the prerequisites are the same (Python 3.11+, Node.js + the `claude` CLI), just expressed in PowerShell. Two Windows-specific notes:
 
@@ -232,6 +258,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `CLAUDE_WEB_FALLBACK_MODEL` | (unset) | Model the CLI retries with when the primary model is overloaded (API 529), e.g. `claude-sonnet-5`. A comma-separated list is tried in order, and the primary is retried at the start of each user turn. Unset = no fallback. |
 | `CLAUDE_WEB_CLI_MODELS_FETCH` | `true` | The model picker is the installed CLI's own `/model` list, read at boot, after each CLI update and every `CLAUDE_WEB_CLI_UPDATE_INTERVAL` seconds, and cached in the state dir. Its `opus` / `fable` / `sonnet` / `haiku` rows always run the newest model of the family. `false` keeps the cached list (or, with none, just those four rows). |
 | `CLAUDE_WEB_SELF_UPDATE` | `auto` | Portable Windows build only: `auto` downloads a newer GitHub release and restarts into it when no conversation is mid-turn, `notify` shows it with an Install button, `off` never checks. `CLAUDE_WEB_SELF_UPDATE_INTERVAL` (default 21600 s) sets the check cadence; `CLAUDE_WEB_SELF_UPDATE_PRERELEASE=true` also offers prereleases. |
+| `CLAUDE_WEB_TOOLS_AUTOUPDATE` | `true` | Portable Windows build only: keep the bundled Codex, Claude Code and Git under `tools/` at their vendors' newest stable releases, checked every `CLAUDE_WEB_CLI_UPDATE_INTERVAL` seconds. `CLAUDE_WEB_TOOLS` (default `codex,claude,git`) limits which are managed; `CLAUDE_WEB_TOOLS_DIR` points a source run at a tools directory. |
 | `CLAUDE_WEB_MAX_BUDGET_USD` | `0` (off) | Hard per-run API-spend ceiling in USD. Only meaningful for API-key credentials — subscription turns report synthetic costs. |
 | `CLAUDE_WEB_PUSHOVER_TOKEN` / `CLAUDE_WEB_PUSHOVER_USER` | (unset) | When both are set, a Pushover notification fires when a turn finishes after running longer than `CLAUDE_WEB_NOTIFY_MIN_SECONDS` (default `120`) — for the walked-away-during-a-long-turn case the in-page earcons can't cover. |
 | `CLAUDE_WEB_FILE_CHECKPOINTS` | `true` | The CLI snapshots files before edits so `/rewind [n]` can restore them to before your nth-last message (only while the conversation's CLI is alive, and only between turns). Set `false` to skip the snapshot overhead. |
@@ -337,7 +364,7 @@ unanswered question forms. Submitting sends the answer to that conversation.
 | `CODEX_HOME` | `$HOME/.codex` | Shared Codex configuration, rollout history, and optional host-level login. Bind-mount this in a container (`./codex-home:/home/claude/.codex`). |
 | `CLAUDE_WEB_CODEX_PERSONAL_HOMES_DIR` | `$HOME/.codex-homes` | Private per-user `auth.json` and Codex SQLite indexes. Bind-mount this too (`./codex-homes:/home/claude/.codex-homes`). |
 | `CLAUDE_WEB_CODEX_SHARED_ACCOUNT_LABEL` | `Shared OpenAI` | Display name for the host-level OpenAI slot. |
-| `CLAUDE_WEB_CODEX_AUTOUPDATE` | `true` | Keep the codex CLI current, since OpenAI only lists its newest models to newer CLIs. Only an npm install under a user-writable `--prefix` is updated; a release that drops an app-server method claude-web uses is rolled back. |
+| `CLAUDE_WEB_CODEX_AUTOUPDATE` | `true` | Keep the codex CLI current, since OpenAI only lists its newest models to newer CLIs. Only an npm install under a user-writable `--prefix` is updated here; the portable Windows build's own copy is handled by `CLAUDE_WEB_TOOLS_AUTOUPDATE`. A release that drops an app-server method claude-web uses is rolled back. |
 
 Codex personal homes link only `sessions/` and user configuration such as `config.toml` and `skills/` back to `CODEX_HOME`. Authentication and SQLite files remain private. On an account change, claude-web interrupts any old writer, terminates that chat's app-server process, and resumes the same thread id under the new account in a fresh process. This avoids both a split chat and the corruption risk of opening one SQLite database through multiple symlink paths.
 
