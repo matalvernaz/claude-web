@@ -24,6 +24,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import time
@@ -183,19 +184,50 @@ except Exception as _rt_exc:  # pragma: no cover — optional dependency
     log.info("roundtable not installed (%s); /roundtable disabled", _rt_exc)
 
 
-_PROJECT_KEY_INVALID_RE = re.compile(r"[\\/:]")
+# Claude Code names a project's transcript directory after the resolved
+# working directory with every character outside ``[A-Za-z0-9]`` replaced by
+# ``-``; ``claude_agent_sdk.project_key_for_directory`` applies the same rule
+# (plus the CLI's hash suffix for over-long paths). The rule used until
+# 2026-10 replaced only ``\\``, ``/`` and ``:``, which agreed with the CLI for
+# ``/workspace`` but not for any path containing a space, dot or underscore —
+# on a Windows install under ``C:\\...\\Claude Web for Windows\\...`` every
+# session lookup missed the directory the CLI had actually written.
+_PROJECT_KEY_INVALID_RE = re.compile(r"[^a-zA-Z0-9]")
+# The pre-2026-10 rule, kept only so _startup_migrate_project_keys can find
+# rows and directories written under it.
+_LEGACY_PROJECT_KEY_RE = re.compile(r"[\\/:]")
+
+try:
+    from claude_agent_sdk import project_key_for_directory as _sdk_project_key
+except ImportError:  # pragma: no cover — SDKs that predate the helper
+    _sdk_project_key = None
+
+
+def _project_key_from_text(resolved: str) -> str:
+    """Sanitise an already-resolved absolute path the way the CLI does."""
+    return _PROJECT_KEY_INVALID_RE.sub("-", resolved)
 
 
 def _sanitize_project_key(cwd: Path) -> str:
-    """Mirror Claude Code's per-project session-dir naming.
+    """Mirror Claude Code's per-project session-dir naming exactly.
 
-    On POSIX the resolved path only contains ``/``, so this collapses to
-    the original ``replace("/", "-")``. On Windows the resolved path has
-    ``\\`` separators and a drive-letter ``:`` — both invalid in NTFS
-    filenames — so we map all three to ``-`` to keep the produced key a
-    valid directory name and match the bundled CLI's own encoding.
+    Delegates to the SDK helper when it exists so the key stays in step with
+    what ``sdk_list_sessions`` (the sidebar) and the bundled CLI use,
+    including the truncate-and-hash rule for very long paths. The local
+    regex is the fallback for SDKs older than the helper.
     """
-    return _PROJECT_KEY_INVALID_RE.sub("-", str(cwd.resolve()))
+    resolved = str(cwd.resolve())
+    if _sdk_project_key is not None:
+        try:
+            return str(_sdk_project_key(resolved))
+        except Exception:  # pragma: no cover — defensive
+            pass
+    return _project_key_from_text(resolved)
+
+
+def _legacy_project_key(cwd: Path) -> str:
+    """The key the pre-2026-10 sanitiser produced for ``cwd``."""
+    return _LEGACY_PROJECT_KEY_RE.sub("-", str(cwd.resolve()))
 
 
 CLAUDE_HOME = Path(os.getenv("CLAUDE_HOME", str(Path.home() / ".claude"))).resolve()
@@ -5309,6 +5341,29 @@ def _credential_home_path(user_sub: str, cred_id: int) -> Path:
     return PERSONAL_HOMES_DIR / _safe_sub(user_sub) / str(cred_id)
 
 
+def _ensure_shared_projects_dir() -> Optional[Path]:
+    """Create ``CLAUDE_HOME/projects`` so credential homes can link to it.
+
+    Returns the directory, or None when it is a symlink (the same
+    planted-link guard ``_ensure_credential_home`` applies: an attacker-
+    controlled link must never become the store every credential shares) or
+    cannot be created.
+    """
+    shared = CLAUDE_HOME / "projects"
+    if shared.is_symlink():
+        log.warning(
+            "shared projects dir %s is a symlink; refusing to use it as the "
+            "transcript store", shared,
+        )
+        return None
+    try:
+        shared.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create shared projects dir %s: %s", shared, e)
+        return None
+    return shared
+
+
 def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     """Create or refresh the per-credential CLAUDE_CONFIG_DIR.
 
@@ -5319,6 +5374,17 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     slot is active.
 
     Idempotent.
+
+    ``projects/`` is the one entry that must exist in the mirror: the CLI only
+    creates it when it first writes a transcript, and on an install whose
+    first run already happens under a credential home (the portable desktop
+    build signs a named account in before any shared-slot chat) it would be
+    missing from CLAUDE_HOME at mirror time. The CLI then creates a private
+    ``projects`` inside the credential home, the sidebar (which reads the
+    shared directory) shows nothing, and resuming under another credential
+    fails with "No conversation found with session ID". So the shared
+    directory is created up front; ``_startup_share_credential_projects``
+    repairs homes created before this guarantee existed.
 
     Symlink-attack hardening: a malicious entry in CLAUDE_HOME could be a
     symlink pointing into another user's per-user home dir. If we followed it
@@ -5333,6 +5399,7 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     """
     home = _credential_home_path(user_sub, cred_id)
     home.mkdir(parents=True, exist_ok=True)
+    _ensure_shared_projects_dir()
     try:
         entries = list(CLAUDE_HOME.iterdir())
     except FileNotFoundError:
@@ -18332,5 +18399,218 @@ def _startup_migrate_personal_homes() -> None:
             )
 
 
+def _is_link(path: Path) -> bool:
+    """True for symlinks and, on Windows, NTFS junctions.
+
+    ``Path.is_symlink`` is False for the junctions ``_link_or_copy`` falls
+    back to when symlinks need Developer Mode, and ``os.path.isjunction``
+    only exists from Python 3.12, so older interpreters check the
+    reparse-point attribute directly.
+    """
+    if path.is_symlink():
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    if IS_WINDOWS:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        return bool(
+            getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    return False
+
+
+def _remove_link(path: Path) -> None:
+    """Delete a symlink or junction without touching what it points at."""
+    try:
+        path.unlink()
+    except OSError:
+        # A directory junction on some Windows/Python combinations needs
+        # rmdir; it still removes only the link, never the target.
+        os.rmdir(path)
+
+
+def _merge_dir_into(src: Path, dest: Path) -> int:
+    """Move every entry of ``src`` into ``dest`` (created if missing).
+
+    Same-named directories merge recursively; an entry whose name already
+    exists in ``dest`` as a file stays behind and is logged, so nothing is
+    ever overwritten. Returns how many entries were left in ``src``.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    left = 0
+    for entry in sorted(src.iterdir()):
+        target = dest / entry.name
+        if (
+            entry.is_dir() and not _is_link(entry)
+            and target.is_dir() and not _is_link(target)
+        ):
+            remaining = _merge_dir_into(entry, target)
+            if remaining:
+                left += remaining
+                continue
+            try:
+                entry.rmdir()
+            except OSError as e:
+                log.warning("merge: could not remove emptied %s: %s", entry, e)
+                left += 1
+            continue
+        if target.exists() or _is_link(target):
+            log.warning(
+                "merge: %s already exists in %s; leaving %s in place",
+                entry.name, dest, entry,
+            )
+            left += 1
+            continue
+        try:
+            shutil.move(str(entry), str(target))
+        except OSError as e:
+            log.warning("merge: moving %s → %s failed: %s", entry, target, e)
+            left += 1
+    return left
+
+
+def _startup_share_credential_projects() -> None:
+    """Point every credential home's ``projects/`` at the shared store.
+
+    ``_ensure_credential_home`` mirrors whatever CLAUDE_HOME holds when a
+    credential home is first created. On an install whose first chat ran
+    under a credential home, ``CLAUDE_HOME/projects`` did not exist yet, so
+    nothing was linked and the CLI created a private ``projects`` directory
+    per credential: the sidebar (which lists the shared directory) showed
+    nothing and a resume under another credential failed with "No
+    conversation found with session ID". ``_ensure_shared_projects_dir`` now
+    prevents that for new homes; this repairs existing ones.
+
+    Runs at import time, before any CLI child exists, so moving transcripts
+    is safe. Each private directory is merged into the shared store (never
+    overwriting) and replaced by a link. Idempotent and best-effort: a
+    directory that cannot be emptied is left unlinked for operator review
+    and retried on the next start.
+    """
+    if not PERSONAL_HOMES_DIR.is_dir():
+        return
+    shared = _ensure_shared_projects_dir()
+    if shared is None:
+        return
+    try:
+        subs = [p for p in PERSONAL_HOMES_DIR.iterdir() if p.is_dir() and not _is_link(p)]
+    except OSError as e:
+        log.warning("startup: cannot list %s: %s", PERSONAL_HOMES_DIR, e)
+        return
+    for sub_dir in subs:
+        try:
+            homes = [p for p in sub_dir.iterdir() if p.is_dir() and not _is_link(p)]
+        except OSError:
+            continue
+        for home in homes:
+            private = home / "projects"
+            if _is_link(private):
+                continue
+            if private.is_dir():
+                left = _merge_dir_into(private, shared)
+                if left:
+                    log.warning(
+                        "startup: %s still holds %d entries that could not be "
+                        "merged into %s; leaving it unlinked for operator review",
+                        private, left, shared,
+                    )
+                    continue
+                try:
+                    private.rmdir()
+                except OSError as e:
+                    log.warning("startup: could not remove emptied %s: %s", private, e)
+                    continue
+                log.info("startup: merged private transcripts %s into %s", private, shared)
+            elif private.exists():
+                log.warning("startup: %s is not a directory; leaving it alone", private)
+                continue
+            _link_or_copy(shared.absolute(), private)
+            if _is_link(private):
+                log.info("startup: linked %s → %s", private, shared)
+
+
+# Every table that stores a project key. Keep in step with _state_db().
+_PROJECT_KEY_TABLES = (
+    "runs",
+    "session_owners",
+    "codex_session",
+    "conversation",
+    "conversation_binding",
+    "roundtable_thread_project",
+)
+
+
+def _startup_migrate_project_keys() -> None:
+    """Rewrite project keys produced by the pre-2026-10 sanitiser.
+
+    That rule replaced only ``\\``, ``/`` and ``:``, so for a project path
+    with a space (or any other non-alphanumeric character) the app's key and
+    the CLI's directory name disagreed. Rows in every ``project_key`` column
+    move to the CLI-compatible key, and a transcript directory the app itself
+    wrote under the old key (forged handoff sessions, or an alias link an
+    operator planted to bridge the mismatch) is folded into the CLI's
+    directory. Paths whose key is identical under both rules — ``/workspace``
+    → ``-workspace`` — make this a no-op.
+    """
+    for project in PROJECTS:
+        try:
+            legacy = _legacy_project_key(project)
+            new = _sanitize_project_key(project)
+        except OSError:
+            continue
+        if legacy == new:
+            continue
+        try:
+            conn = _state_db()
+        except Exception as e:
+            log.warning("startup: project-key migration skipped (no state db): %s", e)
+            conn = None
+        if conn is not None:
+            for table in _PROJECT_KEY_TABLES:
+                try:
+                    cur = conn.execute(
+                        f"UPDATE {table} SET project_key=? WHERE project_key=?",
+                        (new, legacy),
+                    )
+                except sqlite3.Error as e:
+                    log.warning(
+                        "startup: project-key migration failed for %s: %s", table, e,
+                    )
+                    continue
+                if cur.rowcount:
+                    log.info(
+                        "startup: project-key migration: %d %s rows %r → %r",
+                        cur.rowcount, table, legacy, new,
+                    )
+        legacy_dir = CLAUDE_HOME / "projects" / legacy
+        new_dir = CLAUDE_HOME / "projects" / new
+        if _is_link(legacy_dir):
+            try:
+                _remove_link(legacy_dir)
+                log.info("startup: removed legacy project-key link %s", legacy_dir)
+            except OSError as e:
+                log.warning("startup: could not remove %s: %s", legacy_dir, e)
+        elif legacy_dir.is_dir():
+            left = _merge_dir_into(legacy_dir, new_dir)
+            if left:
+                log.warning(
+                    "startup: %s still holds %d entries that could not be merged "
+                    "into %s; leaving it for operator review", legacy_dir, left, new_dir,
+                )
+                continue
+            try:
+                legacy_dir.rmdir()
+            except OSError as e:
+                log.warning("startup: could not remove emptied %s: %s", legacy_dir, e)
+                continue
+            log.info("startup: merged legacy project dir %s into %s", legacy_dir, new_dir)
+
+
 _startup_init_state_db()
 _startup_migrate_personal_homes()
+_startup_share_credential_projects()
+_startup_migrate_project_keys()
