@@ -41,6 +41,7 @@
   const verifyReview = document.getElementById("verify-review");
 
   // ── Advanced elements (lazy-bound below) ────────────────────────
+  const threadFilter = document.getElementById("thread-filter");
   const showClosed = document.getElementById("show-closed");
   const listEl = document.getElementById("thread-list");
   const listStatus = document.getElementById("thread-list-status");
@@ -137,7 +138,11 @@
 
   // ── Mode toggle ─────────────────────────────────────────────────
   toggleAdvanced.addEventListener("click", () => {
-    const advanced = body.classList.toggle("mode-advanced");
+    setAdvanced(!body.classList.contains("mode-advanced"));
+  });
+
+  function setAdvanced(advanced) {
+    body.classList.toggle("mode-advanced", advanced);
     body.classList.toggle("mode-assistant", !advanced);
     toggleAdvanced.setAttribute("aria-pressed", String(advanced));
     document.getElementById("assistant-pane").hidden = advanced;
@@ -157,7 +162,7 @@
         adoptAdvancedThread(currentThreadId);
       }
     }
-  });
+  }
 
   // Pull a thread's history into the assistant view as user + synth
   // pairs. The full panel debate isn't replayed (that's what the
@@ -1222,7 +1227,7 @@
 
     const params = new URLSearchParams();
     params.set("open_only", showClosed.checked ? "false" : "true");
-    if (projectFilter.value) params.set("project", projectFilter.value);
+    if (threadFilter && threadFilter.value) params.set("project", threadFilter.value);
 
     let payload;
     try {
@@ -1501,10 +1506,17 @@
   }
 
   if (showClosed) showClosed.addEventListener("change", loadThreads);
-  // Project filter affects assistant context AND advanced thread list.
-  projectFilter.addEventListener("change", () => {
-    if (body.classList.contains("mode-advanced")) loadThreads();
-  });
+  // The browser has its own filter; the project context above it only
+  // decides which repository the assistant's panel reads.
+  if (threadFilter) threadFilter.addEventListener("change", loadThreads);
+
+  // /roundtable?thread=N opens that thread in the advanced view, so a chat
+  // or a bookmark can link straight to a panel run.
+  const linkedThread = Number(new URLSearchParams(location.search).get("thread"));
+  if (Number.isInteger(linkedThread) && linkedThread > 0 && listEl) {
+    setAdvanced(true);
+    selectThread(linkedThread);
+  }
 
   // A panel run survives tab close server-side. If this page load follows
   // one, rejoin it: full replay then live tail into a fresh shell.

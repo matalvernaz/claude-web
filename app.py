@@ -17282,6 +17282,11 @@ def _roundtable_threads_for_project(project_key: str) -> set[int]:
     return {int(r[0]) for r in rows}
 
 
+# The thread list filters in Python and applies its own limit afterwards, so it
+# asks roundtable_list for every thread. Far above any real store's count.
+_ROUNDTABLE_LIST_ALL = 1_000_000
+
+
 def _resolve_project_path(project_key: str) -> Path:
     """Map a project_key to its absolute Path.
 
@@ -17393,11 +17398,22 @@ async def api_roundtable_threads(
     """
     rt = _require_roundtable()
     limit = max(1, min(int(limit), 500))
+    # Every thread first, then the filters, THEN the limit. Limiting first
+    # kept only the newest ``limit`` threads overall, so a filter matching
+    # older ones came back empty: a project's threads vanished once enough
+    # newer MCP-created (unbound) threads existed. The whole list is a few
+    # hundred rows and one bindings query, so scanning it all is cheap.
     threads = await asyncio.to_thread(
-        rt.roundtable_list, open_only=open_only, limit=limit,
+        rt.roundtable_list, open_only=open_only, limit=_ROUNDTABLE_LIST_ALL,
     )
+    bindings = {
+        int(row[0]): (row[1], row[2])
+        for row in _state_db().execute(
+            "SELECT thread_id, project_key, created_by FROM roundtable_thread_project"
+        ).fetchall()
+    }
     bound_map: dict[int, Optional[str]] = {
-        int(t["thread_id"]): _roundtable_get_project(int(t["thread_id"]))
+        int(t["thread_id"]): bindings.get(int(t["thread_id"]), (None, None))[0]
         for t in threads
     }
     # Hide threads owned by other users. A bound thread with a non-NULL
@@ -17409,7 +17425,7 @@ async def api_roundtable_threads(
     sub = user.get("sub")
     admin = _is_roundtable_admin(user)
     owner_map: dict[int, Optional[str]] = {
-        int(t["thread_id"]): _roundtable_thread_owner(int(t["thread_id"]))
+        int(t["thread_id"]): bindings.get(int(t["thread_id"]), (None, None))[1]
         for t in threads
     }
     threads = [
@@ -17421,6 +17437,7 @@ async def api_roundtable_threads(
             threads = [t for t in threads if bound_map[int(t["thread_id"])] is None]
         else:
             threads = [t for t in threads if bound_map[int(t["thread_id"])] == project]
+    threads = threads[:limit]
 
     out = []
     for t in threads:

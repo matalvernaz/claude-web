@@ -6,7 +6,7 @@ import os
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from jinja2 import Environment, FileSystemLoader
@@ -815,3 +815,110 @@ def test_usage_dialog_says_when_a_token_accounts_model_limits_stop(ui):
     playwright.expect(live).to_contain_text("57%")
     playwright.expect(live).to_contain_text("four-week sign-in, which ends")
     playwright.expect(live).to_contain_text("Nov")
+
+
+RT_THREADS = [
+    {"thread_id": 344, "topic": "Started by Claude over MCP", "project_key": None,
+     "participants": ["gpt-5"], "messages": 3, "open": True,
+     "created_at": "2026-10-09T17:09:29+00:00", "last_activity": "2026-10-09T17:20:00+00:00",
+     "closed_at": None},
+    {"thread_id": 31, "topic": "Asked from the panel page", "project_key": "-home-test",
+     "participants": ["gemini-pro"], "messages": 2, "open": True,
+     "created_at": "2026-05-22T15:38:52+00:00", "last_activity": "2026-05-22T15:40:00+00:00",
+     "closed_at": None},
+]
+
+
+def _roundtable_page(browser, path="/roundtable"):
+    """Serve the roundtable page with a mocked thread API. Each list request's
+    query string lands in ``state["list_queries"]``."""
+    context = browser.new_context()
+    page = context.new_page()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    state = {"list_queries": [], "errors": errors}
+    html = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("roundtable.html").render(
+        site_title="Test", asset_version=lambda _: "test", user={"sub": "anonymous"},
+        available=True, default_project="-home-test",
+        projects=[{"key": "-home-test", "path": "/home/test", "name": "test"},
+                  {"key": "-home-test-app", "path": "/home/test/app", "name": "app"}],
+        participants=[], participants_json="[]", coding_profiles=[],
+        manifest_bg_color="#000000", manifest_short_name="Test",
+    )
+
+    def route(request_route):
+        url = urlparse(request_route.request.url)
+        if url.path == "/roundtable":
+            request_route.fulfill(content_type="text/html", body=html)
+        elif url.path.startswith("/static/"):
+            asset = ROOT / url.path.lstrip("/")
+            request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
+        elif url.path == "/api/roundtable/threads":
+            query = parse_qs(url.query)
+            state["list_queries"].append(query)
+            project = query.get("project", [""])[0]
+            request_route.fulfill(json={"threads": [
+                t for t in RT_THREADS
+                if not project or t["project_key"] == (None if project == "__unbound__" else project)
+            ]})
+        elif url.path.startswith("/api/roundtable/threads/"):
+            thread = next(t for t in RT_THREADS if t["thread_id"] == int(url.path.rsplit("/", 1)[1]))
+            request_route.fulfill(json={"thread": thread, "usage": {}, "messages": [
+                {"idx": 0, "speaker": "GPT Sol", "content": "Panel reply", "ts": thread["last_activity"]},
+            ]})
+        else:
+            request_route.fulfill(json={})
+
+    page.route("**/*", route)
+    page.goto("http://roundtable-ui.test" + path)
+    return context, page, state
+
+
+def test_roundtable_thread_browser_lists_threads_the_ai_started(browser):
+    context, page, state = _roundtable_page(browser)
+    try:
+        page.get_by_role("button", name="Advanced view").click()
+        threads = page.locator("#thread-list")
+        playwright.expect(threads).to_contain_text("Started by Claude over MCP")
+        playwright.expect(threads).to_contain_text("Asked from the panel page")
+        assert "project" not in state["list_queries"][-1]
+        assert state["errors"] == []
+    finally:
+        context.close()
+
+
+def test_roundtable_thread_filter_is_separate_from_the_project_context(browser):
+    context, page, state = _roundtable_page(browser)
+    try:
+        page.get_by_role("button", name="Advanced view").click()
+        threads = page.locator("#thread-list")
+        playwright.expect(threads).to_contain_text("Started by Claude over MCP")
+        page.get_by_label("Show threads").select_option(label="Not tied to a project")
+        playwright.expect(threads).not_to_contain_text("Asked from the panel page")
+        playwright.expect(threads).to_contain_text("Started by Claude over MCP")
+        assert state["list_queries"][-1]["project"] == ["__unbound__"]
+        page.get_by_label("Show threads").select_option(label="test")
+        playwright.expect(threads).not_to_contain_text("Started by Claude over MCP")
+        assert state["list_queries"][-1]["project"] == ["-home-test"]
+        # The assistant's project context is its own control: changing it
+        # neither refetches nor refilters the browser.
+        queries = len(state["list_queries"])
+        page.locator("#project-filter").select_option("")
+        page.wait_for_timeout(300)
+        assert len(state["list_queries"]) == queries
+        assert page.locator("#thread-filter").input_value() == "-home-test"
+        assert state["errors"] == []
+    finally:
+        context.close()
+
+
+def test_roundtable_link_to_a_thread_opens_it(browser):
+    context, page, state = _roundtable_page(browser, "/roundtable?thread=344")
+    try:
+        playwright.expect(page.locator("#advanced-pane")).to_be_visible()
+        playwright.expect(page.locator("#thread-detail-topic")).to_have_text("Started by Claude over MCP")
+        playwright.expect(page.locator("#thread-messages")).to_contain_text("Panel reply")
+        playwright.expect(page.get_by_role("button", name="Advanced view")).to_have_attribute("aria-pressed", "true")
+        assert state["errors"] == []
+    finally:
+        context.close()
