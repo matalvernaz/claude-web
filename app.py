@@ -7424,7 +7424,8 @@ async def _panel_round_task(
     replies: list[dict] = []
     errors: list[dict] = []
     reviewed: Optional[dict] = None
-    state = _panel_load(sid) or panel.PanelState(enabled=True)
+    start = _panel_load(sid) or panel.PanelState(enabled=True)
+    thread_id = start.thread_id
     try:
         if decide_only:
             outcome = "changes"
@@ -7434,20 +7435,21 @@ async def _panel_round_task(
                        "error": "No roundtable participant is configured and available."}]
         else:
             def _on_thread(tid: int) -> None:
+                nonlocal thread_id
+                thread_id = tid
                 _roundtable_set_project(
                     tid, run.project_key or "", run.owner_sub or "anonymous",
                 )
 
             result = await panel.run_round(
                 roundtable_core, stage=stage, repo=root, message=message,
-                notes=notes, thread_id=state.thread_id,
+                notes=notes, thread_id=start.thread_id,
                 participants=participants, round_no=round_no,
-                max_rounds=panel.MAX_ROUNDS, plan_reviewed=state.plan_ok,
+                max_rounds=panel.MAX_ROUNDS, plan_reviewed=start.plan_ok,
                 user_label=user_label, topic=_panel_topic(message),
                 emit=lambda event: _panel_emit(sid, event), on_thread=_on_thread,
             )
-            state = _panel_load(sid) or state
-            state.thread_id = result.thread_id
+            thread_id = result.thread_id
             replies, errors, reviewed = result.replies, result.errors, result.reviewed_state
             outcome = result.outcome
         if outcome == "changes" and (decide_only or round_no >= panel.MAX_ROUNDS):
@@ -7459,8 +7461,12 @@ async def _panel_round_task(
         outcome = "unavailable"
         errors = errors + [{"participant": "", "label": "The panel",
                             "error": f"{type(exc).__name__}: {exc}"}]
-        state = _panel_load(sid) or state
     try:
+        # Read the record afresh: a round plus the user's decision can take
+        # minutes, and saving the copy read at the start would undo anything
+        # that changed meanwhile, the switch included.
+        state = _panel_load(sid) or start
+        state.thread_id = thread_id
         if outcome in ("approved", "unavailable", "go_ahead"):
             await _panel_approve(state, stage, root, reviewed)
         elif outcome == "more_rounds":

@@ -383,3 +383,26 @@ def test_a_reopened_chat_shows_the_panel_as_the_panel(tmp_path, monkeypatch):
     assert msgs[1]["name"] == panel.TOOL_NAME
     assert msgs[1]["input"]["message"] == "My plan, in full."
     assert msgs[3]["role"] == "panel_result"
+
+
+async def test_switching_off_while_the_user_decides_is_not_undone(chat, repo, monkeypatch):
+    run, events, _ = chat
+    monkeypatch.setattr(panel, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(app_module, "roundtable_core", FakeCore([OBJECT]))
+    await _review(run, stage="plan", repo=str(repo), message="Plan.")
+    for _ in range(200):
+        card = next((e for e in events if e["type"] == "question_request"), None)
+        if card:
+            break
+        await asyncio.sleep(0.02)
+    assert card is not None
+    # The user turns panel review off while the card waits, then answers it.
+    app_module._panel_set_enabled(run.session_id, run.owner_sub, False)
+    question = card["questions"][0]["question"]
+    app_module.PENDING[card["id"]]["future"].set_result(
+        {"decision": "answer", "payload": {"answers": {question: "Go ahead anyway"}}},
+    )
+    await _finish_round(run)
+    state = app_module._panel_load(run.session_id)
+    assert state.enabled is False
+    assert state.plan_ok is True and state.thread_id == 77
