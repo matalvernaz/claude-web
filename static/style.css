@@ -905,6 +905,17 @@ details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
   border-style: dashed;
   opacity: 0.85;
 }
+/* Panel review turns: the reviewers' side of the argument, set apart from
+   Claude's own replies; Claude's message to the panel is dashed. */
+.msg.panel {
+  border: 1px solid #9ece6a;
+  background: rgba(158, 206, 106, 0.07);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  max-width: none;
+}
+.msg.panel .role { color: #9ece6a; }
+.msg.panel.panel-submission { border-style: dashed; }
 .permission-timeout-note {
   margin: 0.5rem 0 0;
   font-size: 0.85rem;

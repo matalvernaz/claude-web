@@ -14,6 +14,8 @@
   const modelSelect = document.getElementById("model-select");
   const advisorToggle = document.getElementById("advisor-toggle");
   const advisorToggleLabel = document.getElementById("advisor-toggle-label");
+  const panelToggle = document.getElementById("panel-toggle");
+  const panelToggleLabel = document.getElementById("panel-toggle-label");
   const providerSelect = document.getElementById("provider-select");
   const providerSelectLabel = document.getElementById("provider-select-label");
   const providerStatus = document.getElementById("provider-status");
@@ -71,6 +73,10 @@
   }
   // The advisor is Claude-only, so it needs no per-provider suffix.
   const ADVISOR_KEY = "claude-web.advisor";
+  // Panel review (panel.py): this key is only the default for a new chat; an
+  // existing chat's own setting comes from the server.
+  const PANEL_KEY = "claude-web.panel";
+  const PANEL_TOOL = "mcp__panel__review";
   // Picker values retired when the advisor became its own checkbox. A browser
   // that has one saved is migrated in place on load, so the pick survives
   // instead of silently falling back to Default (the restore below drops any
@@ -985,6 +991,48 @@
     });
   }
 
+  // Panel review: shown where the provider has it (Claude, with the roundtable
+  // set up). ``chatState`` is the open chat's own setting when known; a new
+  // chat starts from the last choice made.
+  function syncPanelControl(chatState) {
+    if (!panelToggle || !panelToggleLabel) return;
+    const ok = !!providerCapabilities().panel;
+    panelToggleLabel.hidden = !ok;
+    if (!ok) {
+      panelToggle.checked = false;
+      return;
+    }
+    if (typeof chatState === "boolean") {
+      panelToggle.checked = chatState;
+    } else if (!sessionId) {
+      panelToggle.checked = safeGet(localStorage, PANEL_KEY) === "1";
+    }
+  }
+
+  if (panelToggle) {
+    panelToggle.addEventListener("change", async () => {
+      const on = panelToggle.checked;
+      safeSet(localStorage, PANEL_KEY, on ? "1" : "");
+      if (!sessionId) {
+        announce(on
+          ? "Panel review on. It starts with this chat's first message."
+          : "Panel review off.");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("session_id", sessionId);
+      fd.append("enabled", on ? "1" : "");
+      try {
+        const r = await fetch("/api/chat/panel", { method: "POST", body: fd });
+        if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+        announce(on ? "Panel review on for this chat." : "Panel review off for this chat.");
+      } catch (e) {
+        panelToggle.checked = !on;
+        announce("Could not change panel review. " + e.message);
+      }
+    });
+  }
+
   function rebuildEffortOptions() {
     if (!effortSelect) return;
     const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
@@ -1048,6 +1096,7 @@
     rebuildModelOptions(provider);
     rebuildEffortOptions();
     syncAdvisorControl();
+    syncPanelControl();
     renderContextMeter();
     syncProviderAvailability();
   }
@@ -1679,6 +1728,8 @@
         [...projectSelect.options].some((o) => o.value === sessionProject)) {
       projectSelect.value = sessionProject;
     }
+    syncPanelControl(!!(data.panel && data.panel.enabled));
+    resetPanelWaiting();
     // Per-session token state belongs to the previous chat — clearing
     // these prevents the context meter from reflecting the wrong session.
     lastInputTokens = null;
@@ -1689,11 +1740,24 @@
     // Switching sessions: any prior run's dedup state belongs to a different
     // conversation now and shouldn't influence rendering of the new one.
     renderedIdxByRun.clear();
+    // The panel tool's own result is just "sent to the panel"; the panel's
+    // answer follows as a panel_result, so the short line is skipped.
+    let skipPanelAck = false;
     for (const m of data.messages) {
+      if (m.role === "tool_result" && skipPanelAck && !m.is_error) {
+        skipPanelAck = false;
+        continue;
+      }
+      skipPanelAck = false;
       if (m.role === "user") {
         const body = appendMessage("user", m.text || "");
         if (m.image_count) appendImagePlaceholder(body, m.image_count);
         if (m.file_count) appendFilePlaceholder(body, m.file_count);
+      } else if (m.role === "panel_result") {
+        renderPanelResult(m.text || "");
+      } else if (m.role === "tool_use" && m.name === PANEL_TOOL) {
+        renderPanelSubmission(m.input || {});
+        skipPanelAck = true;
       } else if (m.role === "assistant") {
         appendMessage("assistant", m.text);
       } else if (m.role === "async_question") {
@@ -1796,6 +1860,112 @@
       rawByBody.delete(ctx.partialBody);
       (ctx.partialBody.closest("article") || ctx.partialBody).remove();
       ctx.partialBody = null;
+    }
+  }
+
+  // ─── Panel review in the transcript ─────────────────────────────────────
+  // Each panel turn is its own article with an h3, so H-key navigation steps
+  // through the argument: Claude's message to the panel, each reviewer's
+  // reply, the verdict. Reviewer text is AI output, so it goes through
+  // renderMarkdown's sanitiser like Claude's own.
+  const PANEL_VERDICT_WORDS = {
+    approve: "approves", changes: "wants changes", unclear: "no clear verdict",
+    error: "couldn't answer",
+  };
+  // Who the panel is still waiting on, for the status line between turns.
+  let panelWaiting = "";
+  let panelPending = new Set();
+
+  function resetPanelWaiting() {
+    panelWaiting = "";
+    panelPending = new Set();
+  }
+
+  function joinNames(names) {
+    const list = names.filter(Boolean);
+    if (list.length <= 1) return list.join("");
+    return list.slice(0, -1).join(", ") + " and " + list[list.length - 1];
+  }
+
+  function panelArticle(heading, extraClass) {
+    const article = document.createElement("article");
+    article.className = "msg panel" + (extraClass ? " " + extraClass : "");
+    const header = document.createElement("div");
+    header.className = "msg-header";
+    const h = document.createElement("h3");
+    h.className = "role";
+    h.textContent = heading;
+    header.appendChild(h);
+    article.appendChild(header);
+    transcript.appendChild(article);
+    return article;
+  }
+
+  function panelText(article, text) {
+    const p = document.createElement("p");
+    p.className = "info-body";
+    p.textContent = text;
+    article.appendChild(p);
+  }
+
+  function panelMarkdown(article, markdown) {
+    const body = document.createElement("div");
+    body.className = "body";
+    body.innerHTML = renderMarkdown(markdown);
+    rawByBody.set(body, markdown || "");
+    article.appendChild(body);
+  }
+
+  function panelThreadLink(article, threadId) {
+    if (!threadId) return;
+    const p = document.createElement("p");
+    const a = document.createElement("a");
+    a.href = `/roundtable?thread=${encodeURIComponent(threadId)}`;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "Open the full panel thread (new tab)";
+    p.appendChild(a);
+    article.appendChild(p);
+  }
+
+  function renderPanelSubmission(input) {
+    const stage = input.stage === "changes" ? "changes" : "plan";
+    const article = panelArticle(`Claude to the panel: ${stage}`, "panel-submission");
+    panelMarkdown(article, input.message || "");
+    maybeAutoScroll();
+  }
+
+  // A reopened chat's copy of the panel's answer, as Claude received it.
+  function renderPanelResult(text) {
+    const lines = text.split("\n");
+    if (lines.length && lines[0].startsWith("[Review panel]")) lines.shift();
+    const article = panelArticle("Review panel", "panel-result");
+    panelMarkdown(article, lines.join("\n").trim());
+  }
+
+  function panelVerdictText(obj) {
+    const stage = obj.stage === "changes" ? "changes" : "plan";
+    const errors = Array.isArray(obj.errors) && obj.errors.length
+      ? ` (${joinNames(obj.errors)} couldn't answer.)` : "";
+    switch (obj.outcome) {
+      case "approved":
+        return (stage === "plan"
+          ? "Approved. Claude is making the changes."
+          : "Approved. Claude can commit them.") + errors;
+      case "changes":
+        return "They want changes. Claude is working through their points." + errors;
+      case "unavailable":
+        return "Nobody on the panel could answer, so it stepped aside and Claude carries on." + errors;
+      case "go_ahead":
+        return "You decided to go ahead. Claude is carrying on.";
+      case "more_rounds":
+        return "You gave them more rounds. Claude is answering their points.";
+      case "stop":
+        return "You told Claude to stop. It'll wait for you.";
+      case "undecided":
+        return "No decision yet. Claude will wait; tell it what you want.";
+      default:
+        return String(obj.outcome || "");
     }
   }
 
@@ -2165,6 +2335,8 @@
     markActive("");
     stopGerunds();
     setStatus("");
+    resetPanelWaiting();
+    syncPanelControl();
     // Drop the per-run dedup state so a long-lived tab doesn't accumulate
     // a Map entry per chat. Run ids are random UUIDs, so once a chat is
     // closed the entry is just dead weight.
@@ -2763,6 +2935,12 @@
       if (wantAdvisor && providerCapabilities(provider).advisor) {
         fd.append("advisor", "1");
       }
+      // Panel review: a new chat takes the checkbox; for an existing one it
+      // matches what the server already holds, since loading the chat set it.
+      if (panelToggle && panelToggleLabel && !panelToggleLabel.hidden
+          && providerCapabilities(provider).panel) {
+        fd.append("panel", panelToggle.checked ? "1" : "0");
+      }
       // Both backends resolve their advertised permission-mode subset
       // server-side. Include the persisted picker value on the first turn so
       // Codex does not silently start in "default" while displaying bypass.
@@ -3086,6 +3264,9 @@
     if (advisorToggle && typeof info.advisor === "boolean") {
       advisorToggle.checked = info.advisor;
       safeSet(localStorage, ADVISOR_KEY, info.advisor ? "1" : "");
+    }
+    if (info.panel && typeof info.panel.enabled === "boolean") {
+      syncPanelControl(info.panel.enabled);
     }
     // Incremental resume: if we still hold this run's high-watermark (the
     // highest _idx already rendered), resume from watermark+1 and keep the
@@ -3536,7 +3717,9 @@
           // Subsequent text blocks should land in a new assistant article
           // *after* this tool call, not into the one above it.
           ctx.currentAssistantBody = null;
-          if (blk.name === "Edit" || blk.name === "Write") {
+          if (blk.name === PANEL_TOOL) {
+            renderPanelSubmission(blk.input || {});
+          } else if (blk.name === "Edit" || blk.name === "Write") {
             insertDiffMessage(blk.name, blk.input || {});
           } else {
             insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
@@ -3569,6 +3752,13 @@
         if (blk.type === "tool_result") {
           const txt = typeof blk.content === "string" ? blk.content : JSON.stringify(blk.content);
           const prefix = blk.is_error ? "✗ " : "← ";
+          const inFlight = blk.tool_use_id ? inFlightTools.get(blk.tool_use_id) : null;
+          if (inFlight && inFlight.name === PANEL_TOOL && !blk.is_error) {
+            // "Sent to the panel": the panel_round article says it better.
+            inFlightTools.delete(blk.tool_use_id);
+            markVisibleActivity();
+            continue;
+          }
           insertToolMessage(prefix + truncate(txt, 200));
           // Drop the matching in-flight entry so the spinner stops
           // claiming this tool is still running.
@@ -3603,7 +3793,7 @@
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
       announce(
-        `${assistantLabel(obj.provider)} is asking you a question.`,
+        `${obj.asker || assistantLabel(obj.provider)} is asking you a question.`,
         { urgent: true },
       );
       playCue("permission");
@@ -3852,6 +4042,75 @@
       setStreaming(false);
       announce("Auto-followups paused — send a message to continue.");
       playCue("attention");
+    } else if (obj.type === "panel_round") {
+      // A review round started (panel.py). Claude has ended its turn, so the
+      // "done" cue already played: the status line keeps saying who's still
+      // reading, and each reply is announced as it lands.
+      ctx.currentAssistantBody = null;
+      const what = obj.stage === "changes" ? "changes" : "plan";
+      const names = Array.isArray(obj.participants) ? obj.participants : [];
+      const article = panelArticle(
+        `Panel review: ${what}, round ${obj.round} of ${obj.max_rounds}`, "panel-round");
+      panelText(article,
+        `${joinNames(names) || "The panel"} ${names.length === 1 ? "is" : "are"} reviewing it. `
+        + "This usually takes a few minutes. You can keep talking to Claude meanwhile.");
+      panelThreadLink(article, obj.thread_id);
+      panelPending = new Set(names);
+      panelWaiting = `Waiting on the panel: ${joinNames(names)}.`;
+      if (!isStreaming) setStatus(panelWaiting);
+      announce(`Panel reviewing the ${what}, round ${obj.round} of ${obj.max_rounds}.`);
+      maybeAutoScroll();
+      markVisibleActivity();
+    } else if (obj.type === "panel_reply") {
+      ctx.currentAssistantBody = null;
+      const word = PANEL_VERDICT_WORDS[obj.verdict] || obj.verdict || "";
+      const article = panelArticle(`${obj.participant}: ${word}`, "panel-reply");
+      if (obj.verdict === "error") panelText(article, obj.text || "");
+      else panelMarkdown(article, obj.text || "");
+      panelPending.delete(obj.participant);
+      panelWaiting = panelPending.size
+        ? `Waiting on the panel: ${joinNames([...panelPending])}.`
+        : "The panel is wrapping up.";
+      if (!isStreaming) setStatus(panelWaiting);
+      announce(`${obj.participant} ${word}.`);
+      playCue(obj.verdict === "error" ? "task_error" : "task_done");
+      maybeAutoScroll();
+      markVisibleActivity();
+    } else if (obj.type === "panel_verdict") {
+      ctx.currentAssistantBody = null;
+      resetPanelWaiting();
+      const verdict = panelVerdictText(obj);
+      const article = panelArticle("Panel verdict", "panel-verdict");
+      panelText(article, verdict);
+      panelThreadLink(article, obj.thread_id);
+      maybeAutoScroll();
+      // The answer goes to Claude as its next message, which starts a turn.
+      setStreaming(true);
+      startGerunds();
+      announce("Panel verdict: " + verdict);
+      markVisibleActivity();
+    } else if (obj.type === "panel_parked") {
+      // The answer couldn't be handed to Claude (its chat had closed, or its
+      // input queue was full), so it waits for the next message.
+      setStreaming(false);
+      stopGerunds();
+      appendNotice("Panel review",
+        "The panel's answer couldn't reach Claude just now, so it goes in front of your next message.");
+      setStatus("The panel's answer is waiting for your next message.");
+      announce("The panel's answer will go with your next message.");
+    } else if (obj.type === "panel_gate") {
+      // A gate stopped Claude. Quiet: the round it starts next is announced.
+      const where = obj.repo ? ` in ${obj.repo}` : "";
+      appendNotice("Panel review", obj.gate === "commit"
+        ? `Claude tried to commit${where} before the panel approved these changes, so they go to the panel first.`
+        : `Claude tried to change files${where} before the panel saw a plan, so the plan goes to the panel first.`);
+      maybeAutoScroll();
+    } else if (obj.type === "panel_cycle_done") {
+      appendNotice("Panel review",
+        "Committed. The next change starts with a new plan for the panel.");
+      maybeAutoScroll();
+    } else if (obj.type === "panel_changed") {
+      syncPanelControl(!!obj.enabled);
     } else if (obj.type === "auto_fire") {
       // Server is auto-firing a follow-up turn driven by a buffered
       // task notification. Render an info block so the user knows the
@@ -3910,7 +4169,7 @@
       setActiveTodoLabel(null);
       stopGerunds();
       const summary = obj.interrupted ? "Turn interrupted." : summariseResult(obj);
-      setStatus(summary);
+      setStatus(panelWaiting ? `${summary} ${panelWaiting}` : summary);
       refreshSessions();
       refreshHeaderCost();
       setStreaming(false);
@@ -4385,7 +4644,9 @@
   }
 
   function entryLabel(entry) {
-    if (entry.kind === "question") return assistantLabel(entry.req.provider) + "'s question";
+    if (entry.kind === "question") {
+      return (entry.req.asker || assistantLabel(entry.req.provider)) + "'s question";
+    }
     if (entry.kind === "plan") return "plan review";
     return entry.req.tool;
   }
@@ -4463,8 +4724,9 @@
       appendDecideLater(actions);
       permDialog.appendChild(actions);
     } else {
+      // Same wording as the docked card's own heading, which is hidden here.
       title.textContent = entry.kind === "question"
-        ? `Claude is asking${countSuffix}`
+        ? `${req.asker || assistantLabel(req.provider)} is asking${countSuffix}`
         : `Claude's plan — review${countSuffix}`;
       const card = findRequestCard(req.id);
       dockedPlaceholder = document.createElement("span");
@@ -4957,7 +5219,10 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = assistantLabel(req.provider) + (req.closed ? " asked" : " is asking");
+    // ``asker`` names who's asking when it isn't the assistant: the review
+    // panel's deadlock card asks the user to decide between it and Claude.
+    heading.textContent = (req.asker || assistantLabel(req.provider))
+      + (req.closed ? " asked" : " is asking");
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
 
