@@ -149,6 +149,17 @@ def _digest(p: Path) -> str:
         return "deleted"
 
 
+def head_commit(root: str) -> Optional[str]:
+    """The commit HEAD points at, or None (no commits yet, or git failed)."""
+    try:
+        r = _git(root, "rev-parse", "--verify", "-q", "HEAD")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode().strip() or None
+
+
 def unapproved(approved: dict[str, str], current: dict[str, str]) -> list[str]:
     """Paths whose current content isn't what the panel approved."""
     return sorted(p for p, digest in current.items() if approved.get(p) != digest)
@@ -694,29 +705,44 @@ async def run_round(
         "max_rounds": max_rounds, "repo": repo, "thread_id": tid,
         "participants": [labels[p] for p in participants],
     })
+    loop = asyncio.get_running_loop()
+    shown: set[str] = set()
+
+    def _reply_event(p: str, text: Optional[str], error: Optional[str]) -> dict:
+        return {
+            "type": "panel_reply", "stage": stage, "round": round_no,
+            "participant": labels[p],
+            "verdict": "error" if error is not None else parse_verdict(text or ""),
+            "text": error if error is not None else (text or ""),
+        }
+
+    def _landed(p: str, text: Optional[str], error: Optional[str]) -> None:
+        # On the library's thread: hand each reply to the loop as it lands,
+        # so the chat shows GPT at three minutes rather than everyone at six.
+        if p in labels and p not in shown:
+            shown.add(p)
+            loop.call_soon_threadsafe(emit, _reply_event(p, text, error))
+
     result = await asyncio.to_thread(
         core.roundtable_ask_parallel, tid, list(participants),
         prompt=round_prompt(stage, round_no, max_rounds, repo, plan_reviewed, diff_note),
         effort=effort, tool_use_context=core._effective_tool_context(tid),
+        on_result=_landed,
     )
     replies: list[dict] = []
     errors: list[dict] = []
     for p in participants:
         if p in (result.get("responses") or {}):
             text = str(result["responses"][p] or "")
-            verdict = parse_verdict(text)
-            replies.append({"participant": p, "label": labels[p], "verdict": verdict, "text": text})
-            emit({
-                "type": "panel_reply", "stage": stage, "round": round_no,
-                "participant": labels[p], "verdict": verdict, "text": text,
-            })
+            replies.append({"participant": p, "label": labels[p],
+                            "verdict": parse_verdict(text), "text": text})
+            if p not in shown:
+                emit(_reply_event(p, text, None))
         elif p in (result.get("errors") or {}):
             err = str(result["errors"][p])
             errors.append({"participant": p, "label": labels[p], "error": err})
-            emit({
-                "type": "panel_reply", "stage": stage, "round": round_no,
-                "participant": labels[p], "verdict": "error", "text": err,
-            })
+            if p not in shown:
+                emit(_reply_event(p, None, err))
     return RoundResult(
         thread_id=tid, outcome=outcome_of(replies), replies=replies,
         errors=errors, reviewed_state=reviewed_state,

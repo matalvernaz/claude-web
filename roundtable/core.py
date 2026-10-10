@@ -2162,6 +2162,13 @@ def _call_anthropic_sdk_with_tools(
         "skills": "all",
         "model": model,
         "max_turns": tool_use_context.max_turns,
+        # Each turn is a one-shot (the transcript rides the prompt), so keep
+        # it out of the repository's session history. Without this every
+        # Claude panellist turn left a session file under the repo's project
+        # directory, which showed up in claude-web's sidebar for any repo
+        # that is also a claude-web project, and panel review runs a round
+        # for every plan and every set of changes.
+        "extra_args": {"no-session-persistence": None},
         # Adaptive thinking on medium/high; same policy as the other
         # Anthropic paths. ThinkingConfigAdaptive is a TypedDict, NOT a
         # dataclass — the bare ``ThinkingConfigAdaptive()`` form yields
@@ -3808,6 +3815,7 @@ def roundtable_ask_parallel(
     thread_id: int, participants: list[str], prompt: str = "",
     effort: str = "", web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
+    on_result: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
 ) -> dict:
     """Ask multiple participants the SAME question in parallel — each sees
     the transcript only up to the prompt, never each other's answers.
@@ -3836,6 +3844,12 @@ def roundtable_ask_parallel(
     in ``responses`` or in ``errors``, never both. Errors are also
     written into the transcript as ``[provider error: …]`` turns so the
     next ``roundtable_ask`` can address them.
+
+    ``on_result(name, text, error)`` (library callers only) hears about
+    each participant as it finishes, before anything is committed, so a
+    UI can show replies as they land; exactly one of ``text`` and
+    ``error`` is set. It runs on this call's thread, and an exception in
+    it is logged and ignored.
     """
     if not participants:
         raise ValueError("roundtable_ask_parallel requires at least one participant.")
@@ -3890,6 +3904,18 @@ def roundtable_ask_parallel(
         for fut in concurrent.futures.as_completed(futures):
             name, resp, err = fut.result()
             results[name] = (resp, err)
+            if on_result is not None:
+                try:
+                    if err is not None:
+                        on_result(name, None, f"{type(err).__name__}: {err}")
+                    else:
+                        on_result(
+                            name,
+                            (resp.text or "").strip() or "[empty response from provider]",
+                            None,
+                        )
+                except Exception:  # noqa: BLE001 — a display hook must not lose the round
+                    logger.warning("roundtable_ask_parallel on_result failed", exc_info=True)
 
     # Recheck closure once before the commit loop. If the thread was
     # closed mid-flight we still record the responses (already paid for)

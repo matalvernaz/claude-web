@@ -254,6 +254,31 @@ def test_sdk_tools_accept_messages_larger_than_the_sdk_default(tmp_path, monkeyp
     assert opts.get("max_buffer_size") == 64 << 20
 
 
+def test_sdk_tools_turns_leave_no_session_file_behind(tmp_path, monkeypatch):
+    """Each panellist turn is a one-shot; persisting it put a session in the
+    repository's project history, i.e. in claude-web's sidebar."""
+    opts = _sdk_tools_turn(monkeypatch, tmp_path, "auto")
+    assert opts.get("extra_args") == {"no-session-persistence": None}
+
+
+def test_ask_parallel_reports_each_participant_as_it_lands(monkeypatch):
+    tid = core.roundtable_create("streaming")["thread_id"]
+
+    def fake_turn(thread, info, snapshot, **kw):
+        if info["label"] == "Gemini Pro":
+            raise RuntimeError("down")
+        return core.ProviderResult(text=" fine ")
+
+    monkeypatch.setattr(core, "_run_turn", fake_turn)
+    heard = []
+    out = core.roundtable_ask_parallel(
+        tid, ["gemini-flash", "gemini-pro"], prompt="go",
+        on_result=lambda name, text, err: heard.append((name, text, err)),
+    )
+    assert sorted(heard) == [("gemini-flash", "fine", None), ("gemini-pro", None, "RuntimeError: down")]
+    assert out["responses"] == {"gemini-flash": "fine"}
+
+
 # ─── DB-lock concurrency (reconstructs the deleted test_concurrency.py) ──
 
 def test_concurrent_posts_get_contiguous_indices():

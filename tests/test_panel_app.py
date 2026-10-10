@@ -62,7 +62,8 @@ class FakeCore:
     def _effective_tool_context(self, tid):
         return None
 
-    def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context):
+    def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context,
+                                on_result=None):
         self.asks += 1
         return self.answers.pop(0)
 
@@ -167,13 +168,25 @@ async def test_the_commit_gate_holds_until_the_panel_approved_this_exact_state(c
     (repo / "a.py").write_text("a = 3\n")
     assert _decision(await commit(inp, "c3", {})) == "deny"
 
-    # Commit what was approved: the task is done and the next change needs a plan.
+    # A commit that doesn't land (here: never run) leaves the task open.
     (repo / "a.py").write_text("a = 2\n")
     assert await commit(inp, "c4", {}) == {}
-    _git(repo, "commit", "-qam", "change")
     await after({"tool_input": inp["tool_input"]}, "c4", {})
+    assert app_module._panel_load(run.session_id).plan_ok is True
+
+    # Commit what was approved, leaving test noise behind: the task is done
+    # all the same, and the next change needs a new plan.
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "a.pyc").write_text("noise")
     state = app_module._panel_load(run.session_id)
-    assert state.plan_ok is False and state.approvals == {}
+    state.approvals[str(repo)] = panel.working_state(str(repo))
+    app_module._panel_save(run.session_id, run.owner_sub, state)
+    assert await commit(inp, "c5", {}) == {}
+    _git(repo, "commit", "-qm", "change", "a.py")
+    await after({"tool_input": inp["tool_input"]}, "c5", {})
+    state = app_module._panel_load(run.session_id)
+    assert state.plan_ok is False
+    assert str(repo) in state.approvals  # the noise it saw is still covered
 
 
 async def test_a_commit_it_cannot_place_is_refused_with_how_to_fix_it(chat):

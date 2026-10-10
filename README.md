@@ -289,6 +289,32 @@ The `/roundtable` assistant exposes the same task modes in a picker. Select a
 project to enable repository grounding. In Review changes mode, the advanced
 options control the diff base, working-diff capture, and grounded verification.
 
+#### Panel review
+
+Tick **Panel review** in the chat header (Claude chats, with the roundtable set
+up) and other AIs check Claude's work in that chat before it lands. The panel is
+the roundtable's coding panel, GPT, Gemini and a second Claude by default, and it
+reads the repository read-only; Claude still makes every change.
+
+- Before Claude changes files in a git repository, its plan goes to the panel.
+- Before it commits, the panel reviews the actual diff. Nothing is committed
+  until they approve, or you decide.
+- Each round runs in the background. Claude ends its turn while the panel
+  reads, and the panel's answer arrives as the chat's next message, so you can
+  talk to Claude meanwhile; what you say also goes to the panel's next round.
+- After three rounds on one stage without agreement you get a question: go
+  ahead anyway, give them more rounds, or stop.
+- If nobody on the panel can answer (provider down, out of credits), the panel
+  steps aside and says so rather than stalling the chat.
+
+The chat shows Claude's message to the panel, each reviewer's reply and the
+verdict as their own headed sections, and links to the full roundtable thread.
+Each round costs one call per paid participant. Settings:
+`CLAUDE_WEB_PANEL_PARTICIPANTS` (comma-separated roundtable keys, default the
+coding panel), `CLAUDE_WEB_PANEL_MAX_ROUNDS` (3), `CLAUDE_WEB_PANEL_EFFORT`
+(`medium`), `CLAUDE_WEB_PANEL_DECISION_TIMEOUT` (seconds the deadlock question
+waits, default the permission timeout).
+
 #### Identity passed to the CLI
 
 Every spawned Claude CLI subprocess receives three env vars describing the signed-in user, so hooks and `CLAUDE.md` personalities can address people by name:

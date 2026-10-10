@@ -156,9 +156,10 @@ class FakeCore:
         "gemini-pro": {"label": "Gemini Pro"},
     }
 
-    def __init__(self, responses=None, errors=None):
+    def __init__(self, responses=None, errors=None, stream=()):
         self.responses = responses or {}
         self.errors = errors or {}
+        self.stream = set(stream)
         self.calls = []
 
     def roundtable_create(self, topic, participants, house_rules):
@@ -178,8 +179,12 @@ class FakeCore:
     def _effective_tool_context(self, tid):
         return "ctx"
 
-    def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context):
+    def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context,
+                                on_result=None):
         self.calls.append(("ask", tuple(participants), prompt, tool_use_context))
+        for name, text in self.responses.items():
+            if on_result and name in self.stream:
+                on_result(name, text, None)
         return {"responses": self.responses, "errors": self.errors}
 
 
@@ -246,3 +251,11 @@ def test_a_repository_the_panel_cannot_open_still_gets_reviewed():
     assert result.outcome == "approved"
     ask = next(c for c in core.calls if c[0] == "ask")
     assert "couldn't be opened for you" in ask[2]
+
+
+def test_replies_stream_as_they_land_and_are_not_shown_twice():
+    core = FakeCore(responses={"gpt-5": "VERDICT: APPROVE", "gemini-pro": "VERDICT: APPROVE"},
+                    stream={"gemini-pro"})
+    _, events, _ = _round(core)
+    replies = [e["participant"] for e in events if e["type"] == "panel_reply"]
+    assert replies == ["Gemini Pro", "GPT Sol"]

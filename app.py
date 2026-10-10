@@ -7218,10 +7218,10 @@ async def _panel_commit_gate(run: "ActiveRun", inp: dict, tool_use_id: Optional[
     if targets is None:
         run.emit({"type": "panel_gate", "gate": "commit", "repo": ""})
         return _panel_deny(panel.commit_unclear())
-    roots: list[str] = []
+    roots: list[tuple[str, Optional[str]]] = []
     for where in targets:
         root = await asyncio.to_thread(panel.repo_root, where)
-        if root is None or root in roots:
+        if root is None or any(r == root for r, _ in roots):
             continue
         current = await asyncio.to_thread(panel.working_state, root)
         missing = panel.unapproved(state.approvals.get(root, {}), current)
@@ -7229,29 +7229,39 @@ async def _panel_commit_gate(run: "ActiveRun", inp: dict, tool_use_id: Optional[
             run.emit({"type": "panel_gate", "gate": "commit", "repo": root,
                       "paths": missing[:20]})
             return _panel_deny(panel.commit_denied(root, missing))
-        roots.append(root)
+        roots.append((root, await asyncio.to_thread(panel.head_commit, root)))
     if roots and tool_use_id:
         run.panel_commits[tool_use_id] = roots
     return {}
 
 
 async def _panel_after_commit(run: "ActiveRun", tool_use_id: Optional[str]) -> None:
-    """After a commit the gate let through: once every repository the panel
-    approved changes in is clean, the task is done and the next change
-    starts with a new plan."""
+    """After a commit the gate let through: if it really landed (HEAD moved),
+    the task is done and the next change starts with a new plan.
+
+    Not "once the repository is clean": running the tests leaves untracked
+    noise like __pycache__ that never gets committed, so a clean tree may
+    never come. The approval stays for whatever approved changes are left,
+    so a commit split in two still goes through.
+    """
     roots = run.panel_commits.pop(tool_use_id or "", None)
     if not roots or not run.session_id:
         return
     state = _panel_load(run.session_id)
     if state is None or not state.enabled:
         return
-    for root in roots:
+    landed = []
+    for root, before in roots:
+        if await asyncio.to_thread(panel.head_commit, root) == before:
+            continue
+        landed.append(root)
         if await asyncio.to_thread(panel.working_state, root) == {}:
             state.approvals.pop(root, None)
-    if not state.approvals:
-        state.end_cycle()
-        run.emit({"type": "panel_cycle_done", "repos": roots})
+    if not landed:
+        return
+    state.end_cycle()
     _panel_save(run.session_id, run.owner_sub, state)
+    run.emit({"type": "panel_cycle_done", "repos": landed})
 
 
 def _panel_hooks_for_run(run: "ActiveRun") -> dict:
@@ -7905,11 +7915,12 @@ class ActiveRun:
         # to session_panel. panel_notes holds what the user said since the
         # last round, for the panel to read. panel_commits maps the tool_use_id
         # of a Bash call the commit gate let through to the repositories it
-        # commits in, so the PostToolUse hook can tell when a task is done.
+        # commits in and each one's HEAD beforehand, so the PostToolUse hook
+        # can tell a commit really landed and the task is done.
         self.panel_requested: Optional[bool] = None
         self.panel_notes: list[str] = []
         self.panel_user_label: str = "the user"
-        self.panel_commits: dict[str, list[str]] = {}
+        self.panel_commits: dict[str, list[tuple[str, Optional[str]]]] = {}
         # Client-correlated recall for queued user input. Each queued message
         # carries a queue_id; POST /api/chat/cancel-queued adds it to
         # canceled_input_ids, and the driver drops it on pickup (the check is
