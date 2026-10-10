@@ -68,6 +68,20 @@
         Advanced view
       </button>
 
+      {# The thread browser's own filter. It used to reuse the project context
+         above, which defaults to a project, so every thread started over MCP
+         (never bound to one) was hidden until you picked "No project". #}
+      <label class="header-select advanced-only" for="thread-filter">
+        <span class="sr-only">Show threads</span>
+        <select id="thread-filter">
+          <option value="" selected>All threads</option>
+          <option value="__unbound__">Not tied to a project</option>
+          {% for p in projects %}
+            <option value="{{ p.key }}">{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
       <label class="checkbox-row advanced-only">
         <input type="checkbox" id="show-closed">
         Show closed threads
