@@ -1,11 +1,20 @@
 """The roundtable thread browser's list endpoint: filters before the limit."""
 from __future__ import annotations
 
+import time
+
 import app as app_module
 
 
 def _create(topic: str) -> int:
-    return app_module.roundtable_core.roundtable_create(topic=topic)["thread_id"]
+    # The list is newest activity first, and Windows' clock can give two
+    # threads created back to back the same timestamp, which leaves their
+    # order to chance. Wait for the clock to pass the newest thread first.
+    core = app_module.roundtable_core
+    newest = core.roundtable_list(open_only=False, limit=1)
+    while newest and time.time() <= newest[0]["last_activity"]:
+        time.sleep(0.005)
+    return core.roundtable_create(topic=topic)["thread_id"]
 
 
 def _listed(client, **params) -> list[int]:
