@@ -406,3 +406,20 @@ async def test_switching_off_while_the_user_decides_is_not_undone(chat, repo, mo
     state = app_module._panel_load(run.session_id)
     assert state.enabled is False
     assert state.plan_ok is True and state.thread_id == 77
+
+
+async def test_a_drain_restart_waits_for_a_panel_round(chat, repo, monkeypatch):
+    run, _, _ = chat
+    gate = threading.Event()
+
+    class SlowCore(FakeCore):
+        def roundtable_ask_parallel(self, *a, **kw):
+            gate.wait(timeout=10)
+            return APPROVE_ALL
+
+    monkeypatch.setattr(app_module, "roundtable_core", SlowCore([]))
+    await _review(run, stage="plan", repo=str(repo), message="Plan.")
+    assert f"panel-review:{run.session_id}" in app_module._busy_runs()
+    gate.set()
+    await _finish_round(run)
+    assert f"panel-review:{run.session_id}" not in app_module._busy_runs()

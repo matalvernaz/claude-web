@@ -8405,6 +8405,12 @@ def _busy_runs() -> list[str]:
     # sent (the 2026-10-05 03:28 attempt died to the 03:31 drain restart).
     for key in setup_flow.active_auto_signins():
         busy.append(f"auto-signin:{key}")
+    # A panel review round runs between Claude's turns, so its chat looks
+    # idle; a restart would drop the round and Claude would wait forever for
+    # an answer that never comes.
+    for sid, task in _PANEL_ROUNDS.items():
+        if not task.done():
+            busy.append(f"panel-review:{sid}")
     return busy
 
 
