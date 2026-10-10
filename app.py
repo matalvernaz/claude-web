@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     ProcessError,
@@ -81,6 +82,7 @@ import portable_tools
 import currency
 import setup_flow
 import auto_signin
+import panel
 
 log = logging.getLogger("claude-web")
 
@@ -714,6 +716,8 @@ async def _providers_payload(
             # the send path keeps asking what a provider can do rather than
             # who it is.
             "advisor": True,
+            # Panel review runs on the roundtable and gates Claude's own tools.
+            "panel": _panel_available(),
         },
     }
     codex_account = _resolve_codex_account_for_run(
@@ -1374,13 +1378,27 @@ def _find_session_path(session_id: str, project_key: str = "") -> Optional[Path]
     return None
 
 
+def _user_turn_entry(text: str, image_count: int = 0) -> dict:
+    """A user-channel message as the transcript shows it: the review panel's
+    answers (which ride that channel into the CLI) as the panel's, and the
+    user's own messages without the panel instruction claude-web put in
+    front of them."""
+    if text.startswith(panel.MESSAGE_MARKER):
+        return {"role": "panel_result", "text": text}
+    entry = {"role": "user", "text": panel.strip_user_prefix(text)}
+    if image_count:
+        entry["image_count"] = image_count
+    return entry
+
+
 def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
     """Return ordered messages for replay, including tool dance.
 
     Roles: "user", "assistant", "tool_use" (Claude→world), "tool_result"
     (world→Claude), "tool_use_full" (Edit/Write so the frontend can render a
-    diff). Frontend renders tool_use/tool_result as single-line chips so
-    reloaded sessions match the live view.
+    diff), "panel_result" (the review panel's answer, see panel.py). Frontend
+    renders tool_use/tool_result as single-line chips so reloaded sessions
+    match the live view.
     """
     path = _find_session_path(session_id, project_key)
     if path is None:
@@ -1392,14 +1410,14 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
         if kind == "user" and not obj.get("isMeta"):
             if isinstance(message, str):
                 if _is_user_visible(message):
-                    msgs.append({"role": "user", "text": message})
+                    msgs.append(_user_turn_entry(message))
                 continue
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
             if isinstance(content, str):
                 if _is_user_visible(content):
-                    msgs.append({"role": "user", "text": content})
+                    msgs.append(_user_turn_entry(content))
             elif isinstance(content, list):
                 # Collect text + count of attachments so the resumed turn
                 # shows the same shape (text + N images) it did live.
@@ -1430,11 +1448,10 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
                             "is_error": bool(blk.get("is_error")),
                         })
                 if text_parts or image_count:
-                    msgs.append({
-                        "role": "user",
-                        "text": "\n".join(text_parts),
-                        "image_count": image_count,
-                    })
+                    entry = _user_turn_entry("\n".join(text_parts))
+                    if entry["role"] == "user":
+                        entry["image_count"] = image_count
+                    msgs.append(entry)
                 msgs.extend(tool_results)
         elif kind == "assistant":
             if not isinstance(message, dict):
@@ -1471,6 +1488,13 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
                         # 200-char summary. The live UI ignores this field
                         # for Bash so the extra payload is export-only cost.
                         entry["input"] = {"command": inp.get("command")}
+                    elif name == panel.TOOL_NAME:
+                        # Claude's side of the panel argument: shown in full.
+                        entry["input"] = {
+                            "stage": inp.get("stage"),
+                            "repo": inp.get("repo"),
+                            "message": inp.get("message"),
+                        }
                     msgs.append(entry)
         elif kind == "system" and obj.get("subtype") in _MODEL_NOTICE_TITLES:
             # The CLI writes its model-switch banner into the transcript, so a
@@ -1632,11 +1656,18 @@ def session_to_markdown(session_id: str, project_key: str = "") -> Optional[str]
                 out.append(fence + "sh")
                 out.append(cmd)
                 out.append(fence)
+            elif name == panel.TOOL_NAME and isinstance(inp, dict):
+                out.append(str(inp.get("message") or ""))
             # No `elif summary:` body — for Read/Grep/WebFetch/etc the path
             # or pattern already lives in the <summary> line, so a duplicate
             # body just adds noise.
             out.append("")
             out.append("</details>")
+            out.append("")
+        elif role == "panel_result":
+            out.append("## Review panel")
+            out.append("")
+            out.append(m.get("text", ""))
             out.append("")
         elif role == "tool_result":
             text = m.get("text", "")
@@ -2120,6 +2151,14 @@ def _state_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_session_account_user "
             "ON session_account(user_sub)"
         )
+        # Panel review per chat (panel.py): on or off, the chat's roundtable
+        # thread, and what the panel has approved, as one JSON record.
+        conn.execute("""CREATE TABLE IF NOT EXISTS session_panel (
+            session_id TEXT PRIMARY KEY,
+            user_sub TEXT,
+            state_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
         # Ordered ring of credential slots the app may substitute for the
         # picked one when that one can't serve the turn (plan window spent, or
         # the model isn't on that plan). Membership is opt-in per slot: a slot
@@ -6846,6 +6885,8 @@ def _flatten_transcript_for_advisor(msgs: list[dict]) -> str:
             lines.append(f"[tool {tag}: {m.get('text', '')}]")
         elif role == "notice":
             lines.append(f"[{m.get('title', 'Notice')}: {m.get('text', '')}]")
+        elif role == "panel_result":
+            lines.append(f"## Review panel\n{m.get('text', '')}")
     body = "\n\n".join(lines)
     if len(body) > _ADVISOR_TRANSCRIPT_CHAR_CAP:
         # Keep the tail — the recent turns are what needs reviewing — and flag
@@ -6990,17 +7031,510 @@ def _in_process_mcp_servers_for_run(
     Callable with no args (the /api/mcp status page) — then it only ever
     yields the stub.
     """
+    servers: dict[str, Any] = {}
     if INPROCESS_ADVISOR and run is not None and run.advisor:
         server = _build_advisor_mcp_server(
             run, account or {}, cwd, ADVISOR_MODEL,
         )
         if server is not None:
-            return {"claude_web": server}
-    if not ENABLE_IN_PROCESS_MCP:
+            servers["claude_web"] = server
+    if not servers and ENABLE_IN_PROCESS_MCP:
+        if not _IN_PROCESS_MCP_SERVERS:
+            _register_in_process_mcp_servers()
+        servers.update(_IN_PROCESS_MCP_SERVERS)
+    # Panel review's `review` tool rides every Claude run, beside whatever is
+    # above, so the checkbox works mid-chat without a respawn; it refuses
+    # politely while the chat's panel is off.
+    if run is not None and run.provider == "claude" and _panel_available():
+        server = _build_panel_mcp_server(run)
+        if server is not None:
+            servers[panel.SERVER_NAME] = server
+    return servers
+
+
+# ─── Panel review (panel.py) ─────────────────────────────────────────────────
+#
+# The pure parts live in panel.py. Here: the per-session record, the hooks
+# that gate edits and commits, the `review` tool, the background round, and
+# delivering the panel's answer into the chat as its next message.
+
+# Rounds in flight, by session id. One holds its chat open (the driver's idle
+# close skips a session listed here) and makes a second round wait.
+_PANEL_ROUNDS: dict[str, asyncio.Task] = {}
+# How long the user's question card waits when the panel deadlocks.
+PANEL_DECISION_TIMEOUT_SECONDS = int(os.getenv(
+    "CLAUDE_WEB_PANEL_DECISION_TIMEOUT", str(PERMISSION_TIMEOUT_SECONDS),
+))
+
+
+def _panel_available() -> bool:
+    return ROUNDTABLE_AVAILABLE and roundtable_core is not None
+
+
+def _panel_load(session_id: Optional[str]) -> Optional[panel.PanelState]:
+    """The chat's stored record, or None if it never had one."""
+    if not session_id:
+        return None
+    row = _state_db().execute(
+        "SELECT state_json FROM session_panel WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    return panel.PanelState.from_json(row[0]) if row else None
+
+
+def _panel_save(session_id: str, user_sub: Optional[str], state: panel.PanelState) -> None:
+    _state_db().execute(
+        "INSERT INTO session_panel(session_id, user_sub, state_json, updated_at) "
+        "VALUES(?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
+        "state_json = excluded.state_json, updated_at = excluded.updated_at",
+        (session_id, user_sub, state.to_json(), time.time()),
+    )
+
+
+def _panel_set_enabled(
+    session_id: str, user_sub: Optional[str], enabled: bool,
+) -> panel.PanelState:
+    state = _panel_load(session_id) or panel.PanelState()
+    state.enabled = bool(enabled)
+    _panel_save(session_id, user_sub, state)
+    return state
+
+
+def _panel_state_for_run(run: "ActiveRun") -> panel.PanelState:
+    """The chat's record; a brand-new chat goes by the browser's checkbox."""
+    if run.provider != "claude" or not _panel_available():
+        return panel.PanelState()
+    state = _panel_load(run.session_id)
+    if state is None:
+        state = panel.PanelState(enabled=bool(run.panel_requested))
+    return state
+
+
+def _panel_payload(session_id: Optional[str]) -> dict:
+    state = _panel_load(session_id) or panel.PanelState()
+    task = _PANEL_ROUNDS.get(session_id or "")
+    return {
+        "enabled": state.enabled,
+        "thread_id": state.thread_id,
+        "plan_approved": state.plan_ok,
+        "round_in_flight": bool(task and not task.done()),
+    }
+
+
+def _panel_field(value: Any) -> Optional[bool]:
+    """The Panel review checkbox from a chat POST: None when the browser
+    didn't say (or the handler was called directly, without a form)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _form_flag(value)
+
+
+def _panel_user_label(user: dict) -> str:
+    name = (user.get("name") or user.get("preferred_username") or "").strip()
+    if not name or name == "anonymous":
+        return "the user"
+    return name
+
+
+def _panel_prefix(run: "ActiveRun", message: str) -> str:
+    """What goes in front of the user's ``message`` on its way to Claude.
+
+    With panel review on, that's the panel instruction (the one place Claude
+    reliably follows it, see panel.user_prefix), and the message is also kept
+    for the panel's next round, so the user can join the argument. Otherwise
+    nothing.
+    """
+    if not _panel_state_for_run(run).enabled:
+        return ""
+    if message.strip():
+        run.panel_notes.append(message.strip()[:4000])
+        del run.panel_notes[:-10]
+    return panel.user_prefix()
+
+
+def _panel_participants() -> list[str]:
+    core = roundtable_core
+    wanted = panel.PARTICIPANTS or core._default_coding_panel("claude-opus")
+    return [
+        p for p in wanted
+        if p in core.PARTICIPANTS and core._participant_provider_available(p)
+    ]
+
+
+def _panel_emit(session_id: str, event: dict) -> None:
+    """Show ``event`` in the chat, on whichever run serves it now."""
+    target = ACTIVE_RUNS_BY_SESSION.get(session_id)
+    if target is not None and not target.done:
+        target.emit(event)
+
+
+def _panel_deny(reason: str) -> dict:
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}
+
+
+def _panel_exempt(path: str) -> bool:
+    """Claude's own files (memory, plans, settings) and claude-web's state."""
+    resolved = Path(path).resolve()
+    for base in (CLAUDE_HOME, PERSONAL_HOMES_DIR, USAGE_DIR):
+        try:
+            resolved.relative_to(Path(base).resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+async def _panel_edit_gate(run: "ActiveRun", inp: dict) -> dict:
+    state = _panel_state_for_run(run)
+    if not state.enabled or state.plan_ok:
         return {}
-    if not _IN_PROCESS_MCP_SERVERS:
-        _register_in_process_mcp_servers()
-    return dict(_IN_PROCESS_MCP_SERVERS)
+    tool_input = inp.get("tool_input") or {}
+    path = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
+    if not path:
+        return {}
+    if not os.path.isabs(path):
+        path = os.path.join(inp.get("cwd") or "", path)
+    if _panel_exempt(path):
+        return {}
+    root = await asyncio.to_thread(panel.repo_root, path)
+    if root is None:
+        return {}
+    run.emit({"type": "panel_gate", "gate": "edit", "repo": root})
+    return _panel_deny(panel.edit_denied(root, subagent=bool(inp.get("agent_id"))))
+
+
+async def _panel_commit_gate(run: "ActiveRun", inp: dict, tool_use_id: Optional[str]) -> dict:
+    command = str((inp.get("tool_input") or {}).get("command") or "")
+    if "commit" not in command:
+        return {}
+    state = _panel_state_for_run(run)
+    if not state.enabled:
+        return {}
+    targets = panel.commit_targets(command, inp.get("cwd") or "")
+    if targets is None:
+        run.emit({"type": "panel_gate", "gate": "commit", "repo": ""})
+        return _panel_deny(panel.commit_unclear())
+    roots: list[str] = []
+    for where in targets:
+        root = await asyncio.to_thread(panel.repo_root, where)
+        if root is None or root in roots:
+            continue
+        current = await asyncio.to_thread(panel.working_state, root)
+        missing = panel.unapproved(state.approvals.get(root, {}), current)
+        if missing:
+            run.emit({"type": "panel_gate", "gate": "commit", "repo": root,
+                      "paths": missing[:20]})
+            return _panel_deny(panel.commit_denied(root, missing))
+        roots.append(root)
+    if roots and tool_use_id:
+        run.panel_commits[tool_use_id] = roots
+    return {}
+
+
+async def _panel_after_commit(run: "ActiveRun", tool_use_id: Optional[str]) -> None:
+    """After a commit the gate let through: once every repository the panel
+    approved changes in is clean, the task is done and the next change
+    starts with a new plan."""
+    roots = run.panel_commits.pop(tool_use_id or "", None)
+    if not roots or not run.session_id:
+        return
+    state = _panel_load(run.session_id)
+    if state is None or not state.enabled:
+        return
+    for root in roots:
+        if await asyncio.to_thread(panel.working_state, root) == {}:
+            state.approvals.pop(root, None)
+    if not state.approvals:
+        state.end_cycle()
+        run.emit({"type": "panel_cycle_done", "repos": roots})
+    _panel_save(run.session_id, run.owner_sub, state)
+
+
+def _panel_hooks_for_run(run: "ActiveRun") -> dict:
+    """The PreToolUse/PostToolUse hooks that enforce panel review.
+
+    Hooks, not can_use_tool: they fire in every permission mode, including
+    the bypass mode most chats run in. Registered on every Claude run, so
+    each returns {} at once while the chat's panel is off, and none may raise:
+    they sit in front of every edit and shell command, so a failure logs and
+    lets the tool run.
+    """
+    async def edit_gate(inp, tool_use_id, context):
+        try:
+            return await _panel_edit_gate(run, inp)
+        except Exception:
+            log.exception("panel edit gate failed; letting the edit through")
+            return {}
+
+    async def commit_gate(inp, tool_use_id, context):
+        try:
+            return await _panel_commit_gate(run, inp, tool_use_id)
+        except Exception:
+            log.exception("panel commit gate failed; letting the command through")
+            return {}
+
+    async def after_bash(inp, tool_use_id, context):
+        try:
+            await _panel_after_commit(run, tool_use_id)
+        except Exception:
+            log.exception("panel post-commit check failed")
+        return {}
+
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Edit|Write|MultiEdit|NotebookEdit", hooks=[edit_gate]),
+            HookMatcher(matcher="Bash", hooks=[commit_gate]),
+        ],
+        "PostToolUse": [HookMatcher(matcher="Bash", hooks=[after_bash])],
+    }
+
+
+def _build_panel_mcp_server(run: "ActiveRun"):
+    """Per-run in-process server with the `review` tool, closed over the run
+    for the same reason as the advisor's: handlers only get the arguments."""
+    try:
+        from claude_agent_sdk import create_sdk_mcp_server, tool
+    except ImportError as e:
+        log.warning("panel review unavailable (SDK too old?): %s", e)
+        return None
+
+    @tool("review", panel.TOOL_DESCRIPTION, panel.TOOL_SCHEMA)
+    async def review(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            text, is_error = await _panel_review_call(run, args)
+        except Exception as exc:  # noqa: BLE001 — reported to the model
+            log.exception("panel review call failed run=%s", run.run_id)
+            text, is_error = (
+                f"The panel round couldn't start ({type(exc).__name__}: {exc}). "
+                "Tell the user; you can try again.", True,
+            )
+        out: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+        if is_error:
+            out["is_error"] = True
+        return out
+
+    return create_sdk_mcp_server(
+        name=panel.SERVER_NAME, version="1.0.0", tools=[review],
+    )
+
+
+async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
+    """Start a round (or the user's decision on a deadlock) in the background."""
+    sid = run.session_id
+    state = _panel_state_for_run(run)
+    if not state.enabled or not sid:
+        return (
+            "Panel review is off in this chat, so there's no panel to send this "
+            "to. The user can turn it on with the Panel review checkbox.", True,
+        )
+    stage = str(args.get("stage") or "").strip().lower()
+    if stage not in panel.STAGES:
+        return ('stage must be "plan" or "changes".', True)
+    message = str(args.get("message") or "").strip()
+    if not message:
+        return ("message is empty: send your plan, or what you changed and why.", True)
+    repo = os.path.expanduser(str(args.get("repo") or "").strip())
+    root = await asyncio.to_thread(panel.repo_root, repo) if repo else None
+    if root is None:
+        return (
+            f"{repo or '(no repo given)'} isn't inside a git repository. Pass the "
+            "absolute path of the repository the work is in.", True,
+        )
+    running = _PANEL_ROUNDS.get(sid)
+    if running is not None and not running.done():
+        return (
+            "A panel round is already running for this chat. Its answer will "
+            "arrive as your next message: end your turn and wait for it.", False,
+        )
+    participants = _panel_participants()
+    decide_only = state.rounds.get(stage, 0) >= panel.MAX_ROUNDS
+    if decide_only:
+        round_no = state.rounds[stage]
+        reply = (
+            f"You and the panel are still apart after {round_no} rounds, so "
+            f"{run.panel_user_label} is being asked to decide. End your turn and "
+            "wait: the decision arrives as your next message."
+        )
+    else:
+        state.rounds[stage] = state.rounds.get(stage, 0) + 1
+        round_no = state.rounds[stage]
+        _panel_save(sid, run.owner_sub, state)
+        labels = [roundtable_core.PARTICIPANTS[p]["label"] for p in participants]
+        reply = panel.submitted_text(stage, round_no, panel.MAX_ROUNDS, labels)
+    notes = run.panel_notes[:]
+    run.panel_notes.clear()
+    task = asyncio.create_task(_panel_round_task(
+        run, sid, stage, root, message, notes, participants, round_no,
+        decide_only=decide_only,
+    ))
+    _PANEL_ROUNDS[sid] = task
+    task.add_done_callback(_log_task_exception)
+    log.info(
+        "panel %s round=%d session=%s repo=%s%s", stage, round_no, sid, root,
+        " (asking the user to decide)" if decide_only else "",
+    )
+    return reply, False
+
+
+def _panel_topic(message: str) -> str:
+    first = next((line.strip() for line in message.splitlines() if line.strip()), "")
+    return "Panel review: " + (first[:90] + ("…" if len(first) > 90 else ""))
+
+
+async def _panel_approve(
+    state: panel.PanelState, stage: str, root: str, reviewed: Optional[dict],
+) -> None:
+    if stage == "plan":
+        state.plan_ok = True
+    else:
+        if reviewed is None:
+            reviewed = await asyncio.to_thread(panel.working_state, root)
+        state.approvals[root] = reviewed
+    state.rounds[stage] = 0
+
+
+async def _panel_round_task(
+    run: "ActiveRun", sid: str, stage: str, root: str, message: str,
+    notes: list[str], participants: list[str], round_no: int,
+    decide_only: bool = False,
+) -> None:
+    """One round, then the answer as the chat's next message.
+
+    Anything that goes wrong steps the panel aside rather than stranding
+    Claude behind a gate it can't pass; the user is told either way.
+    """
+    user_label = run.panel_user_label
+    replies: list[dict] = []
+    errors: list[dict] = []
+    reviewed: Optional[dict] = None
+    state = _panel_load(sid) or panel.PanelState(enabled=True)
+    try:
+        if decide_only:
+            outcome = "changes"
+        elif not participants:
+            outcome = "unavailable"
+            errors = [{"participant": "", "label": "The panel",
+                       "error": "No roundtable participant is configured and available."}]
+        else:
+            def _on_thread(tid: int) -> None:
+                _roundtable_set_project(
+                    tid, run.project_key or "", run.owner_sub or "anonymous",
+                )
+
+            result = await panel.run_round(
+                roundtable_core, stage=stage, repo=root, message=message,
+                notes=notes, thread_id=state.thread_id,
+                participants=participants, round_no=round_no,
+                max_rounds=panel.MAX_ROUNDS, plan_reviewed=state.plan_ok,
+                user_label=user_label, topic=_panel_topic(message),
+                emit=lambda event: _panel_emit(sid, event), on_thread=_on_thread,
+            )
+            state = _panel_load(sid) or state
+            state.thread_id = result.thread_id
+            replies, errors, reviewed = result.replies, result.errors, result.reviewed_state
+            outcome = result.outcome
+        if outcome == "changes" and (decide_only or round_no >= panel.MAX_ROUNDS):
+            outcome = await _panel_ask_user(sid, stage, round_no)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — reported to Claude and the user
+        log.exception("panel round failed session=%s stage=%s", sid, stage)
+        outcome = "unavailable"
+        errors = errors + [{"participant": "", "label": "The panel",
+                            "error": f"{type(exc).__name__}: {exc}"}]
+        state = _panel_load(sid) or state
+    try:
+        if outcome in ("approved", "unavailable", "go_ahead"):
+            await _panel_approve(state, stage, root, reviewed)
+        elif outcome == "more_rounds":
+            state.rounds[stage] = 0
+        _panel_save(sid, run.owner_sub, state)
+        _panel_emit(sid, {
+            "type": "panel_verdict", "stage": stage, "round": round_no,
+            "max_rounds": panel.MAX_ROUNDS, "outcome": outcome,
+            "thread_id": state.thread_id,
+            "errors": [e["label"] for e in errors],
+        })
+        await _panel_deliver(sid, run, panel.result_message(
+            stage, round_no, panel.MAX_ROUNDS, outcome, replies, errors, user_label,
+        ))
+    finally:
+        if _PANEL_ROUNDS.get(sid) is asyncio.current_task():
+            _PANEL_ROUNDS.pop(sid, None)
+
+
+async def _panel_ask_user(sid: str, stage: str, rounds: int) -> str:
+    """The deadlock card: go ahead anyway, more rounds, or stop."""
+    target = ACTIVE_RUNS_BY_SESSION.get(sid)
+    if target is None or target.done:
+        return "undecided"
+    request_id = str(uuid_mod.uuid4())
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    PENDING[request_id] = {"future": fut, "owner_sub": target.owner_sub, "run_id": target.run_id}
+    try:
+        target.emit({
+            "type": "question_request",
+            "id": request_id,
+            "questions": panel.decision_card(stage, rounds, panel.MAX_ROUNDS),
+            "timeout_seconds": PANEL_DECISION_TIMEOUT_SECONDS,
+        })
+        try:
+            decision = await asyncio.wait_for(fut, timeout=PANEL_DECISION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            target.emit({
+                "type": "permission_timeout", "id": request_id,
+                "tool": "PanelDecision",
+                "timeout_seconds": PANEL_DECISION_TIMEOUT_SECONDS,
+            })
+            return "undecided"
+    finally:
+        PENDING.pop(request_id, None)
+    target.emit({
+        "type": "permission_resolved", "id": request_id,
+        "tool": "PanelDecision", "decision": decision.get("decision"),
+    })
+    if decision.get("interrupted"):
+        return "stop"
+    payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
+    answers = (payload or {}).get("answers") or {}
+    picked = next(iter(answers.values()), "") if isinstance(answers, dict) else ""
+    if isinstance(picked, list):
+        picked = picked[0] if picked else ""
+    return panel.DECISIONS.get(str(picked).strip(), "undecided")
+
+
+async def _panel_deliver(sid: str, origin: "ActiveRun", text: str) -> None:
+    """Hand the panel's answer to Claude as the chat's next message.
+
+    Delivered to whichever run serves the chat now (an account switch may
+    have replaced the one that started the round). With none, it waits in
+    the record and rides in front of the user's next message.
+    """
+    target = ACTIVE_RUNS_BY_SESSION.get(sid)
+    if target is not None and not target.done:
+        reason = await _inject_user_input(target, text, [], 0, 0, announce=False)
+        if reason is None:
+            return
+    state = _panel_load(sid) or panel.PanelState(enabled=True)
+    state.pending_message = text
+    _panel_save(sid, origin.owner_sub, state)
+    _panel_emit(sid, {"type": "panel_parked"})
+    log.info("panel answer parked for session %s: no live chat to deliver to", sid)
+
+
+def _panel_take_pending(session_id: Optional[str], user_sub: Optional[str]) -> str:
+    """A parked panel answer for this chat, removed from the record."""
+    state = _panel_load(session_id)
+    if state is None or not state.pending_message:
+        return ""
+    text = state.pending_message
+    state.pending_message = None
+    _panel_save(session_id, user_sub, state)
+    return text + "\n\n"
 
 
 def _mcp_payload() -> dict[str, Any]:
@@ -7366,6 +7900,16 @@ class ActiveRun:
         # ExitPlanMode no longer carries the plan text inline, so the review
         # card reads it from here. See _resolve_plan_text.
         self.plan_file: Optional[str] = None
+        # Panel review (panel.py). panel_requested carries the browser's
+        # checkbox for a chat with no session id yet; the init event writes it
+        # to session_panel. panel_notes holds what the user said since the
+        # last round, for the panel to read. panel_commits maps the tool_use_id
+        # of a Bash call the commit gate let through to the repositories it
+        # commits in, so the PostToolUse hook can tell when a task is done.
+        self.panel_requested: Optional[bool] = None
+        self.panel_notes: list[str] = []
+        self.panel_user_label: str = "the user"
+        self.panel_commits: dict[str, list[str]] = {}
         # Client-correlated recall for queued user input. Each queued message
         # carries a queue_id; POST /api/chat/cancel-queued adds it to
         # canceled_input_ids, and the driver drops it on pickup (the check is
@@ -7483,6 +8027,10 @@ class ActiveRun:
                     _bind_session_account(
                         sid, self.owner_sub, self.requested_account_slot,
                     )
+                # And panel review, when the browser said on or off for this
+                # chat before it had a session id.
+                if self.panel_requested is not None and self.provider == "claude":
+                    _panel_set_enabled(sid, self.owner_sub, self.panel_requested)
             _record_local_session(self)
         if event.get("type") == "run_started":
             meta_changed = True
@@ -9091,6 +9639,7 @@ async def _inject_user_input(
     file_count: int,
     queue_id: Optional[str] = None,
     announce: bool = True,
+    display_text: Optional[str] = None,
 ) -> Optional[str]:
     """Queue user input for the driver to deliver to the CLI.
 
@@ -9098,6 +9647,10 @@ async def _inject_user_input(
     text claude-web generated on the user's behalf (a slash command standing in
     for a control the SDK does not expose). The CLI's own one-line reply still
     renders, so the transcript keeps a record of what changed.
+
+    ``display_text`` is what the transcript shows as the user's message when
+    ``text`` carries something they didn't type in front (the panel review
+    instruction); it defaults to ``text``.
 
     Returns None when the item was enqueued — a background task will emit
     either ``user_prompt`` (on delivery success) or an ``error`` event with
@@ -9135,7 +9688,8 @@ async def _inject_user_input(
     })
     task = asyncio.create_task(
         _confirm_and_emit_user_prompt(
-            run, text, image_count, file_count, delivered,
+            run, text if display_text is None else display_text,
+            image_count, file_count, delivered,
             queue_id=queue_id,
         ) if announce else _await_delivery_quietly(run, text, delivered)
     )
@@ -9600,6 +10154,7 @@ async def api_session(
         "account_slot": None if local_session else _resolve_account_for_run(
             user, session_id=sid,
         )["slot"],
+        "panel": None if local_session else _panel_payload(sid),
         **(local_session or {}),
     }
 
@@ -11922,6 +12477,7 @@ async def api_chat(
     account_slot: str = Form(default=""),
     queue_id: str = Form(default=""),
     provider: str = Form(default=""),
+    panel_review: str = Form(default="", alias="panel"),
     user: dict = Depends(auth.require_user),
 ):
     """Send a user message into a (possibly already-running) conversation.
@@ -11951,6 +12507,7 @@ async def api_chat(
     provider = (provider or "").strip().lower()
     if provider and provider not in VALID_PROVIDERS:
         raise HTTPException(400, "unknown provider")
+    panel_field = _panel_field(panel_review)
     _codex_sess = _codex_session_row(session_id) if session_id else None
     _local_sess = _local_session_row(session_id) if session_id else None
     if _local_sess:
@@ -12261,7 +12818,11 @@ async def api_chat(
         if existing is not None:
             _require_owner(existing, user)
             file_metas = await _save_uploaded_files(files, existing.run_id)
-            effective = _file_attachment_prefix(file_metas) + message
+            if (panel_field is not None and existing.provider == "claude"
+                    and existing.session_id and _panel_available()):
+                _panel_set_enabled(existing.session_id, user.get("sub"), panel_field)
+            shown = _file_attachment_prefix(file_metas) + message
+            effective = _panel_prefix(existing, message) + shown
             # Subscribe BEFORE we emit the new user_prompt so the new subscriber
             # only sees events from this turn forward, not the entire prior
             # history that the browser already rendered. _next_idx is the
@@ -12285,6 +12846,7 @@ async def api_chat(
                 image_count=len(image_blocks),
                 file_count=len(file_metas),
                 queue_id=queue_id or None,
+                display_text=shown,
             )
             if inject_failure == "queue_full":
                 # The run is alive but its input backlog is at the cap.
@@ -12356,6 +12918,9 @@ async def api_chat(
         run.advisor = bool(advisor_on) if provider == "claude" else False
         run.effort = effort
         run.project_key = _sanitize_project_key(cwd)
+        run.panel_user_label = _panel_user_label(user)
+        if provider == "claude" and panel_field is not None:
+            run.panel_requested = panel_field
         # Canonical conversation linkage (Slice 0, shadow-only — nothing reads
         # these tables yet). Resuming an already-wrapped native session reuses
         # its conversation; a fork or a brand-new chat gets a fresh conversation
@@ -12422,7 +12987,13 @@ async def api_chat(
             sess_lock.release()
         if switch_lock:
             switch_lock.release()
-    effective_message = _file_attachment_prefix(file_metas) + message
+    effective_message = (
+        # A panel answer that found no live chat rides in front, then the
+        # panel instruction when the chat has panel review on.
+        (_panel_take_pending(run.session_id, user.get("sub")) if provider == "claude" else "")
+        + (_panel_prefix(run, message) if provider == "claude" else "")
+        + _file_attachment_prefix(file_metas) + message
+    )
     # First two events: run_id (so a reload can reconnect) and the user's
     # prompt (so a resumed transcript shows what was asked — the SDK only
     # echoes assistant content and tool results back).
@@ -12750,6 +13321,10 @@ async def api_chat(
         # Loaded settings.env overrides the inherited subprocess environment.
         # Keep local routing and thinking controls authoritative in both layers.
         options_kwargs["settings"] = json.dumps({"env": options_kwargs["env"]})
+    if provider == "claude" and _panel_available():
+        # Panel review's gates (panel.py). On every Claude run so the checkbox
+        # works mid-chat; they let everything through while it's off.
+        options_kwargs["hooks"] = _panel_hooks_for_run(run)
     if swap_respawn or fork:
         # Personality / credential toggles cancelled an in-flight run (or
         # the user explicitly asked to branch via the fork field). Fork
@@ -13442,6 +14017,12 @@ async def api_chat(
                                 ),
                             })
                             break
+                        if (run.session_id and run.session_id in _PANEL_ROUNDS
+                                and not _PANEL_ROUNDS[run.session_id].done()):
+                            # A panel round (or the user's decision on one) is
+                            # still going, and its answer is delivered into this
+                            # run: idling out now would strand it.
+                            continue
                         # Idle timeout with nothing pending — exit cleanly.
                         break
                 finally:
@@ -13658,7 +14239,8 @@ async def api_chat_send(
     files = _form_uploads(form, "files")
     image_blocks, _meta = await _read_uploaded_images(images)
     file_metas = await _save_uploaded_files(files, run_id)
-    effective = _file_attachment_prefix(file_metas) + message
+    shown = _file_attachment_prefix(file_metas) + message
+    effective = _panel_prefix(run, message) + shown
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0
@@ -13671,6 +14253,7 @@ async def api_chat_send(
         image_count=len(image_blocks),
         file_count=len(file_metas),
         queue_id=queue_id or None,
+        display_text=shown,
     )
     if inject_failure == "queue_full":
         # The run is alive — 429 tells the browser to hold the message
@@ -13709,6 +14292,7 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         # showed the browser's last local value, which is a lie whenever the
         # run was spawned from another tab or the advisor was toggled there.
         "advisor": run.advisor,
+        "panel": _panel_payload(run.session_id) if run.provider == "claude" else None,
         "buffered_events": len(run.events),
         # Turn state + tail index, mirroring the live_run payload in
         # /api/sessions/{sid}. tryResume seeds its streaming UI from
@@ -14135,6 +14719,34 @@ async def api_chat_set_advisor(
     log.info("advisor %s run=%s model=%s",
              "on" if wanted else "off", run.run_id, run.model or "(default)")
     return {"ok": True, "advisor": wanted}
+
+
+@app.post("/api/chat/panel")
+async def api_chat_set_panel(
+    session_id: str = Form(...),
+    enabled: str = Form(default=""),
+    user: dict = Depends(auth.require_user),
+):
+    """Turn panel review on or off for a chat (see panel.py).
+
+    Takes effect at once, with or without a live run: the gates and the
+    `review` tool ride every Claude run and read this record on each call.
+    Turning it off mid-round lets the round finish; its answer still arrives,
+    and the gates stop asking.
+    """
+    sid = _safe_id(session_id)
+    if not _user_can_see_session(sid, user):
+        raise HTTPException(404, "no such session")
+    if not _panel_available():
+        raise HTTPException(409, "panel review needs the roundtable, which isn't set up here")
+    if _codex_session_row(sid) is not None or _local_session_row(sid):
+        raise HTTPException(409, "panel review is only available on Claude")
+    state = _panel_set_enabled(sid, user.get("sub"), _form_flag(enabled))
+    live = _existing_run_for_session(sid)
+    if live is not None:
+        live.emit({"type": "panel_changed", "enabled": state.enabled})
+    log.info("panel %s session=%s", "on" if state.enabled else "off", sid)
+    return {"ok": True, "panel": _panel_payload(sid)}
 
 
 @app.post("/api/chat/stop-task")

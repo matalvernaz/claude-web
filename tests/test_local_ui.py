@@ -922,3 +922,108 @@ def test_roundtable_link_to_a_thread_opens_it(browser):
         assert state["errors"] == []
     finally:
         context.close()
+
+
+PANEL_TURN = [
+    {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "tu-panel", "name": "mcp__panel__review",
+         "input": {"stage": "plan", "repo": "/r", "message": "Change **hello** to howdy in greet.py."}},
+    ]}},
+    {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "tu-panel", "content": "Sent to the panel (round 1 of 3)"},
+    ]}},
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": "It's with the panel."}]}},
+    {"type": "result"},
+    {"type": "panel_round", "stage": "plan", "round": 1, "max_rounds": 3, "repo": "/r",
+     "thread_id": 77, "participants": ["GPT Sol", "Gemini Pro"]},
+    {"type": "panel_reply", "stage": "plan", "round": 1, "participant": "GPT Sol",
+     "verdict": "approve", "text": "Fine.\nVERDICT: APPROVE"},
+    {"type": "panel_reply", "stage": "plan", "round": 1, "participant": "Gemini Pro",
+     "verdict": "changes", "text": "STYLE.md says howdy.\nVERDICT: CHANGES NEEDED"},
+    {"type": "panel_verdict", "stage": "plan", "round": 1, "max_rounds": 3,
+     "outcome": "changes", "thread_id": 77, "errors": []},
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": "Gemini has a point."}]}},
+    {"type": "result"},
+]
+
+
+def _watch_announcements(page):
+    page.add_init_script("""
+        window.__announced = [];
+        document.addEventListener('DOMContentLoaded', () => {
+            const el = document.getElementById('status-announcer');
+            new MutationObserver(() => {
+                if (el.textContent) window.__announced.push(el.textContent);
+            }).observe(el, {childList: true, characterData: true, subtree: true});
+        });
+    """)
+
+
+def test_panel_review_rides_a_new_chat_and_the_argument_plays_out_in_it(ui):
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    state["chat_sse"] = "".join(f"data: {json.dumps(e)}\n\n" for e in PANEL_TURN)
+    _watch_announcements(page)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    toggle = page.get_by_role("checkbox", name="Panel review")
+    playwright.expect(toggle).to_be_visible()
+    toggle.check()
+    page.locator("#prompt").fill("Change the greeting")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+
+    transcript = page.locator("#transcript")
+    playwright.expect(transcript).to_contain_text("Gemini has a point.")
+    chat_post = next(fields for path, fields in state["posts"] if path == "/api/chat")
+    assert chat_post["panel"] == "1"
+    headings = transcript.get_by_role("heading").all_text_contents()
+    order = ["Claude to the panel: plan", "Panel review: plan, round 1 of 3",
+             "GPT Sol: approves", "Gemini Pro: wants changes", "Panel verdict"]
+    positions = [headings.index(h) for h in order]
+    assert positions == sorted(positions)
+    submission = page.locator("article.panel-submission")
+    playwright.expect(submission.locator("strong")).to_have_text("hello")
+    playwright.expect(transcript).not_to_contain_text("Sent to the panel")
+    verdict = page.locator("article.panel-verdict")
+    playwright.expect(verdict).to_contain_text("They want changes")
+    playwright.expect(verdict.get_by_role("link")).to_have_attribute("href", "/roundtable?thread=77")
+    page.wait_for_function(
+        "() => window.__announced.some(t => t.includes('Gemini Pro wants changes'))", timeout=15000)
+    page.wait_for_function(
+        "() => window.__announced.some(t => t.startsWith('Panel verdict: They want changes'))",
+        timeout=15000)
+
+
+def test_panel_review_is_hidden_where_the_provider_cannot_do_it(ui):
+    page, state = ui
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#panel-toggle-label")).to_be_hidden()
+
+
+def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui):
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    state["session"] = {"provider": "claude", "model": "claude-test",
+                        "panel": {"enabled": True, "thread_id": 77}, "messages": [
+        {"role": "user", "text": "Change the greeting"},
+        {"role": "tool_use", "name": "mcp__panel__review", "summary": "",
+         "input": {"stage": "changes", "repo": "/r", "message": "Changed greet.py."}},
+        {"role": "tool_result", "text": "Sent to the panel (round 1 of 3)", "is_error": False},
+        {"role": "panel_result", "text": "[Review panel] This message is from claude-web's review panel, "
+                                         "not typed by Matt.\nRound 1 of 3 on your changes: approved.\n\n"
+                                         "### GPT Sol: approves\nGood."},
+        {"role": "assistant", "text": "Committing."},
+    ]}
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/?session=saved")
+    transcript = page.locator("#transcript")
+    playwright.expect(transcript).to_contain_text("Committing.")
+    playwright.expect(page.locator("article.panel-submission")).to_contain_text("Changed greet.py.")
+    result = page.locator("article.panel-result")
+    playwright.expect(result.get_by_role("heading", name="Review panel")).to_be_visible()
+    playwright.expect(result).to_contain_text("Round 1 of 3 on your changes: approved.")
+    playwright.expect(result).not_to_contain_text("[Review panel]")
+    playwright.expect(transcript).not_to_contain_text("Sent to the panel")
+    playwright.expect(page.get_by_role("checkbox", name="Panel review")).to_be_checked()
