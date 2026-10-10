@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 
 import pytest
 
 import panel
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="panel review is off on Windows (see app._panel_available)",
+)
 
 
 @pytest.mark.parametrize("command, expected", [

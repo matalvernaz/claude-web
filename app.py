@@ -7075,7 +7075,10 @@ PANEL_DECISION_TIMEOUT_SECONDS = int(os.getenv(
 
 
 def _panel_available() -> bool:
-    return ROUNDTABLE_AVAILABLE and roundtable_core is not None
+    # Not on Windows yet: Claude's shell there is Git Bash, whose /c/... paths
+    # and git's C:/... ones the commit gate doesn't reconcile, and a gate that
+    # misreads where a commit runs is worse than none.
+    return ROUNDTABLE_AVAILABLE and roundtable_core is not None and not IS_WINDOWS
 
 
 def _panel_load(session_id: Optional[str]) -> Optional[panel.PanelState]:

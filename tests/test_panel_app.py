@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import threading
 import uuid
@@ -11,6 +12,10 @@ import pytest
 
 import app as app_module
 import panel
+
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="panel review is off on Windows (see app._panel_available)",
+)
 
 
 def _git(repo, *args):

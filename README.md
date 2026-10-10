@@ -292,7 +292,8 @@ options control the diff base, working-diff capture, and grounded verification.
 #### Panel review
 
 Tick **Panel review** in the chat header (Claude chats, with the roundtable set
-up) and other AIs check Claude's work in that chat before it lands. The panel is
+up; not on Windows yet) and other AIs check Claude's work in that chat before it
+lands. The panel is
 the roundtable's coding panel, GPT, Gemini and a second Claude by default, and it
 reads the repository read-only; Claude still makes every change.
 
