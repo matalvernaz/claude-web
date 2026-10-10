@@ -29,6 +29,17 @@ import panel
     ("git commit -m \"$(cat <<'EOF'\nsubject\n\nbody\nEOF\n)\"", ["/r"]),
     ("timeout 60 git commit -m x", ["/r"]),
     ("git --work-tree=/w commit -m x", ["/w"]),
+    # Found by the panel's review of this code: control flow, shells by path
+    # or with flag clusters, eval, and git's own repository options.
+    ("if true; then git commit -am x; fi", ["/r"]),
+    ("for x in 1; do git commit -am x; done", ["/r"]),
+    ("/bin/bash -c 'git commit -m x'", ["/r"]),
+    ("bash -e -c 'cd /repo && git commit -m x'", ["/repo"]),
+    ("bash -xc 'git commit -m x'", ["/r"]),
+    ("eval \"git commit -m x\"", ["/r"]),
+    ("GIT_DIR=/repo/.git git commit -m x", ["/repo"]),
+    ("git --git-dir=/repo/.git commit -m x", ["/repo"]),
+    ("GIT_WORK_TREE=/w git commit -m x", ["/w"]),
 ])
 def test_commit_targets(command, expected):
     assert panel.commit_targets(command, "/r") == expected
@@ -166,6 +177,9 @@ class FakeCore:
         self.calls.append(("create", topic))
         return {"thread_id": 41}
 
+    def _thread_row(self, tid):
+        return {"id": tid, "closed_at": None}
+
     def roundtable_bind_repo(self, tid, repo, policy):
         self.calls.append(("bind_repo", tid, repo, policy))
 
@@ -259,3 +273,42 @@ def test_replies_stream_as_they_land_and_are_not_shown_twice():
     _, events, _ = _round(core)
     replies = [e["participant"] for e in events if e["type"] == "panel_reply"]
     assert replies == ["Gemini Pro", "GPT Sol"]
+
+
+
+@pytest.mark.parametrize("command, other", [
+    # What Claude actually ran in the end-to-end test: must stay allowed.
+    ("git add greet.py test_greet.py && git commit -q -m \"Strip whitespace\n\nCo-Authored-By: C\" "
+     "&& git status --short && git log --stat -1 | tail -4", []),
+    ("cd /repo && git add -A && git commit -qm x && git status --short", []),
+    ("git commit -m x 2>&1 | tail -3", []),
+    ("git commit -m x >/dev/null 2>&1", []),
+    ("git add a.py && git commit -F - <<'EOF'\nmsg with > and sed\nEOF", []),
+    ("sed -i s/a/b/ a.py && git commit -am x", ["sed"]),
+    ("python3 -m pytest && git commit -am x", ["python3"]),
+    ("git stash pop && git commit -am x", ["git stash"]),
+    ("git commit -m x > /tmp/out.txt", ["output to /tmp/out.txt"]),
+    ("sudo rm -rf build; git commit -m y", ["sudo"]),
+    ("bash -c 'touch f && git commit -am x'", ["touch"]),
+])
+def test_a_commit_must_run_without_anything_that_changes_files(command, other):
+    check = panel.check_command(command, "/r")
+    assert check.commits == ["/r"] or check.commits == ["/repo"]
+    assert check.other == other
+
+
+def test_staged_content_that_differs_from_disk_is_caught(repo):
+    (repo / "a.py").write_text("a = 2\n")
+    _git(repo, "add", "a.py")
+    assert panel.staged_differs(str(repo)) == []
+    (repo / "a.py").write_text("a = 1\n")  # back to HEAD on disk, 2 still staged
+    assert panel.staged_differs(str(repo)) == ["a.py"]
+    _git(repo, "add", "a.py")
+    assert panel.staged_differs(str(repo)) == []
+
+
+def test_the_executable_bit_is_part_of_the_state(repo):
+    (repo / "a.py").write_text("a = 2\n")
+    before = panel.working_state(str(repo))
+    (repo / "a.py").chmod(0o755)
+    assert panel.working_state(str(repo)) != before

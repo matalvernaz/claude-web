@@ -40,6 +40,7 @@ class FakeCore:
         self.answers = list(answers)  # one {"responses":…, "errors":…} per round
         self.posts = []
         self.asks = 0
+        self.closed = {}
 
     def _default_coding_panel(self, synthesizer):
         return ["gpt-5", "gemini-pro"]
@@ -49,6 +50,9 @@ class FakeCore:
 
     def roundtable_create(self, topic, participants, house_rules):
         return {"thread_id": 77}
+
+    def _thread_row(self, tid):
+        return {"id": tid, "closed_at": self.closed.get(tid)}
 
     def roundtable_bind_repo(self, tid, repo, policy):
         return {}
@@ -423,3 +427,98 @@ async def test_a_drain_restart_waits_for_a_panel_round(chat, repo, monkeypatch):
     gate.set()
     await _finish_round(run)
     assert f"panel-review:{run.session_id}" not in app_module._busy_runs()
+
+
+
+async def test_the_commit_gate_fails_closed_when_git_errors(chat, repo, monkeypatch):
+    run, _, _ = chat
+    _, commit, _ = _hooks(run)
+    (repo / "a.py").write_text("a = 2\n")
+
+    def broken(root):
+        raise RuntimeError("index.lock exists")
+
+    monkeypatch.setattr(panel, "working_state", broken)
+    result = await commit({"tool_input": {"command": f"git -C {repo} commit -qam x"}, "cwd": "/"}, "c", {})
+    assert _decision(result) == "deny"
+    assert "index.lock exists" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+async def test_a_commit_sharing_its_command_with_an_edit_is_refused(chat, repo):
+    run, _, _ = chat
+    _, commit, _ = _hooks(run)
+    state = app_module._panel_load(run.session_id)
+    state.approvals[str(repo)] = panel.working_state(str(repo))
+    app_module._panel_save(run.session_id, run.owner_sub, state)
+    cmd = f"sed -i s/1/9/ {repo}/a.py && git -C {repo} commit -qam x"
+    result = await commit({"tool_input": {"command": cmd}, "cwd": "/"}, "c", {})
+    assert "has to run on its own" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+async def test_staged_content_the_panel_never_saw_is_refused(chat, repo):
+    run, _, _ = chat
+    _, commit, _ = _hooks(run)
+    (repo / "a.py").write_text("a = 2\n")
+    _git(repo, "add", "a.py")
+    (repo / "a.py").write_text("a = 3\n")
+    state = app_module._panel_load(run.session_id)
+    state.approvals[str(repo)] = panel.working_state(str(repo))  # what's on disk: 3
+    app_module._panel_save(run.session_id, run.owner_sub, state)
+    result = await commit({"tool_input": {"command": f"git -C {repo} commit -qm x"}, "cwd": "/"}, "c", {})
+    assert "what's staged differs" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+async def test_go_ahead_on_a_deadlock_approves_what_the_panel_saw_not_later_edits(chat, repo, monkeypatch):
+    run, events, delivered = chat
+    monkeypatch.setattr(panel, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(app_module, "roundtable_core", FakeCore([OBJECT]))
+
+    async def answer(label):
+        for _ in range(200):
+            cards = [e for e in events if e["type"] == "question_request"
+                     and e["id"] in app_module.PENDING]
+            if cards:
+                break
+            await asyncio.sleep(0.02)
+        card = cards[-1]
+        app_module.PENDING[card["id"]]["future"].set_result(
+            {"decision": "answer", "payload": {"answers": {card["questions"][0]["question"]: label}}})
+
+    (repo / "a.py").write_text("a = 2\n")
+    await _review(run, stage="changes", repo=str(repo), message="Changed a.")
+    await answer("Stop")
+    await _finish_round(run)
+    assert "asked you to stop" in delivered[-1]
+    # Claude edits again, then asks; the user waves it through.
+    (repo / "a.py").write_text("a = 3\n")
+    text, _ = await _review(run, stage="changes", repo=str(repo), message="Changed a again.")
+    assert "being asked to decide" in text
+    await answer("Go ahead anyway")
+    await _finish_round(run)
+    _, commit, _ = _hooks(run)
+    result = await commit({"tool_input": {"command": f"git -C {repo} commit -qam x"}, "cwd": "/"}, "c", {})
+    assert _decision(result) == "deny"  # a = 3 was never in front of the panel
+
+
+async def test_a_closed_panel_thread_is_replaced_not_crashed_into(chat, repo, monkeypatch):
+    run, _, _ = chat
+    core = FakeCore([APPROVE_ALL])
+    core.closed[5] = 1234.0
+    monkeypatch.setattr(app_module, "roundtable_core", core)
+    state = app_module._panel_load(run.session_id)
+    state.thread_id = 5
+    app_module._panel_save(run.session_id, run.owner_sub, state)
+    await _review(run, stage="plan", repo=str(repo), message="Plan.")
+    await _finish_round(run)
+    state = app_module._panel_load(run.session_id)
+    assert state.thread_id == 77 and state.plan_ok is True
+
+
+def test_a_parked_answer_and_the_users_message_come_back_apart():
+    text = (panel.MESSAGE_MARKER + " answer body" + panel.PARKED_SEPARATOR
+            + panel.user_prefix() + "my next message")
+    entries = app_module._user_turn_entries(text)
+    assert entries == [
+        {"role": "panel_result", "text": panel.MESSAGE_MARKER + " answer body"},
+        {"role": "user", "text": "my next message"},
+    ]

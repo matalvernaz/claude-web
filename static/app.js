@@ -4090,11 +4090,12 @@
       announce("Panel verdict: " + verdict);
       markVisibleActivity();
     } else if (obj.type === "panel_parked") {
-      // Claude's chat had closed, so the answer waits for the next message.
+      // The answer couldn't be handed to Claude (its chat had closed, or its
+      // input queue was full), so it waits for the next message.
       setStreaming(false);
       stopGerunds();
       appendNotice("Panel review",
-        "Claude's chat had closed by the time the panel answered, so the answer goes in front of your next message.");
+        "The panel's answer couldn't reach Claude just now, so it goes in front of your next message.");
       setStatus("The panel's answer is waiting for your next message.");
       announce("The panel's answer will go with your next message.");
     } else if (obj.type === "panel_gate") {

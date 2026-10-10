@@ -1378,17 +1378,24 @@ def _find_session_path(session_id: str, project_key: str = "") -> Optional[Path]
     return None
 
 
-def _user_turn_entry(text: str, image_count: int = 0) -> dict:
+def _user_turn_entries(text: str, image_count: int = 0) -> list[dict]:
     """A user-channel message as the transcript shows it: the review panel's
     answers (which ride that channel into the CLI) as the panel's, and the
     user's own messages without the panel instruction claude-web put in
-    front of them."""
+    front of them. A panel answer that waited for the user's next message
+    rides in front of it; the two come back apart."""
+    entries: list[dict] = []
     if text.startswith(panel.MESSAGE_MARKER):
-        return {"role": "panel_result", "text": text}
+        answer, sep, rest = text.partition(panel.PARKED_SEPARATOR)
+        entries.append({"role": "panel_result", "text": answer})
+        if not sep:
+            return entries
+        text = rest
     entry = {"role": "user", "text": panel.strip_user_prefix(text)}
     if image_count:
         entry["image_count"] = image_count
-    return entry
+    entries.append(entry)
+    return entries
 
 
 def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
@@ -1410,14 +1417,14 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
         if kind == "user" and not obj.get("isMeta"):
             if isinstance(message, str):
                 if _is_user_visible(message):
-                    msgs.append(_user_turn_entry(message))
+                    msgs.extend(_user_turn_entries(message))
                 continue
             if not isinstance(message, dict):
                 continue
             content = message.get("content")
             if isinstance(content, str):
                 if _is_user_visible(content):
-                    msgs.append(_user_turn_entry(content))
+                    msgs.extend(_user_turn_entries(content))
             elif isinstance(content, list):
                 # Collect text + count of attachments so the resumed turn
                 # shows the same shape (text + N images) it did live.
@@ -1448,10 +1455,10 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
                             "is_error": bool(blk.get("is_error")),
                         })
                 if text_parts or image_count:
-                    entry = _user_turn_entry("\n".join(text_parts))
-                    if entry["role"] == "user":
-                        entry["image_count"] = image_count
-                    msgs.append(entry)
+                    entries = _user_turn_entries("\n".join(text_parts))
+                    if entries[-1]["role"] == "user":
+                        entries[-1]["image_count"] = image_count
+                    msgs.extend(entries)
                 msgs.extend(tool_results)
         elif kind == "assistant":
             if not isinstance(message, dict):
@@ -7214,25 +7221,41 @@ async def _panel_commit_gate(run: "ActiveRun", inp: dict, tool_use_id: Optional[
     command = str((inp.get("tool_input") or {}).get("command") or "")
     if "commit" not in command:
         return {}
-    state = _panel_state_for_run(run)
-    if not state.enabled:
+    if not _panel_state_for_run(run).enabled:
         return {}
-    targets = panel.commit_targets(command, inp.get("cwd") or "")
-    if targets is None:
+    check = panel.check_command(command, inp.get("cwd") or "")
+    if check.commits is None:
         run.emit({"type": "panel_gate", "gate": "commit", "repo": ""})
         return _panel_deny(panel.commit_unclear())
+    if not check.commits:
+        return {}
+    if check.other:
+        run.emit({"type": "panel_gate", "gate": "commit", "repo": ""})
+        return _panel_deny(panel.commit_not_alone(check.other))
     roots: list[tuple[str, Optional[str]]] = []
-    for where in targets:
+    for where in check.commits:
         root = await asyncio.to_thread(panel.repo_root, where)
         if root is None or any(r == root for r, _ in roots):
             continue
-        current = await asyncio.to_thread(panel.working_state, root)
+        try:
+            staged = await asyncio.to_thread(panel.staged_differs, root)
+            current = await asyncio.to_thread(panel.working_state, root)
+            head = await asyncio.to_thread(panel.head_commit, root)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            # The one check panel review can't skip fails closed: a git error
+            # here must not wave the commit through.
+            run.emit({"type": "panel_gate", "gate": "commit", "repo": root})
+            return _panel_deny(panel.commit_check_failed(root, exc))
+        if staged:
+            run.emit({"type": "panel_gate", "gate": "commit", "repo": root, "paths": staged[:20]})
+            return _panel_deny(panel.commit_staged_differs(root, staged))
+        state = _panel_state_for_run(run)
         missing = panel.unapproved(state.approvals.get(root, {}), current)
         if missing:
             run.emit({"type": "panel_gate", "gate": "commit", "repo": root,
                       "paths": missing[:20]})
             return _panel_deny(panel.commit_denied(root, missing))
-        roots.append((root, await asyncio.to_thread(panel.head_commit, root)))
+        roots.append((root, head))
     if roots and tool_use_id:
         run.panel_commits[tool_use_id] = roots
     return {}
@@ -7250,18 +7273,23 @@ async def _panel_after_commit(run: "ActiveRun", tool_use_id: Optional[str]) -> N
     roots = run.panel_commits.pop(tool_use_id or "", None)
     if not roots or not run.session_id:
         return
-    state = _panel_load(run.session_id)
-    if state is None or not state.enabled:
-        return
-    landed = []
+    landed: list[str] = []
+    clean: list[str] = []
     for root, before in roots:
         if await asyncio.to_thread(panel.head_commit, root) == before:
             continue
         landed.append(root)
         if await asyncio.to_thread(panel.working_state, root) == {}:
-            state.approvals.pop(root, None)
+            clean.append(root)
     if not landed:
         return
+    # Read, change and save with no await in between, so a switch flipped
+    # while git was being read isn't overwritten.
+    state = _panel_load(run.session_id)
+    if state is None or not state.enabled:
+        return
+    for root in clean:
+        state.approvals.pop(root, None)
     state.end_cycle()
     _panel_save(run.session_id, run.owner_sub, state)
     run.emit({"type": "panel_cycle_done", "repos": landed})
@@ -7300,7 +7328,9 @@ def _panel_hooks_for_run(run: "ActiveRun") -> dict:
     return {
         "PreToolUse": [
             HookMatcher(matcher="Edit|Write|MultiEdit|NotebookEdit", hooks=[edit_gate]),
-            HookMatcher(matcher="Bash", hooks=[commit_gate]),
+            # Reading a big repository's status and hashing its changes can
+            # outlast the 60 s default.
+            HookMatcher(matcher="Bash", hooks=[commit_gate], timeout=180),
         ],
         "PostToolUse": [HookMatcher(matcher="Bash", hooks=[after_bash])],
     }
@@ -7338,12 +7368,12 @@ def _build_panel_mcp_server(run: "ActiveRun"):
 async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
     """Start a round (or the user's decision on a deadlock) in the background."""
     sid = run.session_id
-    state = _panel_state_for_run(run)
-    if not state.enabled or not sid:
-        return (
-            "Panel review is off in this chat, so there's no panel to send this "
-            "to. The user can turn it on with the Panel review checkbox.", True,
-        )
+    off = (
+        "Panel review is off in this chat, so there's no panel to send this "
+        "to. The user can turn it on with the Panel review checkbox."
+    )
+    if not sid or not _panel_state_for_run(run).enabled:
+        return off, True
     stage = str(args.get("stage") or "").strip().lower()
     if stage not in panel.STAGES:
         return ('stage must be "plan" or "changes".', True)
@@ -7364,6 +7394,11 @@ async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
             "arrive as your next message: end your turn and wait for it.", False,
         )
     participants = _panel_participants()
+    # Read (and save) the record only now, past the last await, so a switch
+    # flipped meanwhile isn't overwritten with the copy from before.
+    state = _panel_state_for_run(run)
+    if not state.enabled:
+        return off, True
     decide_only = state.rounds.get(stage, 0) >= panel.MAX_ROUNDS
     if decide_only:
         round_no = state.rounds[stage]
@@ -7396,18 +7431,6 @@ async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
 def _panel_topic(message: str) -> str:
     first = next((line.strip() for line in message.splitlines() if line.strip()), "")
     return "Panel review: " + (first[:90] + ("…" if len(first) > 90 else ""))
-
-
-async def _panel_approve(
-    state: panel.PanelState, stage: str, root: str, reviewed: Optional[dict],
-) -> None:
-    if stage == "plan":
-        state.plan_ok = True
-    else:
-        if reviewed is None:
-            reviewed = await asyncio.to_thread(panel.working_state, root)
-        state.approvals[root] = reviewed
-    state.rounds[stage] = 0
 
 
 async def _panel_round_task(
@@ -7462,13 +7485,33 @@ async def _panel_round_task(
         errors = errors + [{"participant": "", "label": "The panel",
                             "error": f"{type(exc).__name__}: {exc}"}]
     try:
-        # Read the record afresh: a round plus the user's decision can take
-        # minutes, and saving the copy read at the start would undo anything
-        # that changed meanwhile, the switch included.
+        approve = outcome in ("approved", "unavailable", "go_ahead")
+        # An approval of changes covers what the panel was shown: this round's
+        # snapshot, or for "go ahead" on a deadlock with no new round, the last
+        # one it saw. Only a panel that stepped aside before seeing anything
+        # approves what's on disk now.
+        on_disk: Optional[dict] = None
+        if (approve and stage == "changes" and reviewed is None
+                and not (decide_only and root in start.last_reviewed)):
+            on_disk = await asyncio.to_thread(panel.working_state, root)
+        # Read the record afresh and save with no await in between: a round
+        # plus the user's decision can take minutes, and saving the copy read
+        # at the start would undo anything that changed meanwhile, the switch
+        # included.
         state = _panel_load(sid) or start
         state.thread_id = thread_id
-        if outcome in ("approved", "unavailable", "go_ahead"):
-            await _panel_approve(state, stage, root, reviewed)
+        if stage == "changes" and reviewed is not None:
+            state.last_reviewed[root] = reviewed
+        if approve:
+            if stage == "plan":
+                state.plan_ok = True
+            elif reviewed is not None:
+                state.approvals[root] = reviewed
+            elif decide_only and root in state.last_reviewed:
+                state.approvals[root] = state.last_reviewed[root]
+            else:
+                state.approvals[root] = on_disk or {}
+            state.rounds[stage] = 0
         elif outcome == "more_rounds":
             state.rounds[stage] = 0
         _panel_save(sid, run.owner_sub, state)
@@ -7554,7 +7597,7 @@ def _panel_take_pending(session_id: Optional[str], user_sub: Optional[str]) -> s
     text = state.pending_message
     state.pending_message = None
     _panel_save(session_id, user_sub, state)
-    return text + "\n\n"
+    return text + panel.PARKED_SEPARATOR
 
 
 def _mcp_payload() -> dict[str, Any]:
@@ -12850,6 +12893,8 @@ async def api_chat(
                 _panel_set_enabled(existing.session_id, user.get("sub"), panel_field)
             shown = _file_attachment_prefix(file_metas) + message
             effective = _panel_prefix(existing, message) + shown
+            if existing.provider == "claude":
+                effective = _panel_take_pending(existing.session_id, user.get("sub")) + effective
             # Subscribe BEFORE we emit the new user_prompt so the new subscriber
             # only sees events from this turn forward, not the entire prior
             # history that the browser already rendered. _next_idx is the
@@ -14268,6 +14313,8 @@ async def api_chat_send(
     file_metas = await _save_uploaded_files(files, run_id)
     shown = _file_attachment_prefix(file_metas) + message
     effective = _panel_prefix(run, message) + shown
+    if run.provider == "claude":
+        effective = _panel_take_pending(run.session_id, user.get("sub")) + effective
     run.pending_notifications.clear()
     run.notification_grace_started_at = None
     run.consecutive_auto_fires = 0

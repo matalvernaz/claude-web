@@ -298,7 +298,9 @@ reads the repository read-only; Claude still makes every change.
 
 - Before Claude changes files in a git repository, its plan goes to the panel.
 - Before it commits, the panel reviews the actual diff. Nothing is committed
-  until they approve, or you decide.
+  until they approve, or you decide. A commit has to run as its own command,
+  and has to match exactly what the panel saw; any later edit needs another
+  round. This keeps a cooperating Claude to the review; it isn't a sandbox.
 - Each round runs in the background. Claude ends its turn while the panel
   reads, and the panel's answer arrives as the chat's next message, so you can
   talk to Claude meanwhile; what you say also goes to the panel's next round.

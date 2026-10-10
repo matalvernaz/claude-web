@@ -66,6 +66,9 @@ MESSAGE_MARKER = "[Review panel]"
 # Opens the instruction put in front of the user's messages in a panel chat;
 # a reopened chat strips everything up to the blank line after it.
 USER_PREFIX_MARKER = "[Panel review is on in this chat."
+# Between a parked panel answer and the user's message that carries it, so a
+# reopened chat can show the two apart.
+PARKED_SEPARATOR = "\n\n[The user's message follows.]\n\n"
 
 _GIT_TIMEOUT = 20
 
@@ -137,16 +140,37 @@ def _digest(p: Path) -> str:
         if p.is_symlink():
             return "link:" + os.readlink(p)
         if p.is_dir():
-            # A submodule or nested repository: its own commits are not
-            # this repository's changes to review.
-            return "dir"
+            # A submodule or nested repository: what this repository would
+            # commit is the commit it points at.
+            try:
+                r = _git(str(p), "rev-parse", "HEAD")
+                return "dir:" + r.stdout.decode().strip() if r.returncode == 0 else "dir"
+            except (OSError, subprocess.TimeoutExpired):
+                return "dir"
         h = hashlib.sha256()
         with p.open("rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-        return h.hexdigest()
+        # The executable bit is part of what git commits.
+        return h.hexdigest() + (":x" if os.access(p, os.X_OK) else "")
     except FileNotFoundError:
         return "deleted"
+
+
+def staged_differs(root: str) -> list[str]:
+    """Paths whose staged content isn't what's on disk.
+
+    The panel reviews files as they are on disk, and ``git commit`` commits
+    what's staged, so a path staged at one version and edited (or restored)
+    since would commit something the panel never saw.
+    """
+    def names(*args: str) -> set[str]:
+        r = _git(root, "diff", *args, "--name-only", "-z")
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode("utf-8", "replace").strip() or "git diff failed")
+        return {n.decode("utf-8", "surrogateescape") for n in r.stdout.split(b"\0") if n}
+
+    return sorted(names("--cached") & names())
 
 
 def head_commit(root: str) -> Optional[str]:
@@ -170,13 +194,38 @@ def unapproved(approved: dict[str, str], current: dict[str, str]) -> list[str]:
 _HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _LOOSE_COMMIT = re.compile(r"(?<![\w./-])git\b[^\n;&|]*?\bcommit\b")
+# Shell words that start or end a compound command rather than run one.
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}",
+             "fi", "done", "esac"}
 # Commands that run the rest of their arguments as a command.
-_WRAPPERS = {"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin"}
+_WRAPPERS = {"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin",
+             "timeout", "stdbuf", "ionice"}
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+# What may share a Bash call with a commit: nothing here changes files, so
+# the gate's check of the repository still holds when the commit runs.
+_SAFE_WITH_COMMIT = {"cd", "pushd", "popd", "echo", "printf", "true", "false", ":",
+                     "tail", "head", "wc", "test", "[", "sleep"}
+_GIT_SAFE_WITH_COMMIT = {"add", "commit", "status", "log", "diff", "show", "rev-parse",
+                         "push", "branch", "describe", "shortlog", "ls-files", "tag",
+                         "fetch", "remote"}
 _GIT_OPTS_WITH_VALUE = {
-    "-c", "--git-dir", "--namespace", "--super-prefix", "--config-env",
-    "--exec-path", "--list-cmds",
+    "-c", "--namespace", "--super-prefix", "--config-env", "--exec-path", "--list-cmds",
 }
-_PUNCT = ";&|()"
+_PUNCT = ";&|()<>"
+_SEPARATOR_CHARS = set(";&|()")
+_HARMLESS_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
+
+
+@dataclasses.dataclass
+class CommandCheck:
+    """What a Bash command does that the commit gate cares about."""
+
+    # Where it runs `git commit`; None when it commits somewhere the gate
+    # can't work out (it then refuses and asks for `git -C <repo> commit`).
+    commits: Optional[list[str]]
+    # Anything else in the same call that could change files: run before the
+    # commit, it would slip past a check made before the command started.
+    other: list[str]
 
 
 def _strip_heredocs(command: str) -> str:
@@ -199,7 +248,8 @@ def _strip_heredocs(command: str) -> str:
 
 def _segments(command: str) -> Optional[list[list[str]]]:
     """Split a shell command into simple commands (argv lists), or None when
-    it won't tokenize (unbalanced quotes)."""
+    it won't tokenize (unbalanced quotes). Redirection operators stay in the
+    argv as their own tokens."""
     lexer = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=_PUNCT)
     lexer.whitespace_split = True
     try:
@@ -209,7 +259,7 @@ def _segments(command: str) -> Optional[list[list[str]]]:
     segs: list[list[str]] = []
     cur: list[str] = []
     for t in tokens:
-        if t and all(c in _PUNCT for c in t):
+        if t and set(t) <= _SEPARATOR_CHARS:
             if cur:
                 segs.append(cur)
             cur = []
@@ -229,79 +279,176 @@ def _resolve(base: Optional[str], target: str) -> Optional[str]:
     return os.path.normpath(os.path.join(base, target))
 
 
-def _unwrap(argv: list[str]) -> list[str]:
-    """Skip leading VAR=value assignments and wrappers like sudo, env, nice.
+def _redirections(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split redirections out of ``argv``: the words left, and the files the
+    command writes to (``/dev/null`` and fd copies like ``2>&1`` don't count)."""
+    words: list[str] = []
+    writes: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok and set(tok) <= set("<>&|") and ("<" in tok or ">" in tok):
+            target = argv[i + 1] if i + 1 < len(argv) else ""
+            if ">" in tok and not tok.endswith("&") and target not in _HARMLESS_TARGETS:
+                writes.append(target)
+            if words and words[-1].isdigit():
+                words.pop()  # the fd number in front of 2>
+            i += 2
+            continue
+        words.append(tok)
+        i += 1
+    return words, writes
 
-    Wrappers take options with values (``sudo -u matt``), so rather than
-    parse each one, jump to the first word that starts a command we care
-    about.
+
+def _unwrap(argv: list[str]) -> tuple[list[str], dict[str, str], bool]:
+    """Skip shell keywords, VAR=value assignments and wrappers like sudo.
+
+    Returns the command's own argv, the assignments, and whether a wrapper
+    hid a command this module doesn't follow. Wrappers take options with
+    values (``sudo -u matt``, ``timeout 60``), so rather than parse each one,
+    jump to the first word that starts a command we follow.
     """
-    if not argv:
-        return argv
-    first = argv[0]
-    if _ENV_ASSIGN.match(first) or first in _WRAPPERS or first == "timeout":
-        for i, a in enumerate(argv):
-            if os.path.basename(a) == "git" or a in ("cd", "pushd", "bash", "sh", "zsh"):
-                return argv[i:]
-        return []
-    return argv
+    env: dict[str, str] = {}
+    i = 0
+    while i < len(argv) and (argv[i] in _KEYWORDS or _ENV_ASSIGN.match(argv[i])):
+        if _ENV_ASSIGN.match(argv[i]):
+            key, _, value = argv[i].partition("=")
+            env[key] = value
+        i += 1
+    argv = argv[i:]
+    if argv and argv[0] in _WRAPPERS:
+        for j, word in enumerate(argv):
+            if _ENV_ASSIGN.match(word):
+                key, _, value = word.partition("=")
+                env[key] = value
+            elif (os.path.basename(word) in ("git", *_SHELLS)
+                  or word in ("cd", "pushd", "eval")):
+                return argv[j:], env, False
+        return [], env, True
+    return argv, env, False
 
 
-def commit_targets(command: str, cwd: str) -> Optional[list[str]]:
-    """Directories where ``command`` would run ``git commit``.
+def _shell_script(argv: list[str]) -> Optional[str]:
+    """The script a shell runs with -c (in any flag cluster: -c, -ec, -xc)."""
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-o", "+o", "-O", "+O"):
+            i += 2
+            continue
+        if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if not tok.startswith(("-", "+")):
+            return None
+        i += 1
+    return None
 
-    Returns [] when it doesn't commit, and None when it seems to but the
-    directory can't be worked out (a ``cd -``, quoting the tokenizer can't
-    follow); the caller then refuses and asks for ``git -C <repo> commit``.
+
+def _git_dir_root(base: Optional[str], git_dir: str) -> Optional[str]:
+    p = _resolve(base, git_dir)
+    if p is None:
+        return None
+    return os.path.dirname(p) if os.path.basename(p) == ".git" else p
+
+
+def _git_command(argv: list[str], where: Optional[str], env: dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """git's subcommand and the directory it runs in."""
+    if "GIT_WORK_TREE" in env:
+        where = _resolve(where, env["GIT_WORK_TREE"])
+    elif "GIT_DIR" in env:
+        where = _git_dir_root(where, env["GIT_DIR"])
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-C", "--work-tree") and i + 1 < len(argv):
+            where = _resolve(where, argv[i + 1])
+            i += 2
+        elif a.startswith("--work-tree="):
+            where = _resolve(where, a.split("=", 1)[1])
+            i += 1
+        elif a == "--git-dir" and i + 1 < len(argv):
+            where = _git_dir_root(where, argv[i + 1])
+            i += 2
+        elif a.startswith("--git-dir="):
+            where = _git_dir_root(where, a.split("=", 1)[1])
+            i += 1
+        elif a in _GIT_OPTS_WITH_VALUE and i + 1 < len(argv):
+            i += 2
+        elif a.startswith("-"):
+            i += 1
+        else:
+            return a, where
+    return None, where
+
+
+def check_command(command: str, cwd: str) -> CommandCheck:
+    """Where ``command`` runs ``git commit``, and what else it does.
+
     ``cwd`` is the shell's directory when the command starts, which the hook
     input carries (it follows earlier ``cd`` commands; verified on 2.1.296).
+    This follows the shell forms an agent writes (``&&`` chains, ``cd``,
+    ``git -C``, ``if``/``for`` bodies, ``bash -c``, ``eval``, wrappers like
+    ``sudo`` and ``env``). It's there to hold a cooperating agent to the
+    review, not to stop one trying to get round it: a script that commits,
+    a git alias or ``xargs git commit`` aren't followed.
     """
     text = _strip_heredocs(command.replace("\\\n", " "))
     segs = _segments(text)
     if segs is None:
-        return None if _LOOSE_COMMIT.search(text) else []
+        return CommandCheck(None if _LOOSE_COMMIT.search(text) else [], [])
     here: Optional[str] = cwd or None
     found: list[str] = []
+    other: list[str] = []
+    unplaced = False
     for raw in segs:
-        argv = _unwrap(raw)
+        argv, env, hidden = _unwrap(raw)
+        if hidden:
+            other.append(raw[0])
+            continue
         if not argv:
             continue
-        head = argv[0]
-        if head in ("cd", "pushd"):
+        argv, writes = _redirections(argv)
+        other.extend(f"output to {w}" for w in writes)
+        if not argv:
+            continue
+        head = os.path.basename(argv[0])
+        if argv[0] in ("cd", "pushd"):
             target = argv[1] if len(argv) > 1 else "~"
             here = None if target == "-" else _resolve(here, target)
             continue
-        if head in ("bash", "sh", "zsh") and len(argv) >= 3 and argv[1] in ("-c", "-lc", "-ec"):
-            inner = commit_targets(argv[2], here or "")
-            if inner is None:
-                return None
-            found.extend(inner)
+        if argv[0] == "popd":
+            here = None
             continue
-        if os.path.basename(head) != "git":
-            continue
-        where = here
-        sub = None
-        i = 1
-        while i < len(argv):
-            a = argv[i]
-            if a in ("-C", "--work-tree") and i + 1 < len(argv):
-                where = _resolve(where, argv[i + 1])
-                i += 2
-            elif a.startswith("--work-tree="):
-                where = _resolve(where, a.split("=", 1)[1])
-                i += 1
-            elif a in _GIT_OPTS_WITH_VALUE and i + 1 < len(argv):
-                i += 2
-            elif a.startswith("-"):
-                i += 1
+        if head in _SHELLS or argv[0] == "eval":
+            script = " ".join(argv[1:]) if argv[0] == "eval" else _shell_script(argv)
+            if script is None:
+                other.append(argv[0])
+                continue
+            inner = check_command(script, here or "")
+            if inner.commits is None:
+                unplaced = True
             else:
-                sub = a
-                break
-        if sub == "commit":
-            if where is None:
-                return None
-            found.append(where)
-    return found
+                found.extend(inner.commits)
+            other.extend(inner.other)
+            continue
+        if head == "git":
+            sub, where = _git_command(argv, here, env)
+            if sub == "commit":
+                if where is None:
+                    unplaced = True
+                else:
+                    found.append(where)
+            elif sub not in _GIT_SAFE_WITH_COMMIT:
+                other.append(f"git {sub}" if sub else "git")
+            continue
+        if argv[0] not in _SAFE_WITH_COMMIT:
+            other.append(argv[0])
+    return CommandCheck(None if unplaced else found, other)
+
+
+def commit_targets(command: str, cwd: str) -> Optional[list[str]]:
+    """Where ``command`` runs ``git commit`` (see check_command)."""
+    return check_command(command, cwd).commits
 
 
 # ─── Verdicts ────────────────────────────────────────────────────────────────
@@ -332,6 +479,9 @@ class PanelState:
     rounds: dict = dataclasses.field(default_factory=lambda: {"plan": 0, "changes": 0})
     # repo root -> {path: digest}: the working state the panel last approved.
     approvals: dict = dataclasses.field(default_factory=dict)
+    # repo root -> {path: digest}: what the panel was last shown, approved or
+    # not. "Go ahead anyway" approves this, never what's on disk by then.
+    last_reviewed: dict = dataclasses.field(default_factory=dict)
     # Set when a round's answer found no live chat to deliver to; the next
     # message the user sends carries it in front.
     pending_message: Optional[str] = None
@@ -349,6 +499,7 @@ class PanelState:
         state = cls(**{k: v for k, v in data.items() if k in fields})
         state.rounds = {s: int((state.rounds or {}).get(s, 0)) for s in STAGES}
         state.approvals = dict(state.approvals or {})
+        state.last_reviewed = dict(state.last_reviewed or {})
         return state
 
     def end_cycle(self) -> None:
@@ -505,6 +656,35 @@ def commit_denied(root: str, paths: list[str]) -> str:
         f"in {root} as they stand now: {shown}. Send them with the {TOOL_NAME} tool "
         "(stage \"changes\") and end your turn; commit after they approve. If some of "
         "those files are noise that shouldn't be committed, say so to the panel."
+    )
+
+
+def commit_not_alone(other: list[str]) -> str:
+    shown = ", ".join(dict.fromkeys(other))
+    return (
+        "Panel review is on in this chat, so a commit has to run on its own: this "
+        f"command also runs {shown}, which could change files after the panel's check "
+        "and before the commit. Do that first, then commit in a separate command "
+        "(git add, git commit, and git status or git log if you like)."
+    )
+
+
+def commit_staged_differs(root: str, paths: list[str]) -> str:
+    shown = ", ".join(paths[:20]) + (f" and {len(paths) - 20} more" if len(paths) > 20 else "")
+    return (
+        f"Panel review is on in this chat, and in {root} what's staged differs from "
+        f"what's on disk for: {shown}. The panel reviews the files as they are on disk, "
+        "and git commit commits what's staged, so stage them again (git add) or "
+        "unstage them before committing."
+    )
+
+
+def commit_check_failed(root: str, error: Exception) -> str:
+    return (
+        f"Panel review is on in this chat, and claude-web couldn't read {root} to "
+        f"check the commit against the panel's approval ({type(error).__name__}: "
+        f"{error}). Nothing was committed. Try again in a moment; if git is busy "
+        "(an index.lock), wait for it to finish."
     )
 
 
@@ -665,6 +845,12 @@ async def run_round(
     """
     labels = {p: core.PARTICIPANTS[p]["label"] for p in participants}
     tid = thread_id
+    if tid is not None:
+        # Closed from the Roundtable page, or gone: every post to it would
+        # fail and the panel would step aside on every round from then on.
+        row = await asyncio.to_thread(core._thread_row, tid)
+        if row is None or row.get("closed_at"):
+            tid = None
     if tid is None:
         created = await asyncio.to_thread(
             core.roundtable_create, topic=topic, participants=list(participants),
