@@ -3793,7 +3793,7 @@
     } else if (obj.type === "question_request") {
       ctx.currentAssistantBody = null;
       announce(
-        `${assistantLabel(obj.provider)} is asking you a question.`,
+        `${obj.asker || assistantLabel(obj.provider)} is asking you a question.`,
         { urgent: true },
       );
       playCue("permission");
@@ -4643,7 +4643,9 @@
   }
 
   function entryLabel(entry) {
-    if (entry.kind === "question") return assistantLabel(entry.req.provider) + "'s question";
+    if (entry.kind === "question") {
+      return (entry.req.asker || assistantLabel(entry.req.provider)) + "'s question";
+    }
     if (entry.kind === "plan") return "plan review";
     return entry.req.tool;
   }
@@ -4721,8 +4723,9 @@
       appendDecideLater(actions);
       permDialog.appendChild(actions);
     } else {
+      // Same wording as the docked card's own heading, which is hidden here.
       title.textContent = entry.kind === "question"
-        ? `Claude is asking${countSuffix}`
+        ? `${req.asker || assistantLabel(req.provider)} is asking${countSuffix}`
         : `Claude's plan — review${countSuffix}`;
       const card = findRequestCard(req.id);
       dockedPlaceholder = document.createElement("span");
@@ -5215,7 +5218,10 @@
     const heading = document.createElement("h3");
     heading.className = "role";
     heading.id = headingId;
-    heading.textContent = assistantLabel(req.provider) + (req.closed ? " asked" : " is asking");
+    // ``asker`` names who's asking when it isn't the assistant: the review
+    // panel's deadlock card asks the user to decide between it and Claude.
+    heading.textContent = (req.asker || assistantLabel(req.provider))
+      + (req.closed ? " asked" : " is asking");
     card.appendChild(heading);
     card.setAttribute("aria-labelledby", headingId);
 

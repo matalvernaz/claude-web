@@ -1027,3 +1027,33 @@ def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui):
     playwright.expect(result).not_to_contain_text("[Review panel]")
     playwright.expect(transcript).not_to_contain_text("Sent to the panel")
     playwright.expect(page.get_by_role("checkbox", name="Panel review")).to_be_checked()
+
+
+def test_the_panels_deadlock_card_says_the_panel_is_asking(ui):
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    card = {"type": "question_request", "id": "panel-q", "asker": "The review panel",
+            "timeout_seconds": 900, "questions": [{
+                "question": "The panel still has objections to Claude's plan after 3 rounds. What now?",
+                "header": "Panel", "multiSelect": False, "options": [
+                    {"label": "Go ahead anyway", "description": "Treat it as approved: Claude makes the changes."},
+                    {"label": "Keep discussing", "description": "Give them up to 3 more rounds."},
+                    {"label": "Stop", "description": "Claude stops here and waits for you."},
+                ]}]}
+    state["chat_sse"] = f"data: {json.dumps(card)}\n\n"
+    _watch_announcements(page)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Change the greeting")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    dialog = page.locator("dialog[open]")
+    playwright.expect(dialog.get_by_role("heading", name="The review panel is asking")).to_be_visible()
+    playwright.expect(dialog).not_to_contain_text("Claude is asking")
+    dialog.get_by_label("Go ahead anyway", exact=False).check()
+    with page.expect_request("**/api/permission/panel-q") as req:
+        dialog.get_by_role("button", name="Submit answers").click()
+    sent = req.value.post_data
+    assert "Go ahead anyway" in sent
+    page.wait_for_function(
+        "() => window.__announced.some(t => t.startsWith('The review panel is asking'))", timeout=15000)

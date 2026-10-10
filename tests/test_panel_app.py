@@ -340,6 +340,9 @@ async def test_the_users_messages_carry_the_instruction_and_reach_the_panel(chat
     run, _, _ = chat
     assert app_module._panel_prefix(run, "fix it").startswith(panel.USER_PREFIX_MARKER)
     assert run.panel_notes == ["fix it"]
+    # A slash command must stay first in the message or it stops working.
+    assert app_module._panel_prefix(run, "/compact") == ""
+    assert run.panel_notes == ["fix it"]
     app_module._panel_set_enabled(run.session_id, run.owner_sub, False)
     assert app_module._panel_prefix(run, "and this") == ""
 

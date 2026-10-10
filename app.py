@@ -7146,6 +7146,9 @@ def _panel_prefix(run: "ActiveRun", message: str) -> str:
     """
     if not _panel_state_for_run(run).enabled:
         return ""
+    if message.lstrip().startswith("/"):
+        # A slash command only works at the very start of the message.
+        return ""
     if message.strip():
         run.panel_notes.append(message.strip()[:4000])
         del run.panel_notes[:-10]
@@ -7491,6 +7494,7 @@ async def _panel_ask_user(sid: str, stage: str, rounds: int) -> str:
             "id": request_id,
             "questions": panel.decision_card(stage, rounds, panel.MAX_ROUNDS),
             "timeout_seconds": PANEL_DECISION_TIMEOUT_SECONDS,
+            "asker": "The review panel",
         })
         try:
             decision = await asyncio.wait_for(fut, timeout=PANEL_DECISION_TIMEOUT_SECONDS)
