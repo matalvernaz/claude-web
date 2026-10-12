@@ -8110,6 +8110,10 @@ class ActiveRun:
         # last successful set_model). Lets _sync_plan_model skip redundant
         # control requests when plan state flaps without a model change.
         self.live_sdk_model: Optional[str] = None
+        # Model id the CLI named in its init message. What a turn actually ran
+        # on when live_sdk_model is None: a Default pick sends no --model, and
+        # a resumed session can carry on with the model it last used.
+        self.init_model: Optional[str] = None
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -15487,6 +15491,8 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
     if isinstance(msg, SystemMessage):
         if msg.subtype == "init":
             data = msg.data or {}
+            if run is not None:
+                run.init_model = data.get("model") or None
             rli = data.get("rate_limit_info") or {}
             if rli and run is not None and run.provider == "claude":
                 # No run means no way to attribute the info to a credential
@@ -15798,6 +15804,12 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             if offer:
                 events.append({"type": "failover_offer", **offer})
         elif msg.is_error and msg.api_error_status == 429 and not is_local:
+            if run is not None and _is_model_credits_refusal(
+                    run.rate_limit_info, msg.result or ""):
+                # Not a plan window at all: this account wants usage credits
+                # for the model the turn ran on. Bar that family alone, so the
+                # ranker moves Fable off the slot and leaves Opus on it.
+                _note_credits_refusal(run, slot)
             # Plan window spent mid-turn. The turn is already lost; point at an
             # account that could carry the retry instead of leaving the user to
             # work out which of their slots still has room.
@@ -16041,8 +16053,9 @@ _MODEL_FAMILY_TOKENS = frozenset({"fable", "opus", "sonnet", "haiku", "mythos"})
 #
 # Entitlement, from the bottom: an observed refusal; a scoped bucket seen at
 # 100% with its reset still ahead; a fresh reading with no bucket for the
-# family (the plan doesn't carry it — the only signal there is that a Pro seat
-# can't run Fable, whose refusal is a 429 that records no denial); no fresh
+# family (the plan doesn't carry it — the only signal that a Pro seat can't
+# run Fable until a Fable turn there is actually refused for want of usage
+# credits, which _note_credits_refusal records as a denial); no fresh
 # reading at all; a bucket with room. UNSEEN and UNMETERED used to share one
 # "unknown", which let "never looked" lose to "proven" and divert a healthy,
 # never-asked slot onto a dead one (2026-09-14, 2026-10-05).
@@ -16190,6 +16203,12 @@ def _note_model_denial(slot: str, model_key: str, advisor: bool = False) -> None
     families = _model_families_for_key(model_key)
     if not families:
         return
+    _record_denials(slot, families, int(time.time() + _MODEL_DENIAL_TTL_SECONDS))
+    log.info("recorded model denial slot=%s families=%s", slot, sorted(families))
+
+
+def _record_denials(slot: str, families: set[str], expires: int) -> None:
+    """Write ``families`` as refused by ``slot`` until ``expires`` (epoch seconds)."""
     data = _entitlement_cache()
     denied = data.setdefault("denied", {})
     if not isinstance(denied, dict):
@@ -16199,11 +16218,58 @@ def _note_model_denial(slot: str, model_key: str, advisor: bool = False) -> None
     if not isinstance(per_slot, dict):
         per_slot = {}
         denied[slot] = per_slot
-    expires = int(time.time() + _MODEL_DENIAL_TTL_SECONDS)
     for fam in families:
         per_slot[fam] = expires
     _write_entitlement_cache(data)
-    log.info("recorded model denial slot=%s families=%s", slot, sorted(families))
+
+
+# Words the CLI's usage-credits refusal of a *model* ends with, in the
+# non-interactive form the SDK gets: "You're out of usage credits. Switch to
+# another model to continue." (measured on a Pro account and a standard Team
+# seat, 2026-10-11), and the pooled-team "You've hit your team's shared budget.
+# Switch to another model to continue." The error code alone can't tell this
+# from a long-context refusal ("Usage credits required for 1M context"), which
+# carries the same code but is about one oversized request, not the model.
+_MODEL_CREDITS_REFUSAL_PHRASE = "switch to another model"
+
+
+def _is_model_credits_refusal(rli: Optional[dict], text: str) -> bool:
+    """True when a 429 turn was the account refusing its *model* for want of credits.
+
+    Needs both halves: the rate-limit info the CLI sent with the refusal
+    (rejected, ``errorCode: credits_required``) and the result text naming a
+    model switch as the way out. Unfamiliar or empty wording is not evidence,
+    so a rewording upstream degrades to recording nothing, never to barring a
+    model the account can run.
+    """
+    if not isinstance(rli, dict):
+        return False
+    if rli.get("status") != "rejected" or rli.get("errorCode") != "credits_required":
+        return False
+    return _MODEL_CREDITS_REFUSAL_PHRASE in " ".join((text or "").casefold().split())
+
+
+def _note_credits_refusal(run: "ActiveRun", slot: str) -> None:
+    """Bar the model family ``run`` was refused on ``slot``, until its credits reset.
+
+    The family comes from the model the CLI actually ran, never from the
+    picker: a Default pick sends no --model, and on 2026-10-11 a resumed chat
+    on Default was still running Fable when it was refused. An unknown model
+    records nothing. The bar lasts until the refusal's ``resetsAt`` (the
+    credits period), at most the usual denial TTL so a top-up isn't ignored
+    for weeks.
+    """
+    family = _normalize_family(run.live_sdk_model or run.init_model or "")
+    if not family:
+        return
+    now = time.time()
+    expires = now + _MODEL_DENIAL_TTL_SECONDS
+    resets_at = (run.rate_limit_info or {}).get("resetsAt")
+    if isinstance(resets_at, (int, float)) and now < resets_at < expires:
+        expires = resets_at
+    _record_denials(slot, {family}, int(expires))
+    log.info("recorded usage-credits refusal slot=%s family=%s until=%d",
+             slot, family, int(expires))
 
 
 def _denied_families(slot: str) -> set[str]:
@@ -16317,6 +16383,14 @@ def _slot_health_rank(slot: str) -> int:
     if not _reset_pending(info.get("resetsAt")):
         return _HEALTH_UNKNOWN
     if info.get("status") == "rejected":
+        if info.get("errorCode") == "credits_required":
+            # A refusal for want of usage credits names no plan window: one
+            # model (or one oversized request) was turned away, and the reset
+            # it carries is the credits period's. Read as spent, it benched the
+            # slot for every model until the 1st (2026-10-11: one Fable turn on
+            # a Pro account sent every Opus pick elsewhere). The model itself
+            # is barred by _note_credits_refusal.
+            return _HEALTH_UNKNOWN
         # Same distinction the overage gate draws: a spent plan window with
         # credits behind it is payable, not unusable.
         if info.get("overageStatus") in ("allowed", "allowed_warning"):

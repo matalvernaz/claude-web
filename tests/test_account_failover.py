@@ -153,8 +153,9 @@ def test_missing_bucket_is_unmetered_not_denied() -> None:
     """The whole design turns on this: absence must not become a refusal.
 
     A fresh reading without the bucket is still evidence the plan lacks the
-    model (a Pro account's Fable refusal is a 429 that records no denial),
-    so it ranks below "never looked" — but never as a refusal.
+    model (a Pro account's Fable refusal records a denial only once it has
+    actually happened), so it ranks below "never looked" — but never as a
+    refusal.
     """
     app_module._save_entitlements(
         "cred:2", _profile("default_claude_max_5x", "team_tier_1"),
@@ -961,3 +962,222 @@ def test_follow_up_does_not_migrate_a_fallback_on_ring_order(
     r = _send(client, run, "shared")
     assert r.status_code == 202, r.text
     assert run.accepting_input is True
+
+
+# ─── a usage-credits refusal is about one model, not the plan ─────────────
+
+
+def _credits_refusal(resets_in: float = 20 * 86400) -> dict:
+    """The rate-limit dict a usage-credits 429 leaves behind (measured 2026-10-11).
+
+    A Fable turn on a Pro account and on a standard Team seat both came back
+    with exactly this shape: rejected, the credits error code, no
+    ``rateLimitType`` and a reset at the start of next month.
+    """
+    return {
+        "status": "rejected",
+        "resetsAt": int(time.time() + resets_in),
+        "overageDisabledReason": "out_of_credits",
+        "isUsingOverage": False,
+        "errorCode": "credits_required",
+        "canUserPurchaseCredits": True,
+        "hasChargeableSavedPaymentMethod": True,
+    }
+
+
+_MEASURED_CREDITS_TEXT = "You're out of usage credits. Switch to another model to continue."
+_TEAM_BUDGET_TEXT = (
+    "You've hit your team's shared budget. Switch to another model to continue."
+)
+_LONG_CONTEXT_TEXT = (
+    "API Error: Usage credits required for 1M context · run /extra-usage to "
+    "turn them on (they take effect in a new session), or /model opus to switch "
+    "to standard context"
+)
+
+
+def _refused_turn(text: str):
+    from claude_agent_sdk import ResultMessage
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=True,
+        num_turns=1, session_id="s1", result=text, usage={},
+        api_error_status=429,
+    )
+
+
+@pytest.fixture
+def quiet_results(monkeypatch):
+    """Translate result messages without writing to the usage log."""
+    monkeypatch.setattr(app_module, "_log_usage", lambda *a, **k: None)
+    monkeypatch.setattr(app_module, "_resolve_credential_mode", lambda *a, **k: "oauth")
+
+
+def _turn_on(slot: str, *, live_model, init_model=None, rli=None, model_key=None):
+    """A run on ``slot`` as the result handler sees it at the end of a turn.
+
+    ``init_model`` goes through the real init message, the way the CLI reports
+    what it is running when claude-web sent no --model.
+    """
+    import uuid
+
+    run = app_module.ActiveRun(str(uuid.uuid4()), owner_sub=SUB, account_slot=slot)
+    run.model = model_key
+    run.live_sdk_model = live_model
+    if init_model is not None:
+        app_module._sdk_message_to_events(app_module.SystemMessage(
+            subtype="init", data={"model": init_model, "session_id": "s1"},
+        ), run)
+    run.rate_limit_info = rli
+    return run
+
+
+def test_credits_refusal_is_not_a_spent_plan_window() -> None:
+    """It names no plan window, and the reset it carries is the credits period's."""
+    _write_rate_limit("a", _credits_refusal())
+    assert app_module._slot_health_rank("a") == app_module._HEALTH_UNKNOWN
+    _write_rate_limit("b", _spent_window())
+    assert app_module._slot_health_rank("b") == app_module._HEALTH_SPENT
+
+
+def test_opus_pick_stays_on_a_slot_whose_fable_turn_ran_out_of_credits(slots) -> None:
+    """The bug as hit (2026-10-11): one Fable turn on Personal came back out of
+    usage credits until the 1st, and every Opus pick on Personal then went to
+    another account for the rest of the month."""
+    _enable([slots["personal"], slots["alex"]])
+    _write_rate_limit(slots["personal"], _credits_refusal())
+    _write_rate_limit(slots["alex"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "opus",
+    )
+    assert chosen == slots["personal"]
+    assert sub is None
+
+
+def test_credits_refusal_bars_only_the_family_that_ran(slots, quiet_results) -> None:
+    _enable([slots["personal"], slots["alex"]])
+    rli = _credits_refusal()
+    _write_rate_limit(slots["personal"], rli)
+    _write_rate_limit(slots["alex"], _healthy_window())
+    run = _turn_on(slots["personal"], live_model="fable", rli=rli, model_key="fable")
+    app_module._sdk_message_to_events(_refused_turn(_MEASURED_CREDITS_TEXT), run)
+    assert app_module._denied_families(slots["personal"]) == {"fable"}
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "fable",
+    )
+    assert chosen == slots["alex"]
+    assert sub["reason"] == "model_unavailable"
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["personal"], "opus",
+    )
+    assert chosen == slots["personal"]
+    assert sub is None
+
+
+@pytest.mark.parametrize("resets_in,expected_life", [
+    (3 * 86400, 3 * 86400),
+    (20 * 86400, app_module._MODEL_DENIAL_TTL_SECONDS),
+])
+def test_credits_denial_lasts_until_the_reset_capped_at_the_denial_ttl(
+    slots, quiet_results, resets_in, expected_life,
+) -> None:
+    rli = _credits_refusal(resets_in=resets_in)
+    run = _turn_on(slots["personal"], live_model="fable", rli=rli)
+    app_module._sdk_message_to_events(_refused_turn(_MEASURED_CREDITS_TEXT), run)
+    expires = app_module._entitlement_cache()["denied"][slots["personal"]]["fable"]
+    assert abs(expires - (time.time() + expected_life)) < 5
+
+
+def test_default_pick_records_the_model_the_cli_actually_ran(slots, quiet_results) -> None:
+    """A Default pick sends no --model, and a resumed Fable chat kept running
+    Fable (how Office was hit on 2026-10-11). Blaming the picker's model
+    would have barred Sonnet from Office for a week."""
+    rli = _credits_refusal()
+    run = _turn_on(slots["office"], live_model=None, init_model="claude-fable-5-1",
+                   rli=rli, model_key=None)
+    app_module._sdk_message_to_events(_refused_turn(_MEASURED_CREDITS_TEXT), run)
+    assert app_module._denied_families(slots["office"]) == {"fable"}
+
+
+def test_team_budget_wording_is_the_same_refusal(slots, quiet_results) -> None:
+    run = _turn_on(slots["office"], live_model="fable", rli=_credits_refusal())
+    app_module._sdk_message_to_events(_refused_turn(_TEAM_BUDGET_TEXT), run)
+    assert app_module._denied_families(slots["office"]) == {"fable"}
+
+
+@pytest.mark.parametrize("text,info,live_model", [
+    ("", "credits", "fable"),
+    ("Something nobody has seen before.", "credits", "fable"),
+    # Same error code, but about one oversized request, not the model.
+    (_LONG_CONTEXT_TEXT, "credits", "opus"),
+    (_MEASURED_CREDITS_TEXT, "plan", "fable"),
+    (_MEASURED_CREDITS_TEXT, None, "fable"),
+    # The model that ran is unknown: never fall back to the picker's.
+    (_MEASURED_CREDITS_TEXT, "credits", None),
+])
+def test_unrecognised_refusals_record_nothing(
+    slots, quiet_results, text, info, live_model,
+) -> None:
+    rli = {"credits": _credits_refusal(), "plan": _spent_window(), None: None}[info]
+    run = _turn_on(slots["personal"], live_model=live_model, rli=rli, model_key="fable")
+    app_module._sdk_message_to_events(_refused_turn(text), run)
+    assert app_module._denied_families(slots["personal"]) == set()
+
+
+def test_follow_up_moves_a_fable_run_off_after_its_credits_refusal(
+    client, alex_slot, quiet_results,
+) -> None:
+    """The move a slot-wide "spent" used to make for this case must survive."""
+    rli = _credits_refusal()
+    _write_rate_limit("shared", rli)
+    run = _live_run("shared")
+    run.live_sdk_model = "claude-fable-5-1"
+    run.rate_limit_info = rli
+    app_module._sdk_message_to_events(_refused_turn(_MEASURED_CREDITS_TEXT), run)
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"
+
+
+def test_follow_up_keeps_an_opus_run_after_a_fable_credits_refusal(
+    client, alex_slot,
+) -> None:
+    _write_rate_limit("shared", _credits_refusal())
+    app_module._note_model_denial("shared", "claude-fable-5-1")
+    run = _live_run("shared")
+    run.model = "opus"
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
+
+
+def test_follow_up_keeps_a_default_run_whose_cli_reports_opus(client, alex_slot) -> None:
+    """A Default pick on a slot that refused Fable: the CLI said it is running
+    Opus, so nothing observed stands against this run."""
+    _write_rate_limit("shared", _credits_refusal())
+    app_module._note_model_denial("shared", "claude-fable-5-1")
+    run = _live_run("shared")
+    run.model = None
+    run.init_model = "claude-opus-5-5"
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+
+
+def test_follow_up_does_not_respawn_a_default_run_onto_the_same_refusal(
+    client, alex_slot, quiet_results,
+) -> None:
+    """Known limit, kept on purpose: a Default pick on a resumed Fable chat
+    (how Office was hit on 2026-10-11). A 409 here would only send the browser
+    back to /api/chat, whose preflight sees the picker's Default, keeps the
+    same slot, and respawns a CLI that resumes Fable and is refused again: a
+    respawn per message. Staying costs one fast refusal plus the offer. The
+    real fix is Default meaning Default on a resumed chat, which is separate."""
+    rli = _credits_refusal()
+    _write_rate_limit("shared", rli)
+    run = _live_run("shared")
+    run.model = None
+    run.init_model = "claude-fable-5-1"
+    run.rate_limit_info = rli
+    app_module._sdk_message_to_events(_refused_turn(_MEASURED_CREDITS_TEXT), run)
+    assert app_module._denied_families("shared") == {"fable"}
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
