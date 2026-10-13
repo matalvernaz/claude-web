@@ -330,6 +330,10 @@ Every spawned Claude CLI subprocess receives three env vars describing the signe
 
 The schema is stable — keys are always set, only their values are empty when there's no real identity. A typical use is a `SessionStart` hook in `$CLAUDE_HOME/settings.json` that emits an `additionalContext` line like *"Signed-in user: Jocelyn Smith <jocelyn@cobd.ca>"*, which the model then reads at the start of every session.
 
+#### Task list
+
+Claude Code only offers its task-list tools to Opus 4.7 and older on its own, which would leave the task panel empty on every newer model. claude-web sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` for every chat unless the server's environment already sets it, so `CLAUDE_CODE_ENABLE_TODO_TOOLS=0` leaves the choice to Claude Code.
+
 ### Multi-user
 
 | Variable | Default | Notes |
