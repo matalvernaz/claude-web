@@ -1503,6 +1503,10 @@
     const dialog = document.getElementById(dialogId);
     const body = document.getElementById(bodyId);
     if (!dialog || !body || !node) return null;
+    // The heading is focusable (tabindex="-1") and comes first, so showModal()
+    // lands on it instead of the first control: iOS answers focus on a select
+    // or a search box by opening the picker or the keyboard over the sheet.
+    const heading = dialog.querySelector("h2");
     let home = null;
     // One "close" listener covers every exit path — Esc, the Done button's
     // method="dialog" submit, and a programmatic close() on rotation.
@@ -1520,6 +1524,7 @@
         home = { parent: node.parentNode, next: node.nextSibling };
         body.appendChild(node);
         dialog.showModal();
+        if (heading && document.activeElement !== heading) heading.focus();
       },
     };
   }

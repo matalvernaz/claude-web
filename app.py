@@ -1073,6 +1073,16 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault(
             "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
         )
+        # Ask proxies not to rewrite pages. Cloudflare otherwise injects its
+        # analytics beacon into every HTML response; the CSP blocks it, and
+        # where an ad blocker resolves its host to 0.0.0.0 that blocked script
+        # left the iPhone home-screen app on a blank page.
+        if response.headers.get("content-type", "").startswith("text/html"):
+            cache_control = response.headers.get("Cache-Control")
+            if not cache_control:
+                response.headers["Cache-Control"] = "no-transform"
+            elif "no-transform" not in cache_control.lower():
+                response.headers["Cache-Control"] = cache_control + ", no-transform"
         return response
 
 
