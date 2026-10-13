@@ -631,6 +631,29 @@ def test_local_settings_reach_live_send_and_fresh_run_after_conflict(ui, conflic
     assert state["posts"][1][1]["session_id"] == "saved"
 
 
+@pytest.mark.parametrize("opener, heading", [
+    ("header-menu-toggle", "menu-sheet-title"),
+    ("toggle-sessions", "sessions-sheet-title"),
+])
+def test_phone_sheets_open_on_their_heading(ui, opener, heading):
+    """showModal() focuses a sheet's first control, and iOS answers focus on a
+    select or a search box by opening the picker or the keyboard over the sheet
+    before anything was chosen. Nothing in the sheet but its heading may take
+    focus on the way in."""
+    page, _state = ui
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto("http://local-ui.test/")
+    page.evaluate("""() => {
+        window.sheetFocus = [];
+        document.addEventListener('focusin', (e) => {
+            if (e.target.closest('dialog')) window.sheetFocus.push(e.target.id || e.target.tagName);
+        }, true);
+    }""")
+    page.locator(f"#{opener}").click()
+    playwright.expect(page.locator(f"#{heading}")).to_be_focused()
+    assert page.evaluate("window.sheetFocus") == [heading]
+
+
 def test_model_notice_is_shown_spoken_and_splits_the_reply(ui):
     # A safeguard refusal: the CLI retries on a fallback model and says so. The
     # notice must be in the transcript, spoken, and sit between the refused
