@@ -480,6 +480,17 @@ codex_provider.SCRUB_ENV_NAMES = list(CHILD_ENV_SCRUB) + [
     "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
 ]
 
+# Claude Code only offers its task-list tools (TaskCreate, TaskUpdate, ...) to
+# Opus 4.7 and older unless this is set, so the task panel never fills on any
+# newer model. A value in our own environment wins, so
+# CLAUDE_CODE_ENABLE_TODO_TOOLS=0 in .env turns it back off.
+_CHILD_ENV_DEFAULTS = {"CLAUDE_CODE_ENABLE_TODO_TOOLS": "1"}
+
+
+def _child_env_defaults() -> dict[str, str]:
+    """Defaults for a chat's CLI that this process's environment doesn't set."""
+    return {name: value for name, value in _CHILD_ENV_DEFAULTS.items() if name not in os.environ}
+
 # Cap how many synth-message turns can chain off background tool notifications
 # before we stop and wait for the human. Prevents a notification-emitting tool
 # from looping the driver against the API forever.
@@ -13629,9 +13640,9 @@ async def api_chat(
     # ANTHROPIC_API_KEY are added when the user has activated a personal
     # credential slot. The SDK merges this dict over inherited env, so
     # PATH/HOME/etc. survive. Set unconditionally: even a shared-slot run with
-    # no account env needs the CHILD_ENV_SCRUB overlay.
+    # no account env needs the CHILD_ENV_SCRUB overlay and the task-list default.
     options_kwargs["env"] = _scrubbed_child_env({
-        **account["env"], **options_kwargs.get("env", {}),
+        **_child_env_defaults(), **account["env"], **options_kwargs.get("env", {}),
     })
     if provider == "local":
         # Loaded settings.env overrides the inherited subprocess environment.
