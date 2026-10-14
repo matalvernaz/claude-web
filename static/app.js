@@ -938,6 +938,20 @@
       if (dflt) modelSelect.value = dflt.key;
     }
     lastSeenModel = modelSelect.value || null;
+    if (provider === "claude") syncDefaultModelLabel();
+  }
+
+  // Default spawns with no model, so the account picks one, and an account
+  // can default to a different model from another. The server names the
+  // Default row per account (labels_by_account); keep it naming the account
+  // the picker shows.
+  function syncDefaultModelLabel() {
+    if (!modelSelect) return;
+    const option = [...modelSelect.options].find((o) => o.value === "");
+    const entry = ((PROVIDERS.claude && PROVIDERS.claude.models) || []).find((m) => !m.key);
+    if (!option || !entry) return;
+    const account = accountSelect ? accountSelect.value : "shared";
+    option.textContent = (entry.labels_by_account || {})[account] || entry.label || "Default";
   }
 
   // Show the advisor checkbox only where it means something: the Claude
@@ -1240,6 +1254,7 @@
         const accounts = await r.json();
         if (PROVIDERS[provider]) PROVIDERS[provider].accounts = accounts;
         lastAccount = target;
+        if (provider === "claude") syncDefaultModelLabel();
         if (provider === "codex") {
           try {
             await refreshCodexProvider(target);

@@ -159,12 +159,22 @@ def test_disabled_and_malformed_rows_are_skipped() -> None:
 
 def test_cache_round_trip(tmp_path) -> None:
     path = tmp_path / "cli_models.json"
-    claude_models.save_cache(path, ROWS, "2.1.289 (Claude Code)")
+    claude_models.save_cache(path, {"shared": ROWS, "cred:3": ROWS[:5]}, "2.1.289 (Claude Code)")
     data = claude_models.load_cache(path)
-    assert data["rows"] == ROWS
+    assert data["accounts"] == {"shared": ROWS, "cred:3": ROWS[:5]}
     assert data["cli_version"] == "2.1.289 (Claude Code)"
+    # An older build reads only "rows"; it gets every account's rows at once.
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert [r["value"] for r in raw["rows"]] == [r["value"] for r in ROWS]
     path.write_text("{not json", encoding="utf-8")
     assert claude_models.load_cache(path) is None
+
+
+def test_a_cache_from_before_per_account_lists_is_the_shared_accounts(tmp_path) -> None:
+    # The fixture is such a cache: one rows list, fetched as the shared account.
+    path = tmp_path / "cli_models.json"
+    path.write_text(json.dumps(FIXTURE), encoding="utf-8")
+    assert claude_models.load_cache(path)["accounts"] == {"shared": ROWS}
 
 
 def test_turn_usage_teaches_the_meter_each_window(restore_models, tmp_path, monkeypatch) -> None:
@@ -251,3 +261,61 @@ def test_frontend_maps_a_saved_id_through_resolved() -> None:
     fn = fn[:fn.index("\n  }\n")]
     assert "resolved" in fn
     assert "LEGACY_MODEL_KEYS" in fn and "RETIRED_MODEL_KEYS" in fn
+
+
+# ─── the two lists the CLI can answer with (2.1.299) ──────────────────────────
+# With the server's model catalog on for the account the CLI lists every model
+# named with its version; without it, a list compiled into the binary that names
+# the family aliases "Opus" or "Sonnet" and leaves the version in the
+# description. Both fixtures are real answers from the same Team account.
+
+SERVED = json.loads((Path(__file__).parent / "fixtures" / "cli_models_2.1.299_served.json")
+                    .read_text(encoding="utf-8"))["rows"]
+COMPILED = json.loads((Path(__file__).parent / "fixtures" / "cli_models_2.1.299_compiled.json")
+                      .read_text(encoding="utf-8"))["rows"]
+
+
+def test_the_compiled_list_is_named_with_its_versions() -> None:
+    labels = {e["key"]: e["label"] for e in claude_models.build_entries(COMPILED)}
+    assert labels == {
+        "": "Default (Sonnet 5.5)", "sonnet": "Sonnet 5.5", "fable": "Fable 5.1",
+        "fableplan": "Fableplan (Fable 5.1 plans, Opus 5.5 builds)",
+        "opus": "Opus 5.5", "haiku": "Haiku 5.5",
+    }
+
+
+def test_fableplan_survives_a_fable_row_that_is_not_the_alias() -> None:
+    # Some accounts' compiled list carries Fable as the server's extra option,
+    # an explicit 1M-context id, rather than the `fable` alias.
+    rows = copy.deepcopy(COMPILED)
+    fable = next(r for r in rows if r["value"] == "fable")
+    fable["value"] = "claude-fable-5-1[1m]"
+    entries = {e["key"]: e for e in claude_models.build_entries(rows)}
+    assert entries["claude-fable-5-1[1m]"]["label"] == "Fable 5.1 (1M context)"
+    plan = entries["fableplan"]
+    assert (plan["model"], plan["plan_model"]) == ("opus", "claude-fable-5-1[1m]")
+    assert plan["label"] == "Fableplan (Fable 5.1 plans, Opus 5.5 builds)"
+
+
+def test_the_union_keeps_the_fullest_list_in_its_order() -> None:
+    union = claude_models.union_rows([COMPILED, SERVED])
+    assert [r["value"] for r in union] == [r["value"] for r in SERVED]
+    # The default row too comes from the fuller list.
+    assert union[0]["resolvedModel"] == "claude-opus-5-5"
+
+
+def test_a_shared_row_offers_only_the_efforts_every_account_accepts() -> None:
+    narrow = copy.deepcopy(COMPILED)
+    next(r for r in narrow if r["value"] == "opus")["supportedEffortLevels"] = ["low", "high"]
+    union = {r["value"]: r for r in claude_models.union_rows([SERVED, narrow])}
+    assert union["opus"]["supportedEffortLevels"] == ["low", "high"]
+    assert union["claude-opus-4-8"]["supportedEffortLevels"] == SERVED[9]["supportedEffortLevels"]
+
+
+def test_a_1m_row_reads_differently_from_its_model() -> None:
+    extra = copy.deepcopy(COMPILED)
+    next(r for r in extra if r["value"] == "fable")["value"] = "claude-fable-5-1[1m]"
+    labels = [e["label"] for e in claude_models.build_entries(
+        claude_models.union_rows([SERVED, extra]))]
+    assert "Fable 5.1" in labels and "Fable 5.1 (1M context)" in labels
+    assert len(labels) == len(set(labels))

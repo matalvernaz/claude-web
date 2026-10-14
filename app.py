@@ -577,15 +577,34 @@ def _observed_context_windows() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _apply_cli_model_rows(rows: list) -> None:
-    """Rebuild KNOWN_MODELS / MODELS_BY_KEY from the CLI's picker rows."""
-    entries = claude_models.build_entries(rows, _observed_context_windows())
+# Each Claude account's own picker rows: "shared", or "cred:<id>" (the account
+# picker's values). The CLI decides per account whether it lists every model
+# or only the family aliases (claude_models), so the lists are fetched and kept
+# per account. A user's picker offers the rows of every account they can run
+# on (_user_model_entries); KNOWN_MODELS is the same over every account, which
+# is what keys are validated and resolved against.
+CLI_MODEL_ROWS: dict[str, list[dict]] = {}
+
+
+def _apply_account_model_rows(rows_by_account: dict) -> None:
+    """Rebuild CLI_MODEL_ROWS, KNOWN_MODELS and MODELS_BY_KEY in place."""
+    CLI_MODEL_ROWS.clear()
+    CLI_MODEL_ROWS.update({key: rows for key, rows in rows_by_account.items() if rows})
+    entries = claude_models.build_entries(
+        claude_models.union_rows(list(CLI_MODEL_ROWS.values())),
+        _observed_context_windows(),
+    )
     KNOWN_MODELS[:] = entries
     MODELS_BY_KEY.clear()
     MODELS_BY_KEY.update({m["key"]: m for m in entries})
 
 
-_apply_cli_model_rows((claude_models.load_cache(CLI_MODELS_CACHE) or {}).get("rows") or [])
+def _apply_cli_model_rows(rows: list) -> None:
+    """Rebuild from one list, the shared account's."""
+    _apply_account_model_rows({"shared": rows})
+
+
+_apply_account_model_rows((claude_models.load_cache(CLI_MODELS_CACHE) or {}).get("accounts") or {})
 
 
 def _note_context_windows(model_usage: Any) -> dict[str, int]:
@@ -668,21 +687,66 @@ def resolve_model_key(model_key: str) -> tuple[str, bool]:
     return key, advisor
 
 
-def _models_payload() -> list[dict]:
-    """Client-visible slice of KNOWN_MODELS (the index page's models-data tag).
+def _user_account_keys(user: Optional[dict]) -> list[str]:
+    sub = (user or {}).get("sub")
+    creds = _list_user_credentials(sub) if sub else []
+    return ["shared"] + [f"cred:{c['id']}" for c in creds]
+
+
+def _default_labels(user: Optional[dict]) -> dict[str, str]:
+    """What the Default row runs on each of the user's accounts.
+
+    Default spawns with no --model, so the account picks the model, and an
+    account the server's catalog doesn't cover yet defaults to another one.
+    """
+    labels: dict[str, str] = {}
+    for key in _user_account_keys(user):
+        rows = CLI_MODEL_ROWS.get(key)
+        if rows:
+            entry = next((e for e in claude_models.build_entries(rows) if e["key"] == ""), None)
+            if entry:
+                labels[key] = entry["label"]
+    return labels
+
+
+def _user_model_entries(user: Optional[dict]) -> list[dict]:
+    """The picker for one user: every row their accounts list (``union_rows``),
+    with the Default row named for the account their next chat starts on."""
+    lists = [CLI_MODEL_ROWS[key] for key in _user_account_keys(user) if key in CLI_MODEL_ROWS]
+    if not lists:
+        return KNOWN_MODELS
+    entries = claude_models.build_entries(
+        claude_models.union_rows(lists), _observed_context_windows(),
+    )
+    label = _default_labels(user).get(_user_active_slot((user or {}).get("sub")))
+    for entry in entries:
+        if entry["key"] == "" and label:
+            entry["label"] = label
+    return entries
+
+
+def _models_payload(user: Optional[dict] = None) -> list[dict]:
+    """Client-visible slice of the picker (the index page's models-data tag).
 
     ``resolved`` lets the browser map a saved explicit id onto the alias row
     that now covers it, and pick its context window out of a turn's usage.
     ``advisor_ok`` drives whether the advisor checkbox is offered; ``betas``
-    still drives the mid-chat switch refusal (no current entry has any).
+    still drives the mid-chat switch refusal (no current entry has any). The
+    Default row carries ``labels_by_account`` so the browser can rename it
+    when the account picker changes.
     """
-    return [
-        {"key": m["key"], "label": m["label"], "context": m.get("context"),
-         "efforts": m.get("efforts") or [], "betas": m.get("betas") or [],
-         "resolved": m.get("resolved") or "",
-         "advisor_ok": model_supports_advisor(m["key"])}
-        for m in KNOWN_MODELS
-    ]
+    entries = KNOWN_MODELS if user is None else _user_model_entries(user)
+    defaults = {} if user is None else _default_labels(user)
+    payload = []
+    for m in entries:
+        item = {"key": m["key"], "label": m["label"], "context": m.get("context"),
+                "efforts": m.get("efforts") or [], "betas": m.get("betas") or [],
+                "resolved": m.get("resolved") or "",
+                "advisor_ok": model_supports_advisor(m["key"])}
+        if m["key"] == "" and defaults:
+            item["labels_by_account"] = defaults
+        payload.append(item)
+    return payload
 
 
 # ─── AI providers ─────────────────────────────────────────────────────────────
@@ -717,7 +781,7 @@ async def _providers_payload(
         "label": "Claude",
         "available": True,
         "reason": None,
-        "models": _models_payload(),
+        "models": _models_payload(user),
         "accounts": _account_payload(user),
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
@@ -5692,11 +5756,170 @@ def _ensure_shared_projects_dir() -> Optional[Path]:
     return shared
 
 
+# What the CLI keeps per signed-in account, so a credential home holds its own
+# copy rather than a link to CLAUDE_HOME's. Until 2026-10 only the credentials
+# were private and every account read and wrote one .claude.json, which holds
+# the signed-in account's details and the feature flags the server last sent
+# for it. Each account then ran on whatever the last account to start had
+# left there: the model picker flipped between the full list and five
+# aliases depending on whose chat had run last. The policy and remote-settings
+# files belong to an organisation in the same way, and backups/ holds the
+# .claude.json copies the CLI restores from.
+_CREDENTIAL_FILES = (".credentials.json", ".anthropic_api_key", ".claude_oauth_token")
+_ACCOUNT_STATE_FILES = (
+    ".claude.json", "backups",
+    "policy-limits.json", "policy-limits.json.stamp.json",
+    "remote-settings.json", "remote-settings.json.synced-at",
+)
+# Keys of .claude.json that describe the signed-in account rather than the
+# person: who it is, and what the server last said about it. The CLI names
+# those caches cached* or *Cache*.
+_ACCOUNT_CONFIG_KEYS = frozenset({
+    "oauthAccount", "hasAvailableSubscription", "penguinModeOrgEnabled",
+    "passesLastSeenRemaining", "subscriptionNoticeCount",
+    "additionalModelOptionsAnsweredAt", "claudeAiMcpEverConnected",
+})
+# The ones every account wrote while they were linked. backups/ only ever
+# held copies, read back by whichever account's CLI was restoring.
+_ACCOUNT_WRITTEN_FILES = (".claude.json", "policy-limits.json", "remote-settings.json")
+
+
+def _is_account_state(name: str) -> bool:
+    return (name in _CREDENTIAL_FILES or name in _ACCOUNT_STATE_FILES
+            or name.startswith(".claude.json"))
+
+
+def _strip_account_config(config: dict) -> dict:
+    return {
+        key: value for key, value in config.items()
+        if key not in _ACCOUNT_CONFIG_KEYS and not key.startswith("cached")
+        and "Cache" not in key
+    }
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True when ``a`` is ``b`` under another name (a hardlink on Windows)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _write_json_atomic(path: Path, data: Any, mode: int = 0o600) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        if os.chmod in os.supports_fd:
+            os.chmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _seed_account_config(home: Path) -> None:
+    """Give a credential home its own ``.claude.json``, started from the shared one.
+
+    What is about the person carries over (onboarding, the update setting,
+    per-project trust); what describes an account does not. Nor do the MCP
+    servers: a chat on this home gets the shared file's servers at spawn
+    (_shared_mcp_config_file), so one added there reaches every account.
+    """
+    target = home / ".claude.json"
+    if target.exists() or _is_link(target):
+        return
+    try:
+        shared = json.loads((CLAUDE_HOME / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        shared = {}
+    seed = _strip_account_config(shared) if isinstance(shared, dict) else {}
+    seed.pop("mcpServers", None)
+    projects = seed.get("projects")
+    if isinstance(projects, dict):
+        seed["projects"] = {
+            path: ({k: v for k, v in entry.items() if k != "mcpServers"}
+                   if isinstance(entry, dict) else entry)
+            for path, entry in projects.items()
+        }
+    try:
+        _write_json_atomic(target, seed)
+    except OSError as e:
+        log.warning("could not create %s: %s", target, e)
+
+
+def _privatize_account_state(home: Path, seed: bool = True) -> bool:
+    """Make sure none of the home's per-account files leads to the shared copy.
+
+    Returns True when one this account wrote did, which means other accounts
+    have been writing into CLAUDE_HOME's copies. Then the home's policy
+    stamps go too: they vouch for files it no longer has, and without them
+    the CLI fetches its own account's afresh. A home that had its
+    ``.claude.json`` linked gets its own copy at once; otherwise ``seed``
+    decides.
+    """
+    written = False
+    try:
+        entries = list(home.iterdir())
+    except FileNotFoundError:
+        return False
+    for path in entries:
+        if not _is_account_state(path.name) or path.name in _CREDENTIAL_FILES:
+            continue
+        if not (_is_link(path) or _same_file(path, CLAUDE_HOME / path.name)):
+            continue
+        written = written or path.name in _ACCOUNT_WRITTEN_FILES
+        seed = seed or path.name == ".claude.json"
+        try:
+            if _is_link(path):
+                _remove_link(path)
+            else:
+                path.unlink()
+        except OSError as e:
+            log.warning("could not unshare %s: %s", path, e)
+            continue
+        log.info("account state: %s no longer shared with %s", path, CLAUDE_HOME)
+    if written:
+        for stamp in ("policy-limits.json.stamp.json", "remote-settings.json.synced-at"):
+            with contextlib.suppress(FileNotFoundError):
+                (home / stamp).unlink()
+    if seed:
+        _seed_account_config(home)
+    return written
+
+
+def _forget_account_details(home: Path) -> None:
+    """Drop the signed-in account's details from a home's own .claude.json.
+
+    Run on sign-out, so the next sign-in starts as nobody in particular: a
+    long-lived token never tells the CLI which account it belongs to, and
+    without this a slot signed back in as someone else would run on the old
+    account's details and feature flags.
+    """
+    path = home / ".claude.json"
+    if _is_link(path):
+        return
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(config, dict):
+        return
+    cleaned = _strip_account_config(config)
+    if cleaned != config:
+        try:
+            _write_json_atomic(path, cleaned, stat.S_IMODE(path.stat().st_mode))
+        except OSError as e:
+            log.warning("could not reset %s: %s", path, e)
+
+
 def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     """Create or refresh the per-credential CLAUDE_CONFIG_DIR.
 
-    Mirrors CLAUDE_HOME via symlinks except for ``.credentials.json`` and
-    ``.anthropic_api_key`` (the only files that must be per-credential).
+    Mirrors CLAUDE_HOME via symlinks except for the credentials and the
+    account's own CLI state (``_is_account_state``: ``.claude.json``, the
+    policy files, ``backups/``), which the home keeps privately.
     Projects/, sessions/, settings.json, skills/, etc. all resolve back to
     the shared home so transcripts/history stay shared regardless of which
     slot is active.
@@ -5733,8 +5956,8 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     except FileNotFoundError:
         return home
     for entry in entries:
-        # Per-credential files: must be real, not symlinked back to shared.
-        if entry.name in (".credentials.json", ".anthropic_api_key", ".claude_oauth_token"):
+        # Per-account files: must be real, not symlinked back to shared.
+        if _is_account_state(entry.name):
             continue
         # Refuse to follow a symlink planted in CLAUDE_HOME. A shared-instance
         # deployment lets every signed-in user write here (via the Bash tool
@@ -5752,6 +5975,7 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
         if link.is_symlink() or link.exists():
             continue
         _link_or_copy(entry.absolute(), link)
+    _privatize_account_state(home)
     return home
 
 
@@ -5998,6 +6222,25 @@ def _account_slot_visible(user_sub: Optional[str], slot: Optional[str]) -> bool:
     return cred_id is not None and bool(user_sub) and _get_credential(user_sub, cred_id) is not None
 
 
+def _credential_cli_env(home: Path) -> dict[str, str]:
+    """What a CLI needs to run as the credential in ``home``.
+
+    A credential in the per-credential home overrides the shared slot's. A
+    blank unmasks whatever the shared slot put in the process env (an API
+    key, a long-lived token) so the CLI falls through to this home's
+    .credentials.json.
+    """
+    try:
+        key = (home / ".anthropic_api_key").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        key = ""
+    return {
+        "CLAUDE_CONFIG_DIR": str(home),
+        "ANTHROPIC_API_KEY": key,
+        "CLAUDE_CODE_OAUTH_TOKEN": "" if key else setup_flow.read_oauth_token(home),
+    }
+
+
 def _resolve_account_for_run(
     user: dict,
     session_id: Optional[str] = None,
@@ -6041,24 +6284,9 @@ def _resolve_account_for_run(
         if cred:
             home = _ensure_credential_home(sub, cred_id)
             if setup_flow.is_configured(home):
-                env: dict[str, str] = {
-                    **identity_env,
-                    "CLAUDE_CONFIG_DIR": str(home),
-                }
-                # A credential in the per-credential home overrides the
-                # shared slot's for this run. A blank unmasks whatever the
-                # shared slot put in the process env (an API key, a
-                # long-lived token) so the CLI falls through to this home's
-                # .credentials.json.
-                try:
-                    key = (home / ".anthropic_api_key").read_text(encoding="utf-8").strip()
-                except FileNotFoundError:
-                    key = ""
-                env["ANTHROPIC_API_KEY"] = key
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = "" if key else setup_flow.read_oauth_token(home)
                 return {
                     "slot": active,
-                    "env": env,
+                    "env": {**identity_env, **_credential_cli_env(home)},
                     "label": cred["label"],
                 }
             logging.getLogger("claude-web").warning(
@@ -7315,6 +7543,55 @@ def _in_process_mcp_servers_for_run(
         if server is not None:
             servers[panel.SERVER_NAME] = server
     return servers
+
+
+SHARED_MCP_DIR = USAGE_DIR / "shared-mcp"
+
+
+def _shared_mcp_config_file(cwd: Any) -> Optional[Path]:
+    """The shared ``.claude.json``'s MCP servers, as a file for ``--mcp-config``.
+
+    A credential home keeps its own ``.claude.json`` (_ACCOUNT_STATE_FILES),
+    and that is where the CLI keeps user-scope servers and each project's
+    local ones, so a chat on another account would lose every server set up
+    in the shared one. A file rather than inline JSON keeps the keys their
+    ``env`` blocks carry out of the process list. On a name clash the CLI
+    runs this file's server rather than the home's own.
+    """
+    try:
+        config = json.loads((CLAUDE_HOME / ".claude.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    user_servers = config.get("mcpServers")
+    servers = dict(user_servers) if isinstance(user_servers, dict) else {}
+    projects = config.get("projects")
+    place = "user"
+    if cwd:
+        resolved = str(Path(cwd).resolve())
+        place = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+        for key in dict.fromkeys((str(cwd), resolved)):
+            entry = projects.get(key) if isinstance(projects, dict) else None
+            local = entry.get("mcpServers") if isinstance(entry, dict) else None
+            if isinstance(local, dict):
+                servers.update(local)
+    if not servers:
+        return None
+    payload = {"mcpServers": servers}
+    path = SHARED_MCP_DIR / f"{place}.json"
+    try:
+        if json.loads(path.read_text(encoding="utf-8")) == payload:
+            return path
+    except (OSError, ValueError):
+        pass
+    try:
+        SHARED_MCP_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_json_atomic(path, payload)
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)
+        return None
+    return path
 
 
 # ─── Panel review (panel.py) ─────────────────────────────────────────────────
@@ -9193,12 +9470,42 @@ CLI_MODELS_STATE: dict[str, Any] = {
 }
 
 
-async def _refresh_cli_models(source: str) -> dict:
-    """Fetch the CLI's picker rows and rebuild KNOWN_MODELS from them.
+def _model_list_accounts() -> list[tuple[str, Optional[Path], dict]]:
+    """``(account key, CLAUDE_CONFIG_DIR, env)`` for every account to ask.
 
-    Asks as the shared account; a per-user slot entitled to fewer models is
-    still the failover layer's business, as it was with the hand-kept list.
-    A failed fetch keeps whatever list is already loaded.
+    The shared account, and each signed-in credential of every user, each
+    with the environment its chats run with, so the CLI answers as that
+    account. API-key credentials are left out: they are per-token billing
+    kept for emergencies, never a failover target, and their list is the
+    API's rather than a plan's.
+    """
+    accounts: list[tuple[str, Optional[Path], dict]] = [
+        ("shared", CLAUDE_HOME, {"CLAUDE_CONFIG_DIR": str(CLAUDE_HOME)}),
+    ]
+    try:
+        rows = _state_db().execute(
+            "SELECT id, user_sub FROM user_credential ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.warning("model list: could not read credentials: %s", e)
+        rows = []
+    for cred_id, sub in rows:
+        home = _credential_home_path(sub, cred_id)
+        if not home.is_dir() or not setup_flow.is_configured(home):
+            continue
+        if setup_flow.whoami(home).get("mode") == "api_key":
+            continue
+        home = _ensure_credential_home(sub, cred_id)
+        accounts.append((f"cred:{cred_id}", home, _credential_cli_env(home)))
+    return accounts
+
+
+async def _refresh_cli_models(source: str) -> dict:
+    """Ask every account's CLI for its picker rows and rebuild the picker.
+
+    Each account answers under its own identity, since that decides which
+    list it gets (claude_models). An account whose fetch fails keeps the rows
+    it had; one that is gone (deleted, signed out) drops out.
     """
     cli = claude_cli.resolve()
     if not cli:
@@ -9206,27 +9513,41 @@ async def _refresh_cli_models(source: str) -> dict:
                                 detail="no claude CLI to ask")
         return dict(CLI_MODELS_STATE)
     async with _CLI_MODELS_LOCK:
-        try:
-            rows = await claude_models.fetch_rows(
-                cli, cwd=USAGE_DIR, env={"CLAUDE_CONFIG_DIR": str(CLAUDE_HOME)})
-        except Exception as exc:  # noqa: BLE001 — keep serving the old list
-            log.warning("claude model list fetch failed (via %s): %s", source, exc)
-            CLI_MODELS_STATE.update(status="error", source=source, detail=str(exc))
-            return dict(CLI_MODELS_STATE)
-        rows = claude_models.usable_rows(rows)
-        if not rows:
+        accounts = _model_list_accounts()
+        rows_by_account: dict[str, list[dict]] = {}
+        failed: dict[str, str] = {}
+        for key, _home, env in accounts:
+            try:
+                rows = claude_models.usable_rows(await claude_models.fetch_rows(
+                    cli, cwd=USAGE_DIR, env=_scrubbed_child_env(env)))
+            except Exception as exc:  # noqa: BLE001 — keep serving the old list
+                failed[key] = str(exc) or type(exc).__name__
+                log.warning("claude model list fetch failed for %s (via %s): %s",
+                            key, source, failed[key])
+                rows = CLI_MODEL_ROWS.get(key) or []
+            else:
+                if not rows:
+                    failed[key] = "the CLI listed no models"
+                    rows = CLI_MODEL_ROWS.get(key) or []
+            if rows:
+                rows_by_account[key] = rows
+        if not rows_by_account:
             CLI_MODELS_STATE.update(status="error", source=source,
-                                    detail="the CLI listed no models")
+                                    detail="; ".join(f"{k}: {v}" for k, v in failed.items()))
             return dict(CLI_MODELS_STATE)
         version = await _cli_version_line(cli)
-        claude_models.save_cache(CLI_MODELS_CACHE, rows, version)
+        claude_models.save_cache(CLI_MODELS_CACHE, rows_by_account, version)
         before = [m["label"] for m in KNOWN_MODELS]
-        _apply_cli_model_rows(rows)
+        _apply_account_model_rows(rows_by_account)
         after = [m["label"] for m in KNOWN_MODELS]
         if before != after:
             log.info("model picker now %s (claude %s, via %s)", after, version, source)
-        CLI_MODELS_STATE.update(status="ok", version=version, count=len(rows),
-                                fetched_at=time.time(), source=source, detail="")
+        CLI_MODELS_STATE.update(
+            status="partial" if failed else "ok", version=version,
+            count=len(KNOWN_MODELS), fetched_at=time.time(), source=source,
+            detail="; ".join(f"{k}: {v}" for k, v in failed.items()),
+            accounts={key: len(rows) for key, rows in rows_by_account.items()},
+        )
         return dict(CLI_MODELS_STATE)
 
 
@@ -9571,6 +9892,21 @@ async def api_cli_update(user: dict = Depends(auth.require_user)):
     _require_cli_update_admin(user)
     return await _run_cli_update(
         f"api:{user.get('email') or user.get('sub') or '?'}")
+
+
+@app.get("/api/admin/claude-models")
+async def api_claude_models_status(user: dict = Depends(auth.require_user)):
+    _require_global_config_admin(user, "model list")
+    return {**CLI_MODELS_STATE, "picker": [m["label"] for m in KNOWN_MODELS]}
+
+
+@app.post("/api/admin/claude-models")
+async def api_claude_models_refresh(user: dict = Depends(auth.require_user)):
+    """Ask every account for its model list now rather than at the next timer
+    tick: after an account's details change, say. Starts a CLI per account."""
+    _require_global_config_admin(user, "model list")
+    state = await _refresh_cli_models(f"api:{user.get('email') or user.get('sub') or '?'}")
+    return {**state, "picker": [m["label"] for m in KNOWN_MODELS]}
 
 
 def _require_app_update_admin(user: dict) -> None:
@@ -10079,9 +10415,9 @@ async def index(request: Request, user: dict = Depends(auth.require_user)):
                 for p in PROJECTS
             ],
             "default_project": _sanitize_project_key(DEFAULT_CWD),
-            "models": KNOWN_MODELS,
+            "models": _user_model_entries(user),
             # Drop SDK-internal fields and expose only what the JS needs.
-            "models_json": json.dumps(_models_payload()),
+            "models_json": json.dumps(_models_payload(user)),
             "effort_levels": EFFORT_LEVELS,
             "multi_project": len(PROJECTS) > 1,
             "account": _account_payload(user),
@@ -11284,6 +11620,7 @@ async def api_credentials_signout(
     home = _credential_home_path(sub, cred_id)
     await setup_flow.cancel_flow(flow_key=_credential_flow_key(sub, cred_id))
     await setup_flow.sign_out(home)
+    _forget_account_details(home)
     if _user_active_slot(sub) == f"cred:{cred_id}":
         _set_user_active(sub, "shared")
     return {"configured": _credential_is_configured(sub, cred_id)}
@@ -13627,7 +13964,13 @@ async def api_chat(
         # consults to our own in-process tool instead (_build_advisor_mcp_server).
         # Undocumented but verified CLI flag; reaches the CLI via extra_args
         # because the SDK has no first-class option for it yet.
-        options_kwargs["extra_args"] = {"advisor": advisor_model}
+        options_kwargs.setdefault("extra_args", {})["advisor"] = advisor_model
+    if provider == "claude" and account["slot"] != "shared":
+        # This account's own .claude.json holds none of the shared MCP
+        # servers; the CLI merges a second --mcp-config with the SDK's.
+        mcp_file = _shared_mcp_config_file(cwd)
+        if mcp_file is not None:
+            options_kwargs.setdefault("extra_args", {})["mcp-config"] = str(mcp_file)
     sdk_betas = list(selected_model.get("betas") or [])
     if sdk_betas:
         # The CLI surfaces an unsupported beta as "Error in input stream", so
@@ -17912,6 +18255,7 @@ async def api_setup_signout(user: dict = Depends(auth.require_user)):
     is unaffected — this only signs the in-container Claude CLI out."""
     _require_setup_access(user)
     await setup_flow.sign_out()
+    _forget_account_details(CLAUDE_HOME)
     return {"configured": setup_flow.is_configured()}
 
 
@@ -19984,6 +20328,70 @@ def _startup_share_credential_projects() -> None:
                 log.info("startup: linked %s → %s", private, shared)
 
 
+def _scrub_shared_account_state() -> None:
+    """Drop what other accounts left in CLAUDE_HOME's per-account files.
+
+    While credential homes linked them, the shared account's ``.claude.json``
+    named whichever account had started last and carried that account's
+    feature flags, and its policy files were whichever organisation's. The
+    CLI fetches its own account's afresh on the next start.
+    """
+    path = CLAUDE_HOME / ".claude.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        config = None
+    if isinstance(config, dict):
+        cleaned = _strip_account_config(config)
+        if cleaned != config:
+            try:
+                _write_json_atomic(path, cleaned, stat.S_IMODE(path.stat().st_mode))
+                log.info("startup: removed other accounts' details from %s", path)
+            except OSError as e:
+                log.warning("startup: could not rewrite %s: %s", path, e)
+    for name in ("policy-limits.json", "policy-limits.json.stamp.json",
+                 "remote-settings.json", "remote-settings.json.synced-at"):
+        try:
+            (CLAUDE_HOME / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("startup: could not remove %s: %s", CLAUDE_HOME / name, e)
+
+
+def _startup_private_account_state() -> None:
+    """Give every credential home its own account state (``_is_account_state``).
+
+    Homes made before 2026-10 linked ``.claude.json``, the policy files and
+    ``backups/`` to CLAUDE_HOME's, so every account shared one set. Runs at
+    import time, before any CLI child exists. Once a linked home is found the
+    shared copies are scrubbed too, since every account had been writing them.
+    Idempotent: a later start finds nothing linked and changes nothing.
+    """
+    if not PERSONAL_HOMES_DIR.is_dir():
+        return
+    try:
+        subs = [p for p in PERSONAL_HOMES_DIR.iterdir() if p.is_dir() and not _is_link(p)]
+    except OSError as e:
+        log.warning("startup: cannot list %s: %s", PERSONAL_HOMES_DIR, e)
+        return
+    shared = False
+    for sub_dir in subs:
+        try:
+            homes = [p for p in sub_dir.iterdir() if p.is_dir() and not _is_link(p)]
+        except OSError:
+            continue
+        for home in homes:
+            try:
+                # A home nobody uses stays as it is; _ensure_credential_home
+                # gives it its own copy when it is.
+                shared = _privatize_account_state(home, seed=False) or shared
+            except OSError as e:
+                log.warning("startup: could not unshare %s: %s", home, e)
+    if shared:
+        _scrub_shared_account_state()
+
+
 # Every table that stores a project key. Keep in step with _state_db().
 _PROJECT_KEY_TABLES = (
     "runs",
@@ -20064,4 +20472,5 @@ def _startup_migrate_project_keys() -> None:
 _startup_init_state_db()
 _startup_migrate_personal_homes()
 _startup_share_credential_projects()
+_startup_private_account_state()
 _startup_migrate_project_keys()

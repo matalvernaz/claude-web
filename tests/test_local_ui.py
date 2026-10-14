@@ -1080,3 +1080,29 @@ def test_the_panels_deadlock_card_says_the_panel_is_asking(ui):
     assert "Go ahead anyway" in sent
     page.wait_for_function(
         "() => window.__announced.some(t => t.startsWith('The review panel is asking'))", timeout=15000)
+
+
+def test_default_names_the_model_of_the_account_picked(ui):
+    """Default runs whatever the account defaults to, and accounts can differ
+    (Claude Code defaults to Opus where the server's catalog covers the account
+    and to Sonnet where it doesn't), so the row follows the account picker."""
+    page, state = ui
+    models = [
+        {"key": "", "label": "Default (Sonnet 5.5)", "efforts": [],
+         "labels_by_account": {"shared": "Default (Sonnet 5.5)", "cred:1": "Default (Opus 5.5)"}},
+        {"key": "opus", "label": "Opus 5.5", "efforts": ["low", "high"]},
+    ]
+    state["claude_models"] = models
+    claude = state["providers"]["providers"][0]
+    claude["models"] = models
+    claude["accounts"] = {"active": "shared", "shared_label": "Shared",
+                          "credentials": [{"id": 1, "label": "Alex", "configured": True}]}
+    page.goto("http://local-ui.test/")
+    default = page.locator('#model-select option[value=""]')
+    playwright.expect(default).to_have_text("Default (Sonnet 5.5)")
+
+    page.locator("#account-select").select_option("cred:1")
+    page.locator("#account-select").press("Enter")
+
+    playwright.expect(default).to_have_text("Default (Opus 5.5)")
+    assert state["posts"][-1][0] == "/api/account/active"
