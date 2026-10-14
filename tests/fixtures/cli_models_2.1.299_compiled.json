@@ -1,0 +1,87 @@
+{
+ "rows": [
+  {
+   "value": "default",
+   "resolvedModel": "claude-sonnet-5-5",
+   "displayName": "Default (recommended)",
+   "description": "Sonnet 5.5 · Efficient for routine tasks",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true
+  },
+  {
+   "value": "sonnet",
+   "resolvedModel": "claude-sonnet-5-5",
+   "displayName": "Sonnet",
+   "description": "Sonnet 5.5 · Efficient for routine tasks",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true
+  },
+  {
+   "value": "fable",
+   "resolvedModel": "claude-fable-5-1",
+   "displayName": "Fable",
+   "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true
+  },
+  {
+   "value": "opus",
+   "resolvedModel": "claude-opus-5-5",
+   "displayName": "Opus",
+   "description": "Opus 5.5 · Best for everyday, complex tasks",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsFastMode": true,
+   "supportsAutoMode": true
+  },
+  {
+   "value": "haiku",
+   "resolvedModel": "claude-haiku-5-5",
+   "displayName": "Haiku",
+   "description": "Haiku 5.5 · Fastest for quick answers",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true
+  }
+ ],
+ "cli_version": "2.1.299 (Claude Code)",
+ "note": "Real initialize-response rows from CLI 2.1.299 on a Team account, compiled list (server catalog off: a long-lived token with no account details)"
+}
