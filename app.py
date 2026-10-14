@@ -5777,8 +5777,11 @@ _ACCOUNT_STATE_FILES = (
 _ACCOUNT_CONFIG_KEYS = frozenset({
     "oauthAccount", "hasAvailableSubscription", "penguinModeOrgEnabled",
     "passesLastSeenRemaining", "subscriptionNoticeCount",
-    "additionalModelOptionsAnsweredAt",
+    "additionalModelOptionsAnsweredAt", "claudeAiMcpEverConnected",
 })
+# The ones every account wrote while they were linked. backups/ only ever
+# held copies, read back by whichever account's CLI was restoring.
+_ACCOUNT_WRITTEN_FILES = (".claude.json", "policy-limits.json", "remote-settings.json")
 
 
 def _is_account_state(name: str) -> bool:
@@ -5849,12 +5852,12 @@ def _seed_account_config(home: Path) -> None:
 def _privatize_account_state(home: Path) -> bool:
     """Make sure none of the home's per-account files leads to the shared copy.
 
-    Returns True when one did, which means other accounts have been writing
-    into CLAUDE_HOME's copies. Then the home's policy stamps go too: they
-    vouch for files it no longer has, and without them the CLI fetches its
-    own account's afresh.
+    Returns True when one this account wrote did, which means other accounts
+    have been writing into CLAUDE_HOME's copies. Then the home's policy
+    stamps go too: they vouch for files it no longer has, and without them
+    the CLI fetches its own account's afresh.
     """
-    linked = False
+    written = False
     try:
         entries = list(home.iterdir())
     except FileNotFoundError:
@@ -5864,7 +5867,7 @@ def _privatize_account_state(home: Path) -> bool:
             continue
         if not (_is_link(path) or _same_file(path, CLAUDE_HOME / path.name)):
             continue
-        linked = True
+        written = written or path.name in _ACCOUNT_WRITTEN_FILES
         try:
             if _is_link(path):
                 _remove_link(path)
@@ -5874,12 +5877,12 @@ def _privatize_account_state(home: Path) -> bool:
             log.warning("could not unshare %s: %s", path, e)
             continue
         log.info("account state: %s no longer shared with %s", path, CLAUDE_HOME)
-    if linked:
+    if written:
         for stamp in ("policy-limits.json.stamp.json", "remote-settings.json.synced-at"):
             with contextlib.suppress(FileNotFoundError):
                 (home / stamp).unlink()
     _seed_account_config(home)
-    return linked
+    return written
 
 
 def _forget_account_details(home: Path) -> None:

@@ -43,6 +43,7 @@ SHARED_CONFIG = {
     "groveConfigCache": {"acct-alex": {}},
     "metricsStatusCacheByPrincipal": {},
     "hasAvailableSubscription": False,
+    "claudeAiMcpEverConnected": True,
     "mcpServers": {"gemini": GEMINI},
     "projects": {"/work": {"hasTrustDialogAccepted": True, "mcpServers": {"local": LOCAL}}},
 }
@@ -74,11 +75,13 @@ def _legacy_home(homes: Path, sub: str, cred_id: int) -> Path:
     """A credential home as _ensure_credential_home made them before the split."""
     home = app_module.PERSONAL_HOMES_DIR / app_module._safe_sub(sub) / str(cred_id)
     home.mkdir(parents=True)
-    for name in (".claude.json", "backups", "policy-limits.json", "remote-settings.json",
-                 "settings.json"):
-        (home / name).symlink_to(homes / name)
     (homes / ".claude.json.backup.123").write_text("{}", encoding="utf-8")
-    (home / ".claude.json.backup.123").symlink_to(homes / ".claude.json.backup.123")
+    try:
+        for name in (".claude.json", "backups", "policy-limits.json", "remote-settings.json",
+                     "settings.json", ".claude.json.backup.123"):
+            (home / name).symlink_to(homes / name)
+    except OSError:
+        pytest.skip("symlinks unavailable on this runner")
     (home / "policy-limits.json.stamp.json").write_text('{"identity": "x"}', encoding="utf-8")
     (home / "remote-settings.json.synced-at").write_text("1", encoding="utf-8")
     (home / ".claude_oauth_token").write_text("sk-ant-oat01-test", encoding="utf-8")
@@ -107,8 +110,10 @@ def test_a_new_account_gets_its_own_settings_file(homes) -> None:
     # The account's policy files and backups are its own, made by its CLI.
     for name in ("policy-limits.json", "remote-settings.json", "backups"):
         assert not (home / name).exists() and not app_module._is_link(home / name)
-    # Everything about the person is still shared.
-    assert app_module._is_link(home / "settings.json")
+    # Everything about the person is still shared (a hardlink where Windows
+    # can't make symlinks).
+    assert app_module._is_link(home / "settings.json") or app_module._same_file(
+        home / "settings.json", homes / "settings.json")
     assert app_module._is_link(home / "projects")
 
 
@@ -144,6 +149,7 @@ def test_startup_unshares_a_home_made_before_the_split(homes) -> None:
     assert not (home / "remote-settings.json.synced-at").exists()
     assert (home / ".claude_oauth_token").read_text(encoding="utf-8") == "sk-ant-oat01-test"
     assert app_module._is_link(home / "settings.json")
+    assert "claudeAiMcpEverConnected" not in config
 
     # Every account had been writing the shared copies, so they lose what
     # describes an account and keep the rest.
@@ -192,6 +198,20 @@ def test_startup_leaves_a_single_account_install_alone(homes) -> None:
 
     assert _config(homes / ".claude.json") == SHARED_CONFIG
     assert (homes / "policy-limits.json").exists()
+
+
+def test_a_shared_backups_folder_alone_leaves_the_shared_account_alone(homes) -> None:
+    # Only the files every account wrote mean the shared copy was overwritten.
+    home = app_module._ensure_credential_home("alice", 1)
+    try:
+        (home / "backups").symlink_to(homes / "backups")
+    except OSError:
+        pytest.skip("symlinks unavailable on this runner")
+
+    app_module._startup_private_account_state()
+
+    assert not app_module._is_link(home / "backups")
+    assert _config(homes / ".claude.json") == SHARED_CONFIG
 
 
 # ─── signing out ────────────────────────────────────────────────────────────
