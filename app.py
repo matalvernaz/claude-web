@@ -5849,13 +5849,15 @@ def _seed_account_config(home: Path) -> None:
         log.warning("could not create %s: %s", target, e)
 
 
-def _privatize_account_state(home: Path) -> bool:
+def _privatize_account_state(home: Path, seed: bool = True) -> bool:
     """Make sure none of the home's per-account files leads to the shared copy.
 
     Returns True when one this account wrote did, which means other accounts
     have been writing into CLAUDE_HOME's copies. Then the home's policy
     stamps go too: they vouch for files it no longer has, and without them
-    the CLI fetches its own account's afresh.
+    the CLI fetches its own account's afresh. A home that had its
+    ``.claude.json`` linked gets its own copy at once; otherwise ``seed``
+    decides.
     """
     written = False
     try:
@@ -5868,6 +5870,7 @@ def _privatize_account_state(home: Path) -> bool:
         if not (_is_link(path) or _same_file(path, CLAUDE_HOME / path.name)):
             continue
         written = written or path.name in _ACCOUNT_WRITTEN_FILES
+        seed = seed or path.name == ".claude.json"
         try:
             if _is_link(path):
                 _remove_link(path)
@@ -5881,7 +5884,8 @@ def _privatize_account_state(home: Path) -> bool:
         for stamp in ("policy-limits.json.stamp.json", "remote-settings.json.synced-at"):
             with contextlib.suppress(FileNotFoundError):
                 (home / stamp).unlink()
-    _seed_account_config(home)
+    if seed:
+        _seed_account_config(home)
     return written
 
 
@@ -20379,7 +20383,9 @@ def _startup_private_account_state() -> None:
             continue
         for home in homes:
             try:
-                shared = _privatize_account_state(home) or shared
+                # A home nobody uses stays as it is; _ensure_credential_home
+                # gives it its own copy when it is.
+                shared = _privatize_account_state(home, seed=False) or shared
             except OSError as e:
                 log.warning("startup: could not unshare %s: %s", home, e)
     if shared:

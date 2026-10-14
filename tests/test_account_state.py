@@ -191,6 +191,15 @@ def test_startup_unshares_a_hardlinked_settings_file(homes) -> None:
     assert "oauthAccount" not in _config(homes / ".claude.json")
 
 
+def test_startup_writes_nothing_into_a_home_it_had_nothing_to_unshare(homes) -> None:
+    home = app_module.PERSONAL_HOMES_DIR / app_module._safe_sub("carol") / "7"
+    home.mkdir(parents=True)
+
+    app_module._startup_private_account_state()
+
+    assert list(home.iterdir()) == []
+
+
 def test_startup_leaves_a_single_account_install_alone(homes) -> None:
     app_module._ensure_credential_home("alice", 1)  # already private
 
