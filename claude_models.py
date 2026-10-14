@@ -296,10 +296,16 @@ def load_cache(path: Path) -> Optional[dict]:
 
 def save_cache(path: Path, accounts: dict[str, list[dict]], cli_version: str) -> None:
     """Atomically replace the cache. Best-effort: a failed write only means
-    the next boot starts from the fallback list until the fetch lands."""
+    the next boot starts from the fallback list until the fetch lands.
+
+    ``rows`` repeats every account's rows as one list, the shape a cache had
+    before lists were kept per account, so an older build reading this file
+    (a rollback) still finds its picker.
+    """
     path = Path(path)
-    payload = {"version": 2, "accounts": accounts, "cli_version": cli_version,
-               "fetched_at": time.time()}
+    payload = {"version": 2, "accounts": accounts,
+               "rows": union_rows(list(accounts.values())),
+               "cli_version": cli_version, "fetched_at": time.time()}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".cli_models.")

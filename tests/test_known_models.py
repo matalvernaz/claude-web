@@ -163,6 +163,9 @@ def test_cache_round_trip(tmp_path) -> None:
     data = claude_models.load_cache(path)
     assert data["accounts"] == {"shared": ROWS, "cred:3": ROWS[:5]}
     assert data["cli_version"] == "2.1.289 (Claude Code)"
+    # An older build reads only "rows"; it gets every account's rows at once.
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert [r["value"] for r in raw["rows"]] == [r["value"] for r in ROWS]
     path.write_text("{not json", encoding="utf-8")
     assert claude_models.load_cache(path) is None
 
