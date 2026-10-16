@@ -253,7 +253,7 @@ def test_ensure_credential_home_skips_symlinks_in_shared_home(tmp_path, monkeypa
 def test_new_account_never_inherits_shared_login_files(tmp_path, monkeypatch):
     shared = tmp_path / "claude"
     shared.mkdir()
-    names = (".credentials.json", ".anthropic_api_key", ".claude_oauth_token")
+    names = (".credentials.json", ".anthropic_api_key", ".claude_oauth_token", ".anthropic_workspace_id")
     for name in names:
         (shared / name).write_text("shared-secret", encoding="utf-8")
     monkeypatch.setattr(app_module, "CLAUDE_HOME", shared)

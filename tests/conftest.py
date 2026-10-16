@@ -52,6 +52,10 @@ for var in (
     "GEMINI_API_KEY",
     "CLAUDE_WEB_OLLAMA_URL",
     "CLAUDE_WEB_OLLAMA_MODELS",
+    # Both shape what the Claude CLI sends, and the API-key workspace check
+    # reads the base URL; a developer's own values must not leak in.
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_BASE_URL",
 ):
     os.environ.pop(var, None)
 os.environ["AUTH_MODE"] = "none"
@@ -81,6 +85,9 @@ os.environ["CLAUDE_WEB_CLI_AUTOUPDATE"] = "false"
 os.environ["CLAUDE_WEB_CLI_MODELS_FETCH"] = "false"
 # And the codex CLI updater, which would run npm against the host's install.
 os.environ["CLAUDE_WEB_CODEX_AUTOUPDATE"] = "false"
+# Saving an API key asks Anthropic whether it needs a workspace; the tests
+# that cover that check switch it on with a fake transport.
+os.environ["CLAUDE_WEB_KEY_WORKSPACE_CHECK"] = "false"
 # And the portable build's tools updater, which downloads from the vendors.
 os.environ["CLAUDE_WEB_TOOLS_AUTOUPDATE"] = "false"
 os.environ.pop("CLAUDE_WEB_TOOLS_DIR", None)

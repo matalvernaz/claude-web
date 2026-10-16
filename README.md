@@ -35,6 +35,8 @@ Open the URL you put in `OIDC_REDIRECT_URI` (minus `/auth/callback`). On first v
 - **Sign in with a Claude account** — drives `claude auth login` (or `--console` for an Anthropic Console account) as a subprocess. Click the link to claude.com, sign in, copy the one-time code back into the textbox.
 - **Or paste an API key** — for headless / shared instances. The key is persisted to `$CLAUDE_WEB_STATE_DIR/anthropic_api_key` (mode 0600) and loaded into `ANTHROPIC_API_KEY` on startup.
 
+  A personal or service account key can be made for every workspace in its organization, and then has to name a workspace on every request. Saving one on `/account` looks the workspace up and sends it with each chat when the organization has just one; with several, it asks for a key made for a single workspace instead. A key pasted here, for the shared account, has to be one made for a single workspace.
+
 Either way, credentials persist in the `claude-home` (or `claude-web-state`) volume across container restarts. The `/setup` page locks itself once a credential is provisioned (`CLAUDE_WEB_ENABLE_SETUP=auto`); to switch accounts later, set `CLAUDE_WEB_ENABLE_SETUP=true` and restart, or shell into the container and run `claude auth login` directly.
 
 If you'd rather sign in from a shell from the start: `docker compose exec claude-web claude auth login`.
@@ -408,6 +410,7 @@ The ownership filter is not an OS security boundary. All model processes still r
 | Variable | Default | Notes |
 |---|---|---|
 | `CLAUDE_WEB_ENABLE_SETUP` | `auto` | Three values: `true` always allow `/setup` actions; `false` always block them (admin must shell in); `auto` allow during first-run, lock once a credential is configured. |
+| `CLAUDE_WEB_KEY_WORKSPACE_CHECK` | `true` | Saving an API key asks Anthropic (at `ANTHROPIC_BASE_URL` if set) whether it is a key made for every workspace, which must name one on each request. `false` saves keys unchecked, as before; such a key then fails every chat. |
 
 ### Hardening
 
