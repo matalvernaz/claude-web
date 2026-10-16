@@ -42,6 +42,10 @@
   const apikeySubmit = $("apikey-submit");
   const apikeyStatus = $("apikey-status");
   const apikeyError = $("apikey-error");
+  const apikeyBlock = $("apikey-block");
+  const variantRadios = oauthForm
+    ? Array.from(oauthForm.querySelectorAll('input[name="variant"]'))
+    : [];
 
   let activeCredId = null;
   // Per-credential endpoints are /api/account/credentials/<id>/...; the
@@ -69,6 +73,21 @@
     show(el);
   }
 
+  function currentVariant() {
+    const checked = variantRadios.find((r) => r.checked);
+    return checked ? checked.value : "claudeai";
+  }
+
+  // The "Paste an API key" radio reveals the key box in place instead of
+  // running an OAuth flow, so when it's picked there's no "Start sign-in" to
+  // run. Toggle only `hidden`, never `disabled`, so this never fights the
+  // OAuth flow state machine. No focus is moved — reveal only, by request.
+  function syncVariantUI() {
+    const isKey = currentVariant() === "apikey";
+    if (isKey) { show(apikeyBlock); hide(oauthStart); }
+    else { hide(apikeyBlock); show(oauthStart); }
+  }
+
   function clearOauthState() {
     lastOauthFlowStatus = null;
     lastMagicLink = null;
@@ -90,6 +109,11 @@
     if (apikeyShow) apikeyShow.checked = false;
     if (apikeyInput) apikeyInput.type = "password";
     apikeySubmit.disabled = false;
+    // Open in the default state: subscription selected, key box hidden, Start
+    // sign-in shown. Keeps the block's visibility matching the chosen radio.
+    const claudeaiRadio = $("variant-claudeai");
+    if (claudeaiRadio) claudeaiRadio.checked = true;
+    syncVariantUI();
   }
 
   function openSignin(credId, label) {
@@ -257,6 +281,11 @@
     oauthForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       if (activeCredId == null) return;
+      // The "Paste an API key" radio isn't an OAuth flow — its own form saves
+      // the key. Guard before any status/progress UI so a stray submit can't
+      // leave a stuck "Starting sign-in…", and never POST variant=apikey to
+      // oauth/start (the server only accepts claudeai/console/token).
+      if (currentVariant() === "apikey") return;
       setText(oauthError, "");
       hide(oauthError);
       hide(oauthLinkBlock);
@@ -280,6 +309,12 @@
       }
     });
   }
+
+  // Reveal the key box in place when the API-key radio is chosen, hide it
+  // again for the OAuth variants. syncVariantUI() here also sets the initial
+  // state on load (subscription is checked by default).
+  variantRadios.forEach((r) => r.addEventListener("change", syncVariantUI));
+  syncVariantUI();
 
   if (oauthCodeForm) {
     oauthCodeForm.addEventListener("submit", async (ev) => {
