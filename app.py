@@ -5765,7 +5765,10 @@ def _ensure_shared_projects_dir() -> Optional[Path]:
 # aliases depending on whose chat had run last. The policy and remote-settings
 # files belong to an organisation in the same way, and backups/ holds the
 # .claude.json copies the CLI restores from.
-_CREDENTIAL_FILES = (".credentials.json", ".anthropic_api_key", ".claude_oauth_token")
+_CREDENTIAL_FILES = (
+    ".credentials.json", ".anthropic_api_key", ".claude_oauth_token",
+    ".anthropic_workspace_id",
+)
 _ACCOUNT_STATE_FILES = (
     ".claude.json", "backups",
     "policy-limits.json", "policy-limits.json.stamp.json",
@@ -6228,17 +6231,42 @@ def _credential_cli_env(home: Path) -> dict[str, str]:
     A credential in the per-credential home overrides the shared slot's. A
     blank unmasks whatever the shared slot put in the process env (an API
     key, a long-lived token) so the CLI falls through to this home's
-    .credentials.json.
+    .credentials.json. A key made for every workspace also names the one it
+    acts in (setup_flow.detect_workspace).
     """
     try:
         key = (home / ".anthropic_api_key").read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         key = ""
-    return {
+    env = {
         "CLAUDE_CONFIG_DIR": str(home),
         "ANTHROPIC_API_KEY": key,
         "CLAUDE_CODE_OAUTH_TOKEN": "" if key else setup_flow.read_oauth_token(home),
     }
+    headers = _cli_custom_headers(setup_flow.read_workspace_id(home) if key else "")
+    if headers is not None:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = headers
+    return env
+
+
+def _cli_custom_headers(workspace_id: str) -> Optional[str]:
+    """ANTHROPIC_CUSTOM_HEADERS for a credential's CLI, or None to leave it out.
+
+    The CLI splits the value on newlines into "Name: Value" headers. It is
+    rebuilt from this process's own value every time, minus any workspace
+    header, so a workspace only ever reaches the credential it belongs to.
+    """
+    inherited = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+    lines = [
+        line for line in re.split(r"\r?\n", inherited)
+        if line.strip()
+        and line.split(":", 1)[0].strip().lower() != setup_flow.WORKSPACE_HEADER
+    ]
+    if workspace_id:
+        lines.append(f"{setup_flow.WORKSPACE_HEADER}: {workspace_id}")
+    if not lines and not inherited:
+        return None
+    return "\n".join(lines)
 
 
 def _resolve_account_for_run(
@@ -11571,6 +11599,25 @@ async def api_shared_oauth_cancel(user: dict = Depends(auth.require_user)):
     return {"ok": True}
 
 
+async def _save_shared_api_key(api_key: str) -> None:
+    """Save the shared slot's key, or 400 without writing anything.
+
+    A key made for every workspace is refused here: the shared key lives in
+    the process env, and its workspace header would reach every other
+    account's CLI along with it.
+    """
+    try:
+        if await setup_flow.detect_workspace(api_key):
+            raise ValueError(
+                "This key isn't tied to one workspace, and the shared account can't "
+                f"send one with it. {setup_flow.SINGLE_WORKSPACE_KEY_HINT} "
+                "This key wasn't saved."
+            )
+        setup_flow.save_api_key(api_key)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
 @app.post("/api/account/shared/apikey")
 async def api_shared_apikey(
     request: Request, user: dict = Depends(auth.require_user),
@@ -11580,10 +11627,7 @@ async def api_shared_apikey(
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
         raise HTTPException(400, "api_key is required")
-    try:
-        setup_flow.save_api_key(api_key)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+    await _save_shared_api_key(api_key)
     log.info("shared api key replaced by %s", user.get("email") or user.get("sub"))
     return {"configured": setup_flow.is_configured()}
 
@@ -11600,12 +11644,18 @@ async def api_credentials_apikey(
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
         raise HTTPException(400, "api_key is required")
-    home = _ensure_credential_home(sub, cred_id)
     try:
-        setup_flow.save_api_key(api_key, home)
+        # Asked before anything is written, so a refused key leaves the slot
+        # exactly as it was.
+        workspace = await setup_flow.detect_workspace(api_key)
+        home = _ensure_credential_home(sub, cred_id)
+        setup_flow.save_api_key(api_key, home, workspace_id=workspace.id if workspace else None)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    return {"configured": _credential_is_configured(sub, cred_id)}
+    return {
+        "configured": _credential_is_configured(sub, cred_id),
+        "workspace": {"id": workspace.id, "name": workspace.name} if workspace else None,
+    }
 
 
 @app.post("/api/account/credentials/{cred_id}/signout")
@@ -18242,10 +18292,7 @@ async def api_setup_apikey(
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
         raise HTTPException(400, "api_key is required")
-    try:
-        setup_flow.save_api_key(api_key)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+    await _save_shared_api_key(api_key)
     return {"configured": setup_flow.is_configured()}
 
 

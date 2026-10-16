@@ -10,7 +10,10 @@ Two flows are supported:
     back into stdin to complete the exchange.
   * **api_key** — the user pastes an Anthropic API key. We persist it
     inside the target home (``.anthropic_api_key`` next to the OAuth
-    credentials) so each credential slot is self-contained.
+    credentials) so each credential slot is self-contained. A key made
+    for every workspace in its organization also needs the workspace it
+    acts in; ``detect_workspace`` finds it before the key is saved and it
+    is kept beside the key in ``.anthropic_workspace_id``.
 
 Multiple flows can be in flight at once, keyed by a caller-chosen string
 ("shared" for the in-container CLI's default home, "cred:<sub>:<id>"
@@ -32,6 +35,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 import claude_cli
+import httpx
 
 
 # os.chmod on a file descriptor needs os.fchmod, which doesn't exist on
@@ -94,6 +98,42 @@ def oauth_token_path(home: Optional[Path] = None) -> Path:
     year), used through CLAUDE_CODE_OAUTH_TOKEN instead of the ~4-week
     ``.credentials.json`` sign-in."""
     return (home or CLAUDE_HOME) / ".claude_oauth_token"
+
+
+# Anthropic's identity-linked API keys (personal and service account keys)
+# are made either for one workspace or for every workspace their owner can
+# use. The second kind must name a workspace on every request, in this
+# header, or the API answers 400 before doing anything. The CLI only sends
+# it through ANTHROPIC_CUSTOM_HEADERS, so such a key keeps its workspace id
+# in a file beside it.
+WORKSPACE_HEADER = "anthropic-workspace-id"
+# The id goes into a newline-separated header list, so nothing but a bare id
+# is ever written or read back.
+_WORKSPACE_ID_RE = re.compile(r"wrkspc_[A-Za-z0-9]{1,64}")
+
+
+def workspace_id_path(home: Optional[Path] = None) -> Path:
+    return (home or CLAUDE_HOME) / ".anthropic_workspace_id"
+
+
+def read_workspace_id(home: Optional[Path] = None) -> str:
+    """The workspace the API key in ``home`` has to name, or "" for none.
+
+    A file that can't be read, or that holds anything but a workspace id, is
+    ignored rather than trusted or allowed to stop the slot from running.
+    """
+    path = workspace_id_path(home)
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeDecodeError) as e:
+        log.warning("ignoring unreadable %s: %s", path, e)
+        return ""
+    if not _WORKSPACE_ID_RE.fullmatch(value):
+        log.warning("ignoring %s: it does not hold a workspace id", path)
+        return ""
+    return value
 
 
 def load_oauth_token_into_env() -> Optional[str]:
@@ -249,7 +289,8 @@ def _atomic_write_secret(path: Path, content: str) -> None:
         raise
 
 
-def save_api_key(key: str, home: Optional[Path] = None) -> None:
+def check_api_key(key: str) -> str:
+    """The pasted key, trimmed, or ValueError if it can't be one."""
     key = (key or "").strip()
     if not key:
         raise ValueError("api key is empty")
@@ -258,13 +299,172 @@ def save_api_key(key: str, home: Optional[Path] = None) -> None:
             "api key doesn't match the expected sk-ant-* format. "
             "Paste only the key, not a whole `export ANTHROPIC_API_KEY=...` line."
         )
+    return key
+
+
+def save_api_key(
+    key: str, home: Optional[Path] = None, workspace_id: Optional[str] = None,
+) -> None:
+    """Store ``key`` for the slot. ``workspace_id`` is the workspace a key
+    made for every workspace has to name (see ``detect_workspace``)."""
+    key = check_api_key(key)
+    if workspace_id is not None and not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+        raise ValueError("that is not a workspace id (they start with wrkspc_)")
+    if home is None and workspace_id:
+        # The shared slot's key lives in the process env, where every other
+        # slot's CLI would inherit the header too.
+        raise ValueError("the shared account can't use a key that needs a workspace")
     target_home = home or CLAUDE_HOME
     _atomic_write_secret(api_key_path(target_home), key)
+    # The workspace belongs to the key: a new key must not inherit the last
+    # one's, which would send its requests somewhere they can't go.
+    if workspace_id:
+        _atomic_write_secret(workspace_id_path(target_home), workspace_id)
+    else:
+        workspace_id_path(target_home).unlink(missing_ok=True)
     # Only the shared slot feeds the process-wide env var; per-user keys
     # are pulled into the spawned CLI's env on demand.
     if home is None:
         _atomic_write_secret(API_KEY_FILE, key)
         os.environ["ANTHROPIC_API_KEY"] = key
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """The workspace a key made for every workspace acts in."""
+    id: str
+    name: str
+
+
+SINGLE_WORKSPACE_KEY_HINT = (
+    "In the Claude Console, create a key for a single workspace "
+    "(API keys, Create key, then pick the workspace) and paste that instead."
+)
+_NOT_SAVED = "This key wasn't saved."
+_WORKSPACE_CHECK_TIMEOUT_SECONDS = 10.0
+
+
+class _Unreachable(Exception):
+    """Anthropic answered with a status that says nothing about the key."""
+
+
+def _workspace_check_enabled() -> bool:
+    value = os.environ.get("CLAUDE_WEB_KEY_WORKSPACE_CHECK", "true").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _error_message(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return message if isinstance(message, str) else ""
+
+
+def _check_reachable(response: httpx.Response) -> httpx.Response:
+    if response.status_code == 429 or response.status_code >= 500:
+        raise _Unreachable(f"{response.request.url.path} answered HTTP {response.status_code}")
+    return response
+
+
+async def detect_workspace(
+    key: str, *, transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> Optional[Workspace]:
+    """The workspace ``key`` has to name on every request, or None.
+
+    A key made for one workspace, or a legacy workspace key, needs none, and
+    neither does a key the API turns away for any other reason: saving has
+    never validated keys and still doesn't. A key made for every workspace
+    gets the only workspace its organization has. With several there is no
+    right guess, so the key is refused (ValueError), and so it is when
+    Anthropic can't be reached, because a key that needs a workspace and is
+    saved without one fails every chat on it.
+    """
+    if not _workspace_check_enabled():
+        return None
+    key = check_api_key(key)
+    # Ask where the CLI will send the key's requests.
+    base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+    try:
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            timeout=_WORKSPACE_CHECK_TIMEOUT_SECONDS,
+            transport=transport,
+        ) as client:
+            return await _find_workspace(client)
+    except (httpx.HTTPError, httpx.InvalidURL, _Unreachable) as e:
+        log.warning("API key workspace check failed: %s", e)
+        raise ValueError(
+            "Couldn't reach Anthropic to check this key, so it wasn't saved. "
+            "Try again in a minute."
+        ) from e
+
+
+async def _find_workspace(client: httpx.AsyncClient) -> Optional[Workspace]:
+    # Any request will do; listing one model is free.
+    probe = _check_reachable(await client.get("/v1/models", params={"limit": 1}))
+    if probe.status_code != 400 or WORKSPACE_HEADER not in _error_message(probe):
+        return None
+    # The Admin API answers a key made for every workspace without the header.
+    listing = _check_reachable(await client.get(
+        "/v1/organizations/workspaces", params={"include_default": "true", "limit": 100},
+    ))
+    try:
+        body = listing.json() if listing.status_code == 200 else None
+    except ValueError:
+        body = None
+    rows = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError(
+            "This key isn't tied to one workspace, and Anthropic wouldn't list the "
+            f"workspaces it can use (HTTP {listing.status_code}). "
+            f"{SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    active = [row for row in rows if isinstance(row, dict) and not row.get("archived_at")]
+    # Only a page that says it is the last one is the whole list: even one
+    # workspace on it proves nothing when more may follow.
+    complete = body.get("has_more") is False
+    if len(active) > 1 or body.get("has_more") is True:
+        listed = "" if not complete else " (" + ", ".join(
+            str(row.get("name") or row.get("id")) for row in active
+        ) + ")"
+        raise ValueError(
+            "This key isn't tied to one workspace, and your organization has more "
+            f"than one{listed}, so there's no telling which to use. "
+            f"{SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    if not complete:
+        raise ValueError(
+            "This key isn't tied to one workspace, and Anthropic's list of the "
+            "workspaces it can use came back incomplete. "
+            f"{SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    if not active:
+        raise ValueError(
+            "This key isn't tied to one workspace, and Anthropic listed none it can "
+            f"use. {SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    workspace_id = active[0].get("id")
+    if not isinstance(workspace_id, str) or not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+        raise ValueError(
+            "This key isn't tied to one workspace, and Anthropic's answer didn't "
+            f"include a usable workspace id. {SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    name = str(active[0].get("name") or workspace_id)
+    # Prove the key may act there before every chat depends on it.
+    confirm = _check_reachable(await client.get(
+        "/v1/models", params={"limit": 1}, headers={WORKSPACE_HEADER: workspace_id},
+    ))
+    if confirm.status_code != 200:
+        raise ValueError(
+            f"This key isn't tied to one workspace, and Anthropic turned it away from "
+            f"the {name} workspace (HTTP {confirm.status_code}). "
+            f"{SINGLE_WORKSPACE_KEY_HINT} {_NOT_SAVED}"
+        )
+    return Workspace(workspace_id, name)
 
 
 def save_oauth_token(token: str, home: Optional[Path] = None) -> None:
@@ -334,7 +534,7 @@ async def sign_out(home: Optional[Path] = None) -> None:
             await _kill_and_reap(proc)
 
     candidates = [credentials_path(target_home), api_key_path(target_home),
-                  oauth_token_path(target_home)]
+                  oauth_token_path(target_home), workspace_id_path(target_home)]
     if home is None:
         candidates.append(API_KEY_FILE)
     for p in candidates:
