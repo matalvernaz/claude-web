@@ -378,6 +378,86 @@ def test_a_refused_verification_code_reopens_the_form_with_the_reason(browser):
         context.close()
 
 
+def _account_page_ready_to_sign_in(page, state):
+    """Serve /account for one unconfigured slot and open its sign-in section.
+    Any hit to oauth/start is recorded in ``state["oauth_starts"]``."""
+    template = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("account.html")
+    html = template.render(
+        asset_version=lambda _: "test", user={"sub": "test"},
+        account={"shared_label": "Shared", "credentials": [{
+            "id": 2, "label": "Alex", "configured": False,
+        }]}, codex_account={"credentials": []},
+    )
+    state.setdefault("oauth_starts", [])
+
+    def route(request_route):
+        request = request_route.request
+        path = urlparse(request.url).path
+        if path == "/account":
+            request_route.fulfill(content_type="text/html", body=html)
+        elif path.startswith("/static/"):
+            asset = ROOT / path.lstrip("/")
+            request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
+        elif path.endswith("/oauth/start"):
+            state["oauth_starts"].append(request.post_data_json)
+            request_route.fulfill(json={"status": "starting"})
+        else:
+            request_route.fulfill(json={})
+
+    page.route("**/*", route)
+    page.goto("http://account-ui.test/account")
+    page.get_by_role("button", name="Sign in", exact=True).click()
+
+
+def test_api_key_radio_reveals_the_key_box_in_place_without_stealing_focus(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    state = {}
+    try:
+        _account_page_ready_to_sign_in(page, state)
+        block = page.locator("#apikey-block")
+        start = page.locator("#oauth-start")
+        # Default: subscription selected, key box hidden, Start sign-in shown.
+        playwright.expect(block).to_be_hidden()
+        playwright.expect(start).to_be_visible()
+
+        # Choosing the API-key radio reveals the box in place and drops the
+        # now-meaningless Start sign-in button. Focus must NOT jump into the
+        # input — the owner navigates by screen reader and asked for reveal
+        # only, so the box stays off the focus path until they tab to it.
+        page.get_by_role("radio", name="Paste an API key I already have").check()
+        playwright.expect(block).to_be_visible()
+        playwright.expect(start).to_be_hidden()
+        playwright.expect(page.locator("#apikey-input")).to_be_visible()
+        assert page.evaluate("document.activeElement.id") != "apikey-input"
+
+        # Submitting the OAuth form while the key radio is selected must not
+        # start an OAuth flow (the server only accepts claudeai/console/token).
+        page.evaluate("document.getElementById('oauth-form').requestSubmit()")
+        page.wait_for_timeout(100)
+        assert state["oauth_starts"] == []
+
+        # Back to an OAuth variant hides the box and restores Start sign-in.
+        page.get_by_role("radio", name="Claude subscription (claude.ai)").check()
+        playwright.expect(block).to_be_hidden()
+        playwright.expect(start).to_be_visible()
+
+        # Leave the section in API-key mode, then close and reopen: opening it
+        # must reset to the default (subscription checked, box hidden, Start
+        # shown), not reappear still showing the key box.
+        page.get_by_role("radio", name="Paste an API key I already have").check()
+        playwright.expect(block).to_be_visible()
+        page.get_by_role("button", name="Close", exact=True).click()
+        page.get_by_role("button", name="Sign in", exact=True).click()
+        playwright.expect(block).to_be_hidden()
+        playwright.expect(start).to_be_visible()
+        playwright.expect(
+            page.get_by_role("radio", name="Claude subscription (claude.ai)")
+        ).to_be_checked()
+    finally:
+        context.close()
+
+
 def test_local_boot_and_keyboard_effort_follow_model_capabilities(ui):
     page, state = ui
     state["initial_local"] = True

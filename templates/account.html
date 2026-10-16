@@ -132,6 +132,10 @@
             <input type="radio" id="variant-console" name="variant" value="console">
             <label for="variant-console">Anthropic Console (API billing)</label>
           </p>
+          <p class="radio-row">
+            <input type="radio" id="variant-apikey" name="variant" value="apikey" aria-controls="apikey-block">
+            <label for="variant-apikey">Paste an API key I already have</label>
+          </p>
         </fieldset>
         <p>
           <button type="submit" id="oauth-start">Start sign-in</button>
@@ -186,8 +190,7 @@
         <p id="oauth-error" class="setup-error" role="alert" hidden></p>
       </div>
 
-      <details class="setup-apikey">
-        <summary>I'd rather paste an API key</summary>
+      <div id="apikey-block" class="setup-apikey" hidden>
         <p>The key is stored in this credential's home (mode 0600) and used only when this account is active.</p>
         <form id="apikey-form">
           <p>
@@ -206,7 +209,7 @@
         </form>
         <p id="apikey-status" role="status" aria-live="polite"></p>
         <p id="apikey-error" class="setup-error" role="alert" hidden></p>
-      </details>
+      </div>
     </section>
 
     <section aria-labelledby="codex-creds-heading" class="setup-card">
