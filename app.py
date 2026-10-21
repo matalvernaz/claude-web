@@ -8470,6 +8470,17 @@ class ActiveRun:
         # transition). Read by _notify_turn_complete for the long-turn
         # push notification.
         self.turn_started_at: float = time.monotonic()
+        # Per-turn digest for the long-turn Pushover (_notify_turn_complete).
+        # Filled as the turn streams (TextBlock/ToolUseBlock in
+        # _sdk_message_to_events for Claude, the completed agentMessage item
+        # for Codex) so the notification can say what the turn actually did,
+        # not just that it finished. The model's final reply is already a
+        # plain-language account of the work, so it IS the summary. Cleared
+        # when the turn's ResultMessage is consumed.
+        self.turn_last_text: str = ""
+        self.turn_tool_count: int = 0
+        self.turn_files: list[str] = []
+        self.turn_result: Optional[dict] = None
         # Coalescing buffer for partial-text stream deltas; flushed as
         # transient partial_text SSE frames by _handle_partial_stream_event.
         self.partial_text_buf: str = ""
@@ -9204,19 +9215,122 @@ def _send_pushover_sync(title: str, message: str) -> None:
         log.warning("pushover notify failed: %s", exc)
 
 
+# Tools that are bookkeeping rather than work; left out of the turn's tool
+# tally in the completion notification so the count reflects real activity.
+_NOTIFY_BOOKKEEPING_TOOLS = frozenset({
+    "TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList",
+    "EnterPlanMode", "ExitPlanMode",
+})
+_NOTIFY_SUMMARY_MAX = 320
+_NOTIFY_CHAT_MAX = 80
+# Inline markdown marks worth removing before a screen reader reads the push.
+# Underscores and '#' are left alone — they sit inside identifiers
+# (file_path) and issue refs (PR #14) far more often than they mark emphasis.
+_NOTIFY_MD_STRIP_RE = re.compile(r"[*`]+")
+
+
+def _reset_turn_digest(run: "ActiveRun") -> None:
+    """Clear the per-turn notification digest so the next turn starts empty.
+    Called right after each turn's ResultMessage is consumed."""
+    run.turn_last_text = ""
+    run.turn_tool_count = 0
+    run.turn_files = []
+    run.turn_result = None
+
+
+def _clean_notify_text(text: str) -> str:
+    """Flatten a markdown reply into one tidy line for a push notification.
+
+    The notification is read straight through by a screen reader, so fenced
+    code blocks are dropped, bold/backtick marks removed, and every run of
+    whitespace (hard line breaks included) collapsed to one space. Content is
+    preserved; only the markup goes."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    cleaned = _NOTIFY_MD_STRIP_RE.sub("", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
+def _truncate_notify(text: str, limit: int) -> str:
+    """Cut to `limit` chars at a word boundary, with a trailing ellipsis."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip()
+    return (cut or text[:limit].rstrip()) + "..."
+
+
+def _project_label(key: Optional[str]) -> str:
+    """Human name for a project key, matching the header picker: the path's
+    basename ('-home-matt' → 'matt'). Unknown keys fall back to the key."""
+    if not key:
+        return "claude-web"
+    cwd = PROJECT_KEYS.get(key)
+    if cwd is not None:
+        return cwd.name or key
+    return key
+
+
+def _format_turn_notification(run: "ActiveRun", elapsed: float) -> tuple[str, str]:
+    """Build (title, body) for the long-turn push. Pure, so it's unit-tested
+    without touching Pushover. Title leads with the outcome (read first);
+    body leads with the model's own final reply (the summary of the work)."""
+    result = run.turn_result or {}
+    interrupted = bool(result.get("interrupted")
+                       or result.get("subtype") == "interrupted")
+    is_error = bool(result.get("is_error"))
+    # Outcome leads the title so it's the first thing a screen reader says.
+    if interrupted:
+        title = "Turn interrupted"
+    elif is_error:
+        title = "Turn failed"
+    else:
+        title = "Turn finished"
+
+    summary = _truncate_notify(
+        _clean_notify_text(run.turn_last_text or result.get("result") or ""),
+        _NOTIFY_SUMMARY_MAX,
+    )
+
+    mins, secs = divmod(int(elapsed), 60)
+    elapsed_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+    # Project label matches the header picker ('/home/matt' → 'matt').
+    meta = [f"{elapsed_str} in {_project_label(run.project_key)}"]
+    if run.turn_files:
+        shown = ", ".join(run.turn_files[:4])
+        extra = len(run.turn_files) - 4
+        if extra > 0:
+            shown += f" +{extra} more"
+        meta.append(f"edited {shown}")
+    if run.turn_tool_count:
+        meta.append(f"{run.turn_tool_count} tool "
+                    f"call{'s' if run.turn_tool_count != 1 else ''}")
+
+    lines = []
+    if summary:
+        lines.append(summary)
+    lines.append(", ".join(meta))
+    if run.checkpoints:
+        chat = _clean_notify_text(run.checkpoints[-1].get("preview") or "")
+        if chat:
+            lines.append("In reply to: " + _truncate_notify(chat, _NOTIFY_CHAT_MAX))
+    return title, "\n".join(lines)
+
+
 def _notify_turn_complete(run: "ActiveRun") -> None:
-    """Fire-and-forget push when a long turn ends. Called from the driver."""
+    """Fire-and-forget push when a long turn ends. Called from the driver.
+
+    The body says what the turn did — the model's final reply, the outcome, a
+    light activity line and which chat it was — so a glance at a phone says
+    roughly what happened between the last message and now, not just that a
+    turn finished."""
     if not (PUSHOVER_TOKEN and PUSHOVER_USER) or NOTIFY_MIN_SECONDS <= 0:
         return
     elapsed = time.monotonic() - run.turn_started_at
     if elapsed < NOTIFY_MIN_SECONDS:
         return
-    where = run.project_key or "claude-web"
-    message = (
-        f"Turn finished after {int(elapsed // 60)}m{int(elapsed % 60):02d}s "
-        f"in {where} (session …{(run.session_id or run.run_id)[-8:]})"
-    )
-    asyncio.create_task(asyncio.to_thread(_send_pushover_sync, SITE_TITLE, message))
+    title, message = _format_turn_notification(run, elapsed)
+    asyncio.create_task(asyncio.to_thread(_send_pushover_sync, title, message))
 
 
 # ─── CLI auto-update ──────────────────────────────────────────────────────────
@@ -12937,6 +13051,10 @@ async def _codex_driver(
                     completed = method == "item/completed"
                     if completed and item.get("type") == "agentMessage":
                         _flush_codex_partial()
+                        # Keep the turn's final message for the push notification.
+                        _atext = item.get("text") or ""
+                        if _atext.strip():
+                            run.turn_last_text = _atext
                     if completed and item.get("type") == "contextCompaction":
                         # item_events emits the note; suppress the
                         # thread/compacted fallback for this compaction.
@@ -12990,21 +13108,28 @@ async def _codex_driver(
                     interrupted = run.interrupting
                     failed = method == "turn/failed" or bool(err_msg)
                     duration = int((time.monotonic() - turn_started_mono) * 1000)
-                    run.emit(_codex_result_event(
+                    _result_evt = _codex_result_event(
                         run, interrupted=interrupted,
                         failed=failed and not interrupted,
                         error_message=err_msg or "",
                         duration_ms=duration,
-                    ))
+                    )
+                    run.turn_result = _result_evt
+                    run.emit(_result_evt)
                     run.interrupting = False
                     run.codex_turn_id = None
                     run.between_turns = True
                     run.codex_turn_done.set()
-                    run.turn_started_at = time.monotonic()
                     _persist_run_meta(run)
                     _record_codex_session(thread_id, run.owner_sub,
                                           run.project_key, "", None)
+                    # Measure the turn from its real start. The app-server
+                    # reports no wall-clock, and the previous code reset this to
+                    # "now" right before notifying, so every long Codex turn
+                    # looked instant and never pushed.
+                    run.turn_started_at = turn_started_mono
                     _notify_turn_complete(run)
+                    _reset_turn_digest(run)
                 elif method == "error":
                     msg_text = params.get("message") or params.get("error") or ""
                     if msg_text:
@@ -15735,7 +15860,15 @@ def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
         # interrupted block, so it can't be prepended to the next turn's
         # first partial frame.
         run.partial_text_buf = ""
+        # evts already carries the interrupt rewrite (is_error→False,
+        # interrupted→True) applied in the driver before this call, so the
+        # notification reads the true outcome.
+        for _e in evts:
+            if _e.get("type") == "result":
+                run.turn_result = _e
+                break
         _notify_turn_complete(run)
+        _reset_turn_digest(run)
     elif isinstance(msg, (AssistantMessage, UserMessage)):
         # After client.interrupt(), the CLI echoes the interrupt marker
         # ("[Request interrupted by user]") as a bare UserMessage AFTER the
@@ -15981,6 +16114,11 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         for blk in msg.content:
             if isinstance(blk, TextBlock):
                 message_blocks.append({"type": "text", "text": blk.text})
+                # The last non-empty assistant text of the turn is the summary
+                # the long-turn push notification reads back (see
+                # _notify_turn_complete).
+                if run is not None and blk.text and blk.text.strip():
+                    run.turn_last_text = blk.text
             elif isinstance(blk, ThinkingBlock):
                 message_blocks.append({"type": "thinking", "text": blk.thinking})
             elif isinstance(blk, ToolUseBlock):
@@ -15990,6 +16128,16 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                     "name": blk.name,
                     "input": blk.input,
                 })
+                # Light activity tally for the notification. Bookkeeping tools
+                # (TodoWrite/TaskCreate/plan-mode toggles) fire often and aren't
+                # "work", so they're left out of the count; Write/Edit basenames
+                # are collected so the push can name the files touched.
+                if run is not None and blk.name not in _NOTIFY_BOOKKEEPING_TOOLS:
+                    run.turn_tool_count += 1
+                    if blk.name in ("Write", "Edit", "MultiEdit"):
+                        _edited = Path((blk.input or {}).get("file_path") or "").name
+                        if _edited and _edited not in run.turn_files:
+                            run.turn_files.append(_edited)
                 # Remember a plan-file write so the matching ExitPlanMode card
                 # can show the plan — the tool input no longer carries it inline
                 # (CLI 2.1.198+). Sub-agent plans (*-agent-*) are excluded so a
