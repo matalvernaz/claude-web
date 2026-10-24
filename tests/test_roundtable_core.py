@@ -237,14 +237,156 @@ def _sdk_tools_turn(monkeypatch, tmp_path, transport):
 def test_sdk_tools_strips_api_key_on_subscription_transports(tmp_path, monkeypatch):
     """transport auto/cli = subscription intent: the SDK child must not
     inherit ANTHROPIC_API_KEY, or it silently bills the API per-token."""
+    _config_dir(tmp_path, monkeypatch, token=None)
     for transport in ("auto", "cli"):
         opts = _sdk_tools_turn(monkeypatch, tmp_path, transport)
         assert opts.get("env") == {"ANTHROPIC_API_KEY": ""}, transport
 
 
 def test_sdk_tools_keeps_api_key_on_forced_api_transport(tmp_path, monkeypatch):
+    _config_dir(tmp_path, monkeypatch)
     opts = _sdk_tools_turn(monkeypatch, tmp_path, "api")
     assert "env" not in opts
+
+
+# ─── the Claude sign-in a CLI child runs on ──────────────────────────────
+
+def _config_dir(tmp_path, monkeypatch, token="sk-ant-oat01-home"):
+    """A Claude config dir as claude-web lays one out, with no token in env:
+    what the roundtable MCP server sees when a chat starts it."""
+    home = tmp_path / "claude-config"
+    home.mkdir(exist_ok=True)
+    if token is not None:
+        (home / ".claude_oauth_token").write_text(token + "\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    return home
+
+
+def test_cli_children_run_on_the_config_dirs_token(tmp_path, monkeypatch):
+    """Claude Code drops an inherited CLAUDE_CODE_OAUTH_TOKEN from the MCP
+    servers it starts, but passes CLAUDE_CONFIG_DIR. Without the token the
+    child fell back to that dir's long-expired saved sign-in and every Claude
+    seat died with "OAuth session expired"."""
+    _config_dir(tmp_path, monkeypatch)
+    env = core._cli_child_env()
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-home"
+    assert env["ANTHROPIC_API_KEY"] == ""
+
+
+def test_a_token_already_in_the_environment_wins(tmp_path, monkeypatch):
+    """claude-web's own process (panel review) has the shared token in env."""
+    _config_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-env")
+    assert core._cli_child_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-env"
+
+
+def test_a_blank_token_in_the_environment_counts_as_none(tmp_path, monkeypatch):
+    """claude-web blanks the variable for a chat on an API key, and a blank
+    unmasks rather than names a token."""
+    _config_dir(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "  ")
+    assert core._cli_child_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-home"
+
+
+def test_no_token_anywhere_adds_none(tmp_path, monkeypatch):
+    home = _config_dir(tmp_path, monkeypatch, token=None)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in core._cli_child_env()
+    (home / ".claude_oauth_token").write_text(" \n")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in core._cli_child_env()
+
+
+def test_without_a_config_dir_the_token_comes_from_the_default_one(tmp_path, monkeypatch):
+    """The CLI's own default when CLAUDE_CONFIG_DIR is unset is ~/.claude."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".claude_oauth_token").write_text("sk-ant-oat01-default\n")
+    assert core._cli_child_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-default"
+
+
+def test_sdk_tools_carry_the_config_dirs_token(tmp_path, monkeypatch):
+    """Repo-bound Claude turns go through the agent SDK: the path the 10-2x
+    BookPlayer thread's Claude seat died on."""
+    _config_dir(tmp_path, monkeypatch)
+    for transport in ("auto", "cli"):
+        opts = _sdk_tools_turn(monkeypatch, tmp_path, transport)
+        assert opts.get("env") == {
+            "ANTHROPIC_API_KEY": "", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-home",
+        }, transport
+
+
+def _fake_cli_binaries(monkeypatch):
+    monkeypatch.setattr(core, "_CLAUDE_CLI", "/opt/bin/claude-ha")
+    monkeypatch.setattr(core, "_PLAIN_CLAUDE_CLI", "/opt/bin/claude")
+
+
+def test_a_cli_call_with_a_token_runs_plain_claude(tmp_path, monkeypatch):
+    """claude-ha points the CLI at its own config dirs. A token already picks
+    the account, so that can't reach another one; it only runs this account
+    against the shared home's settings, which once flipped the model picker."""
+    from types import SimpleNamespace
+    home = _config_dir(tmp_path, monkeypatch)
+    _fake_cli_binaries(monkeypatch)
+    seen = {}
+
+    def fake_run(args, **kw):
+        seen["args"], seen["env"] = args, kw["env"]
+        return SimpleNamespace(returncode=0, stdout="pong", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    assert core._call_anthropic_cli("sonnet", "sys", "transcript", "", None, False).text == "pong"
+    assert seen["args"][0] == "/opt/bin/claude"
+    assert seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-home"
+    # With no token to give it, the failover wrapper runs as before.
+    (home / ".claude_oauth_token").unlink()
+    core._call_anthropic_cli("sonnet", "sys", "transcript", "", None, False)
+    assert seen["args"][0] == "/opt/bin/claude-ha"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in seen["env"]
+
+
+def test_a_streamed_cli_call_spawns_the_binary_its_env_was_chosen_for(tmp_path, monkeypatch):
+    _config_dir(tmp_path, monkeypatch)
+    _fake_cli_binaries(monkeypatch)
+    seen = {}
+
+    def fake_stream(args, user_msg, on_delta, env):
+        seen["args"], seen["env"] = args, env
+        on_delta("pong")
+        return "pong"
+
+    monkeypatch.setattr(core, "_cli_stream_json", fake_stream)
+    out = core._call_anthropic_cli(
+        "sonnet", "sys", "transcript", "", None, False, on_delta=lambda text: None,
+    )
+    assert out.text == "pong"
+    assert seen["args"][0] == "/opt/bin/claude"
+    assert seen["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-home"
+
+
+def test_the_stream_reader_spawns_with_the_env_it_is_given(monkeypatch):
+    import io
+    seen = {}
+
+    class FakeProc:
+        def __init__(self, args, **kw):
+            seen["env"] = kw["env"]
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(
+                '{"type": "assistant", "message": {"content": '
+                '[{"type": "text", "text": "pong"}]}}\n'
+            )
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(core.subprocess, "Popen", FakeProc)
+    assert core._cli_stream_json(["claude"], "hi", lambda text: None, {"MARK": "1"}) == "pong"
+    assert seen["env"] == {"MARK": "1"}
 
 
 def test_sdk_tools_accept_messages_larger_than_the_sdk_default(tmp_path, monkeypatch):

@@ -79,6 +79,9 @@ _anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
 # If neither is on PATH this stays None and the SDK path is the only
 # option for Anthropic participants.
 _CLAUDE_CLI: Optional[str] = shutil.which("claude-ha") or shutil.which("claude")
+# The plain CLI, for a call that already knows which account it runs on (see
+# _cli_binary): claude-ha's failover only works by switching config dirs.
+_PLAIN_CLAUDE_CLI: Optional[str] = shutil.which("claude")
 
 # Transport selector for Anthropic participants:
 #   "auto" (default): use CLI if discovered, else fall back to SDK.
@@ -1613,6 +1616,39 @@ class _StreamFailedBeforeOutput(RuntimeError):
     the fallback won't double up."""
 
 
+# Where claude-web keeps an account's long-lived sign-in (`claude setup-token`)
+# inside its Claude config dir: setup_flow.oauth_token_path. Repeated here so
+# this package doesn't import claude-web.
+_CONFIG_DIR_TOKEN_FILE = ".claude_oauth_token"
+
+
+def _subscription_token() -> str:
+    """The Claude sign-in a CLI child should use, or "" for none.
+
+    A token already in the environment wins: claude-web's own process has the
+    shared one there. Claude Code doesn't pass that variable on to the MCP
+    servers a chat starts, though, so the roundtable server a chat runs has
+    none; it does pass ``CLAUDE_CONFIG_DIR``, the chat's account's config dir,
+    where claude-web keeps that account's token. Without it the CLI falls back
+    to the dir's saved four-week sign-in, long expired on claude-web, and every
+    Claude seat fails with "OAuth session expired".
+
+    With no ``CLAUDE_CONFIG_DIR`` (a host shell, a Codex chat) this reads
+    ``~/.claude``, the CLI's own default: on claude-web, the shared account's
+    token.
+    """
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if token:
+        return token
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude",
+    )
+    try:
+        return Path(config_dir, _CONFIG_DIR_TOKEN_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
 def _cli_child_env() -> dict[str, str]:
     """Environment for a ``claude`` CLI child on the subscription transport.
 
@@ -1622,14 +1658,34 @@ def _cli_child_env() -> dict[str, str]:
     near-meaningless ``is_error=true subtype=success``. Reaching the CLI at all
     means subscription intent (``auto``/``cli``), so blank the key; the CLI
     treats empty as unset and falls back to OAuth. Mirrors the SDK path in
-    ``_call_anthropic_sdk_with_tools``.
+    ``_call_anthropic_sdk_with_tools``. The OAuth it falls back to is the
+    account's token when there is one (_subscription_token).
     """
     env = os.environ.copy()
     env["ANTHROPIC_API_KEY"] = ""
+    token = _subscription_token()
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     return env
 
 
-def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") -> str:
+def _cli_binary(env: dict[str, str]) -> Optional[str]:
+    """The CLI to run with ``env``.
+
+    claude-ha fails over by pointing the CLI at another config dir. With a
+    token in ``env`` that can't reach another account (the token decides it),
+    and it would run this account against another dir's settings: a token whose
+    account didn't match a dir's recorded one has rewritten that dir's cached
+    feature flags before, which flipped the model picker to the short list.
+    """
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and _PLAIN_CLAUDE_CLI:
+        return _PLAIN_CLAUDE_CLI
+    return _CLAUDE_CLI
+
+
+def _cli_stream_json(
+    args: list[str], user_msg: str, on_delta: "StreamDelta", env: dict[str, str],
+) -> str:
     """Run the claude CLI in stream-json mode, emitting visible text deltas.
 
     Returns the full accumulated text. Raises ``_StreamFailedBeforeOutput`` if
@@ -1647,7 +1703,7 @@ def _cli_stream_json(args: list[str], user_msg: str, on_delta: "StreamDelta") ->
     # few for the error tail.
     proc = subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, env=_cli_child_env(),
+        stderr=subprocess.STDOUT, text=True, env=env,
     )
     parts: list[str] = []
     noise_tail: list[str] = []  # recent non-JSON lines, for the error message
@@ -1734,7 +1790,11 @@ def _call_anthropic_cli(
     invocation that should never write to the local ``~/.claude/``
     projects dir.
     """
-    if _CLAUDE_CLI is None:
+    # One environment per call, and the binary chosen for it: both the
+    # streamed and the plain run below use the pair.
+    env = _cli_child_env()
+    binary = _cli_binary(env)
+    if binary is None:
         raise RuntimeError(
             "Anthropic CLI transport requested but no claude/claude-ha "
             "binary was found on PATH at server start."
@@ -1743,7 +1803,7 @@ def _call_anthropic_cli(
     if instruction:
         user_msg += f"\n\n[orchestrator]:\n{instruction}"
     args = [
-        _CLAUDE_CLI,
+        binary,
         "-p",
         "--model", model,
         "--system-prompt", system_prompt,
@@ -1778,7 +1838,7 @@ def _call_anthropic_cli(
         try:
             out = _call_with_wall_cap(
                 f"anthropic-cli/{model}/stream",
-                lambda: _cli_stream_json(stream_args, user_msg, on_delta),
+                lambda: _cli_stream_json(stream_args, user_msg, on_delta, env),
             )
             return ProviderResult(text=out)
         except _StreamFailedBeforeOutput as exc:
@@ -1797,7 +1857,7 @@ def _call_anthropic_cli(
             text=True,
             capture_output=True,
             timeout=PROVIDER_TIMEOUT_SEC,
-            env=_cli_child_env(),
+            env=env,
         )
         if proc.returncode != 0:
             # Surface BOTH streams. claude-ha writes account-switching
@@ -2200,8 +2260,12 @@ def _call_anthropic_sdk_with_tools(
         # has no credits: the CLI reports it as is_error=true subtype=success,
         # which the SDK masks into "error result: success"). options.env can
         # override but not remove, so blank the key; the CLI treats an empty
-        # value as unset and falls back to OAuth.
+        # value as unset and falls back to OAuth: the account's token when
+        # there is one (_subscription_token, same as _cli_child_env).
         options_kwargs["env"] = {"ANTHROPIC_API_KEY": ""}
+        token = _subscription_token()
+        if token:
+            options_kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] = token
 
     # One tool result carrying an image or a big file outgrows the SDK's 1 MiB
     # per-message default and kills the call; same knob as the main app.
