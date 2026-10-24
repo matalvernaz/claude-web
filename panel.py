@@ -6,6 +6,12 @@ for the actual changes before it commits them. The panel is the roundtable's
 coding panel (GPT, Gemini and a second Claude by default), reading the
 repository read-only. Claude makes every change itself; the panel only reviews.
 
+When it's off, Claude can still ask for a review of big or risky work. The
+user is asked first, on a card; a yes covers that stage's rounds until it
+resolves or the user says something in the chat. Nothing is gated then: the
+panel's answer is advice, the user's word in the chat settles a disagreement,
+and there's no decision card.
+
 How it fits together:
 
 - Gates. app.py registers PreToolUse hooks on every Claude run. Hooks fire in
@@ -485,6 +491,10 @@ class PanelState:
     # Set when a round's answer found no live chat to deliver to; the next
     # message the user sends carries it in front.
     pending_message: Optional[str] = None
+    # With panel review off: the stages the user said yes to on Claude's
+    # card, still running. A yes ends when its stage resolves, when the user
+    # sends a message of their own, or when the switch flips.
+    granted: list = dataclasses.field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -500,6 +510,8 @@ class PanelState:
         state.rounds = {s: int((state.rounds or {}).get(s, 0)) for s in STAGES}
         state.approvals = dict(state.approvals or {})
         state.last_reviewed = dict(state.last_reviewed or {})
+        granted = state.granted if isinstance(state.granted, list) else []
+        state.granted = [s for s in STAGES if s in granted]
         return state
 
     def end_cycle(self) -> None:
@@ -512,16 +524,35 @@ class PanelState:
 
 TOOL_DESCRIPTION = (
     "The user's review panel: GPT, Gemini and a second Claude, run through the "
-    "roundtable. When panel review is on in this chat they check your work at two "
-    "points, and you can't skip them: (1) stage \"plan\": before you change files in "
-    "a git repository, by any means, send your plan; (2) stage \"changes\": when the "
-    "changes are made and before you commit, send a summary, and the panel reviews "
-    "the repository's actual diff. Each call starts one round in the background and "
-    "returns at once. End your turn right after calling it: the panel's answer "
-    "arrives as your next message, usually within a few minutes, and the user can "
-    "talk to you while you wait. When they want changes, fix what you agree with, "
-    "push back with reasons on what you don't (they read your reasons), and send it "
-    "again. After a few rounds without agreement the user decides."
+    "roundtable. They check your work at two points: stage \"plan\", before you "
+    "change files in a git repository by any means, where you send your plan; and "
+    "stage \"changes\", when the changes are made and before you commit, where you "
+    "send a summary and the panel reviews the repository's actual diff. When panel "
+    "review is on in this chat (the user's messages say so), both are required and "
+    "you can't skip them. When it's off, you can still ask for a review of big or "
+    "risky work: give a one-sentence reason, the user is asked first, and if they "
+    "say no, carry on without it. A call that starts a round returns at once: end "
+    "your turn right after it. The panel's answer arrives as your next message, "
+    "usually within a few minutes, and the user can talk to you while you wait. "
+    "When they want changes, fix what you agree with, push back with reasons on "
+    "what you don't (they read your reasons), and send it again. After a few rounds "
+    "without agreement the user decides."
+)
+
+# Appended to every Claude chat's system prompt where the panel exists. The
+# tool is deferred, so its description is unseen until ToolSearch loads it,
+# and with panel review off nothing else mentions it. Keep it static: it sits
+# in the prompt prefix every chat shares in the cache.
+SYSTEM_HINT = (
+    "claude-web has a review panel (GPT, Gemini and a second Claude) that can check "
+    "your plan before you change files in a git repository, or your changes before "
+    f"you commit, through the {TOOL_NAME} tool (load it with ToolSearch). When panel "
+    "review is on, the user's messages say so and you must use it. When it's off, "
+    "use it only when a second opinion is clearly worth a few minutes: a big or "
+    "risky change, such as a rewrite, anything touching security, privacy or data "
+    "that can't be recovered, or a large diff. Not for small fixes, tests, docs or "
+    "notes. The tool asks the user before anything is sent, so don't ask them in "
+    "the chat first."
 )
 
 TOOL_SCHEMA = {
@@ -541,6 +572,13 @@ TOOL_SCHEMA = {
                 "Your plan, or what you changed and why. From the second round on, "
                 "also answer the panel's points: what you changed, and why you "
                 "disagree with any you didn't take."
+            ),
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "When panel review is off: one sentence for the user on why this "
+                "needs a second look. It's read out on the card that asks them."
             ),
         },
     },
@@ -622,15 +660,111 @@ def round_prompt(
     )
 
 
-def submitted_text(stage: str, round_no: int, max_rounds: int, labels: list[str]) -> str:
+def submitted_text(
+    stage: str, round_no: int, max_rounds: int, labels: list[str],
+    advisory: bool = False, user_label: str = "the user",
+) -> str:
+    """What the tool tells Claude when a round starts. ``advisory``: panel
+    review is off, so the review is advice and holds nothing back."""
     who = _join(labels) or "the panel"
     hold = "change files" if stage == "plan" else "commit"
+    wait = (
+        "Panel review is off in this chat, so this review is advice: if "
+        f"{user_label} tells you to go ahead before they answer, go ahead."
+        if advisory else
+        f"Don't {hold} until they approve."
+    )
     return (
         f"Sent to the panel (round {round_no} of {max_rounds} on your {stage}): {who} "
         f"{'is' if len(labels) == 1 else 'are'} reviewing it. Their answer will arrive "
         "as your next message, usually within a few minutes. End your turn now: tell "
-        "the user in a sentence that it's with the panel. Don't "
-        f"{hold} until they approve."
+        f"the user in a sentence that it's with the panel. {wait}"
+    )
+
+
+# ─── Asking first, with panel review off ─────────────────────────────────────
+
+ASK_SEND = "Yes, send it"
+ASK_KEEP_ON = "Yes, and keep panel review on"
+ASK_SKIP = "No, skip it"
+ASK_ANSWERS = {ASK_SEND: "send", ASK_KEEP_ON: "keep_on", ASK_SKIP: "skip"}
+# Long enough for a sentence; the card is read out in full.
+ASK_REASON_CHARS = 300
+
+
+def ask_card(stage: str, repo_name: str, reason: str, again: bool) -> list[dict]:
+    """The question card for Claude's request, in Claude's words.
+
+    ``again``: this stage already went to the panel and the user has said
+    something since, so this asks to send the revised version back.
+    Keeping panel review on is offered for a plan only: turned on during a
+    changes review, the edit gate (no plan approved) would stop Claude fixing
+    the very points the panel raised.
+    """
+    what = "plan for" if stage == "plan" else "changes in"
+    if again:
+        question = f"Can I send my revised {what} {repo_name} back to the review panel?"
+    elif stage == "plan":
+        question = f"Can I send my plan for {repo_name} to the review panel?"
+    else:
+        question = f"Can I send my changes in {repo_name} to the review panel before I commit?"
+    reason = " ".join((reason or "").split())[:ASK_REASON_CHARS]
+    if reason:
+        question += " " + reason
+    options = [{
+        "label": ASK_SEND,
+        "description": (
+            "GPT, Gemini and a second Claude review it, usually within a few minutes. "
+            "Panel review stays off."
+        ),
+    }]
+    if stage == "plan":
+        options.append({
+            "label": ASK_KEEP_ON,
+            "description": (
+                "The same, and panel review stays on for this chat: every plan and "
+                "every set of changes goes to them before files change or anything "
+                "is committed."
+            ),
+        })
+    options.append({
+        "label": ASK_SKIP,
+        "description": "Nothing is sent. Claude carries on without the panel.",
+    })
+    return [{"question": question, "header": "Panel", "multiSelect": False,
+             "options": options}]
+
+
+def ask_declined(how: str, user_label: str, other: str = "", minutes: int = 0) -> str:
+    """What the tool tells Claude when nothing went to the panel.
+
+    ``how``: skip (they said no), other (they typed their own answer),
+    skipped (they skipped the card), timeout, or interrupted.
+    """
+    carry_on = "Carry on without the panel, and don't ask again for this same work."
+    if how == "other":
+        return (
+            f"{user_label} didn't choose to send it, so nothing was sent. They wrote: "
+            f"\"{other}\". Carry on without the panel; if that needs an answer, reply "
+            "to them in the chat."
+        )
+    if how == "timeout":
+        return (
+            f"{user_label} didn't answer within {minutes} minute{'s' if minutes != 1 else ''}, "
+            "so nothing was sent. Carry on without the panel, and mention in your "
+            "reply that you'd wanted a review and why."
+        )
+    if how == "interrupted":
+        return f"The turn was stopped before {user_label} answered, so nothing was sent."
+    if how == "skipped":
+        return f"{user_label} skipped the question, so nothing was sent. {carry_on}"
+    return f"{user_label} said no to a panel review this time, so nothing was sent. {carry_on}"
+
+
+def ask_busy(user_label: str) -> str:
+    return (
+        f"You already asked {user_label} about sending something to the panel. "
+        "Wait for that answer."
     )
 
 
@@ -715,11 +849,15 @@ def reply_heading(label: str, verdict: str) -> str:
 def result_message(
     stage: str, round_no: int, max_rounds: int, outcome: str,
     replies: list[dict], errors: list[dict], user_label: str,
+    advisory: bool = False,
 ) -> str:
     """The panel's answer, delivered to Claude as its next message.
 
     ``outcome`` is approved, changes, unavailable, go_ahead (the user overrode
-    a deadlock), more_rounds, stop, or undecided (the question card timed out).
+    a deadlock), more_rounds, stop, undecided (the question card timed out),
+    or unresolved (objections after the last round with panel review off).
+    ``advisory``: panel review is off, so nothing waits on the panel and the
+    user's word in the chat is what counts.
     """
     phrase = {
         "approved": "approved",
@@ -731,7 +869,12 @@ def result_message(
                        f"the panel to keep going for up to {max_rounds} more rounds",
         "stop": f"they still had objections, and {user_label} asked you to stop here",
         "undecided": f"they still had objections, and {user_label} hasn't decided yet",
+        "unresolved": "they still had objections after the last round, and with panel "
+                      "review off in this chat, the review ends here",
     }[outcome]
+    if advisory and outcome == "unavailable":
+        phrase = ("nobody on the panel could answer, so there's no review this time; "
+                  f"{user_label} has been told")
     parts = [
         f"{MESSAGE_MARKER} This message is from claude-web's review panel, not typed "
         f"by {user_label}.",
@@ -770,7 +913,40 @@ def result_message(
             f"Next: stop here and wait for {user_label}. When they answer, send it to "
             f"the panel again (stage \"{stage}\") and they'll be asked to decide."
         ),
+        "unresolved": (
+            f"Next: tell {user_label} in a sentence or two what the panel still objects "
+            "to and what you'd do about it, then wait for them to decide."
+        ),
     }[outcome]
+    if advisory:
+        advice = (
+            "Panel review is off in this chat, so this is advice: if "
+            f"{user_label} tells you to go ahead, go ahead."
+        )
+        approved_next = (
+            "Next: make the changes. Panel review is off in this chat, so a review of "
+            "the changes is your call: ask for one (stage \"changes\") if they turn out "
+            f"big or risky; {user_label} is asked first."
+            if stage == "plan" else
+            "Next: commit these changes."
+        )
+        nxt = {
+            "approved": approved_next,
+            "go_ahead": approved_next,
+            "unavailable": "Next: carry on without the panel.",
+            "changes": (
+                "Next: fix what you agree with and push back on what you don't (they'll "
+                f"read your reasons), then send it again (stage \"{stage}\") and end your "
+                f"turn. {advice}"
+            ),
+            "more_rounds": (
+                "Next: answer their points, then send it again (stage "
+                f"\"{stage}\") and end your turn. {advice}"
+            ),
+            "undecided": (
+                f"Next: stop here and wait for {user_label} to tell you what they want."
+            ),
+        }.get(outcome, nxt)
     parts.append(nxt)
     return "\n\n".join(parts)
 

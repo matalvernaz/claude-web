@@ -95,6 +95,10 @@ os.environ.pop("CLAUDE_WEB_TOOLS_DIR", None)
 # so the roundtable tests (and test_panel_tools' core import) never touch the
 # host's real ~/.claude-roundtable/state.db.
 os.environ["CLAUDE_ROUNDTABLE_STATE_DIR"] = os.path.join(_TEST_TMP, "roundtable-state")
+# The roundtable gives its Claude CLI children the sign-in kept in
+# $CLAUDE_CONFIG_DIR (default ~/.claude), and a suite run inside a chat
+# inherits that chat's real one. Point it at an empty directory instead.
+os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(_TEST_TMP, "claude-config")
 # app.py decides /roundtable availability at import: roundtable_core collapses
 # to None unless providers_configured() sees a provider key or a claude binary
 # on PATH. CI runners have neither, so without this the roundtable web tests

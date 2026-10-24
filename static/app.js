@@ -77,6 +77,10 @@
   // existing chat's own setting comes from the server.
   const PANEL_KEY = "claude-web.panel";
   const PANEL_TOOL = "mcp__panel__review";
+  // The review tool's "Sent to the panel" note: the round's own article says
+  // it better, so it's not shown. Anything else it says (a request the user
+  // turned down, say) is.
+  const isPanelAck = (text) => /^Sent to the panel\b/.test(text || "");
   // Picker values retired when the advisor became its own checkbox. A browser
   // that has one saved is migrated in place on load, so the pick survives
   // instead of silently falling back to Default (the restore below drops any
@@ -1030,7 +1034,7 @@
       if (!sessionId) {
         announce(on
           ? "Panel review on. It starts with this chat's first message."
-          : "Panel review off.");
+          : "Panel review off. Claude can still ask you before sending something to the panel.");
         return;
       }
       const fd = new FormData();
@@ -1039,7 +1043,9 @@
       try {
         const r = await fetch("/api/chat/panel", { method: "POST", body: fd });
         if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
-        announce(on ? "Panel review on for this chat." : "Panel review off for this chat.");
+        announce(on
+          ? "Panel review on for this chat."
+          : "Panel review off for this chat. Claude can still ask you before sending something to the panel.");
       } catch (e) {
         panelToggle.checked = !on;
         announce("Could not change panel review. " + e.message);
@@ -1760,11 +1766,11 @@
     // Switching sessions: any prior run's dedup state belongs to a different
     // conversation now and shouldn't influence rendering of the new one.
     renderedIdxByRun.clear();
-    // The panel tool's own result is just "sent to the panel"; the panel's
-    // answer follows as a panel_result, so the short line is skipped.
+    // The panel tool's "sent to the panel" note is skipped: the panel's
+    // answer follows as a panel_result.
     let skipPanelAck = false;
     for (const m of data.messages) {
-      if (m.role === "tool_result" && skipPanelAck && !m.is_error) {
+      if (m.role === "tool_result" && skipPanelAck && !m.is_error && isPanelAck(m.text)) {
         skipPanelAck = false;
         continue;
       }
@@ -1984,6 +1990,8 @@
         return "You told Claude to stop. It'll wait for you.";
       case "undecided":
         return "No decision yet. Claude will wait; tell it what you want.";
+      case "unresolved":
+        return "They still have objections after the last round. Panel review is off, so it's your call: Claude will tell you what's left.";
       default:
         return String(obj.outcome || "");
     }
@@ -3773,7 +3781,7 @@
           const txt = typeof blk.content === "string" ? blk.content : JSON.stringify(blk.content);
           const prefix = blk.is_error ? "✗ " : "← ";
           const inFlight = blk.tool_use_id ? inFlightTools.get(blk.tool_use_id) : null;
-          if (inFlight && inFlight.name === PANEL_TOOL && !blk.is_error) {
+          if (inFlight && inFlight.name === PANEL_TOOL && !blk.is_error && isPanelAck(txt)) {
             // "Sent to the panel": the panel_round article says it better.
             inFlightTools.delete(blk.tool_use_id);
             markVisibleActivity();

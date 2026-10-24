@@ -142,6 +142,63 @@ def test_state_round_trips_and_survives_junk():
     assert st.plan_ok is False and st.rounds == {"plan": 0, "changes": 0}
 
 
+def test_the_stages_the_user_said_yes_to_round_trip_and_junk_is_dropped():
+    st = panel.PanelState(granted=["plan"])
+    assert panel.PanelState.from_json(st.to_json()).granted == ["plan"]
+    assert panel.PanelState.from_json('{"granted": ["plan", "nonsense", "plan"]}').granted == ["plan"]
+    assert panel.PanelState.from_json('{"granted": "plan"}').granted == []
+    assert panel.PanelState.from_json("{}").granted == []
+
+
+def test_the_ask_card_offers_keeping_review_on_only_for_a_plan():
+    """Turned on mid-changes, the edit gate (no plan approved) would stop
+    Claude fixing the very points the panel raised."""
+    plan = panel.ask_card("plan", "claude-web", "It rewrites the engine.", again=False)
+    changes = panel.ask_card("changes", "claude-web", "", again=False)
+    assert [o["label"] for o in plan[0]["options"]] == [
+        panel.ASK_SEND, panel.ASK_KEEP_ON, panel.ASK_SKIP,
+    ]
+    assert [o["label"] for o in changes[0]["options"]] == [panel.ASK_SEND, panel.ASK_SKIP]
+    question = plan[0]["question"]
+    assert "plan" in question and "claude-web" in question
+    assert question.endswith("It rewrites the engine.")
+    assert "revised plan" in panel.ask_card("plan", "claude-web", "", again=True)[0]["question"]
+    assert set(panel.ASK_ANSWERS) == {panel.ASK_SEND, panel.ASK_KEEP_ON, panel.ASK_SKIP}
+
+
+def test_nothing_said_with_the_panel_off_makes_claude_wait_for_its_approval():
+    """With panel review off a review is advice, and the user's go-ahead in the
+    chat is what counts: the words must not hold Claude to the panel."""
+    replies = [{"label": "GPT Sol", "verdict": "changes", "text": "Bug.\nVERDICT: CHANGES NEEDED"}]
+    texts = [panel.submitted_text("plan", 1, 3, ["GPT Sol"], advisory=True, user_label="Matt")]
+    for stage in panel.STAGES:
+        for outcome in ("approved", "changes", "unavailable", "unresolved", "go_ahead",
+                        "more_rounds", "undecided"):
+            texts.append(panel.result_message(stage, 3, 3, outcome, replies, [], "Matt",
+                                              advisory=True))
+    for text in texts:
+        assert "until they approve" not in text, text
+        assert "counts as approved" not in text, text
+    assert "tells you to go ahead" in texts[0]
+    changes = panel.result_message("plan", 1, 3, "changes", replies, [], "Matt", advisory=True)
+    assert "if Matt tells you to go ahead, go ahead" in changes
+    approved = panel.result_message("plan", 1, 3, "approved", [], [], "Matt", advisory=True)
+    assert "your call" in approved
+    unresolved = panel.result_message("changes", 3, 3, "unresolved", replies, [], "Matt",
+                                      advisory=True)
+    assert "still had objections" in unresolved and "tell Matt" in unresolved
+    # With it on, the words are as they were.
+    assert "Don't change files until they approve" in panel.submitted_text(
+        "plan", 1, 3, ["GPT Sol"])
+
+
+def test_the_tool_explains_both_modes_and_takes_a_reason():
+    assert "off" in panel.TOOL_DESCRIPTION and "asked first" in panel.TOOL_DESCRIPTION
+    assert "reason" in panel.TOOL_SCHEMA["properties"]
+    assert "reason" not in panel.TOOL_SCHEMA["required"]
+    assert panel.TOOL_NAME in panel.SYSTEM_HINT
+
+
 def test_user_prefix_strips_back_to_what_the_user_typed():
     sent = panel.user_prefix() + "please fix the login bug"
     assert sent.startswith(panel.USER_PREFIX_MARKER)

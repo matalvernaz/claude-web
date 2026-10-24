@@ -1132,6 +1132,53 @@ def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui):
     playwright.expect(page.get_by_role("checkbox", name="Panel review")).to_be_checked()
 
 
+DECLINED = ("Matt said no to a panel review this time, so nothing was sent. Carry on "
+            "without the panel, and don't ask again for this same work.")
+
+
+def test_a_declined_request_says_nothing_went_to_the_panel(ui):
+    """Only the "Sent to the panel" note is hidden (the round's own article
+    says it better); a request the user turned down must say so, or the
+    "Claude to the panel" section reads as if it went."""
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    turn = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "tu-ask", "name": "mcp__panel__review",
+             "input": {"stage": "plan", "repo": "/r", "message": "Rewrite the engine."}},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tu-ask", "content": DECLINED},
+        ]}},
+        {"type": "result"},
+    ]
+    state["chat_sse"] = "".join(f"data: {json.dumps(e)}\n\n" for e in turn)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Rewrite the engine")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    playwright.expect(page.locator("#transcript")).to_contain_text("nothing was sent")
+
+
+def test_a_reopened_chat_shows_a_declined_request_was_not_sent(ui):
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    state["session"] = {"provider": "claude", "model": "claude-test",
+                        "panel": {"enabled": False}, "messages": [
+        {"role": "user", "text": "Rewrite the engine"},
+        {"role": "tool_use", "name": "mcp__panel__review", "summary": "",
+         "input": {"stage": "plan", "repo": "/r", "message": "Rewrite the engine."}},
+        {"role": "tool_result", "text": DECLINED, "is_error": False},
+        {"role": "assistant", "text": "Rewriting it now."},
+    ]}
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/?session=saved")
+    transcript = page.locator("#transcript")
+    playwright.expect(transcript).to_contain_text("Rewriting it now.")
+    playwright.expect(transcript).to_contain_text("nothing was sent")
+
+
 def test_the_panels_deadlock_card_says_the_panel_is_asking(ui):
     page, state = ui
     state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
@@ -1160,6 +1207,38 @@ def test_the_panels_deadlock_card_says_the_panel_is_asking(ui):
     assert "Go ahead anyway" in sent
     page.wait_for_function(
         "() => window.__announced.some(t => t.startsWith('The review panel is asking'))", timeout=15000)
+
+
+def test_with_panel_review_off_claude_asks_before_sending_and_the_user_settles_it(ui):
+    import panel
+    page, state = ui
+    state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
+    card = {"type": "question_request", "id": "panel-ask", "timeout_seconds": 900,
+            "questions": panel.ask_card("plan", "claude-web", "It rewrites the engine.", again=False)}
+    verdict = {"type": "panel_verdict", "stage": "plan", "round": 3, "max_rounds": 3,
+               "outcome": "unresolved", "thread_id": 77, "errors": []}
+    state["chat_sse"] = f"data: {json.dumps(card)}\n\ndata: {json.dumps(verdict)}\n\n"
+    _watch_announcements(page)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Rewrite the engine")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    dialog = page.locator("dialog[open]")
+    playwright.expect(dialog.get_by_role("heading", name="Claude is asking")).to_be_visible()
+    playwright.expect(dialog).to_contain_text(
+        "Can I send my plan for claude-web to the review panel? It rewrites the engine.")
+    for label in (panel.ASK_SEND, panel.ASK_KEEP_ON, panel.ASK_SKIP):
+        playwright.expect(dialog.get_by_label(label, exact=False)).to_be_visible()
+    dialog.get_by_label(panel.ASK_SEND, exact=False).check()
+    with page.expect_request("**/api/permission/panel-ask") as req:
+        dialog.get_by_role("button", name="Submit answers").click()
+    assert panel.ASK_SEND in req.value.post_data
+    playwright.expect(page.locator("article.panel-verdict")).to_contain_text(
+        "Panel review is off, so it's your call")
+    page.wait_for_function(
+        "() => window.__announced.some(t => t.startsWith('Panel verdict: They still have objections'))",
+        timeout=15000)
 
 
 def test_default_names_the_model_of_the_account_picked(ui):
