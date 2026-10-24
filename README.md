@@ -312,13 +312,23 @@ reads the repository read-only; Claude still makes every change.
 - If nobody on the panel can answer (provider down, out of credits), the panel
   steps aside and says so rather than stalling the chat.
 
+With the box unticked, Claude can still ask for the panel when it judges a
+change big or risky enough to want a second opinion. You get a question first:
+send it, send it and keep panel review on for the chat (plans only), or skip
+it. A yes covers that plan's or those changes' back-and-forth with the panel
+until it's settled or you say something in the chat; the next request asks
+again. Nothing is held back in this mode: the panel's answer is advice, your
+word in the chat settles a disagreement, and there's no question card after
+the last round.
+
 The chat shows Claude's message to the panel, each reviewer's reply and the
 verdict as their own headed sections, and links to the full roundtable thread.
 Each round costs one call per paid participant. Settings:
 `CLAUDE_WEB_PANEL_PARTICIPANTS` (comma-separated roundtable keys, default the
 coding panel), `CLAUDE_WEB_PANEL_MAX_ROUNDS` (3), `CLAUDE_WEB_PANEL_EFFORT`
-(`medium`), `CLAUDE_WEB_PANEL_DECISION_TIMEOUT` (seconds the deadlock question
-waits, default the permission timeout).
+(`medium`), `CLAUDE_WEB_PANEL_DECISION_TIMEOUT` (seconds the deadlock question,
+and Claude's request with the box unticked, wait; default the permission
+timeout).
 
 #### Identity passed to the CLI
 

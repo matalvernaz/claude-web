@@ -7631,6 +7631,10 @@ def _shared_mcp_config_file(cwd: Any) -> Optional[Path]:
 # Rounds in flight, by session id. One holds its chat open (the driver's idle
 # close skips a session listed here) and makes a second round wait.
 _PANEL_ROUNDS: dict[str, asyncio.Task] = {}
+# With panel review off: chats whose user is looking at Claude's "can I send
+# this to the panel?" card, by session id (the run id that asked). A second
+# request while it's up is told to wait rather than raising another card.
+_PANEL_ASKS: dict[str, str] = {}
 # How long the user's question card waits when the panel deadlocks.
 PANEL_DECISION_TIMEOUT_SECONDS = int(os.getenv(
     "CLAUDE_WEB_PANEL_DECISION_TIMEOUT", str(PERMISSION_TIMEOUT_SECONDS),
@@ -7668,6 +7672,9 @@ def _panel_set_enabled(
     session_id: str, user_sub: Optional[str], enabled: bool,
 ) -> panel.PanelState:
     state = _panel_load(session_id) or panel.PanelState()
+    if state.enabled != bool(enabled):
+        # A yes on Claude's card was given with the switch the other way.
+        state.granted = []
     state.enabled = bool(enabled)
     _panel_save(session_id, user_sub, state)
     return state
@@ -7709,6 +7716,14 @@ def _panel_user_label(user: dict) -> str:
     return name
 
 
+def _panel_end_grants(session_id: Optional[str], user_sub: Optional[str]) -> None:
+    """Forget any yes the user gave on Claude's card (panel review off)."""
+    state = _panel_load(session_id)
+    if state is not None and state.granted:
+        state.granted = []
+        _panel_save(session_id, user_sub, state)
+
+
 def _panel_prefix(run: "ActiveRun", message: str) -> str:
     """What goes in front of the user's ``message`` on its way to Claude.
 
@@ -7716,7 +7731,15 @@ def _panel_prefix(run: "ActiveRun", message: str) -> str:
     reliably follows it, see panel.user_prefix), and the message is also kept
     for the panel's next round, so the user can join the argument. Otherwise
     nothing.
+
+    Every message the user types comes through here, and nothing else does
+    (the panel's answers go in through _inject_user_input), so this is also
+    where their words end a yes on Claude's card: things may have moved on
+    since, so the next send asks again. A slash command isn't their words.
     """
+    if (run.provider == "claude" and message.strip()
+            and not message.lstrip().startswith("/")):
+        _panel_end_grants(run.session_id, run.owner_sub)
     if not _panel_state_for_run(run).enabled:
         return ""
     if message.lstrip().startswith("/"):
@@ -7931,15 +7954,24 @@ def _build_panel_mcp_server(run: "ActiveRun"):
     )
 
 
+_PANEL_RUNNING = (
+    "A panel round is already running for this chat. Its answer will "
+    "arrive as your next message: end your turn and wait for it."
+)
+
+
 async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
-    """Start a round (or the user's decision on a deadlock) in the background."""
+    """Start a round (or the user's decision on a deadlock) in the background.
+
+    With panel review off, the user is asked first, on a card this call waits
+    for (_panel_ask_first); their yes covers that stage's later rounds.
+    """
     sid = run.session_id
-    off = (
-        "Panel review is off in this chat, so there's no panel to send this "
-        "to. The user can turn it on with the Panel review checkbox."
-    )
-    if not sid or not _panel_state_for_run(run).enabled:
-        return off, True
+    if not sid:
+        return (
+            "This chat hasn't started yet, so there's nothing to send to the panel. "
+            "Try again once it has.", True,
+        )
     stage = str(args.get("stage") or "").strip().lower()
     if stage not in panel.STAGES:
         return ('stage must be "plan" or "changes".', True)
@@ -7955,16 +7987,84 @@ async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
         )
     running = _PANEL_ROUNDS.get(sid)
     if running is not None and not running.done():
-        return (
-            "A panel round is already running for this chat. Its answer will "
-            "arrive as your next message: end your turn and wait for it.", False,
-        )
-    participants = _panel_participants()
-    # Read (and save) the record only now, past the last await, so a switch
-    # flipped meanwhile isn't overwritten with the copy from before.
+        return _PANEL_RUNNING, False
+    if sid in _PANEL_ASKS:
+        return panel.ask_busy(run.panel_user_label), False
     state = _panel_state_for_run(run)
-    if not state.enabled:
-        return off, True
+    if state.enabled or stage in state.granted:
+        return _panel_launch_round(run, sid, stage, root, message)
+    return await _panel_ask_first(
+        run, sid, stage, root, message, str(args.get("reason") or ""), state,
+    )
+
+
+async def _panel_ask_first(
+    run: "ActiveRun", sid: str, stage: str, root: str, message: str,
+    reason: str, state: panel.PanelState,
+) -> tuple[str, bool]:
+    """Panel review is off: ask the user before anything goes to the panel."""
+    user_label = run.panel_user_label
+    # Stop resolves only the cards already up, so a turn being stopped must
+    # not put up a new one.
+    if run.interrupting:
+        return panel.ask_declined("interrupted", user_label), False
+    _PANEL_ASKS[sid] = run.run_id
+    try:
+        status, picked, other = await _panel_question(
+            run,
+            panel.ask_card(stage, os.path.basename(root) or root, reason,
+                           again=state.rounds.get(stage, 0) > 0),
+            tool_label="PanelAsk",
+        )
+    finally:
+        if _PANEL_ASKS.get(sid) == run.run_id:
+            _PANEL_ASKS.pop(sid, None)
+    # A Stop that came right after the answer found the card already
+    # resolved, so it couldn't turn it into a no: check for it here.
+    if run.interrupting:
+        return panel.ask_declined("interrupted", user_label), False
+    answer = panel.ASK_ANSWERS.get(picked)
+    if answer not in ("send", "keep_on"):
+        how = status if status in ("timeout", "interrupted", "skipped") else (
+            "other" if other else "skip"
+        )
+        log.info("panel ask session=%s stage=%s: not sent (%s)", sid, stage, how)
+        minutes = max(1, round(PANEL_DECISION_TIMEOUT_SECONDS / 60))
+        return panel.ask_declined(how, user_label, other, minutes), False
+    # Past the await the switch, the record and the round slot may all have
+    # moved. From here until the round starts there's no await.
+    running = _PANEL_ROUNDS.get(sid)
+    if running is not None and not running.done():
+        return _PANEL_RUNNING, False
+    if answer == "keep_on":
+        state = _panel_set_enabled(sid, run.owner_sub, True)
+        state.rounds[stage] = 0
+        _panel_save(sid, run.owner_sub, state)
+        run.emit({"type": "panel_changed", "enabled": True})
+    else:
+        state = _panel_state_for_run(run)
+        if not state.enabled:
+            state.granted = [s for s in panel.STAGES if s in state.granted or s == stage]
+            # A count left from an earlier review mustn't jump to a decision.
+            state.rounds[stage] = 0
+            _panel_save(sid, run.owner_sub, state)
+    log.info("panel ask session=%s stage=%s: %s", sid, stage, answer)
+    return _panel_launch_round(run, sid, stage, root, message)
+
+
+def _panel_launch_round(
+    run: "ActiveRun", sid: str, stage: str, root: str, message: str,
+) -> tuple[str, bool]:
+    """Start the round in the background and say so.
+
+    No awaits: the record is read and saved here, with nothing in between, so
+    a switch flipped meanwhile isn't overwritten with an older copy.
+    """
+    participants = _panel_participants()
+    state = _panel_state_for_run(run)
+    advisory = not state.enabled
+    # With panel review off this is never true: a yes starts the stage at
+    # round 0, and its last round resets the count however it ends.
     decide_only = state.rounds.get(stage, 0) >= panel.MAX_ROUNDS
     if decide_only:
         round_no = state.rounds[stage]
@@ -7978,7 +8078,10 @@ async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
         round_no = state.rounds[stage]
         _panel_save(sid, run.owner_sub, state)
         labels = [roundtable_core.PARTICIPANTS[p]["label"] for p in participants]
-        reply = panel.submitted_text(stage, round_no, panel.MAX_ROUNDS, labels)
+        reply = panel.submitted_text(
+            stage, round_no, panel.MAX_ROUNDS, labels,
+            advisory=advisory, user_label=run.panel_user_label,
+        )
     notes = run.panel_notes[:]
     run.panel_notes.clear()
     task = asyncio.create_task(_panel_round_task(
@@ -8042,7 +8145,14 @@ async def _panel_round_task(
             replies, errors, reviewed = result.replies, result.errors, result.reviewed_state
             outcome = result.outcome
         if outcome == "changes" and (decide_only or round_no >= panel.MAX_ROUNDS):
-            outcome = await _panel_ask_user(sid, stage, round_no)
+            fresh = _panel_load(sid)
+            if fresh is not None and not fresh.enabled:
+                # Panel review is off: nothing waits on the panel, so a
+                # decision card would decide nothing. The user settles it in
+                # the chat, where their word counts.
+                outcome = "unresolved"
+            else:
+                outcome = await _panel_ask_user(sid, stage, round_no)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — reported to Claude and the user
@@ -8065,6 +8175,7 @@ async def _panel_round_task(
         # at the start would undo anything that changed meanwhile, the switch
         # included.
         state = _panel_load(sid) or start
+        advisory = not state.enabled
         state.thread_id = thread_id
         if stage == "changes" and reviewed is not None:
             state.last_reviewed[root] = reviewed
@@ -8078,8 +8189,17 @@ async def _panel_round_task(
             else:
                 state.approvals[root] = on_disk or {}
             state.rounds[stage] = 0
-        elif outcome == "more_rounds":
+        elif outcome in ("more_rounds", "unresolved"):
             state.rounds[stage] = 0
+        if advisory and outcome not in ("changes", "more_rounds"):
+            # That stage's review is over (including a decision card answered
+            # after the box went off): the next one asks the user again.
+            state.granted = [s for s in state.granted if s != stage]
+            if stage == "changes":
+                # And the task with it, so a later changes review isn't told
+                # a plan was approved for it. With the box off no commit will
+                # end it.
+                state.end_cycle()
         _panel_save(sid, run.owner_sub, state)
         _panel_emit(sid, {
             "type": "panel_verdict", "stage": stage, "round": round_no,
@@ -8089,51 +8209,82 @@ async def _panel_round_task(
         })
         await _panel_deliver(sid, run, panel.result_message(
             stage, round_no, panel.MAX_ROUNDS, outcome, replies, errors, user_label,
+            advisory=advisory,
         ))
     finally:
         if _PANEL_ROUNDS.get(sid) is asyncio.current_task():
             _PANEL_ROUNDS.pop(sid, None)
 
 
-async def _panel_ask_user(sid: str, stage: str, rounds: int) -> str:
-    """The deadlock card: go ahead anyway, more rounds, or stop."""
-    target = ACTIVE_RUNS_BY_SESSION.get(sid)
-    if target is None or target.done:
-        return "undecided"
+async def _panel_question(
+    target: "ActiveRun", questions: list[dict], *, tool_label: str,
+    asker: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """Put a question card in front of the user on ``target`` and wait.
+
+    Returns (status, picked, other). status: answered, skipped (Skip, or
+    nothing chosen), timeout, or interrupted (Stop resolves every card the
+    run has up). picked is the option label chosen, other the user's own
+    words from the card's Other box; at most one is set.
+    """
+    timeout = PANEL_DECISION_TIMEOUT_SECONDS
     request_id = str(uuid_mod.uuid4())
     fut: asyncio.Future = asyncio.get_running_loop().create_future()
     PENDING[request_id] = {"future": fut, "owner_sub": target.owner_sub, "run_id": target.run_id}
+    event = {
+        "type": "question_request",
+        "id": request_id,
+        "questions": questions,
+        "timeout_seconds": timeout,
+    }
+    if asker:
+        event["asker"] = asker
     try:
-        target.emit({
-            "type": "question_request",
-            "id": request_id,
-            "questions": panel.decision_card(stage, rounds, panel.MAX_ROUNDS),
-            "timeout_seconds": PANEL_DECISION_TIMEOUT_SECONDS,
-            "asker": "The review panel",
-        })
+        target.emit(event)
         try:
-            decision = await asyncio.wait_for(fut, timeout=PANEL_DECISION_TIMEOUT_SECONDS)
+            decision = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
             target.emit({
                 "type": "permission_timeout", "id": request_id,
-                "tool": "PanelDecision",
-                "timeout_seconds": PANEL_DECISION_TIMEOUT_SECONDS,
+                "tool": tool_label, "timeout_seconds": timeout,
             })
-            return "undecided"
+            return "timeout", "", ""
     finally:
         PENDING.pop(request_id, None)
     target.emit({
         "type": "permission_resolved", "id": request_id,
-        "tool": "PanelDecision", "decision": decision.get("decision"),
+        "tool": tool_label, "decision": decision.get("decision"),
     })
     if decision.get("interrupted"):
-        return "stop"
+        return "interrupted", "", ""
     payload = decision.get("payload") if isinstance(decision.get("payload"), dict) else {}
     answers = (payload or {}).get("answers") or {}
     picked = next(iter(answers.values()), "") if isinstance(answers, dict) else ""
     if isinstance(picked, list):
         picked = picked[0] if picked else ""
-    return panel.DECISIONS.get(str(picked).strip(), "undecided")
+    picked = str(picked).strip()
+    if not picked:
+        return "skipped", "", ""
+    labels = {option.get("label") for q in questions for option in q.get("options") or []}
+    if picked in labels:
+        return "answered", picked, ""
+    return "answered", "", picked[:500]
+
+
+async def _panel_ask_user(sid: str, stage: str, rounds: int) -> str:
+    """The deadlock card: go ahead anyway, more rounds, or stop."""
+    # Found by session, not passed in: the round can outlive the run that
+    # started it (an account switch replaces it).
+    target = ACTIVE_RUNS_BY_SESSION.get(sid)
+    if target is None or target.done:
+        return "undecided"
+    status, picked, _ = await _panel_question(
+        target, panel.decision_card(stage, rounds, panel.MAX_ROUNDS),
+        tool_label="PanelDecision", asker="The review panel",
+    )
+    if status == "interrupted":
+        return "stop"
+    return panel.DECISIONS.get(picked, "undecided")
 
 
 async def _panel_deliver(sid: str, origin: "ActiveRun", text: str) -> None:
@@ -14080,8 +14231,14 @@ async def api_chat(
         # caching when set, but no-personality turns hit the shared prefix.
         "exclude_dynamic_sections": True,
     }
-    if personality_append:
-        system_prompt_opt["append"] = personality_append
+    appended = [personality_append] if personality_append else []
+    if provider == "claude" and _panel_available():
+        # How a chat with panel review off learns it can still ask for the
+        # panel: the review tool is deferred, so its own description stays
+        # unseen until ToolSearch loads it. Static text, like the preset.
+        appended.append(panel.SYSTEM_HINT)
+    if appended:
+        system_prompt_opt["append"] = "\n\n".join(appended)
     options_kwargs: dict[str, Any] = dict(
         cwd=str(cwd),
         resume=sid_in,
