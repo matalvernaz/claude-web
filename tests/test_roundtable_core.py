@@ -301,6 +301,7 @@ def test_without_a_config_dir_the_token_comes_from_the_default_one(tmp_path, mon
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
     (tmp_path / ".claude").mkdir()
     (tmp_path / ".claude" / ".claude_oauth_token").write_text("sk-ant-oat01-default\n")
     assert core._cli_child_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-default"
