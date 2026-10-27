@@ -843,7 +843,7 @@ def _join(items: list[str]) -> str:
 
 
 _VERDICT_WORDS = {
-    "approve": "approves", "changes": "wants changes", "unclear": "no clear verdict",
+    "approve": "approves", "changes": "wants changes", "unclear": "review not verified",
 }
 
 
@@ -1159,7 +1159,7 @@ async def run_round(
 
 
 def evidence_reader(core: Any, context: Any, label: str, proposal: str, requirements: str):
-    """Return exact lines through the same read-only permission gate as review tools."""
+    """Read permission-gated lines, caching windows for bounded quote relocation."""
     texts = {"@proposal": proposal.splitlines(), "@requirements": requirements.splitlines()}
     cache = {}
     tools = None
@@ -1174,9 +1174,21 @@ def evidence_reader(core: Any, context: Any, label: str, proposal: str, requirem
                 lines = texts[source]
                 value = lines[line - 1] if 0 < line <= len(lines) else None
             elif tools is not None and not source.startswith("@") and not Path(source).is_absolute():
-                excerpt = tools.execute("Read", {"path": source, "line": line, "context": 1})
-                prefix = f"{line}: "
-                value = next((v[len(prefix):] for v in excerpt.splitlines() if v.startswith(prefix)), None)
+                radius = review_contract.CITATION_SEARCH_RADIUS
+                lo, hi = max(1, line - radius), line + radius
+                # One authorized read serves the whole search, including missing
+                # lines and denied reads; a typo must not trigger 81 tool calls.
+                excerpt = tools.execute("Read", {"path": source, "line": line, "context": radius})
+                cache.update({(source, n): None for n in range(lo, hi + 1)})
+                if excerpt.startswith("["):
+                    # Error messages can echo a model-supplied filename. They
+                    # are never source, even if that filename embeds newlines.
+                    return None
+                for row in excerpt.split("\n"):
+                    number, sep, content = row.partition(": ")
+                    if sep and number.isascii() and number.isdecimal() and lo <= int(number) <= hi:
+                        cache[(source, int(number))] = content
+                value = cache[key]
             cache[key] = value
         return cache[key]
     return read_line

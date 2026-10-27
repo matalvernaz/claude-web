@@ -24,9 +24,25 @@ def _mk(tmp_path, cb=_allow_all):
     return core._RepoTools(tmp_path, cb, "gemini")
 
 
-def test_read_returns_contents(tmp_path):
+def test_read_returns_numbered_contents(tmp_path):
     (tmp_path / "a.txt").write_text("hello world", encoding="utf-8")
-    assert _mk(tmp_path).execute("Read", {"path": "a.txt"}) == "hello world"
+    assert _mk(tmp_path).execute("Read", {"path": "a.txt"}) == "1: hello world"
+
+
+def test_default_read_and_window_agree_on_line_numbers(tmp_path):
+    (tmp_path / "a.txt").write_bytes("first\r\n\r\nthird\u2028still third\r\n".encode("utf-8"))
+    tools = _mk(tmp_path)
+    full = tools.execute("Read", {"path": "a.txt"})
+    assert full == "1: first\n2: \n3: third\u2028still third"
+    assert tools.execute("Read", {"path": "a.txt", "line": 2, "context": 1}) == full
+
+
+def test_number_prefixes_are_included_in_the_read_output_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "_TOOL_READ_MAX_BYTES", 40)
+    (tmp_path / "a.txt").write_text("x\n" * 20, encoding="utf-8")
+    out = _mk(tmp_path).execute("Read", {"path": "a.txt"})
+    assert "truncated" in out
+    assert len(out) <= 40 + len("\n[… truncated]")
 
 
 def test_read_denied_by_permission(tmp_path):
@@ -301,7 +317,7 @@ def test_git_metadata_not_readable(tmp_path):
     assert "GITSECRET" not in t.execute("Read", {"path": ".git/config"})
     assert "GITSECRET" not in t.execute("Grep", {"pattern": "GITSECRET"})
     assert ".git/config" not in t.execute("Glob", {"pattern": "**/*"})
-    assert t.execute("Read", {"path": "code.py"}) == "ok"  # normal files still work
+    assert t.execute("Read", {"path": "code.py"}) == "1: ok"  # normal files still work
 
 
 def test_glob_symlink_escape_blocked(tmp_path):

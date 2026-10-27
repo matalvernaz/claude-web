@@ -1897,7 +1897,7 @@
   // reply, the verdict. Reviewer text is AI output, so it goes through
   // renderMarkdown's sanitiser like Claude's own.
   const PANEL_VERDICT_WORDS = {
-    approve: "approves", changes: "wants changes", unclear: "no clear verdict",
+    approve: "approves", changes: "wants changes", unclear: "review not verified",
     error: "couldn't answer",
   };
   // Who the panel is still waiting on, for the status line between turns.
