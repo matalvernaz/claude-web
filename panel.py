@@ -53,6 +53,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import review_contract
+
 MAX_ROUNDS = max(1, int(os.getenv("CLAUDE_WEB_PANEL_MAX_ROUNDS", "3")))
 EFFORT = os.getenv("CLAUDE_WEB_PANEL_EFFORT", "medium")
 # Comma-separated roundtable participant keys; empty uses the roundtable's
@@ -495,6 +497,10 @@ class PanelState:
     # card, still running. A yes ends when its stage resolves, when the user
     # sends a message of their own, or when the switch flips.
     granted: list = dataclasses.field(default_factory=list)
+    # repo -> stage -> participant -> findings, including explicit resolutions.
+    review_ledger: dict = dataclasses.field(default_factory=dict)
+    # User requirements remain citable when later rounds have no new user turn.
+    review_requirements: dict = dataclasses.field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -510,6 +516,10 @@ class PanelState:
         state.rounds = {s: int((state.rounds or {}).get(s, 0)) for s in STAGES}
         state.approvals = dict(state.approvals or {})
         state.last_reviewed = dict(state.last_reviewed or {})
+        if not isinstance(state.review_ledger, dict):
+            state.review_ledger = {}
+        if not isinstance(state.review_requirements, dict):
+            state.review_requirements = {}
         granted = state.granted if isinstance(state.granted, list) else []
         state.granted = [s for s in STAGES if s in granted]
         return state
@@ -518,6 +528,8 @@ class PanelState:
         """A task's changes are committed: the next change starts with a plan."""
         self.plan_ok = False
         self.rounds = {s: 0 for s in STAGES}
+        self.review_ledger = {}
+        self.review_requirements = {}
 
 
 # ─── What the panel and Claude see ───────────────────────────────────────────
@@ -569,9 +581,11 @@ TOOL_SCHEMA = {
         "message": {
             "type": "string",
             "description": (
-                "Your plan, or what you changed and why. From the second round on, "
-                "also answer the panel's points: what you changed, and why you "
-                "disagree with any you didn't take."
+                "The user's requirements, proposed steps or actual changes, and "
+                "assumptions to check. Separate observed facts from hypotheses. "
+                "On later rounds address each finding id with the relevant code "
+                "change, test result, or factual correction. Do not ask reviewers "
+                "to endorse your conclusion."
             ),
         },
         "reason": {
@@ -611,23 +625,10 @@ def strip_user_prefix(text: str) -> str:
 
 def house_rules(user_label: str) -> str:
     return (
-        f"You're on a review panel for {user_label}, who owns this project. "
-        f"{AUTHOR} is the AI doing the work in {user_label}'s chat: it makes every "
-        "change itself and sends you its plan before editing and its changes before "
-        "committing. You review; you never edit. You can read the repository with "
-        "your tools.\n"
-        "- Check claims against the actual code and cite file:line.\n"
-        "- Raise only what matters: bugs, wrong assumptions, missed cases, risky or "
-        "unnecessary changes, missing tests. No style nits or matters of taste.\n"
-        f"- When {AUTHOR} pushes back on a point, accept good reasoning or explain "
-        "concretely why it's still wrong. Don't repeat points that are settled.\n"
-        f"- {user_label} may join in. What {user_label} asks for wins over your "
-        "preferences.\n"
-        "- Keep it short: a sentence or two of summary, then numbered points if you "
-        "have any.\n"
-        "- End every reply with exactly one line, VERDICT: APPROVE or VERDICT: "
-        "CHANGES NEEDED. APPROVE means good enough to go ahead; minor notes can ride "
-        "along."
+        f"You're an independent code reviewer for {user_label}. "
+        f"{AUTHOR} proposes and implements work; review its claims as hypotheses. "
+        "You can read the repository but must never edit it.\n"
+        + review_contract.CONTRACT
     )
 
 
@@ -638,7 +639,10 @@ def round_prompt(
     budget = (
         "Budget about 10 tool calls: read what the work touches, not the whole tree."
     )
-    ending = "End with exactly one line: VERDICT: APPROVE or VERDICT: CHANGES NEEDED."
+    ending = (
+        "Return the evidence-backed JSON report specified in the review contract. "
+        "An approval needs inspected source evidence; keep unanswered objections open."
+    )
     if stage == "plan":
         return (
             f"Round {round_no} of {max_rounds} on {AUTHOR}'s PLAN for {repo}. Nothing "
@@ -647,7 +651,8 @@ def round_prompt(
             f"job. {diff_note + ' ' if diff_note else ''}{budget} {ending}"
         )
     against = (
-        "Check them against the plan approved earlier in this thread."
+        "Check the requirements and implementation afresh. Earlier plan approval "
+        "does not establish that the approach or code is correct."
         if plan_reviewed else
         "No plan was reviewed before these changes were made, so judge the approach "
         "as well as the code."
@@ -995,6 +1000,7 @@ class RoundResult:
     # For a changes round, the working state the panel was shown, which is
     # what an approval covers.
     reviewed_state: Optional[dict] = None
+    review_ledger: Optional[dict] = None
 
 
 def outcome_of(replies: list[dict]) -> str:
@@ -1009,7 +1015,8 @@ async def run_round(
     max_rounds: int, plan_reviewed: bool, user_label: str, topic: str,
     emit: Callable[[dict], None],
     on_thread: Callable[[int], None] = lambda tid: None,
-    effort: str = EFFORT,
+    effort: str = EFFORT, review_ledger: Optional[dict] = None,
+    requirements: Optional[str] = None,
 ) -> RoundResult:
     """Run one review round through the roundtable library ``core``.
 
@@ -1034,10 +1041,25 @@ async def run_round(
         )
         tid = int(created["thread_id"])
         on_thread(tid)
+    ledger = json.loads(json.dumps(review_ledger or {}))
+    # Adopt still-open objections from pre-contract threads on an in-flight
+    # stage. Once a stage has a ledger, it is authoritative, including {}.
+    if review_ledger is None and round_no > 1 and hasattr(core, "_thread_messages"):
+        latest = {}
+        for turn in await asyncio.to_thread(core._thread_messages, tid):
+            if turn["speaker"] in labels.values():
+                latest[turn["speaker"]] = turn["content"]
+        for participant, label in labels.items():
+            old = latest.get(label, "")
+            if parse_verdict(old) == "changes":
+                ledger[participant] = [{"id": "F1", "status": "open", "claim": old,
+                                        "evidence": []}]
     reviewed_state = None
     diff_note = ""
+    repo_bound = False
     try:
         await asyncio.to_thread(core.roundtable_bind_repo, tid, repo, "readonly")
+        repo_bound = True
     except (ValueError, RuntimeError) as exc:
         # A deployment can fence repositories off (ROUNDTABLE_REPO_ROOTS).
         # Review from what's posted rather than not at all.
@@ -1067,15 +1089,29 @@ async def run_round(
         "max_rounds": max_rounds, "repo": repo, "thread_id": tid,
         "participants": [labels[p] for p in participants],
     })
+    context = core._effective_tool_context(tid) if repo_bound else None
+    if requirements is None:
+        requirements = "\n\n".join(notes)
+    assessed: dict[str, dict] = {}
     loop = asyncio.get_running_loop()
     shown: set[str] = set()
 
+    def assess_reply(participant: str, text: str) -> dict:
+        if participant not in assessed:
+            read_line = evidence_reader(core, context, labels[participant], message, requirements)
+            assessed[participant] = review_contract.assess(
+                text, ledger.get(participant, []), stage=stage, read_line=read_line,
+            )
+            ledger[participant] = assessed[participant]["ledger"]
+        return assessed[participant]
+
     def _reply_event(p: str, text: Optional[str], error: Optional[str]) -> dict:
+        assessment = assess_reply(p, text or "") if error is None else None
         return {
             "type": "panel_reply", "stage": stage, "round": round_no,
             "participant": labels[p],
-            "verdict": "error" if error is not None else parse_verdict(text or ""),
-            "text": error if error is not None else (text or ""),
+            "verdict": "error" if error is not None else assessment["verdict"],
+            "text": error if error is not None else assessment["text"],
         }
 
     def _landed(p: str, text: Optional[str], error: Optional[str]) -> None:
@@ -1088,16 +1124,20 @@ async def run_round(
     result = await asyncio.to_thread(
         core.roundtable_ask_parallel, tid, list(participants),
         prompt=round_prompt(stage, round_no, max_rounds, repo, plan_reviewed, diff_note),
-        effort=effort, tool_use_context=core._effective_tool_context(tid),
-        on_result=_landed,
+        effort=effort, tool_use_context=context,
+        on_result=_landed, independent=True, house_rules=house_rules(user_label),
+        participant_prompts={p: review_contract.reviewer_prompt(
+            message, requirements, ledger.get(p, []),
+        ) for p in participants},
     )
     replies: list[dict] = []
     errors: list[dict] = []
     for p in participants:
         if p in (result.get("responses") or {}):
             text = str(result["responses"][p] or "")
+            assessment = await asyncio.to_thread(assess_reply, p, text)
             replies.append({"participant": p, "label": labels[p],
-                            "verdict": parse_verdict(text), "text": text})
+                            "verdict": assessment["verdict"], "text": assessment["text"]})
             if p not in shown:
                 emit(_reply_event(p, text, None))
         elif p in (result.get("errors") or {}):
@@ -1105,7 +1145,38 @@ async def run_round(
             errors.append({"participant": p, "label": labels[p], "error": err})
             if p not in shown:
                 emit(_reply_event(p, None, err))
+    # An unavailable reviewer cannot silently withdraw its earlier objection.
+    open_findings = any(f["status"] == "open" for rows in ledger.values() for f in rows)
+    for p, rows in ledger.items():
+        if p not in assessed and any(f["status"] == "open" for f in rows):
+            replies.append({"participant": p, "label": labels.get(p, p), "verdict": "changes",
+                            "text": "Earlier objections remain unresolved:\n" + "\n".join(
+                                f"{f['id']}: {f['claim']}" for f in rows if f["status"] == "open")})
     return RoundResult(
-        thread_id=tid, outcome=outcome_of(replies), replies=replies,
-        errors=errors, reviewed_state=reviewed_state,
+        thread_id=tid, outcome="changes" if open_findings else outcome_of(replies), replies=replies,
+        errors=errors, reviewed_state=reviewed_state, review_ledger=ledger,
     )
+
+
+def evidence_reader(core: Any, context: Any, label: str, proposal: str, requirements: str):
+    """Return exact lines through the same read-only permission gate as review tools."""
+    texts = {"@proposal": proposal.splitlines(), "@requirements": requirements.splitlines()}
+    cache = {}
+    tools = None
+    if context is not None and context.working_directory is not None:
+        tools = core._RepoTools(Path(context.working_directory), context.permission_callback, label)
+
+    def read_line(source: str, line: int) -> Optional[str]:
+        key = (source, line)
+        if key not in cache:
+            value = None
+            if source in texts:
+                lines = texts[source]
+                value = lines[line - 1] if 0 < line <= len(lines) else None
+            elif tools is not None and not source.startswith("@") and not Path(source).is_absolute():
+                excerpt = tools.execute("Read", {"path": source, "line": line, "context": 1})
+                prefix = f"{line}: "
+                value = next((v[len(prefix):] for v in excerpt.splitlines() if v.startswith(prefix)), None)
+            cache[key] = value
+        return cache[key]
+    return read_line

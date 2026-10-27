@@ -3281,6 +3281,10 @@ _PANEL_TOOL_DECLS = [
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Repo-relative file path."},
+                "line": {"type": "integer", "minimum": 1,
+                         "description": "Optional 1-based center line; returns numbered source lines."},
+                "context": {"type": "integer", "minimum": 1, "maximum": 100,
+                            "description": "Lines before/after line (default 40, max 100)."},
             },
             "required": ["path"],
         },
@@ -3352,14 +3356,12 @@ class _RepoTools:
             return f"[permission denied for {name}]"
         try:
             if name == "Read":
-                # An explicit line makes this a bounded window read (used by
-                # verification, which must reach any depth into a file). The
-                # declared Read schema has no `line`, so panellists get the
-                # plain capped read.
+                # An explicit line gives reviewers and verification the same
+                # numbered, bounded view at any depth in the source file.
                 if "line" in args:
                     return self.read_line_window(
                         args.get("path"), int(args.get("line") or 0),
-                        int(args.get("context") or 40),
+                        max(1, min(100, int(args.get("context") or 40))),
                     )
                 return self._read(args.get("path"))
             if name == "Grep":
@@ -3880,6 +3882,9 @@ def roundtable_ask_parallel(
     effort: str = "", web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
     on_result: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
+    independent: bool = False,
+    house_rules: Optional[str] = None,
+    participant_prompts: Optional[dict[str, str]] = None,
 ) -> dict:
     """Ask multiple participants the SAME question in parallel — each sees
     the transcript only up to the prompt, never each other's answers.
@@ -3908,6 +3913,12 @@ def roundtable_ask_parallel(
     in ``responses`` or in ``errors``, never both. Errors are also
     written into the transcript as ``[provider error: …]`` turns so the
     next ``roundtable_ask`` can address them.
+
+    Library callers can set ``independent`` to hide other reviewers' previous
+    replies, override ``house_rules`` for this call, and supply
+    ``participant_prompts`` with each reviewer's own outstanding findings.
+    The shared prompt is still recorded; callers persist private instructions
+    separately when they need an audit trail.
 
     ``on_result(name, text, error)`` (library callers only) hears about
     each participant as it finishes, before anything is committed, so a
@@ -3939,7 +3950,12 @@ def roundtable_ask_parallel(
     # returns — that's what guarantees independence.
     if prompt.strip():
         _append_message(thread_id, "orchestrator", prompt)
-    snapshot = _effective_messages(thread_id)
+    # Compacted summaries can contain peers' opinions under an orchestrator
+    # label. Filter raw turns instead, then let _run_turn trim that view.
+    snapshot = _thread_messages(thread_id) if independent else _effective_messages(thread_id)
+    if house_rules is not None:
+        # Per-call contracts also apply to threads created before an upgrade.
+        thread = {**thread, "house_rules": house_rules}
 
     # Empty instruction in _run_turn — the prompt is already in the
     # snapshot. Passing it again would duplicate it for each participant.
@@ -3951,8 +3967,17 @@ def roundtable_ask_parallel(
     ) -> tuple[str, Optional[ProviderResult], Optional[Exception]]:
         info = infos[name]
         try:
+            messages = snapshot
+            if independent:
+                # Keep the reviewer's own history and the user's requirements,
+                # but do not anchor it to other reviewers' earlier verdicts.
+                peer_labels = set().union(*_LABEL_ALIASES.values())
+                own_labels = _LABEL_ALIASES.get(info["label"], {info["label"]})
+                messages = [m for m in snapshot
+                            if m["speaker"] not in peer_labels or m["speaker"] in own_labels]
+            instruction = (participant_prompts or {}).get(name, "")
             resp = _run_turn(
-                thread, info, snapshot, instruction="", effort=effort,
+                thread, info, messages, instruction=instruction, effort=effort,
                 web_search=web_search,
                 tool_use_context=tool_use_context,
             )

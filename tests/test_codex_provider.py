@@ -1433,6 +1433,87 @@ async def test_codex_account_handoff_waits_for_interrupted_turn_to_finish(client
     assert run.task.cancelled()
 
 
+@pytest.mark.parametrize("boundary", ["active", "completed", "exited"])
+async def test_codex_steering_handles_simultaneous_turn_boundaries(client, monkeypatch, boundary):
+    import app as app_module
+
+    run = app_module.ActiveRun("steer-boundary-" + boundary, owner_sub="anonymous")
+    run.provider = "codex"
+    events = []
+    original_emit = run.emit
+
+    def emit(event):
+        events.append(event)
+        original_emit(event)
+
+    monkeypatch.setattr(run, "emit", emit)
+    monkeypatch.setattr(app_module, "_notify_turn_complete", lambda run: None)
+
+    class Server:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+            self.calls = []
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method == "thread/start":
+                return {"thread": {"id": "steer-thread-" + boundary}}
+            if method == "turn/start" and len(self.calls) == 2:
+                await app_module._inject_user_input(run, "Correction", [], 0, 0, steer=True)
+                notification = {
+                    "active": {"method": "item/agentMessage/delta", "params": {"delta": "Working"}},
+                    "completed": {"method": "turn/completed", "params": {"turn": {"id": "first"}}},
+                    "exited": {"method": codex_provider.SERVER_EXITED_METHOD, "params": {}},
+                }[boundary]
+                self.queue.put_nowait(notification)
+                return {"turn": {"id": "first"}}
+            if method in {"turn/steer", "turn/start"}:
+                self.queue.put_nowait({"method": codex_provider.SERVER_EXITED_METHOD, "params": {}})
+                return {"turn": {"id": "next"}}
+            assert method == "thread/unsubscribe"
+            return {}
+
+        def subscribe(self, thread_id):
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            pass
+
+        def unsubscribe(self, thread_id):
+            pass
+
+    server = Server()
+
+    async def server_for_account(*args, **kwargs):
+        return server
+
+    async def close_key(key):
+        pass
+
+    monkeypatch.setattr(app_module, "_codex_server_for_account", server_for_account)
+    monkeypatch.setattr(codex_provider.CodexAppServer, "close_key", close_key)
+    await asyncio.wait_for(app_module._codex_driver(
+        run, initial_text="Original task", initial_images=[], resume_thread_id=None,
+        model_id="gpt-test", effort="", cwd=app_module.DEFAULT_CWD,
+        personality_append="", first_prompt_title="Original task", account={"server_key": "test"},
+    ), 3)
+    await asyncio.sleep(0)  # Let delivery acknowledgement callbacks finish.
+    deliveries = [(method, params) for method, params in server.calls
+                  if method in {"turn/start", "turn/steer"}]
+    if boundary == "exited":
+        assert len(deliveries) == 1
+        assert any(e.get("lost_input") for e in events)
+    else:
+        method, params = deliveries[1]
+        assert method == ("turn/steer" if boundary == "active" else "turn/start")
+        assert params["input"] == [{"type": "text", "text": "Correction"}]
+        if boundary == "active":
+            assert params["expectedTurnId"] == "first"
+        assert not any(e.get("lost_input") for e in events)
+    assert not any(method == "turn/interrupt" for method, _ in server.calls)
+    app_module._state_db().execute("DELETE FROM codex_session WHERE thread_id = ?", (run.session_id,))
+
+
 async def test_codex_driver_resumes_same_thread_in_fresh_run_server(
     client, monkeypatch,
 ):

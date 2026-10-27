@@ -8109,8 +8109,8 @@ async def _panel_round_task(
 ) -> None:
     """One round, then the answer as the chat's next message.
 
-    Anything that goes wrong steps the panel aside rather than stranding
-    Claude behind a gate it can't pass; the user is told either way.
+    Failures step the panel aside unless an existing objection remains open;
+    the user is told either way and can explicitly override an objection.
     """
     user_label = run.panel_user_label
     replies: list[dict] = []
@@ -8118,6 +8118,11 @@ async def _panel_round_task(
     reviewed: Optional[dict] = None
     start = _panel_load(sid) or panel.PanelState(enabled=True)
     thread_id = start.thread_id
+    if notes:
+        requirements = start.review_requirements.setdefault(root, [])
+        requirements.extend(notes)
+        del requirements[:-20]
+        _panel_save(sid, run.owner_sub, start)
     try:
         if decide_only:
             outcome = "changes"
@@ -8140,10 +8145,18 @@ async def _panel_round_task(
                 max_rounds=panel.MAX_ROUNDS, plan_reviewed=start.plan_ok,
                 user_label=user_label, topic=_panel_topic(message),
                 emit=lambda event: _panel_emit(sid, event), on_thread=_on_thread,
+                review_ledger=start.review_ledger.get(root, {}).get(stage),
+                requirements="\n\n".join(start.review_requirements.get(root, [])),
             )
             thread_id = result.thread_id
             replies, errors, reviewed = result.replies, result.errors, result.reviewed_state
             outcome = result.outcome
+            # Persist findings before a decision-card await so cancellation or
+            # a restart cannot erase an objection that has already been shown.
+            if result.review_ledger is not None:
+                fresh_state = _panel_load(sid) or start
+                fresh_state.review_ledger.setdefault(root, {})[stage] = result.review_ledger
+                _panel_save(sid, run.owner_sub, fresh_state)
         if outcome == "changes" and (decide_only or round_no >= panel.MAX_ROUNDS):
             fresh = _panel_load(sid)
             if fresh is not None and not fresh.enabled:
@@ -8160,6 +8173,15 @@ async def _panel_round_task(
         outcome = "unavailable"
         errors = errors + [{"participant": "", "label": "The panel",
                             "error": f"{type(exc).__name__}: {exc}"}]
+    if outcome == "unavailable":
+        outstanding = (_panel_load(sid) or start).review_ledger.get(root, {}).get(stage, {})
+        for participant, findings in outstanding.items():
+            remaining = [f for f in findings if f["status"] == "open"]
+            if remaining:
+                outcome = "changes"
+                replies.append({"participant": participant, "label": participant,
+                                "verdict": "changes", "text": "Earlier objections remain open:\n" +
+                                "\n".join(f"{f['id']}: {f['claim']}" for f in remaining)})
     try:
         approve = outcome in ("approved", "unavailable", "go_ahead")
         # An approval of changes covers what the panel was shown: this round's
@@ -8177,6 +8199,11 @@ async def _panel_round_task(
         state = _panel_load(sid) or start
         advisory = not state.enabled
         state.thread_id = thread_id
+        if outcome == "go_ahead":
+            for findings in state.review_ledger.get(root, {}).get(stage, {}).values():
+                for finding in findings:
+                    if finding["status"] == "open":
+                        finding["status"] = "overridden_by_user"
         if stage == "changes" and reviewed is not None:
             state.last_reviewed[root] = reviewed
         if approve:
@@ -8685,6 +8712,8 @@ class ActiveRun:
         self._task_order: int = 0
         # Long-lived conversation state.
         self.user_input_queue: asyncio.Queue = asyncio.Queue()
+        # Explicit Send now input bypasses the between-turn queue on Claude.
+        self.steering_input_queue: asyncio.Queue = asyncio.Queue()
         # One-slot holdover for a message popped from the queue that couldn't
         # be delivered this wait round (CLI started a new turn). Kept out of
         # the queue so it stays ahead of anything queued afterward. Drained by
@@ -9006,11 +9035,12 @@ class ActiveRun:
             # comes first when we report what was lost.
             strays.append(self._deferred_user_item)
             self._deferred_user_item = None
-        while True:
-            try:
-                strays.append(self.user_input_queue.get_nowait())
-            except asyncio.QueueEmpty:
-                break
+        for input_queue in (self.steering_input_queue, self.user_input_queue):
+            while True:
+                try:
+                    strays.append(input_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
         for stray in strays:
             stray_qid = stray.get("queue_id")
             if stray_qid and stray_qid in self.canceled_input_ids:
@@ -9169,7 +9199,7 @@ def _busy_runs() -> list[str]:
             # Finished, or a restored row from state.db with no live CLI —
             # nothing a drain needs to wait for.
             continue
-        if (not run.between_turns or not run.user_input_queue.empty()
+        if (not run.between_turns or (not run.user_input_queue.empty() or not run.steering_input_queue.empty())
                 or run._deferred_user_item is not None):
             busy.append(run.run_id)
     live_panels = sum(1 for s in ASSISTANT_STREAMS.values() if not s.done)
@@ -10604,6 +10634,7 @@ async def _inject_user_input(
     queue_id: Optional[str] = None,
     announce: bool = True,
     display_text: Optional[str] = None,
+    steer: bool = False,
 ) -> Optional[str]:
     """Queue user input for the driver to deliver to the CLI.
 
@@ -10628,24 +10659,24 @@ async def _inject_user_input(
       healthy run. Previously both conditions returned a bare False and the
       browser's run_finished fallback aborted a live mid-turn stream.
 
-    Originally this also wrote directly to ``client.query()`` from the
-    HTTP handler when the driver was running, in pursuit of
-    "binary-style steerability". In practice writing to stdin while the
-    CLI was still generating a turn caused the message to be silently
-    discarded. The fix is to always enqueue; the driver pops only when
-    between turns, serializing every write through one writer.
+    Ordinary input waits for a turn boundary on Claude. Explicit steering uses
+    its own queue, consumed by the same driver and serialized write lock while
+    the current turn continues. Codex consumes user input through turn/steer.
     """
     if run.done or not run.accepting_input:
         return "run_finished"
     # Bound the per-run input backlog. The browser caps at MAX_QUEUE_LENGTH
     # client-side, but a direct API caller could otherwise enqueue without
     # limit — each item spawns a delivery task + Future.
-    if run.user_input_queue.qsize() >= MAX_USER_INPUT_QUEUE:
+    if run.user_input_queue.qsize() + run.steering_input_queue.qsize() >= MAX_USER_INPUT_QUEUE:
         return "queue_full"
     loop = asyncio.get_running_loop()
     delivered: asyncio.Future = loop.create_future()
-    await run.user_input_queue.put({
+    target_queue = (run.steering_input_queue if steer and run.provider != "codex"
+                    else run.user_input_queue)
+    await target_queue.put({
         "text": text,
+        "steer": steer,
         "image_blocks": blocks,
         "delivered": delivered,
         "queue_id": queue_id,
@@ -12377,7 +12408,7 @@ async def _stop_source_run_for_switch(
     for run in live:
         _require_owner(run, user)
         if (not run.between_turns
-                or not run.user_input_queue.empty()
+                or (not run.user_input_queue.empty() or not run.steering_input_queue.empty())
                 or run._deferred_user_item is not None
                 or any(e.get("run_id") == run.run_id for e in PENDING.values())):
             raise HTTPException(
@@ -13100,82 +13131,10 @@ async def _codex_driver(
                 break
 
             if user_get is not None and user_get in done:
-                item = user_get.result()
-                qid = item.get("queue_id")
-                ack = item.get("delivered")
-                if not run.accepting_input:
-                    try:
-                        run.user_input_queue.put_nowait(item)
-                    except asyncio.QueueFull:
-                        _emit_lost_input(
-                            run, item.get("text") or "",
-                            "The run switched accounts before this message "
-                            "could be delivered; send it again",
-                            queue_id=qid,
-                        )
-                        if ack is not None and not ack.done():
-                            ack.set_exception(_DeliveryAlreadyReported(
-                                "account handoff; lost_input already emitted"
-                            ))
-                elif qid and qid in run.canceled_input_ids:
-                    run.canceled_input_ids.discard(qid)
-                    if ack is not None and not ack.done():
-                        ack.set_exception(_DeliveryAlreadyReported("recalled"))
-                else:
-                    if qid:
-                        run.committed_input_ids.add(qid)
-                    delivered_ok = True
-                    if run.between_turns:
-                        delivered_ok = await _start_turn(
-                            item.get("text") or "", item.get("image_blocks") or [],
-                        )
-                        turn_started_mono = time.monotonic()
-                    else:
-                        try:
-                            async with run.client_write_lock:
-                                if not run.accepting_input:
-                                    run.user_input_queue.put_nowait(item)
-                                    delivered_ok = False
-                                elif not run.codex_turn_id:
-                                    # between_turns and codex_turn_id are always
-                                    # assigned together with no await between,
-                                    # so this only happens when turn/start
-                                    # answered without a turn id. Nothing to
-                                    # steer; report it rather than requeueing,
-                                    # which would spin (accepting_input is still
-                                    # True, so the loop re-gets it immediately).
-                                    raise CodexSteerUnavailable(
-                                        "no active Codex turn to steer"
-                                    )
-                                else:
-                                    # expectedTurnId is REQUIRED by
-                                    # TurnSteerParams — omitting it makes the
-                                    # app-server reject every mid-turn message
-                                    # with -32600 missing field.
-                                    await server.request("turn/steer", {
-                                        "threadId": thread_id,
-                                        "expectedTurnId": run.codex_turn_id,
-                                        "input": _codex_input_items(
-                                            item.get("text") or "",
-                                            item.get("image_blocks") or [],
-                                            run.run_id,
-                                        ),
-                                    })
-                        except Exception as e:
-                            log.warning("codex steer failed: %s", e)
-                            delivered_ok = False
-                            _emit_lost_input(
-                                run, item.get("text") or "",
-                                f"Codex rejected the mid-turn message ({e}); "
-                                "send it again",
-                                queue_id=qid,
-                            )
-                            if ack is not None and not ack.done():
-                                ack.set_exception(_DeliveryAlreadyReported(
-                                    "steer failed; lost_input already emitted"
-                                ))
-                    if delivered_ok and ack is not None and not ack.done():
-                        ack.set_result(True)
+                # Preserve popped input through a simultaneous completion or
+                # server exit. Process that notification before choosing steer
+                # versus start; finish() reports it if the server has exited.
+                run._deferred_user_item = user_get.result()
 
             if notif_get in done:
                 notif = notif_get.result()
@@ -13291,6 +13250,85 @@ async def _codex_driver(
                 # _handle_partial_stream_event), so streaming them as
                 # partial_text would show codex thinking where Claude's is
                 # deliberately hidden.
+
+            if run._deferred_user_item is not None:
+                item = run._deferred_user_item
+                run._deferred_user_item = None
+                qid = item.get("queue_id")
+                ack = item.get("delivered")
+                if not run.accepting_input:
+                    try:
+                        run.user_input_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        _emit_lost_input(
+                            run, item.get("text") or "",
+                            "The run switched accounts before this message "
+                            "could be delivered; send it again",
+                            queue_id=qid,
+                        )
+                        if ack is not None and not ack.done():
+                            ack.set_exception(_DeliveryAlreadyReported(
+                                "account handoff; lost_input already emitted"
+                            ))
+                elif qid and qid in run.canceled_input_ids:
+                    run.canceled_input_ids.discard(qid)
+                    if ack is not None and not ack.done():
+                        ack.set_exception(_DeliveryAlreadyReported("recalled"))
+                else:
+                    if qid:
+                        run.committed_input_ids.add(qid)
+                    delivered_ok = True
+                    if run.between_turns:
+                        delivered_ok = await _start_turn(
+                            item.get("text") or "", item.get("image_blocks") or [],
+                        )
+                        turn_started_mono = time.monotonic()
+                    else:
+                        try:
+                            async with run.client_write_lock:
+                                if not run.accepting_input:
+                                    run.user_input_queue.put_nowait(item)
+                                    delivered_ok = False
+                                elif not run.codex_turn_id:
+                                    # between_turns and codex_turn_id are always
+                                    # assigned together with no await between,
+                                    # so this only happens when turn/start
+                                    # answered without a turn id. Nothing to
+                                    # steer; report it rather than requeueing,
+                                    # which would spin (accepting_input is still
+                                    # True, so the loop re-gets it immediately).
+                                    raise CodexSteerUnavailable(
+                                        "no active Codex turn to steer"
+                                    )
+                                else:
+                                    # expectedTurnId is REQUIRED by
+                                    # TurnSteerParams — omitting it makes the
+                                    # app-server reject every mid-turn message
+                                    # with -32600 missing field.
+                                    await server.request("turn/steer", {
+                                        "threadId": thread_id,
+                                        "expectedTurnId": run.codex_turn_id,
+                                        "input": _codex_input_items(
+                                            item.get("text") or "",
+                                            item.get("image_blocks") or [],
+                                            run.run_id,
+                                        ),
+                                    })
+                        except Exception as e:
+                            log.warning("codex steer failed: %s", e)
+                            delivered_ok = False
+                            _emit_lost_input(
+                                run, item.get("text") or "",
+                                f"Codex rejected the mid-turn message ({e}); "
+                                "send it again",
+                                queue_id=qid,
+                            )
+                            if ack is not None and not ack.done():
+                                ack.set_exception(_DeliveryAlreadyReported(
+                                    "steer failed; lost_input already emitted"
+                                ))
+                    if delivered_ok and ack is not None and not ack.done():
+                        ack.set_result(True)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -14489,11 +14527,9 @@ async def api_chat(
                     # back to False whenever we send something to the CLI
                     # (user input or auto-fire synth). Auto-fire only arms
                     # while run.between_turns — we never auto-fire while an LLM
-                    # turn is still in flight, and we likewise never pop a
-                    # queued user message into a busy CLI (writing to the
-                    # CLI's stdin mid-turn caused the message to be silently
-                    # consumed-and-discarded; queueing serialises everything
-                    # through one writer so that bug can't recur).
+                    # turn is still in flight. Ordinary queued input waits;
+                    # explicit steering is delivered while the turn continues
+                    # (verified on CLI 2.1.311). Both use the same write lock.
                     run.between_turns = False
 
                     # Mid-turn silence clock. Bumped whenever an SDK message
@@ -14540,12 +14576,10 @@ async def api_chat(
                             timeout = SESSION_IDLE_TIMEOUT_MS / 1000
 
                         msg_get = asyncio.create_task(msg_queue.get())
-                        # Only race on user_input_queue when the CLI is idle.
-                        # If we polled it while a turn was still streaming,
-                        # we'd write user input into a CLI that isn't ready
-                        # to consume it, with the same disappear-into-the-
-                        # void failure mode the queue is designed to avoid.
-                        waitables: set[asyncio.Task] = {msg_get}
+                        # Ordinary queued input waits until idle. Explicit
+                        # steering is eligible at every message/tool boundary.
+                        steer_get = asyncio.create_task(run.steering_input_queue.get())
+                        waitables: set[asyncio.Task] = {msg_get, steer_get}
                         user_get: Optional[asyncio.Task] = None
                         # A previously-popped message that had to be deferred
                         # (the CLI started a new turn in the same wait round)
@@ -14568,7 +14602,7 @@ async def api_chat(
                             # carrying transfer. The pump still owns the SDK
                             # iterator exclusively, so we never lose a
                             # message by cancelling msg_get here.
-                            for t in (msg_get, user_get):
+                            for t in (msg_get, user_get, steer_get):
                                 if t is not None and not t.done():
                                     t.cancel()
 
@@ -14584,6 +14618,7 @@ async def api_chat(
                         # the user queues a message at the same time.
                         msg_done = msg_get in done
                         user_done = user_get is not None and user_get in done
+                        steer_done = steer_get in done
                         # Harvest user_get's result FIRST so a terminal msg
                         # (pump_done / _PumpFailed) in the same wait round
                         # can't make us break before reading the user's
@@ -14602,6 +14637,12 @@ async def api_chat(
                             popped_user_item = (
                                 user_get.result() if user_done else None
                             )
+                        if steer_done:
+                            # Both queue gets can finish together. Keep the
+                            # ordinary message for the next turn, never lose it.
+                            if popped_user_item is not None:
+                                run._deferred_user_item = popped_user_item
+                            popped_user_item = steer_get.result()
                         if msg_done:
                             msg = msg_get.result()
                             terminal_kind: Optional[str] = None
@@ -14829,19 +14870,11 @@ async def api_chat(
                         # CLI this round, so the continue below fires and we don't
                         # misclassify the new turn as a wedge.
                         delivered_user_input = False
-                        if popped_user_item is not None and not run.between_turns:
-                            # Race fix (2026-05-29): if msg_get just delivered
-                            # a new UserMessage/AssistantMessage (commonly a
-                            # ScheduleWakeup firing inside the CLI), the
-                            # run.between_turns block above flipped to False AFTER
-                            # we'd already popped a queued user message. Sending
-                            # it now would write to the CLI's stdin mid-turn,
-                            # which (per the comment at the top of this loop)
-                            # silently consumes-and-discards the message. Push
-                            # it back onto user_input_queue so the next
-                            # between-turns moment picks it up. Ack stays
-                            # attached so the POST handler still resolves when
-                            # the message actually lands.
+                        if (popped_user_item is not None and not run.between_turns
+                                and not popped_user_item.get("steer")):
+                            # Ordinary queued input must still wait when a
+                            # provider event starts a turn in the same iteration.
+                            # Explicit steering is deliberately exempt.
                             log.info(
                                 "deferring queued user input for run %s — "
                                 "CLI started a new turn in the same wait round",
@@ -14968,7 +15001,7 @@ async def api_chat(
                             run.between_turns = False
                             delivered_user_input = True
 
-                        if msg_done or user_done or delivered_user_input:
+                        if msg_done or user_done or steer_done or delivered_user_input:
                             # Delivering a queued/deferred message starts a new
                             # turn. Loop again rather than fall through to the
                             # timeout classifier below, which would see
@@ -15121,6 +15154,7 @@ async def api_chat_send(
     provider: str = Form(default=""),
     personality_id: Optional[int] = Form(default=None),
     account_slot: str = Form(default=""),
+    steer: bool = Form(False),
     queue_id: str = Form(default=""),
     user: dict = Depends(auth.require_user),
 ):
@@ -15267,7 +15301,7 @@ async def api_chat_send(
         image_count=len(image_blocks),
         file_count=len(file_metas),
         queue_id=queue_id or None,
-        display_text=shown,
+        display_text=shown, steer=steer is True,
     )
     if inject_failure == "queue_full":
         # The run is alive — 429 tells the browser to hold the message
@@ -15397,7 +15431,7 @@ async def api_chat_rewind(
             # a new turn. Rewinding now would yank files out from under the
             # in-progress edits — the exact case the 409 guards. The empty-queue
             # check covers a message queued but not yet delivered.
-            if not run.between_turns or not run.user_input_queue.empty():
+            if not run.between_turns or (not run.user_input_queue.empty() or not run.steering_input_queue.empty()):
                 raise HTTPException(
                     409, "turn started while preparing the rewind — retry once it's idle",
                 )

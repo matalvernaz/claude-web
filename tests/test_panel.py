@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 import panel
+from tests import panel_support
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="panel review is off on Windows (see app._panel_available)",
@@ -224,6 +225,8 @@ def test_result_message_carries_the_marker_every_reply_and_the_next_step():
 class FakeCore:
     """Just enough of roundtable.core for one round, recording every call."""
 
+    _RepoTools = panel_support.SourceTools
+
     PARTICIPANTS = {
         "gpt-5": {"label": "GPT Sol"},
         "gemini-pro": {"label": "Gemini Pro"},
@@ -243,6 +246,7 @@ class FakeCore:
         return {"id": tid, "closed_at": None}
 
     def roundtable_bind_repo(self, tid, repo, policy):
+        self.root = repo
         self.calls.append(("bind_repo", tid, repo, policy))
 
     def roundtable_bind_diff(self, tid, repo, base):
@@ -253,15 +257,17 @@ class FakeCore:
         self.calls.append(("post", speaker, content))
 
     def _effective_tool_context(self, tid):
-        return "ctx"
+        return panel_support.context(self.root) if hasattr(self, "root") else None
 
     def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context,
-                                on_result=None):
+                                on_result=None, **kwargs):
         self.calls.append(("ask", tuple(participants), prompt, tool_use_context))
-        for name, text in self.responses.items():
+        responses = {p: panel_support.report(t, getattr(self, "root", "/r"),
+                     kwargs.get("participant_prompts", {}).get(p, "")) for p, t in self.responses.items()}
+        for name, text in responses.items():
             if on_result and name in self.stream:
                 on_result(name, text, None)
-        return {"responses": self.responses, "errors": self.errors}
+        return {"responses": responses, "errors": self.errors}
 
 
 def _round(core, **kw):
@@ -317,14 +323,15 @@ def test_a_changes_round_attaches_the_diff_and_records_what_was_reviewed(repo):
     assert "No plan was reviewed" in ask[2]
 
 
-def test_a_repository_the_panel_cannot_open_still_gets_reviewed():
+def test_a_repository_the_panel_cannot_open_cannot_get_verified_approval():
     class FencedCore(FakeCore):
         def roundtable_bind_repo(self, tid, repo, policy):
             raise ValueError("outside ROUNDTABLE_REPO_ROOTS")
 
     core = FencedCore(responses={"gpt-5": "VERDICT: APPROVE", "gemini-pro": "VERDICT: APPROVE"})
     result, _, _ = _round(core)
-    assert result.outcome == "approved"
+    assert result.outcome == "changes"
+    assert all(r["verdict"] == "unclear" for r in result.replies)
     ask = next(c for c in core.calls if c[0] == "ask")
     assert "couldn't be opened for you" in ask[2]
 

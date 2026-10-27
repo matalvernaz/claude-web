@@ -214,6 +214,42 @@ def test_codex_async_question_skip_needs_no_pending_rpc_and_old_questions_are_re
     playwright.expect(page.get_by_role("button", name="Submit answers", exact=True)).to_have_count(0)
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_composer_can_steer_without_stopping_or_waiting_for_the_turn(ui, provider):
+    page, state = ui
+    state["providers"]["providers"].append({
+        "key": "codex", "label": "Codex", "available": True,
+        "models": [{"key": "gpt-test", "label": "GPT", "efforts": []}],
+        "capabilities": CLOUD_CAPS,
+    })
+    state["send_ok"] = True
+    state["session"] = {"provider": provider, "messages": [], "live_run": {
+        "run_id": "working-run", "active": True, "between_turns": False,
+    }}
+    page.add_init_script("""(() => {
+      const original = window.fetch;
+      window.fetch = (url, options) => String(url).includes('/api/chat/stream/working-run')
+        ? Promise.resolve(new Response(new ReadableStream({start() {}}),
+            {headers: {'Content-Type': 'text/event-stream'}}))
+        : original(url, options);
+    })();""")
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.get_by_role("button", name="Send now", exact=True)).to_be_visible()
+    page.locator("#prompt").fill("Keep going, but check the timeout too.")
+    page.locator("#prompt").press("Enter")
+    page.wait_for_function("document.querySelector('#prompt').value === ''")
+    assert len(state["posts"]) == 1
+    path, fields = state["posts"][0]
+    assert path == "/api/chat/send/working-run"
+    assert fields["steer"] == "true"
+    assert fields["message"] == "Keep going, but check the timeout too."
+    assert all("/stop/" not in path for path, _ in state["posts"])
+    page.locator("#prompt").fill("Do this after the current work.")
+    page.get_by_role("button", name="Queue for later", exact=True).click()
+    playwright.expect(page.locator("#queue-area")).to_contain_text("Do this after")
+    assert len(state["posts"]) == 1
+
+
 def test_codex_question_from_live_stream_stays_answerable_after_result(ui):
     page, state = ui
     _codex_question_session(page, state)
