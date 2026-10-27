@@ -12,6 +12,9 @@ import re
 from collections.abc import Callable
 
 
+CITATION_SEARCH_RADIUS = 40
+
+
 CONTRACT = """Review contract:
 - Treat the author's explanation as claims to test, not established facts. Turn
   assertions into questions: what would demonstrate or disprove this behavior?
@@ -42,6 +45,7 @@ CONTRACT = """Review contract:
 "reason":"why", "evidence":[]}], "limitations":[],
 "verdict":"approve|changes|abstain"}
 Evidence quotes must be exact nonempty excerpts from single lines, with 1-based line numbers.
+Copy line numbers from Read or Grep output rather than estimating them.
 Use a repository-relative path, or @proposal / @requirements for the line-numbered
 current proposal and user requirements supplied below. Do not cite old proposals
 as current evidence. Findings/resolutions/checks are arrays; use [] when empty.
@@ -77,17 +81,42 @@ def _objects(obj: dict, key: str) -> list[dict]:
     return value
 
 
+def _quote_line(source: str, line: int, quote: str, read_line: Callable) -> int | None:
+    """Locate an exact quote without trusting an approximate line number.
+
+    Relocation is bounded to the same file and requires one distinctive match.
+    Short snippets such as ``return`` and ambiguous matches are not relocated.
+    Virtual proposal/requirement lines are already numbered and stay exact.
+    Every candidate goes through the caller's permission-gated reader.
+    """
+    actual = read_line(source, line)
+    if actual is not None and quote in actual.strip():
+        return line
+    if source.startswith("@") or len(quote) < 12:
+        return None
+    matches = []
+    for candidate in range(max(1, line - CITATION_SEARCH_RADIUS), line + CITATION_SEARCH_RADIUS + 1):
+        actual = read_line(source, candidate)
+        if actual is not None and quote in actual.strip():
+            matches.append(candidate)
+            if len(matches) > 1:
+                return None
+    return matches[0] if matches else None
+
+
 def assess(
     text: str, previous: list[dict], *, stage: str,
     read_line: Callable[[str, int], str | None],
 ) -> dict:
     """Validate a reply without ever deleting an unresolved previous finding.
 
-    ``read_line`` is permission-gated by the caller. A bad quote invalidates the
-    reply, rather than being accepted just because a model supplied file:line.
+    ``read_line`` is permission-gated by the caller. An exact quote found once
+    near the cited line corrects its location. Missing or ambiguous evidence
+    invalidates the reply rather than trusting a model-supplied file:line.
     """
     ledger = copy.deepcopy(previous)
     report = None
+    corrections = []
     try:
         raw = re.sub(r"^\s*```(?:json)?\s*\n|\n```\s*$", "", text.strip())
         report = json.loads(raw)
@@ -109,17 +138,23 @@ def assess(
                 raise ValueError("evidence is required")
             for ref in refs:
                 source, quote = _text(ref, "source"), _text(ref, "quote")
+                if "\n" in source or "\r" in source:
+                    raise ValueError("citation source must be a single path or virtual source name")
                 line = ref.get("line")
                 if type(line) is not int or line < 1 or line > 2_000_000:
                     raise ValueError("citation line must be a positive integer")
                 if "\n" in quote or "\r" in quote:
                     raise ValueError("cite one exact source line at a time")
-                actual = read_line(source, line)
-                if actual is None or quote not in actual.strip():
+                located = _quote_line(source, line, quote, read_line)
+                if located is None:
                     raise ValueError(f"citation does not match accessible source: {source}:{line}")
+                if located != line:
+                    correction = (source, line, located)
+                    if correction not in corrections:
+                        corrections.append(correction)
                 if not allow_proposal and source == "@proposal":
                     raise ValueError("the author's proposal alone cannot refute a finding")
-                ref.update(source=source, quote=quote)
+                ref.update(source=source, line=located, quote=quote)
             if repo and not any(not r["source"].strip().startswith("@") for r in refs):
                 raise ValueError("repository evidence is required")
             return refs
@@ -188,6 +223,10 @@ def assess(
                 parts.append(f"{resolution['id']} {resolution['status']}: {resolution['reason']} "
                              + citations(resolution["evidence"]))
         parts.extend("Not verified: " + line for line in limitations)
+        if corrections:
+            parts.append("Citation locations corrected using exact source matches: " + "; ".join(
+                f"{source}:{old} to line {new}" for source, old, new in corrections
+            ) + ".")
         parts.extend(problems)
         parts.append("VERDICT: " + {"approve": "APPROVE", "changes": "CHANGES NEEDED",
                                    "unclear": "NOT VERIFIED"}[verdict])
@@ -210,10 +249,15 @@ def assess(
                 ledger.append({"id": f"F{len(ledger) + 1}", "status": "open",
                                "claim": text, "evidence": []})
         display = report.get("summary", "") if isinstance(report, dict) else text
+        requested = report.get("verdict") if isinstance(report, dict) else None
+        requested = {"approve": "APPROVE", "changes": "CHANGES NEEDED", "abstain": "ABSTAIN"}.get(
+            requested if isinstance(requested, str) else "",
+        )
+        verdict_note = f"Reviewer verdict: {requested} (unverified).\n\n" if requested else ""
         open_text = "\n".join(f"{f['id']}: {f['claim']}" for f in ledger if f["status"] == "open")
         return {"verdict": "unclear", "ledger": ledger, "report": None,
                 "validation_error": str(exc),
-                "text": f"Review not verified: {exc}.\n\n{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
+                "text": f"Review not verified: {exc}.\n\n{verdict_note}{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
 
 
 def citations(refs: list[dict]) -> str:

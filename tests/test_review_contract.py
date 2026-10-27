@@ -49,6 +49,79 @@ def test_empty_approval_is_not_a_review(reader):
     assert assess(reader, report(checks=[]))["verdict"] == "unclear"
 
 
+@pytest.mark.parametrize("verdict", ["approve", "changes"])
+def test_exact_quote_with_approximate_line_preserves_the_review(tmp_path, verdict):
+    """Regression: both a finding and its later resolution became 'unclear'
+    because Gemini read unnumbered source and estimated citation locations.
+    """
+    quote = "return 50 if saved is None else saved"
+    (tmp_path / "volume.py").write_text("# surrounding source\n" * 184 + quote + "\n")
+    reads = []
+
+    def allow(label, tool, args):
+        reads.append((tool, args))
+        return "allow"
+
+    ctx = SimpleNamespace(working_directory=tmp_path, permission_callback=allow)
+    reader = panel.evidence_reader(core, ctx, "Reviewer", "", "")
+    refs = evidence("volume.py", 178, quote)
+    obj = report(checks=[{"scenario": "Saved mute value", "result": "Zero remains zero", "evidence": refs}],
+                 verdict=verdict)
+    if verdict == "changes":
+        obj["findings"] = [{"claim": "A concrete defect requiring attention", "evidence": refs}]
+        old = []
+    else:
+        old = [{"id": "F1", "status": "open", "claim": "Zero was replaced by 50",
+                "evidence": [], "unverified": True}]
+        obj["resolutions"] = [{"id": "F1", "status": "fixed", "reason": "Only None uses the fallback",
+                               "evidence": refs}]
+    result = assess(reader, obj, old)
+    assert result["verdict"] == verdict
+    assert result["validation_error"] is None
+    assert result["report"]["checks"][0]["evidence"][0]["line"] == 185
+    assert refs[0]["line"] == 178  # The caller's original report stays intact.
+    assert "volume.py:178 to line 185" in result["text"]
+    assert len(reads) == 1  # Search uses one permission-gated window, not 81 reads.
+    if verdict == "changes":
+        assert result["ledger"][0]["evidence"][0]["line"] == 185
+    else:
+        assert result["ledger"][0]["status"] == "fixed"
+
+
+@pytest.mark.parametrize("lines, cited, quote", [
+    (["return owner == user", "# here", "return owner == user"], 2, "return owner == user"),
+    (["return owner == user", "# here"], 2, "return"),
+    (["return owner != user", "# here"], 2, "return owner == user"),
+    (["# source"] * 100 + ["return owner == user"], 2, "return owner == user"),
+])
+def test_relocation_rejects_ambiguous_short_changed_or_distant_quotes(tmp_path, lines, cited, quote):
+    (tmp_path / "access.py").write_text("\n".join(lines))
+    ctx = SimpleNamespace(working_directory=tmp_path, permission_callback=lambda *args: "allow")
+    reader = panel.evidence_reader(core, ctx, "Reviewer", "", "")
+    obj = report()
+    obj["checks"][0]["evidence"] = evidence(line=cited, quote=quote)
+    result = assess(reader, obj)
+    assert result["verdict"] == "unclear"
+    assert result["validation_error"]
+    assert "Reviewer verdict: APPROVE (unverified)." in result["text"]
+
+
+def test_relocation_still_respects_denied_reads(tmp_path):
+    (tmp_path / "access.py").write_text("# header\nreturn owner == user\n")
+    denied = []
+
+    def deny(*args):
+        denied.append(args)
+        return "deny"
+
+    reader = panel.evidence_reader(core, SimpleNamespace(working_directory=tmp_path,
+                                   permission_callback=deny), "Reviewer", "", "")
+    obj = report()
+    obj["checks"][0]["evidence"] = evidence(line=1)
+    assert assess(reader, obj)["verdict"] == "unclear"
+    assert len(denied) == 1
+
+
 def test_new_code_plan_can_be_checked_against_requirements(reader):
     obj = report()
     obj["checks"][0]["evidence"] = (
@@ -73,6 +146,7 @@ def test_unchanged_evidence_cannot_be_called_an_implementation_fix(reader):
 @pytest.mark.parametrize("refs", [
     evidence(quote="return True"), evidence(line=100),
     evidence(source="missing.py"), evidence(source="../access.py"),
+    evidence(source="missing.py\n2: return owner == user\n"),
     evidence(source=".env"), evidence(source="@proposal", line=1, quote="Keep the owner check."),
     evidence(source=" @proposal", line=1, quote="Keep the owner check."),
 ])
@@ -155,6 +229,10 @@ def test_a_denied_read_and_a_symlink_escape_cannot_validate_evidence(tmp_path):
         pytest.skip("symlinks unavailable")
     ctx.permission_callback = lambda *args: "allow"
     assert panel.evidence_reader(core, ctx, "Reviewer", "", "")("link.py", 1) is None
+
+
+def test_read_errors_are_never_treated_as_numbered_source(reader):
+    assert reader("missing.py\n2: return owner == user\n", 2) is None
 
 
 def test_finding_state_survives_reload_and_resets_after_commit():

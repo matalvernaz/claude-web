@@ -3276,7 +3276,7 @@ _PANEL_TOOL_DECLS = [
     {
         "name": "Read",
         "description": "Read a UTF-8 text file from the bound repository. "
-                       "Returns the file contents (truncated if very large).",
+                       "Returns 1-based numbered lines (truncated if very large).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3376,11 +3376,18 @@ class _RepoTools:
         p = self._resolve(rel)
         if p is None or not p.is_file():
             return f"[no such file: {rel}]"
-        data = p.read_bytes()[: _TOOL_READ_MAX_BYTES + 1]
-        text = data.decode("utf-8", errors="replace")
-        if len(text) > _TOOL_READ_MAX_BYTES:
-            text = text[:_TOOL_READ_MAX_BYTES] + "\n[… truncated]"
-        return text
+        with p.open("rb") as fh:
+            data = fh.read(_TOOL_READ_MAX_BYTES + 1)
+        truncated = len(data) > _TOOL_READ_MAX_BYTES
+        text = data[:_TOOL_READ_MAX_BYTES].decode("utf-8", errors="replace")
+        # Match TextIO's universal newlines in read_line_window. Do not treat
+        # Unicode separators or form feeds inside a source line as new lines.
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        numbered = "\n".join(f"{n}: {line}" for n, line in enumerate(lines, 1))
+        truncated = truncated or len(numbered) > _TOOL_READ_MAX_BYTES
+        return numbered[:_TOOL_READ_MAX_BYTES] + ("\n[… truncated]" if truncated else "")
 
     def read_line_window(self, rel: str, line: int, context: int) -> str:
         """Line-numbered window around ``line``, at any depth into the file.
