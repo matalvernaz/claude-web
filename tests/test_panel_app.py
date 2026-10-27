@@ -12,6 +12,7 @@ import pytest
 
 import app as app_module
 import panel
+from tests import panel_support
 
 pytestmark = pytest.mark.skipif(
     os.name == "nt", reason="panel review is off on Windows (see app._panel_available)",
@@ -39,6 +40,8 @@ def repo(tmp_path):
 class FakeCore:
     """The slice of roundtable.core panel review uses, scripted per test."""
 
+    _RepoTools = panel_support.SourceTools
+
     PARTICIPANTS = {"gpt-5": {"label": "GPT Sol"}, "gemini-pro": {"label": "Gemini Pro"}}
 
     def __init__(self, answers):
@@ -60,6 +63,7 @@ class FakeCore:
         return {"id": tid, "closed_at": self.closed.get(tid)}
 
     def roundtable_bind_repo(self, tid, repo, policy):
+        self.root = repo
         return {}
 
     def roundtable_bind_diff(self, tid, repo, base):
@@ -69,17 +73,40 @@ class FakeCore:
         self.posts.append((speaker, content))
 
     def _effective_tool_context(self, tid):
-        return None
+        return panel_support.context(self.root)
 
     def roundtable_ask_parallel(self, tid, participants, prompt, effort, tool_use_context,
-                                on_result=None):
+                                on_result=None, **kwargs):
         self.asks += 1
-        return self.answers.pop(0)
+        result = self.answers.pop(0)
+        return {**result, "responses": {p: panel_support.report(t, self.root,
+                    kwargs.get("participant_prompts", {}).get(p, ""))
+                for p, t in result.get("responses", {}).items()}}
 
 
 APPROVE_ALL = {"responses": {"gpt-5": "Fine.\nVERDICT: APPROVE", "gemini-pro": "OK\nVERDICT: APPROVE"}}
 OBJECT = {"responses": {"gpt-5": "Bug at a.py:1\nVERDICT: CHANGES NEEDED",
                         "gemini-pro": "OK\nVERDICT: APPROVE"}}
+
+
+async def test_user_requirements_remain_citable_without_a_new_user_message(chat, repo, monkeypatch):
+    run, _, _ = chat
+    prompts = []
+
+    class CaptureCore(FakeCore):
+        def roundtable_ask_parallel(self, *args, **kwargs):
+            prompts.append(kwargs["participant_prompts"])
+            return super().roundtable_ask_parallel(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "roundtable_core", CaptureCore([OBJECT, APPROVE_ALL]))
+    for number, notes in ((1, ["Preserve the user's saved value."]), (2, [])):
+        await app_module._panel_round_task(
+            run, run.session_id, "plan", str(repo), "The proposed plan.", notes,
+            ["gpt-5", "gemini-pro"], number,
+        )
+    assert "1: Preserve the user's saved value." in prompts[1]["gpt-5"]
+    state = app_module._panel_load(run.session_id)
+    assert state.review_requirements[str(repo)] == ["Preserve the user's saved value."]
 
 
 @pytest.fixture
@@ -681,6 +708,39 @@ async def test_a_panel_nobody_can_answer_steps_aside(chat, repo, monkeypatch):
     assert app_module._panel_load(run.session_id).plan_ok is True
     assert "stepped aside" in delivered[-1]
     assert "### GPT Sol: couldn't answer" in delivered[-1]
+
+
+async def test_an_outage_cannot_erase_an_objection_from_the_previous_round(chat, repo, monkeypatch):
+    run, _, delivered = chat
+    monkeypatch.setattr(app_module, "roundtable_core", FakeCore([
+        OBJECT, {"responses": {}, "errors": {"gpt-5": "Timeout", "gemini-pro": "Timeout"}},
+    ]))
+    await _review(run, stage="plan", repo=str(repo), message="Plan.")
+    await _finish_round(run)
+    before = app_module._panel_load(run.session_id).review_ledger
+    assert before[str(repo)]["plan"]["gpt-5"][0]["status"] == "open"
+    await _review(run, stage="plan", repo=str(repo), message="Please reconsider.")
+    await _finish_round(run)
+    state = app_module._panel_load(run.session_id)
+    assert not state.plan_ok
+    assert state.review_ledger == before
+    assert "Earlier objections remain unresolved" in delivered[-1]
+
+
+async def test_a_crash_cannot_turn_a_prior_objection_into_approval(chat, repo, monkeypatch):
+    run, _, _ = chat
+    monkeypatch.setattr(app_module, "roundtable_core", FakeCore([OBJECT]))
+    await _review(run, stage="plan", repo=str(repo), message="Plan.")
+    await _finish_round(run)
+
+    class BrokenCore(FakeCore):
+        def roundtable_ask_parallel(self, *args, **kwargs):
+            raise RuntimeError("failed round")
+
+    monkeypatch.setattr(app_module, "roundtable_core", BrokenCore([]))
+    await _review(run, stage="plan", repo=str(repo), message="No changes.")
+    await _finish_round(run)
+    assert not app_module._panel_load(run.session_id).plan_ok
 
 
 async def test_a_crashing_round_steps_aside_instead_of_stranding_claude(chat, repo, monkeypatch):

@@ -32,6 +32,36 @@ def test_format_transcript_labels_and_you_tag():
     )
 
 
+def test_independent_review_keeps_own_findings_but_hides_peer_verdicts(monkeypatch):
+    monkeypatch.setattr(core, "_resolve_participant", lambda key: dict(core.PARTICIPANTS[key]))
+    monkeypatch.setattr(core, "_participant_provider_available", lambda key: True)
+    tid = core.roundtable_create("Review", ["gpt-5", "gemini-pro"], house_rules="old rules")["thread_id"]
+    core._append_message(tid, "user", "Keep ownership checks")
+    core._append_message(tid, "GPT Sol", "My prior objection")
+    core._append_message(tid, "Gemini Pro", "Everything is excellent")
+    seen = {}
+
+    def turn(thread, info, messages, instruction, **kwargs):
+        seen[info["label"]] = (thread, messages, instruction)
+        return core.ProviderResult(text="review")
+
+    monkeypatch.setattr(core, "_run_turn", turn)
+    core.roundtable_ask_parallel(
+        tid, ["gpt-5", "gemini-pro"], prompt="Review the revision",
+        independent=True, house_rules="current contract",
+        participant_prompts={"gpt-5": "Resolve F1", "gemini-pro": "No open issues"},
+    )
+    for label, peer in [("GPT Sol", "Gemini Pro"), ("Gemini Pro", "GPT Sol")]:
+        thread, messages, instruction = seen[label]
+        assert thread["house_rules"] == "current contract"
+        assert any(m["speaker"] == label for m in messages)
+        assert not any(m["speaker"] == peer for m in messages)
+        assert any(m["content"] == "Keep ownership checks" for m in messages)
+        assert instruction == ("Resolve F1" if label == "GPT Sol" else "No open issues")
+    # Independent presentation never erases the shared audit history.
+    assert "Everything is excellent" in core.roundtable_history(tid)
+
+
 # ─── context-cap trimming ────────────────────────────────────────────────
 
 def _msg(speaker, content, idx):

@@ -5,6 +5,7 @@
   const form = document.getElementById("chat-form");
   const promptEl = document.getElementById("prompt");
   const sendBtn = document.getElementById("send");
+  const queueBtn = document.getElementById("queue-message");
   const stopBtn = document.getElementById("stop");
   const statusEl = document.getElementById("status");
   const announcer = document.getElementById("status-announcer");
@@ -820,6 +821,7 @@
   function syncProviderAvailability() {
     const reason = providerBlockReason();
     sendBtn.disabled = !!reason;
+    if (queueBtn) queueBtn.disabled = !!reason;
     if (providerStatus) {
       providerStatus.textContent = reason;
       providerStatus.hidden = !reason;
@@ -2430,7 +2432,8 @@
     }
     sendBtn.hidden = false;
     syncProviderAvailability();
-    sendBtn.textContent = on ? "Queue" : "Send";
+    sendBtn.textContent = on ? "Send now" : "Send";
+    if (queueBtn) queueBtn.hidden = !on;
     stopBtn.hidden = !on;
   }
 
@@ -2649,7 +2652,12 @@
         return;
       }
     }
-    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId(), originRunId: currentRunId };
+    const queueOnly = e.submitter === queueBtn;
+    if (isStreaming && queueOnly && messageQueue.length >= MAX_QUEUE_LENGTH) {
+      announce("Queue is full. Your message is still in the text box.");
+      return;
+    }
+    const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId(), originRunId: currentRunId, steer: isStreaming && !queueOnly };
     promptEl.value = "";
     clearAttachments();
     if (forkNextSend) {
@@ -2687,15 +2695,18 @@
         await drainQueue();
         return;
       }
-      // Currently mid-turn — queue this for when the current run finishes.
-      // Cap so a long-idle tab can't accumulate messages + attachments
-      // unboundedly. The user can clear the queue or wait for the running
-      // turn to drain.
-      if (messageQueue.length >= MAX_QUEUE_LENGTH) {
-        setStatus(`Queue full (${MAX_QUEUE_LENGTH}). Wait for the current turn to finish, or stop it.`);
-        announce("Queue is full.");
+      if (!queueOnly) {
+        const res = await sendInExistingRun(entry);
+        if (res && !res.ok && messageQueue.indexOf(entry) === -1) {
+          entry.originRunId = currentRunId;
+          messageQueue.push(entry);
+          renderQueue();
+          announce("Message could not be sent now. Kept in the queue for retry.");
+        }
+        promptEl.focus();
         return;
       }
+      // Queue for later is explicit; Send now never interrupts the active turn.
       messageQueue.push(entry);
       renderQueue();
       announce(`Queued. ${messageQueue.length} message${messageQueue.length === 1 ? "" : "s"} pending.`);
@@ -2761,6 +2772,7 @@
     try {
       const fd = new FormData();
       fd.append("message", entry.text || "");
+      if (entry.steer) fd.append("steer", "true");
       if (entry.queue_id) fd.append("queue_id", entry.queue_id);
       // Carry the picker's current value so the server can compare it to
       // the run's spawned personality. If they disagree (mid-conversation

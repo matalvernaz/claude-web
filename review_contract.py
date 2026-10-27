@@ -1,0 +1,220 @@
+"""Evidence-backed panel replies and a persistent, reviewer-owned findings ledger.
+
+The provider still uses its repository tools. JSON is a transport format only;
+the chat receives readable prose. Matching a quote proves the citation exists,
+not that the reviewer's interpretation is correct.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import re
+from collections.abc import Callable
+
+
+CONTRACT = """Review contract:
+- Treat the author's explanation as claims to test, not established facts. Turn
+  assertions into questions: what would demonstrate or disprove this behavior?
+- First inspect the requirements and relevant source. Trace a concrete failure
+  case, including callers or tests when relevant, before deciding. Prior approval,
+  another reviewer's confidence, and 'intentional' are not correctness evidence.
+- The user's preferences set scope; they do not establish technical facts.
+- Report real defects, not style preferences. No criticism quota: clean work
+  should pass. Do not invent problems to sound skeptical.
+- An approval needs at least one meaningful check with a source quotation.
+  Explain the scenario checked and what the evidence shows. Never claim a test
+  ran merely because you read it. State material inspection limits separately.
+  For plans involving new code, a check may instead quote the user requirement
+  and the proposed step together. Implementation checks must cite source code.
+- Revisit each of YOUR open findings by its exact id. Mark it open, fixed, or
+  refuted, with a reason. Fixed/refuted needs evidence of the change or factual
+  correction; agreement with the author is not evidence. Do not silently drop it.
+- For a revised plan, quote the revised proposal when a planned step changes.
+  For implementation fixes, quote current repository code. Refutations require
+  repository evidence or an explicit user requirement, not just the proposal.
+- Return ONLY this JSON object (no Markdown, no extra verdict line):
+{"summary":"short assessment", "checks":[{"scenario":"failure case checked",
+"result":"what the inspected source establishes", "evidence":[
+{"source":"relative/path.py", "line":12, "quote":"exact excerpt from source line"}]}],
+"findings":[{"claim":"concrete new defect and its consequence", "evidence":[
+{"source":"relative/path.py", "line":12, "quote":"exact excerpt from source line"}]}],
+"resolutions":[{"id":"id supplied below", "status":"open|fixed|refuted",
+"reason":"why", "evidence":[]}], "limitations":[],
+"verdict":"approve|changes|abstain"}
+Evidence quotes must be exact nonempty excerpts from single lines, with 1-based line numbers.
+Use a repository-relative path, or @proposal / @requirements for the line-numbered
+current proposal and user requirements supplied below. Do not cite old proposals
+as current evidence. Findings/resolutions/checks are arrays; use [] when empty.
+Use abstain when you cannot inspect enough to judge, and explain in limitations.
+Keep the report concise. Do not repeat an existing finding as a new finding.
+"""
+
+
+def numbered(text: str) -> str:
+    return "\n".join(f"{i}: {line}" for i, line in enumerate(text.splitlines(), 1))
+
+
+def reviewer_prompt(proposal: str, requirements: str, findings: list[dict]) -> str:
+    return (
+        "Current proposal (@proposal), claims to verify:\n" + numbered(proposal)
+        + "\n\nUser requirements (@requirements):\n" + numbered(requirements)
+        + "\n\nYour outstanding findings (address every id in resolutions):\n"
+        + json.dumps([f for f in findings if f["status"] == "open"], ensure_ascii=False)
+    )
+
+
+def _text(obj: dict, key: str) -> str:
+    value = obj.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be nonempty text")
+    return value.strip()
+
+
+def _objects(obj: dict, key: str) -> list[dict]:
+    value = obj.get(key)
+    if not isinstance(value, list) or len(value) > 40 or not all(isinstance(v, dict) for v in value):
+        raise ValueError(f"{key} must be an array of at most 40 objects")
+    return value
+
+
+def assess(
+    text: str, previous: list[dict], *, stage: str,
+    read_line: Callable[[str, int], str | None],
+) -> dict:
+    """Validate a reply without ever deleting an unresolved previous finding.
+
+    ``read_line`` is permission-gated by the caller. A bad quote invalidates the
+    reply, rather than being accepted just because a model supplied file:line.
+    """
+    ledger = copy.deepcopy(previous)
+    report = None
+    try:
+        raw = re.sub(r"^\s*```(?:json)?\s*\n|\n```\s*$", "", text.strip())
+        report = json.loads(raw)
+        if not isinstance(report, dict):
+            raise ValueError("expected one JSON object")
+        summary = _text(report, "summary")
+        requested = _text(report, "verdict")
+        if requested not in {"approve", "changes", "abstain"}:
+            raise ValueError("unknown verdict")
+        limitations = report.get("limitations")
+        if (not isinstance(limitations, list) or len(limitations) > 40
+                or not all(isinstance(v, str) and v.strip() for v in limitations)):
+            raise ValueError("limitations must be an array of nonempty strings")
+
+        def evidence(item: dict, *, required: bool = True, repo: bool = False,
+                     allow_proposal: bool = True) -> list[dict]:
+            refs = _objects(item, "evidence")
+            if required and not refs:
+                raise ValueError("evidence is required")
+            for ref in refs:
+                source, quote = _text(ref, "source"), _text(ref, "quote")
+                line = ref.get("line")
+                if type(line) is not int or line < 1 or line > 2_000_000:
+                    raise ValueError("citation line must be a positive integer")
+                if "\n" in quote or "\r" in quote:
+                    raise ValueError("cite one exact source line at a time")
+                actual = read_line(source, line)
+                if actual is None or quote not in actual.strip():
+                    raise ValueError(f"citation does not match accessible source: {source}:{line}")
+                if not allow_proposal and source == "@proposal":
+                    raise ValueError("the author's proposal alone cannot refute a finding")
+                ref.update(source=source, quote=quote)
+            if repo and not any(not r["source"].strip().startswith("@") for r in refs):
+                raise ValueError("repository evidence is required")
+            return refs
+
+        checks = _objects(report, "checks")
+        findings = _objects(report, "findings")
+        resolutions = _objects(report, "resolutions")
+        for check in checks:
+            _text(check, "scenario")
+            _text(check, "result")
+            refs = evidence(check, repo=stage != "plan")
+            if stage == "plan":
+                sources = {r["source"].strip() for r in refs}
+                if all(s.startswith("@") for s in sources) and not {"@proposal", "@requirements"} <= sources:
+                    raise ValueError("a plan check needs repository evidence or both requirement and proposal")
+        for finding in findings:
+            _text(finding, "claim")
+            evidence(finding)
+        known = {f["id"]: f for f in ledger if f["status"] == "open"}
+        addressed = set()
+        for resolution in resolutions:
+            fid = _text(resolution, "id")
+            status = _text(resolution, "status")
+            _text(resolution, "reason")
+            if fid not in known or fid in addressed:
+                raise ValueError("resolution must name one of your open findings exactly once")
+            if status not in {"open", "fixed", "refuted"}:
+                raise ValueError("unknown resolution status")
+            evidence(resolution, required=status != "open",
+                     repo=status == "fixed" and stage == "changes",
+                     allow_proposal=status != "refuted")
+            if status == "fixed" and stage == "changes":
+                old_refs = {(r["source"], r["quote"].strip()) for r in known[fid].get("evidence", [])}
+                if old_refs and not any((r["source"], r["quote"].strip()) not in old_refs
+                                        for r in resolution["evidence"]):
+                    raise ValueError("a fix needs evidence of a change, not the same cited code")
+            addressed.add(fid)
+        # Validate the entire report before applying any resolution.
+        for resolution in resolutions:
+            known[resolution["id"]].update(
+                status=resolution["status"], resolution=copy.deepcopy(resolution),
+            )
+        for finding in findings:
+            # Stable ids belong to a reviewer, so peers cannot close their issues.
+            if any(f["status"] == "open" and f["claim"] == finding["claim"] for f in ledger):
+                continue
+            ledger.append({"id": f"F{len(ledger) + 1}", "status": "open",
+                           "claim": finding["claim"], "evidence": finding["evidence"]})
+        outstanding = [f for f in ledger if f["status"] == "open"]
+        problems = []
+        if set(known) - addressed:
+            problems.append("Earlier objections were not all addressed and remain open.")
+        if requested == "approve" and not checks:
+            problems.append("Approval has no source-backed check and was not accepted.")
+        if requested == "changes" and not outstanding:
+            problems.append("Changes were requested without a concrete finding.")
+        verdict = ("changes" if outstanding else
+                   "approve" if requested == "approve" and checks and not problems else "unclear")
+        parts = [summary]
+        for check in checks:
+            parts.append(f"Checked: {check['scenario']}. {check['result']} " + citations(check["evidence"]))
+        for finding in outstanding:
+            parts.append(f"{finding['id']}: {finding['claim']} " + citations(finding.get("evidence", [])))
+        for resolution in resolutions:
+            if resolution["status"] != "open":
+                parts.append(f"{resolution['id']} {resolution['status']}: {resolution['reason']} "
+                             + citations(resolution["evidence"]))
+        parts.extend("Not verified: " + line for line in limitations)
+        parts.extend(problems)
+        parts.append("VERDICT: " + {"approve": "APPROVE", "changes": "CHANGES NEEDED",
+                                   "unclear": "NOT VERIFIED"}[verdict])
+        return {"verdict": verdict, "text": "\n\n".join(parts), "ledger": ledger,
+                "report": report, "validation_error": None}
+    except (ValueError, TypeError, KeyError) as exc:
+        ledger = copy.deepcopy(previous)
+        # A badly formatted citation must not silently erase a newly raised
+        # objection. Keep it explicitly unverified until it is addressed.
+        if isinstance(report, dict) and isinstance(report.get("findings"), list):
+            for finding in report["findings"][:40]:
+                claim = finding.get("claim") if isinstance(finding, dict) else None
+                if isinstance(claim, str) and claim.strip() and not any(f["claim"] == claim for f in ledger):
+                    ledger.append({"id": f"F{len(ledger) + 1}", "status": "open", "claim": claim,
+                                   "evidence": [], "unverified": True})
+        # Preserve a legacy/free-form objection when a provider ignores the
+        # contract. It must still be answered explicitly on a subsequent round.
+        if re.search(r"VERDICT\s*:\s*CHANGES NEEDED", text, re.I):
+            if not any(f["claim"] == text for f in ledger):
+                ledger.append({"id": f"F{len(ledger) + 1}", "status": "open",
+                               "claim": text, "evidence": []})
+        display = report.get("summary", "") if isinstance(report, dict) else text
+        open_text = "\n".join(f"{f['id']}: {f['claim']}" for f in ledger if f["status"] == "open")
+        return {"verdict": "unclear", "ledger": ledger, "report": None,
+                "validation_error": str(exc),
+                "text": f"Review not verified: {exc}.\n\n{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
+
+
+def citations(refs: list[dict]) -> str:
+    return "; ".join(f"{r['source']}:{r['line']}" for r in refs)
