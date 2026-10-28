@@ -12,6 +12,7 @@ import pytest
 
 import app as app_module
 import panel
+import review_contract
 from tests import panel_support
 
 pytestmark = pytest.mark.skipif(
@@ -87,6 +88,26 @@ class FakeCore:
 APPROVE_ALL = {"responses": {"gpt-5": "Fine.\nVERDICT: APPROVE", "gemini-pro": "OK\nVERDICT: APPROVE"}}
 OBJECT = {"responses": {"gpt-5": "Bug at a.py:1\nVERDICT: CHANGES NEEDED",
                         "gemini-pro": "OK\nVERDICT: APPROVE"}}
+
+
+async def test_validator_faults_cannot_release_the_plan_gate(chat, repo, monkeypatch):
+    run, events, delivered = chat
+    core = FakeCore([APPROVE_ALL])
+    monkeypatch.setattr(app_module, "roundtable_core", core)
+
+    def faulty(*args, **kwargs):
+        raise RuntimeError("Injected validator failure")
+
+    monkeypatch.setattr(review_contract, "assess", faulty)
+    await _review(run, stage="plan", repo=str(repo), message="Change a to 2.")
+    await _finish_round(run)
+    state = app_module._panel_load(run.session_id)
+    assert not state.plan_ok and state.rounds["plan"] == 1
+    assert core.asks == 1
+    assert "Report validator failed" in delivered[-1]
+    assert "stepped aside" not in delivered[-1]
+    assert all(rows[0]["unreconciled_report"] for rows in state.review_ledger[str(repo)]["plan"].values())
+    assert next(e for e in events if e["type"] == "panel_verdict")["outcome"] == "changes"
 
 
 @pytest.mark.parametrize("round_no", [1, panel.MAX_ROUNDS])

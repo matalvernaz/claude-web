@@ -43,6 +43,7 @@ Claude see. app.py owns runs, events, delivery and the question card.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import hashlib
 import json
@@ -1121,19 +1122,30 @@ async def run_round(
             # for cores without callbacks. Assess and display each reply once.
             if p not in people or p in assessed:
                 return
-            assessed.add(p)
             if error is not None:
                 provider_errors[p] = error
+                assessed.add(p)
                 if p not in assessments:
                     show(p, "error", error, from_thread=True)
                 return
             raw_replies[p] = text or ""
-            read_line = evidence_reader(core, context, labels[p], message, requirements)
-            assessment = review_contract.assess(
-                raw_replies[p], ledger.get(p, []), stage=stage, read_line=read_line,
-            )
+            previous = ledger.get(p, [])
+            try:
+                read_line = evidence_reader(core, context, labels[p], message, requirements)
+                assessment = review_contract.assess(
+                    raw_replies[p], copy.deepcopy(previous), stage=stage, read_line=read_line,
+                )
+            except Exception as exc:  # A validator fault is not a provider outage.
+                assessment = review_contract.unverified_report(
+                    raw_replies[p], previous, f"Report validator failed: {type(exc).__name__}: {exc}",
+                )
+                # A local validator fault cannot be repaired by asking the AI
+                # again. Keep the report unverified until a later review can be
+                # validated; malformed provider reports still get correction.
+                assessment["correction_error"] = None
             assessments[p] = assessment
             ledger[p] = assessment["ledger"]
+            assessed.add(p)
             # A malformed report gets one private correction attempt before
             # being shown. Valid peers still stream immediately.
             if correcting or not assessment["correction_error"]:

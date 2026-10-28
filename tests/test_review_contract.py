@@ -244,3 +244,87 @@ def test_finding_state_survives_reload_and_resets_after_commit():
     restored.end_cycle()
     assert restored.review_ledger == {}
     assert restored.review_requirements == {}
+
+
+def malformed_report(payload):
+    # Peer reproduction: a missing opening quote makes the whole report unreadable.
+    return json.dumps(payload).replace('"quote": "', '"quote": ', 1)
+
+
+@pytest.mark.parametrize("verdict", ["approve", "changes"])
+def test_an_unreadable_report_cannot_be_silently_replaced_by_approval(reader, verdict):
+    obj = report(verdict=verdict)
+    if verdict == "changes":
+        obj["findings"] = [{"claim": "Nonowners can access the record", "evidence": evidence()}]
+    raw = malformed_report(obj)
+    first = review_contract.assess(raw, [], stage="changes", read_line=reader)
+    assert first["verdict"] == "unclear"
+    marker, = first["ledger"]
+    assert marker["status"] == "open" and marker["unreconciled_report"] == raw
+    assert marker["evidence"] == [] and marker["unverified"]
+    second = assess(reader, report(), first["ledger"])
+    assert second["verdict"] == "changes" and second["ledger"] == first["ledger"]
+    # Repeated malformed output must not inflate the ledger with duplicate markers.
+    assert review_contract.assess(raw, first["ledger"], stage="changes", read_line=reader)["ledger"] == first["ledger"]
+    state = panel.PanelState(review_ledger={"/repo": {"changes": {"gpt-5": first["ledger"]}}})
+    assert panel.PanelState.from_json(state.to_json()).review_ledger == state.review_ledger
+
+
+@pytest.mark.parametrize("with_evidence", [False, True])
+@pytest.mark.parametrize("status", ["fixed", "refuted"])
+def test_a_malformed_approval_is_repairable_with_explicit_evidenced_reconciliation(reader, with_evidence, status):
+    raw = malformed_report(report())
+    first = review_contract.assess(raw, [], stage="changes", read_line=reader)
+    obj = report(resolutions=[{
+        "id": "F1", "status": status,
+        "reason": "The unreadable report only approved the owner guard; the comparison still denies nonowners",
+        "evidence": evidence() if with_evidence else [],
+    }])
+    result = assess(reader, obj, first["ledger"])
+    assert result["verdict"] == ("approve" if with_evidence else "unclear")
+    assert result["ledger"][0]["status"] == (status if with_evidence else "open")
+
+
+def test_reconciling_an_unreadable_report_can_restate_a_still_open_defect(reader):
+    raw = malformed_report(report(verdict="changes", findings=[{
+        "claim": "The caller supplies another user's owner", "evidence": evidence(),
+    }]))
+    first = review_contract.assess(raw, [], stage="changes", read_line=reader)
+    corrected = report(verdict="changes", findings=[{
+        "claim": "The caller supplies another user's owner", "evidence": evidence(),
+    }], resolutions=[{
+        "id": "F1", "status": "fixed", "reason": "The unreadable report's objection is restated in findings",
+        "evidence": evidence(),
+    }])
+    result = assess(reader, corrected, first["ledger"])
+    assert result["verdict"] == "changes"
+    assert [f["status"] for f in result["ledger"]] == ["fixed", "open"]
+    assert result["ledger"][1]["claim"] == corrected["findings"][0]["claim"]
+
+
+@pytest.mark.parametrize("raw", ["null", "[]", '{"findings": {"claim": "Missing owner check"}}'])
+def test_unreadable_findings_are_kept_verbatim_until_reconciled(reader, raw):
+    first = review_contract.assess(raw, [], stage="changes", read_line=reader)
+    assert first["ledger"][0]["unreconciled_report"] == raw
+    assert assess(reader, report(), first["ledger"])["verdict"] == "changes"
+
+
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_a_resolved_objection_repeated_in_a_rejected_report_must_be_reconciled_again(reader, unreadable):
+    obj = report(verdict="changes", findings=[{
+        "claim": "Nonowners can access the record", "evidence": evidence(),
+    }])
+    if unreadable:
+        raw = malformed_report(obj)
+    else:
+        obj["checks"][0]["evidence"] = evidence(quote="nonexistent code")
+        raw = json.dumps(obj)
+    first = review_contract.assess(raw, [], stage="changes", read_line=reader)
+    resolved = assess(reader, report(resolutions=[{
+        "id": "F1", "status": "refuted", "reason": "The owner guard denies nonowners", "evidence": evidence(),
+    }]), first["ledger"])
+    assert resolved["verdict"] == "approve" and resolved["ledger"][0]["status"] == "refuted"
+    repeated = review_contract.assess(raw, resolved["ledger"], stage="changes", read_line=reader)
+    assert [f["status"] for f in repeated["ledger"]] == ["refuted", "open"]
+    assert repeated["ledger"][1]["id"] == "F2"
+    assert assess(reader, report(), repeated["ledger"])["verdict"] == "changes"
