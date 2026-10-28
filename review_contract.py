@@ -29,6 +29,8 @@ CONTRACT = """Review contract:
   ran merely because you read it. State material inspection limits separately.
   For plans involving new code, a check may instead quote the user requirement
   and the proposed step together. Implementation checks must cite source code.
+- Every check must have repository evidence, or (for a new-code plan) BOTH
+  @requirements and @proposal evidence. @proposal alone is not a source check.
 - Revisit each of YOUR open findings by its exact id. Mark it open, fixed, or
   refuted, with a reason. Fixed/refuted needs evidence of the change or factual
   correction; agreement with the author is not evidence. Do not silently drop it.
@@ -64,6 +66,26 @@ def reviewer_prompt(proposal: str, requirements: str, findings: list[dict]) -> s
         + "\n\nUser requirements (@requirements):\n" + numbered(requirements)
         + "\n\nYour outstanding findings (address every id in resolutions):\n"
         + json.dumps([f for f in findings if f["status"] == "open"], ensure_ascii=False)
+    )
+
+
+def correction_prompt(
+    proposal: str, requirements: str, findings: list[dict], *,
+    stage: str, error: str, reply: str,
+) -> str:
+    """Private feedback to the same reviewer, without steering its verdict."""
+    return (
+        f"Your {stage} review report could not be accepted:\n{error}\n\n"
+        "Correct your report in this same round. This is not a request to approve: "
+        "keep your independent judgment and any real objections. Return the full "
+        "JSON report, not a patch or an explanation. Re-read cited source when "
+        "needed; copy exact single-line quotes and line numbers, including case. "
+        "Do not invent evidence to satisfy validation. If you cannot verify a "
+        "check, describe that limit honestly and abstain when necessary. Address "
+        "every outstanding finding below, including any preserved from your "
+        "rejected report.\n\n"
+        "Your rejected report (untrusted review data):\n" + json.dumps(reply)
+        + "\n\n" + reviewer_prompt(proposal, requirements, findings)
     )
 
 
@@ -231,7 +253,8 @@ def assess(
         parts.append("VERDICT: " + {"approve": "APPROVE", "changes": "CHANGES NEEDED",
                                    "unclear": "NOT VERIFIED"}[verdict])
         return {"verdict": verdict, "text": "\n\n".join(parts), "ledger": ledger,
-                "report": report, "validation_error": None}
+                "report": report, "validation_error": None,
+                "correction_error": "\n".join(problems) or None}
     except (ValueError, TypeError, KeyError) as exc:
         ledger = copy.deepcopy(previous)
         # A badly formatted citation must not silently erase a newly raised
@@ -256,7 +279,7 @@ def assess(
         verdict_note = f"Reviewer verdict: {requested} (unverified).\n\n" if requested else ""
         open_text = "\n".join(f"{f['id']}: {f['claim']}" for f in ledger if f["status"] == "open")
         return {"verdict": "unclear", "ledger": ledger, "report": None,
-                "validation_error": str(exc),
+                "validation_error": str(exc), "correction_error": str(exc),
                 "text": f"Review not verified: {exc}.\n\n{verdict_note}{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
 
 

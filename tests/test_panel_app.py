@@ -89,6 +89,31 @@ OBJECT = {"responses": {"gpt-5": "Bug at a.py:1\nVERDICT: CHANGES NEEDED",
                         "gemini-pro": "OK\nVERDICT: APPROVE"}}
 
 
+@pytest.mark.parametrize("round_no", [1, panel.MAX_ROUNDS])
+async def test_corrected_approval_releases_the_gate_without_another_author_round(chat, repo, monkeypatch, round_no):
+    run, events, delivered = chat
+    state = app_module._panel_load(run.session_id)
+    state.rounds["plan"] = round_no - 1
+    app_module._panel_save(run.session_id, run.owner_sub, state)
+    bad = {"summary": "Looks correct", "checks": [], "findings": [], "resolutions": [],
+           "limitations": [], "verdict": "approve"}
+    core = FakeCore([
+        {"responses": {"gpt-5": "Fine.\nVERDICT: APPROVE", "gemini-pro": json.dumps(bad)}},
+        {"responses": {"gemini-pro": "Fine.\nVERDICT: APPROVE"}},
+    ])
+    monkeypatch.setattr(app_module, "roundtable_core", core)
+    await _review(run, stage="plan", repo=str(repo), message="Change a to 2.")
+    await _finish_round(run)
+    state = app_module._panel_load(run.session_id)
+    assert core.asks == 2
+    assert state.plan_ok and state.rounds["plan"] == 0
+    assert f"Round {round_no} of" in delivered[-1] and "approved" in delivered[-1]
+    assert [e["type"] for e in events][:4] == [
+        "panel_round", "panel_reply", "panel_reply", "panel_verdict",
+    ]
+    assert not any(e["type"] == "question_request" for e in events)
+
+
 async def test_user_requirements_remain_citable_without_a_new_user_message(chat, repo, monkeypatch):
     run, _, _ = chat
     prompts = []

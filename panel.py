@@ -1025,6 +1025,8 @@ async def run_round(
     messages and Claude's message, then asks every participant in parallel.
     Each blocking library call runs in a worker thread. ``emit`` gets the
     events the chat shows; it's called on the event loop.
+    Malformed or incomplete reports get one private correction attempt in the
+    same round. A failed correction retains the unverified report and findings.
     """
     labels = {p: core.PARTICIPANTS[p]["label"] for p in participants}
     tid = thread_id
@@ -1092,63 +1094,96 @@ async def run_round(
     context = core._effective_tool_context(tid) if repo_bound else None
     if requirements is None:
         requirements = "\n\n".join(notes)
-    assessed: dict[str, dict] = {}
     loop = asyncio.get_running_loop()
     shown: set[str] = set()
+    assessments: dict[str, dict] = {}
+    raw_replies: dict[str, str] = {}
+    provider_errors: dict[str, str] = {}
 
-    def assess_reply(participant: str, text: str) -> dict:
-        if participant not in assessed:
-            read_line = evidence_reader(core, context, labels[participant], message, requirements)
-            assessed[participant] = review_contract.assess(
-                text, ledger.get(participant, []), stage=stage, read_line=read_line,
-            )
-            ledger[participant] = assessed[participant]["ledger"]
-        return assessed[participant]
-
-    def _reply_event(p: str, text: Optional[str], error: Optional[str]) -> dict:
-        assessment = assess_reply(p, text or "") if error is None else None
-        return {
-            "type": "panel_reply", "stage": stage, "round": round_no,
-            "participant": labels[p],
-            "verdict": "error" if error is not None else assessment["verdict"],
-            "text": error if error is not None else assessment["text"],
-        }
-
-    def _landed(p: str, text: Optional[str], error: Optional[str]) -> None:
-        # On the library's thread: hand each reply to the loop as it lands,
-        # so the chat shows GPT at three minutes rather than everyone at six.
-        if p in labels and p not in shown:
+    def show(p: str, verdict: str, text: str, *, from_thread: bool = False) -> None:
+        if p not in shown:
             shown.add(p)
-            loop.call_soon_threadsafe(emit, _reply_event(p, text, error))
+            event = {
+                "type": "panel_reply", "stage": stage, "round": round_no,
+                "participant": labels[p], "verdict": verdict, "text": text,
+            }
+            if from_thread:
+                loop.call_soon_threadsafe(emit, event)
+            else:
+                emit(event)
 
-    result = await asyncio.to_thread(
-        core.roundtable_ask_parallel, tid, list(participants),
-        prompt=round_prompt(stage, round_no, max_rounds, repo, plan_reviewed, diff_note),
-        effort=effort, tool_use_context=context,
-        on_result=_landed, independent=True, house_rules=house_rules(user_label),
-        participant_prompts={p: review_contract.reviewer_prompt(
+    async def ask(people: list[str], prompts: dict[str, str], prompt: str = "", *,
+                  correcting: bool = False) -> None:
+        assessed: set[str] = set()
+
+        def landed(p: str, text: Optional[str], error: Optional[str]) -> None:
+            # Called on the library's worker thread, then again as a fallback
+            # for cores without callbacks. Assess and display each reply once.
+            if p not in people or p in assessed:
+                return
+            assessed.add(p)
+            if error is not None:
+                provider_errors[p] = error
+                if p not in assessments:
+                    show(p, "error", error, from_thread=True)
+                return
+            raw_replies[p] = text or ""
+            read_line = evidence_reader(core, context, labels[p], message, requirements)
+            assessment = review_contract.assess(
+                raw_replies[p], ledger.get(p, []), stage=stage, read_line=read_line,
+            )
+            assessments[p] = assessment
+            ledger[p] = assessment["ledger"]
+            # A malformed report gets one private correction attempt before
+            # being shown. Valid peers still stream immediately.
+            if correcting or not assessment["correction_error"]:
+                show(p, assessment["verdict"], assessment["text"], from_thread=True)
+
+        result = await asyncio.to_thread(
+            core.roundtable_ask_parallel, tid, people, prompt=prompt,
+            effort=effort, tool_use_context=context, on_result=landed,
+            independent=True, house_rules=house_rules(user_label), participant_prompts=prompts,
+        )
+        for p in people:
+            if p in (result.get("responses") or {}):
+                await asyncio.to_thread(landed, p, str(result["responses"][p] or ""), None)
+            elif p in (result.get("errors") or {}):
+                await asyncio.to_thread(landed, p, None, str(result["errors"][p]))
+
+    await ask(list(participants), {p: review_contract.reviewer_prompt(
             message, requirements, ledger.get(p, []),
         ) for p in participants},
+        round_prompt(stage, round_no, max_rounds, repo, plan_reviewed, diff_note),
     )
+    retry = [p for p in participants if p in assessments and assessments[p]["correction_error"]]
+    if retry:
+        prompts = {p: review_contract.correction_prompt(
+            message, requirements, ledger.get(p, []), stage=stage,
+            error=assessments[p]["correction_error"], reply=raw_replies[p],
+        ) for p in retry}
+        try:
+            await ask(retry, prompts, correcting=True)
+        except Exception as exc:  # A failed correction must keep the rejected report and its objections.
+            for p in retry:
+                if p not in shown:
+                    provider_errors[p] = f"Report correction failed: {type(exc).__name__}: {exc}"
+
     replies: list[dict] = []
     errors: list[dict] = []
     for p in participants:
-        if p in (result.get("responses") or {}):
-            text = str(result["responses"][p] or "")
-            assessment = await asyncio.to_thread(assess_reply, p, text)
+        if p in assessments:
+            assessment = assessments[p]
             replies.append({"participant": p, "label": labels[p],
                             "verdict": assessment["verdict"], "text": assessment["text"]})
-            if p not in shown:
-                emit(_reply_event(p, text, None))
-        elif p in (result.get("errors") or {}):
-            err = str(result["errors"][p])
+            show(p, assessment["verdict"], assessment["text"])
+        if p in provider_errors:
+            err = provider_errors[p]
             errors.append({"participant": p, "label": labels[p], "error": err})
-            if p not in shown:
-                emit(_reply_event(p, None, err))
+            show(p, "error", err)
     # An unavailable reviewer cannot silently withdraw its earlier objection.
     open_findings = any(f["status"] == "open" for rows in ledger.values() for f in rows)
     for p, rows in ledger.items():
-        if p not in assessed and any(f["status"] == "open" for f in rows):
+        if p not in assessments and any(f["status"] == "open" for f in rows):
             replies.append({"participant": p, "label": labels.get(p, p), "verdict": "changes",
                             "text": "Earlier objections remain unresolved:\n" + "\n".join(
                                 f"{f['id']}: {f['claim']}" for f in rows if f["status"] == "open")})
