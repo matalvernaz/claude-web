@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 import panel
+import review_contract
 from roundtable import core
 
 
@@ -99,8 +100,13 @@ def test_changes_correction_requires_current_repository_evidence_and_keeps_its_s
     ("empty", "Approval has no source-backed check"),
 ])
 def test_only_the_invalid_reviewer_corrects_its_report_in_the_same_round(review, kind, error):
+    corrected = report()
+    if kind == "json":
+        corrected["resolutions"] = [{"id": "F1", "status": "refuted",
+                                     "reason": "The unreadable report only approved; inspected guard denies nonowners",
+                                     "evidence": refs()}]
     result, calls, events = review({
-        "GPT Sol": [report()], "Gemini Pro": [invalid_report(kind), report()],
+        "GPT Sol": [report()], "Gemini Pro": [invalid_report(kind), corrected],
     })
     assert result.outcome == "approved"
     assert [c[0] for c in calls].count("GPT Sol") == 1
@@ -193,3 +199,88 @@ def test_a_crashing_correction_request_cannot_make_the_panel_step_aside(review, 
     assert result.outcome == "changes"
     assert "correction request crashed" in result.errors[0]["error"]
     assert len(events) == 3
+
+
+@pytest.mark.parametrize("resolved", [False, True])
+def test_malformed_objection_requires_explicit_reconciliation_in_the_correction(review, resolved):
+    bad = report(verdict="changes", findings=[{"claim": "Nonowners can access the record", "evidence": refs()}])
+    raw = json.dumps(bad).replace('"quote": "return owner', '"quote": return owner', 1)
+    corrected = report()
+    if resolved:
+        corrected["resolutions"] = [{"id": "F1", "status": "refuted",
+                                     "reason": "The unreadable report claimed missing ownership; the guard denies nonowners",
+                                     "evidence": refs()}]
+    result, calls, _ = review({"GPT Sol": [report()], "Gemini Pro": [raw, corrected]})
+    assert result.outcome == ("approved" if resolved else "changes")
+    assert result.review_ledger["gemini-pro"][0]["status"] == ("refuted" if resolved else "open")
+    assert result.review_ledger["gemini-pro"][0]["unreconciled_report"] == raw
+    assert "Nonowners can access the record" in calls[-1][2]
+    assert '"id": "F1"' in calls[-1][2]
+
+
+@pytest.mark.parametrize("callbacks", [False, True])
+@pytest.mark.parametrize("phase", ["initial", "correction"])
+def test_validator_faults_retain_the_report_and_ledger_without_becoming_outages(review, monkeypatch, callbacks, phase):
+    previous = [{"id": "F1", "status": "open", "claim": "Nonowners can access the record", "evidence": refs()}]
+    failing = report(summary="Simulate a validator fault", resolutions=[{
+        "id": "F1", "status": "refuted", "reason": "The guard denies other users", "evidence": refs(),
+    }])
+    raw = json.dumps(failing)
+    original_assess = review_contract.assess
+
+    def faulty_assess(text, old, **kwargs):
+        if "Simulate a validator fault" in text:
+            old[0]["status"] = "refuted"  # Partial mutation before the fault must roll back.
+            raise RuntimeError("Injected validator failure")
+        return original_assess(text, old, **kwargs)
+
+    monkeypatch.setattr(review_contract, "assess", faulty_assess)
+    if not callbacks:
+        original_ask = core.roundtable_ask_parallel
+
+        def ask(*args, **kwargs):
+            kwargs["on_result"] = None
+            return original_ask(*args, **kwargs)
+
+        monkeypatch.setattr(core, "roundtable_ask_parallel", ask)
+    scripts = [failing] if phase == "initial" else [invalid_report("citation"), failing]
+    result, calls, events = review({"GPT Sol": [report()], "Gemini Pro": scripts},
+                                  review_ledger={"gemini-pro": previous})
+    assert result.outcome == "changes"
+    assert result.errors == []  # Local validation failure must not be classified as provider outage.
+    gemini = next(r for r in result.replies if r["participant"] == "gemini-pro")
+    assert gemini["verdict"] == "unclear"
+    assert "Report validator failed: RuntimeError: Injected validator failure" in gemini["text"]
+    assert raw in gemini["text"]
+    ledger = result.review_ledger["gemini-pro"]
+    assert ledger[0] == previous[0] and previous[0]["status"] == "open"
+    assert ledger[1]["unreconciled_report"] == raw and ledger[1]["status"] == "open"
+    assert len(calls) == (2 if phase == "initial" else 3)
+    assert len([e for e in events if e.get("participant") == "Gemini Pro"]) == 1
+    assert next(e for e in events if e.get("participant") == "Gemini Pro")["verdict"] == "unclear"
+
+
+def test_all_validator_faults_cannot_make_the_panel_step_aside(review, monkeypatch):
+    def faulty(*args, **kwargs):
+        raise RuntimeError("Validator unavailable")
+
+    monkeypatch.setattr(review_contract, "assess", faulty)
+    result, calls, events = review({"GPT Sol": [report()], "Gemini Pro": [report()]})
+    assert result.outcome == "changes" and result.errors == []
+    assert len(calls) == 2 and len(result.replies) == 2
+    assert all(r["verdict"] == "unclear" for r in result.replies)
+    assert all(rows[0]["status"] == "open" for rows in result.review_ledger.values())
+    assert len(events) == 3
+
+
+@pytest.mark.parametrize("old_objection", [False, True])
+def test_actual_provider_outages_keep_their_existing_behavior(review, old_objection):
+    old = {"gemini-pro": [{"id": "F1", "status": "open", "claim": "Missing owner check",
+                           "evidence": refs()}]} if old_objection else {}
+    result, calls, events = review({
+        "GPT Sol": [RuntimeError("provider unavailable")],
+        "Gemini Pro": [RuntimeError("provider unavailable")],
+    }, review_ledger=old)
+    assert result.outcome == ("changes" if old_objection else "unavailable")
+    assert result.review_ledger == old
+    assert len(result.errors) == 2 and len(calls) == 2 and len(events) == 3

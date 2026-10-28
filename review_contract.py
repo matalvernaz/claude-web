@@ -34,6 +34,16 @@ CONTRACT = """Review contract:
 - Revisit each of YOUR open findings by its exact id. Mark it open, fixed, or
   refuted, with a reason. Fixed/refuted needs evidence of the change or factual
   correction; agreement with the author is not evidence. Do not silently drop it.
+- EVERY fixed or refuted resolution must have its OWN nonempty evidence array,
+  including resolutions of unreconciled_report items. Evidence in checks does
+  not count for a resolution: repeat those citations in the resolution itself
+  if appropriate. Only a resolution with status=open may use evidence: [].
+- A ledger item with unreconciled_report retains a prior report that could not
+  be read or validated completely. Read that raw report and explicitly reconcile
+  its objections in the resolution reason. Restate still-open defects as findings,
+  or fix/refute them with evidence. If it contained only approval, explain that
+  and support the resolution with inspected evidence. Correcting JSON alone or
+  returning a new verdict does not resolve this item. If unsure, keep it open.
 - For a revised plan, quote the revised proposal when a planned step changes.
   For implementation fixes, quote current repository code. Refutations require
   repository evidence or an explicit user requirement, not just the proposal.
@@ -44,7 +54,8 @@ CONTRACT = """Review contract:
 "findings":[{"claim":"concrete new defect and its consequence", "evidence":[
 {"source":"relative/path.py", "line":12, "quote":"exact excerpt from source line"}]}],
 "resolutions":[{"id":"id supplied below", "status":"open|fixed|refuted",
-"reason":"why", "evidence":[]}], "limitations":[],
+"reason":"why", "evidence":[
+{"source":"relative/path.py", "line":12, "quote":"exact excerpt supporting this resolution"}]}], "limitations":[],
 "verdict":"approve|changes|abstain"}
 Evidence quotes must be exact nonempty excerpts from single lines, with 1-based line numbers.
 Copy line numbers from Read or Grep output rather than estimating them.
@@ -83,7 +94,9 @@ def correction_prompt(
         "Do not invent evidence to satisfy validation. If you cannot verify a "
         "check, describe that limit honestly and abstain when necessary. Address "
         "every outstanding finding below, including any preserved from your "
-        "rejected report.\n\n"
+        "rejected report. EVERY fixed/refuted resolution needs its own nonempty "
+        "evidence array, even when reconciling an unreadable report or repeating "
+        "citations from checks. evidence: [] is allowed only for status=open.\n\n"
         "Your rejected report (untrusted review data):\n" + json.dumps(reply)
         + "\n\n" + reviewer_prompt(proposal, requirements, findings)
     )
@@ -124,6 +137,51 @@ def _quote_line(source: str, line: int, quote: str, read_line: Callable) -> int 
             if len(matches) > 1:
                 return None
     return matches[0] if matches else None
+
+
+def unverified_report(text: str, previous: list[dict], error: str, *, parsed=None) -> dict:
+    """Retain claims, or the whole report when its objections cannot be read.
+
+    Never repair JSON heuristically or treat recovered quotations as evidence.
+    Unreadable reports become reviewer-owned reconciliation items so a later
+    approval cannot silently replace a report that might have raised objections.
+    This also provides a fail-closed result for unexpected validator failures.
+    """
+    ledger = copy.deepcopy(previous)
+    findings = parsed.get("findings") if isinstance(parsed, dict) else None
+    readable = (isinstance(findings, list) and len(findings) <= 40
+                and all(isinstance(f, dict) and isinstance(f.get("claim"), str)
+                        and f["claim"].strip() for f in findings))
+    if isinstance(findings, list):
+        for finding in findings[:40]:
+            claim = finding.get("claim") if isinstance(finding, dict) else None
+            if (isinstance(claim, str) and claim.strip()
+                    and not any(f["claim"] == claim and f["status"] == "open" for f in ledger)):
+                ledger.append({"id": f"F{len(ledger) + 1}", "status": "open", "claim": claim,
+                               "evidence": [], "unverified": True})
+    if not readable and not any(f.get("unreconciled_report") == text and f["status"] == "open" for f in ledger):
+        ledger.append({
+            "id": f"F{len(ledger) + 1}", "status": "open", "unverified": True,
+            "claim": "Reconcile the earlier unreadable review report and any objections it contains. "
+                     "A replacement verdict alone cannot clear this item.",
+            "evidence": [], "unreconciled_report": text,
+        })
+    # A readable JSON report can also contain a legacy/free-form objection.
+    # Unreadable reports are already retained verbatim above.
+    if readable and re.search(r"VERDICT\s*:\s*CHANGES NEEDED", text, re.I):
+        if not any(f["claim"] == text and f["status"] == "open" for f in ledger):
+            ledger.append({"id": f"F{len(ledger) + 1}", "status": "open",
+                           "claim": text, "evidence": []})
+    display = parsed.get("summary", "") if isinstance(parsed, dict) else text
+    requested = parsed.get("verdict") if isinstance(parsed, dict) else None
+    requested = {"approve": "APPROVE", "changes": "CHANGES NEEDED", "abstain": "ABSTAIN"}.get(
+        requested if isinstance(requested, str) else "",
+    )
+    verdict_note = f"Reviewer verdict: {requested} (unverified).\n\n" if requested else ""
+    open_text = "\n".join(f"{f['id']}: {f['claim']}" for f in ledger if f["status"] == "open")
+    return {"verdict": "unclear", "ledger": ledger, "report": None,
+            "validation_error": error, "correction_error": error,
+            "text": f"Review not verified: {error}.\n\n{verdict_note}{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
 
 
 def assess(
@@ -256,31 +314,7 @@ def assess(
                 "report": report, "validation_error": None,
                 "correction_error": "\n".join(problems) or None}
     except (ValueError, TypeError, KeyError) as exc:
-        ledger = copy.deepcopy(previous)
-        # A badly formatted citation must not silently erase a newly raised
-        # objection. Keep it explicitly unverified until it is addressed.
-        if isinstance(report, dict) and isinstance(report.get("findings"), list):
-            for finding in report["findings"][:40]:
-                claim = finding.get("claim") if isinstance(finding, dict) else None
-                if isinstance(claim, str) and claim.strip() and not any(f["claim"] == claim for f in ledger):
-                    ledger.append({"id": f"F{len(ledger) + 1}", "status": "open", "claim": claim,
-                                   "evidence": [], "unverified": True})
-        # Preserve a legacy/free-form objection when a provider ignores the
-        # contract. It must still be answered explicitly on a subsequent round.
-        if re.search(r"VERDICT\s*:\s*CHANGES NEEDED", text, re.I):
-            if not any(f["claim"] == text for f in ledger):
-                ledger.append({"id": f"F{len(ledger) + 1}", "status": "open",
-                               "claim": text, "evidence": []})
-        display = report.get("summary", "") if isinstance(report, dict) else text
-        requested = report.get("verdict") if isinstance(report, dict) else None
-        requested = {"approve": "APPROVE", "changes": "CHANGES NEEDED", "abstain": "ABSTAIN"}.get(
-            requested if isinstance(requested, str) else "",
-        )
-        verdict_note = f"Reviewer verdict: {requested} (unverified).\n\n" if requested else ""
-        open_text = "\n".join(f"{f['id']}: {f['claim']}" for f in ledger if f["status"] == "open")
-        return {"verdict": "unclear", "ledger": ledger, "report": None,
-                "validation_error": str(exc), "correction_error": str(exc),
-                "text": f"Review not verified: {exc}.\n\n{verdict_note}{display}\n\n{open_text}\n\nVERDICT: NOT VERIFIED"}
+        return unverified_report(text, previous, str(exc), parsed=report)
 
 
 def citations(refs: list[dict]) -> str:
