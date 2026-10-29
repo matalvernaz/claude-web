@@ -8318,12 +8318,16 @@ async def _panel_deliver(sid: str, origin: "ActiveRun", text: str) -> None:
     """Hand the panel's answer to Claude as the chat's next message.
 
     Delivered to whichever run serves the chat now (an account switch may
-    have replaced the one that started the round). With none, it waits in
-    the record and rides in front of the user's next message.
+    have replaced the one that started the round). It goes in as steering, so
+    it reaches a turn still in progress at its next step instead of waiting
+    for the turn to end. With no run, it waits in the record and rides in
+    front of the user's next message.
     """
     target = ACTIVE_RUNS_BY_SESSION.get(sid)
     if target is not None and not target.done:
-        reason = await _inject_user_input(target, text, [], 0, 0, announce=False)
+        reason = await _inject_user_input(
+            target, text, [], 0, 0, announce=False, steer=True,
+        )
         if reason is None:
             return
     state = _panel_load(sid) or panel.PanelState(enabled=True)
@@ -8760,6 +8764,10 @@ class ActiveRun:
         # inline; a synth would be redundant noise and would burn the
         # MAX_CONSECUTIVE_AUTO_FIRES cap on no-op follow-ups).
         self.bg_tool_use_ids: set[str] = set()
+        # The CLI's live background tasks, as its last background_tasks_changed
+        # listed them (see _track_background_tasks). While any are running, an
+        # idle conversation stays open instead of closing and killing them.
+        self.background_tasks: set[str] = set()
         self.last_activity: float = now
         # The live SDK client, published once the driver has finished the
         # initial query. Held only as a debug breadcrumb / capability
@@ -10322,6 +10330,12 @@ RUN_RETENTION_SECONDS = PERSIST_RETENTION_SECONDS
 _ZOMBIE_RUN_GRACE_SECONDS = 30.0
 AUTO_FIRE_GRACE_MS = 1500  # buffer late task notifications this long before auto-firing
 SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000  # close idle conversation after 10 min
+# A quiet conversation whose CLI still has background work running (a Bash in
+# the background, an agent, a workflow) stays open past the idle timeout, since
+# closing it kills that work. This caps how long it may stay quiet that way, so
+# a silent or stale task can't pin a CLI for good.
+BACKGROUND_KEEPALIVE_SECONDS = float(
+    os.getenv("CLAUDE_WEB_BACKGROUND_KEEPALIVE_HOURS", "6") or 0) * 3600
 # Mid-turn silence cap: when the CLI is mid-turn (run.between_turns=False) the
 # normal idle timeout doesn't apply — a Bash that takes 20 min or a Monitor
 # watching a slow process emits nothing while it's working. But we still need
@@ -14491,6 +14505,9 @@ async def api_chat(
 
         try:
             async with _sdk_client(options, run, stderr_buf) as client:
+                # A CLI that has just started has no background work, and
+                # says nothing about it until some starts.
+                run.background_tasks = set()
                 pump_task = asyncio.create_task(_pump_messages(client))
                 try:
                     # Send the initial query, then publish run.client so
@@ -14865,6 +14882,7 @@ async def api_chat(
                                     )
 
                             _apply_turn_state(run, msg, evts)
+                            _track_background_tasks(run, msg)
 
                         # Set once a queued/deferred message actually reaches the
                         # CLI this round, so the continue below fires and we don't
@@ -15067,6 +15085,10 @@ async def api_chat(
                             # A panel round (or the user's decision on one) is
                             # still going, and its answer is delivered into this
                             # run: idling out now would strand it.
+                            continue
+                        if _background_work_keeps_open(run):
+                            # Closing now would kill the CLI's background
+                            # work; its end wakes the conversation instead.
                             continue
                         # Idle timeout with nothing pending — exit cleanly.
                         break
@@ -16035,6 +16057,49 @@ def _is_local_command_echo(msg) -> bool:
         content = content[0].text
     return (isinstance(content, str)
             and content.lstrip().startswith(_LOCAL_COMMAND_OUTPUT_MARKERS))
+
+
+def _track_background_tasks(run: "ActiveRun", msg) -> None:
+    """Keep ``run.background_tasks`` equal to the CLI's live background work.
+
+    The CLI sends the whole set (``background_tasks_changed``) each time it
+    changes, so every payload replaces the last; pairing task_started with
+    task_notification instead could leave a stale entry when one is missed.
+    Ambient tasks are the CLI's own housekeeping and don't count. A CLI that
+    never sends the set leaves it empty, so its conversation idles out as
+    before.
+    """
+    if not isinstance(msg, SystemMessage) or msg.subtype != "background_tasks_changed":
+        return
+    tasks = (msg.data or {}).get("tasks")
+    if not isinstance(tasks, list):
+        return
+    run.background_tasks = {
+        str(task["task_id"]) for task in tasks
+        if isinstance(task, dict) and task.get("task_id") and not task.get("ambient")
+    }
+
+
+def _background_work_keeps_open(run: "ActiveRun") -> bool:
+    """Whether an idled-out conversation stays open for its background work.
+
+    Only while the CLI reports background tasks running, and only until the
+    conversation has been quiet for BACKGROUND_KEEPALIVE_SECONDS.
+    """
+    if not run.background_tasks:
+        return False
+    quiet_for = time.time() - run.last_activity
+    if quiet_for < BACKGROUND_KEEPALIVE_SECONDS:
+        log.info(
+            "run %s idle but kept open: %d background task(s) still running",
+            run.run_id, len(run.background_tasks),
+        )
+        return True
+    log.warning(
+        "run %s closing after %.0f s quiet although %d background task(s) "
+        "were still running", run.run_id, quiet_for, len(run.background_tasks),
+    )
+    return False
 
 
 def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
