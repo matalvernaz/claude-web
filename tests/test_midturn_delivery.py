@@ -3,7 +3,15 @@ import asyncio
 import contextlib
 
 import pytest
-from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 from starlette.datastructures import FormData
 from starlette.requests import Request
 
@@ -88,6 +96,42 @@ async def test_steering_is_not_lost_when_a_provider_message_arrives_together(dri
     await app_module._inject_user_input(run, "Also check errors", [], 0, 0, steer=True)
     await wait_queries(driver, 2)
     assert driver["queries"][-1] == "Also check errors"
+
+
+async def test_a_queued_message_reaches_the_cli_while_a_background_agent_talks(driver):
+    """A background Agent keeps working after the turn that started it ends.
+
+    Its messages carry the Agent call's parent_tool_use_id. Read as the start
+    of a new turn, they held every ordinary message in the queue until the
+    agent finished. On 2026-10-31 a chat sat on "why did you stop" for six
+    minutes, and the Stop pressed meanwhile killed the agent.
+    """
+    run = driver["run"]
+    driver["messages"].put_nowait(ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=1, session_id="steering-session",
+    ))
+    # The agent runs a command, gets its result, then says what it is doing.
+    driver["messages"].put_nowait(AssistantMessage(
+        content=[ToolUseBlock(id="tu_sub_bash", name="Bash", input={"command": "ls"})],
+        model="sonnet", parent_tool_use_id="tu_agent",
+    ))
+    driver["messages"].put_nowait(UserMessage(
+        content=[ToolResultBlock(tool_use_id="tu_sub_bash", content="ok")],
+        parent_tool_use_id="tu_agent",
+    ))
+    driver["messages"].put_nowait(AssistantMessage(
+        content=[TextBlock(text="Pushing the scripts to the Mac.")],
+        model="sonnet", parent_tool_use_id="tu_agent",
+    ))
+    async with asyncio.timeout(3):
+        while not any(e.get("type") == "subagent_text" for e in run.events):
+            await asyncio.sleep(0.01)
+    assert run.between_turns
+
+    await app_module._inject_user_input(run, "why did you stop", [], 0, 0)
+    await wait_queries(driver, 2)
+    assert driver["queries"][-1] == "why did you stop"
 
 
 async def test_steering_counts_toward_the_backlog_cap_and_finish_reports_undelivered(monkeypatch):

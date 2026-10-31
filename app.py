@@ -16126,6 +16126,16 @@ def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
         _notify_turn_complete(run)
         _reset_turn_digest(run)
     elif isinstance(msg, (AssistantMessage, UserMessage)):
+        if msg.parent_tool_use_id is not None:
+            # A subagent's own message (forward_subagent_text) says nothing
+            # about the main turn. A foreground Agent call already opened the
+            # turn with the parent's tool_use. A background one keeps talking
+            # after the parent's ResultMessage; reading its messages as a turn
+            # start held every queued message until the agent finished
+            # (2026-10-31: a chat sat on "why did you stop" while its
+            # background agent worked). The interrupt-echo flag is left armed
+            # too, so the agent can't use it up before the real echo arrives.
+            return
         # After client.interrupt(), the CLI echoes the interrupt marker
         # ("[Request interrupted by user]") as a bare UserMessage AFTER the
         # turn's ResultMessage. The echo opens no turn and translates to no
@@ -16139,7 +16149,6 @@ def _apply_turn_state(run: "ActiveRun", msg, evts: list[dict]) -> None:
             run.expect_interrupt_echo
             and run.between_turns
             and isinstance(msg, UserMessage)
-            and msg.parent_tool_use_id is None
             and not evts
         )
         run.expect_interrupt_echo = False

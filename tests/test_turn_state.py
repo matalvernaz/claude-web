@@ -16,6 +16,7 @@ from claude_agent_sdk.types import (
     ResultMessage,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
 )
 
@@ -164,3 +165,63 @@ def test_assistant_message_starts_turn_and_stamps_clock(run) -> None:
     app_module._apply_turn_state(run, msg, [{"type": "assistant"}])
     assert run.between_turns is False
     assert run.turn_started_at >= before
+
+
+def _subagent_messages() -> list:
+    """What a running Agent forwards: a tool call, its result, then narration.
+    Every one carries the parent Agent call's tool_use id."""
+    return [
+        AssistantMessage(
+            content=[ToolUseBlock(id="tu_sub", name="Bash", input={"command": "ls"})],
+            model="sonnet", parent_tool_use_id="tu_agent",
+        ),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="tu_sub", content="ok")],
+            uuid="u-sub-result", parent_tool_use_id="tu_agent",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="Pushing the scripts to the Mac.")],
+            model="sonnet", parent_tool_use_id="tu_agent",
+        ),
+    ]
+
+
+def test_background_subagent_after_the_result_keeps_the_run_idle(run) -> None:
+    """A background Agent outlives the turn that started it. Its messages must
+    not reopen that turn, or queued input waits until the agent finishes
+    (2026-10-31: a chat froze while its background agent worked)."""
+    run.between_turns = False
+    app_module._apply_turn_state(run, _result(), [])
+    for msg in _subagent_messages():
+        app_module._apply_turn_state(run, msg, _translate(msg, run))
+        assert run.between_turns is True
+
+
+def test_foreground_subagent_keeps_the_turn_running(run) -> None:
+    run.between_turns = False
+    for msg in _subagent_messages():
+        app_module._apply_turn_state(run, msg, _translate(msg, run))
+        assert run.between_turns is False
+
+
+def test_subagent_message_leaves_the_interrupt_echo_armed(run) -> None:
+    """A background agent talking between the interrupted result and the
+    marker echo must not use up the flag the echo needs."""
+    run.between_turns = False
+    app_module._apply_turn_state(run, _result("error_during_execution", True), [])
+    run.expect_interrupt_echo = True
+    for msg in _subagent_messages():
+        app_module._apply_turn_state(run, msg, _translate(msg, run))
+    assert run.expect_interrupt_echo is True
+
+    echo = _marker_echo()
+    app_module._apply_turn_state(run, echo, _translate(echo, run))
+    assert run.between_turns is True
+    assert run.expect_interrupt_echo is False
+
+
+def test_subagent_message_records_no_checkpoint(run) -> None:
+    run.between_turns = True
+    for msg in _subagent_messages():
+        app_module._apply_turn_state(run, msg, _translate(msg, run))
+    assert not run.checkpoints
