@@ -249,6 +249,13 @@ main {
   overflow-y: auto;
   padding: 1rem;
   min-height: 0;
+  /* Holds the absolutely positioned screen-reader labels inside the
+     conversation (a file edit's "Added line:" / "Removed line:"). Without a
+     positioned ancestor they sit against the page instead, and every one far
+     down the conversation stretched the page itself, about 50,000px in one
+     chat. On a phone a VoiceOver three-finger swipe could then scroll the
+     page into that empty space, leaving the screen blank. */
+  position: relative;
 }
 .msg { margin-bottom: 1.25rem; max-width: 75ch; }
 .msg.user .role { color: var(--user); }
