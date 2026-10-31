@@ -1948,8 +1948,9 @@ def test_subagent_tool_results_are_not_the_parents() -> None:
 
 def test_subagent_message_is_never_read_as_the_interrupt_echo() -> None:
     """A subagent message now maps to no events, which is the shape the
-    post-interrupt echo has. Only a top-level UserMessage is that echo: a
-    subagent message means a turn is running, so it must open one."""
+    post-interrupt echo has. Only a top-level UserMessage is that echo. A
+    subagent message says nothing about the main turn: a background Agent
+    talks between turns, so it neither opens a turn nor uses up the flag."""
     from claude_agent_sdk import UserMessage
     run = app_module.ActiveRun("subagent-not-echo")
     run.expect_interrupt_echo = True
@@ -1957,7 +1958,8 @@ def test_subagent_message_is_never_read_as_the_interrupt_echo() -> None:
     app_module._apply_turn_state(
         run, UserMessage(content=[], parent_tool_use_id="tu_agent"), [],
     )
-    assert run.between_turns is False
+    assert run.between_turns is True
+    assert run.expect_interrupt_echo is True
 
     echo = app_module.ActiveRun("real-echo")
     echo.expect_interrupt_echo = True
