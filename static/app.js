@@ -5312,7 +5312,13 @@
       otherText.type = q.isSecret ? "password" : "text";
       otherText.className = "question-other-text";
       otherText.setAttribute("aria-label", `Other answer for: ${q.question || q.header || "question"}`);
-      otherText.addEventListener("input", () => { if (otherText.value) otherInput.checked = true; });
+      // The answer box shows only once "Other" is picked: always there, it was
+      // one more stop on every question for a screen reader. Focus stays where
+      // it is, so arrowing through the options still works, and Tab reaches
+      // the box once it shows. A radio that gets unpicked fires no change
+      // event of its own, so the whole group is listened to.
+      otherText.hidden = !otherInput.checked;
+      fs.addEventListener("change", () => { otherText.hidden = !otherInput.checked; });
       otherRow.appendChild(otherInput);
       otherRow.appendChild(otherLabel);
       otherRow.appendChild(otherText);
