@@ -191,6 +191,8 @@ def test_codex_async_question_can_be_answered_during_or_after_a_turn(ui, live):
 def test_codex_async_question_accepts_free_text_and_retries_a_failed_send(ui):
     page, state = ui
     _codex_question_session(page, state)
+    # The answer box shows once "Other" is picked (see test_question_other_box).
+    page.get_by_role("radio", name="Other:", exact=True).check()
     page.get_by_role("textbox", name="Other answer for: Which account?").fill("The account labelled Alex")
     page.route("**/api/chat", lambda route: route.fulfill(status=503, json={"detail": "Unavailable"}))
     page.get_by_role("button", name="Submit answers", exact=True).click()
