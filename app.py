@@ -959,6 +959,21 @@ PROMPT_REQUEST_EVENT_TYPES = {"permission_request", "question_request", "plan_re
 QUESTION_TOOL = "AskUserQuestion"
 PLAN_TOOL = "ExitPlanMode"
 
+# A chat message sent while a question card is open answers the card. The CLI
+# holds every message behind the tool call it is waiting on, so the message
+# used to sit queued until the card timed out (PERMISSION_TIMEOUT_SECONDS).
+# The model reads only `answers`; `annotations[q].unanswered` is for clients
+# and transcripts, and goes only to a CLI whose init lists the capability: an
+# older CLI on a strict host refuses the whole answer.
+REPLIED_IN_CHAT_ANSWER = (
+    "(No option chosen. The user replied in the chat instead: {reply}. That "
+    "message also arrives as their next turn; it is the same reply, so answer "
+    "it once.)"
+)
+# How much of the typed reply goes into the answer; all of it still arrives.
+REPLIED_IN_CHAT_QUOTE_CHARS = 2000
+UNANSWERED_CAPABILITY = "ask_user_question_unanswered_v1"
+
 # Cap on per-subscriber SSE event queue depth. A slow or stuck client used to
 # accumulate every event for the run forever; with this cap a 1000-event
 # backlog disconnects the slow subscriber instead of growing memory unbounded.
@@ -8622,6 +8637,9 @@ class ActiveRun:
         # on when live_sdk_model is None: a Default pick sends no --model, and
         # a resumed session can carry on with the model it last used.
         self.init_model: Optional[str] = None
+        # Protocol capabilities the CLI listed in its init message, for
+        # feature detection (empty until the first init, and on old CLIs).
+        self.cli_capabilities: frozenset[str] = frozenset()
         self.events: list[dict] = []
         # Monotonic per-run event counter, distinct from len(self.events).
         # Necessary so an in-memory trim (when self.events exceeds
@@ -14131,7 +14149,12 @@ async def api_chat(
         if tool_name == QUESTION_TOOL:
             request_id = str(uuid_mod.uuid4())
             fut = asyncio.get_running_loop().create_future()
-            PENDING[request_id] = {"future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id}
+            # kind + questions let a chat message answer this card
+            # (_answer_open_questions_from_chat); no other card carries them.
+            PENDING[request_id] = {
+                "future": fut, "owner_sub": run.owner_sub, "run_id": run.run_id,
+                "kind": "question", "questions": tool_input.get("questions", []),
+            }
             try:
                 run.emit({
                     "type": "question_request",
@@ -15168,6 +15191,62 @@ async def api_chat(
     return _stream_run_response(run)
 
 
+def _replied_in_chat_answer(message: str) -> str:
+    """The answer text for a card the user replied to in the chat.
+
+    It quotes the reply: the model reads the answer at once, while the chat
+    message itself reaches it only a step later, and without the words it
+    told the user their answer was empty (seen live 2026-11-04).
+    """
+    reply = " ".join((message or "").split())
+    if len(reply) > REPLIED_IN_CHAT_QUOTE_CHARS:
+        reply = reply[:REPLIED_IN_CHAT_QUOTE_CHARS].rstrip() + "..."
+    quoted = json.dumps(reply, ensure_ascii=False) if reply else "(attachments only)"
+    return REPLIED_IN_CHAT_ANSWER.format(reply=quoted)
+
+
+def _replied_in_chat_payload(questions: Any, annotate: bool, message: str = "") -> dict:
+    """A question card's answer for "the user replied in the chat instead".
+
+    Keyed by question text, as the CLI reads answers. ``annotate`` adds the
+    ``unanswered`` marker, which only a CLI listing UNANSWERED_CAPABILITY
+    accepts.
+    """
+    texts = [
+        item["question"] for item in (questions if isinstance(questions, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("question"), str) and item["question"]
+    ]
+    answer = _replied_in_chat_answer(message)
+    payload: dict = {"answers": {text: answer for text in texts}}
+    if annotate and texts:
+        payload["annotations"] = {text: {"unanswered": "replied_in_chat"} for text in texts}
+    return payload
+
+
+def _answer_open_questions_from_chat(run: "ActiveRun", message: str = "") -> int:
+    """Answer this run's open question cards as replied in chat; how many.
+
+    Only AskUserQuestion cards carry ``kind == "question"``: permission
+    prompts, plan reviews, the overage gate and the panel's ask stay open.
+    The card collapses through the permission_resolved event the question
+    branch already emits.
+    """
+    annotate = UNANSWERED_CAPABILITY in run.cli_capabilities
+    answered = 0
+    for entry in list(PENDING.values()):
+        if entry.get("run_id") != run.run_id or entry.get("kind") != "question":
+            continue
+        future = entry["future"]
+        if future.done():
+            continue
+        future.set_result({
+            "decision": "replied_in_chat",
+            "payload": _replied_in_chat_payload(entry.get("questions"), annotate, message),
+        })
+        answered += 1
+    return answered
+
+
 @app.post("/api/chat/send/{run_id}")
 async def api_chat_send(
     request: Request,
@@ -15337,6 +15416,12 @@ async def api_chat_send(
         return JSONResponse(
             {"ok": False, "error": "run_finished"}, status_code=409,
         )
+    if run.provider == "claude":
+        # Typed instead of picking: the message is the answer, and the turn
+        # it would otherwise wait behind can go on.
+        answered = _answer_open_questions_from_chat(run, message)
+        if answered:
+            log.info("question answered by a chat message run=%s cards=%d", run.run_id, answered)
     return JSONResponse({"ok": True}, status_code=202)
 
 
@@ -16305,6 +16390,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             data = msg.data or {}
             if run is not None:
                 run.init_model = data.get("model") or None
+                capabilities = data.get("capabilities")
+                run.cli_capabilities = frozenset(
+                    item for item in capabilities if isinstance(item, str)
+                ) if isinstance(capabilities, list) else frozenset()
             rli = data.get("rate_limit_info") or {}
             if rli and run is not None and run.provider == "claude":
                 # No run means no way to attribute the info to a credential
