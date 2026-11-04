@@ -48,12 +48,17 @@ def capture_servers():
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                requests.append({
+                request = {
                     "path": self.path, "body": payload,
                     "authorization": self.headers.get("Authorization"),
                     "api_key": self.headers.get("X-Api-Key"),
-                })
-                if stopping.wait(delay):
+                    "arrived": time.monotonic(), "answered": None,
+                }
+                requests.append(request)
+                # Only the first request goes silent. The CLI's own tries after
+                # the 400 are answered at once, so they can't run the clock out;
+                # one that comes while the first is still silent is the failure.
+                if stopping.wait(delay if len(requests) == 1 else 0):
                     return
                 body = json.dumps({"type": "error", "error": {
                     "type": "invalid_request_error", "message": CAPTURE_STOP,
@@ -64,6 +69,7 @@ def capture_servers():
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                request["answered"] = time.monotonic()
 
             def log_message(self, *args):
                 pass
@@ -203,15 +209,19 @@ def test_installed_cli_preserves_local_routing_and_thinking(
     result = asyncio.run(_query_installed_cli(options, CLI_STARTUP_ALLOWANCE_SECONDS))
     assert result.is_error and CAPTURE_STOP in (result.result or "")
     assert conflicts == [], "loaded settings redirected the Local request"
-    assert len(requests) == 1
-    request = requests[0]
-    assert request["path"].split("?")[0] == "/v1/messages"
-    assert request["authorization"] == "Bearer ollama"
-    assert not request["api_key"]
-    assert request["body"]["model"] == model
-    assert request["body"].get("thinking") == thinking
-    if family == "gptoss":
-        assert request["body"]["output_config"]["effort"] == effort
+    # The capture server stops the CLI with a 400, and CLI 2.1.318 tries a 400
+    # again (up to three more times, the later ones with its whole tool list),
+    # so how many requests arrive is the CLI's business. What each one carries
+    # is the contract: every attempt must stay Local and keep the thinking.
+    assert requests
+    for request in requests:
+        assert request["path"].split("?")[0] == "/v1/messages"
+        assert request["authorization"] == "Bearer ollama"
+        assert not request["api_key"]
+        assert request["body"]["model"] == model
+        assert request["body"].get("thinking") == thinking
+        if family == "gptoss":
+            assert request["body"]["output_config"]["effort"] == effort
 
 
 def test_installed_cli_survives_silent_local_response(assembled_options, capture_servers):
@@ -226,4 +236,8 @@ def test_installed_cli_survives_silent_local_response(assembled_options, capture
     assert time.monotonic() - started >= delay
     assert result.is_error and CAPTURE_STOP in (result.result or "")
     assert conflicts == []
-    assert len(requests) == 1, "CLI retried after dropping the original silent connection"
+    # Tries after the 400 are the CLI's own (see above); one that arrived while
+    # the first request was still silent means the CLI gave up on it.
+    assert requests[0]["answered"] is not None
+    assert all(r["arrived"] >= requests[0]["answered"] for r in requests[1:]), \
+        "CLI retried after dropping the original silent connection"
