@@ -222,16 +222,189 @@ async def test_a_refused_code_fails_the_token_flow_with_the_cli_message(fake_set
 
 def test_a_wrapped_and_styled_token_is_read_back_whole(fresh_setup_flow) -> None:
     sf = fresh_setup_flow
+
+    def read(raw: bytes):
+        return sf._extract_token(sf._render_screen(raw))
+
     raw = (b"\x1b[32mYour token:\x1b[0m\r\n  \x1b[1m" + _TOKEN[:50].encode() + b"\x1b[0m\r\n  "
            + _TOKEN[50:].encode() + b"\r\n\r\nStore this token securely. export CLAUDE_CODE_OAUTH_TOKEN=...\r\n")
-    assert sf._extract_token(raw) == _TOKEN
-    assert sf._extract_token(b"OAuth error: Request failed with status code 400") is None
+    assert read(raw) == _TOKEN
+    assert read(b"OAuth error: Request failed with status code 400") is None
     # A short fragment never passes as a token.
-    assert sf._extract_token(b"sk-ant-oat01-tooshort\r\nStore this") is None
+    assert read(b"sk-ant-oat01-tooshort\r\nStore this") is None
     # Drawn inside a box, with borders between the pieces.
-    boxed = ("\u250c" + "\u2500" * 40 + "\u2510\n\u2502 " + _TOKEN[:40] + " \u2502\n\u2502 "
-             + _TOKEN[40:80] + " \u2502\n\u2502 " + _TOKEN[80:] + " \u2502\n\u2514" + "\u2500" * 40 + "\u2518\n")
-    assert sf._extract_token(boxed.encode()) == _TOKEN
+    boxed = ("\u250c" + "\u2500" * 40 + "\u2510\r\n\u2502 " + _TOKEN[:40] + " \u2502\r\n\u2502 "
+             + _TOKEN[40:80] + " \u2502\r\n\u2502 " + _TOKEN[80:] + " \u2502\r\n\u2514" + "\u2500" * 40 + "\u2518\r\n")
+    assert read(boxed.encode()) == _TOKEN
+
+
+# A token with no repeats in its first stretch, so a missing or extra character is easy to spot.
+_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+_VARIED_TOKEN = "sk-ant-oat01-" + "".join(_ALPHABET[(index * 7) % 64] for index in range(95))
+# Cells setup-token skipped on 2026-11-05: the 't' of "oat", then two in the body.
+_PREFIX_SKIPS = (9,)
+_BODY_SKIPS = (40, 77)
+
+
+def _diff_rendered_token(token: str, skips: tuple[int, ...]) -> bytes:
+    """Bytes the way setup-token's UI draws a token over an earlier row: each run of characters
+    placed with a cursor jump, and every cell that already shows the right character left out."""
+    out = b"\r"
+    index = 0
+    while index < len(token):
+        if index in skips:
+            index += 1
+            continue
+        run_start = index
+        while index < len(token) and index not in skips:
+            index += 1
+        out += b"\x1b[%dG" % (2 + run_start) + token[run_start:index].encode()
+    return out
+
+
+def _earlier_frame_holding(token: str, skips: tuple[int, ...]) -> bytes:
+    """A row drawn before the token, which happens to hold the token's character in every skipped cell
+    (on the real screen it was the sign-in URL's text)."""
+    cells = [" "] * 120
+    for index in skips:
+        cells[1 + index] = token[index]
+    return "".join(cells).rstrip().encode()
+
+
+@pytest.mark.parametrize("skips", [_PREFIX_SKIPS, _BODY_SKIPS], ids=["prefix", "body"])
+def test_a_token_drawn_over_cells_that_already_match_is_read_back_whole(fresh_setup_flow, skips) -> None:
+    sf = fresh_setup_flow
+    raw = (b"Welcome\r\n" + _earlier_frame_holding(_VARIED_TOKEN, skips) + b"\r\n\r\nPaste code here if prompted >"
+           + b"\x1b[2A" + _diff_rendered_token(_VARIED_TOKEN, skips) + b"\r\n\x1b[J\x1b[2GStore\x1b[8Gthis\x1b[13Gtoken\r\n")
+    assert sf._extract_token(sf._render_screen(raw)) == _VARIED_TOKEN
+
+
+def test_a_token_that_runs_on_past_its_length_is_refused_not_cut(fresh_setup_flow) -> None:
+    sf = fresh_setup_flow
+    assert sf._extract_token(sf._render_screen(_VARIED_TOKEN.encode() + b"x\r\n")) is None
+    assert sf._extract_token(sf._render_screen(_VARIED_TOKEN.encode() + b" next\r\n")) == _VARIED_TOKEN
+
+
+def test_the_newest_copy_of_a_token_on_screen_wins(fresh_setup_flow) -> None:
+    sf = fresh_setup_flow
+    # A half-drawn copy from an earlier frame, followed by other text that would make up the length.
+    half = _VARIED_TOKEN[:60].encode() + b"\r\n" + b"z" * 48 + b" done\r\n"
+    assert sf._extract_token(sf._render_screen(half + _VARIED_TOKEN.encode() + b"\r\n")) == _VARIED_TOKEN
+
+
+# Draws like the real setup-token: raw mode, words placed with cursor jumps instead of spaces,
+# and after the code the token is drawn over earlier rows, leaving out every cell that already
+# shows the right character. Row 3 holds those characters before the code arrives.
+_FAKE_DIFF_RENDERING_SETUP_TOKEN = '''#!@PYTHON@
+import os
+import tty
+
+token = "@TOKEN@"
+held = [int(index) for index in "@HELD@".split(",")]
+skips_for_code = {"prefix#code": [int(index) for index in "@PREFIX_SKIPS@".split(",")],
+                  "body#code": [int(index) for index in "@BODY_SKIPS@".split(",")]}
+url = "https://claude.com/cai/oauth/authorize?code=true&client_id=x&scope=user%3Ainference&code_challenge=abc&state=def"
+tty.setraw(0)
+status = [" "] * 120
+for index in held:
+    status[1 + index] = token[index]
+os.write(1, b"Welcome\\x1b[9Gto\\x1b[12GClaude\\x1b[19GCode\\r\\n")
+os.write(1, b"\\x1b]8;id=1;" + url.encode() + b"\\x07" + url[:150].encode() + b"\\x1b]8;;\\x07\\r\\n\\r\\n")
+os.write(1, "".join(status).rstrip().encode() + b"\\r\\n\\r\\n")
+os.write(1, b"\\x1b[2GPaste\\x1b[8Gcode\\x1b[13Ghere\\x1b[18Gif\\x1b[21Gprompted\\x1b[30G>\\r\\n")
+typed = b""
+while not typed.endswith(b"\\r"):
+    typed += os.read(0, 1024)
+code = typed.strip().decode()
+skips = skips_for_code[code]
+out = b"\\r\\x1b[31C\\x1b[1A" + b"*" * len(code) + b"\\r\\n"
+out += b"\\x1b[4A\\r\\x1b[2GLong-lived\\x1b[13Gtoken\\x1b[19Gcreated\\r\\n\\r"
+index = 0
+while index < len(token):
+    if index in skips:
+        index += 1
+        continue
+    run_start = index
+    while index < len(token) and index not in skips:
+        index += 1
+    out += b"\\x1b[%dG" % (2 + run_start) + token[run_start:index].encode()
+out += b"\\r\\n\\x1b[J\\x1b[2GStore\\x1b[8Gthis\\x1b[13Gtoken\\x1b[19Gsecurely.\\r\\n"
+os.write(1, out)
+os.read(0, 1)
+'''
+
+
+@pytest.fixture
+def diff_rendering_setup_token(fresh_setup_flow, tmp_path, monkeypatch):
+    import sys
+    script = tmp_path / "fake-claude-diff"
+    body = (_FAKE_DIFF_RENDERING_SETUP_TOKEN
+            .replace("@PYTHON@", sys.executable)
+            .replace("@TOKEN@", _VARIED_TOKEN)
+            .replace("@HELD@", ",".join(str(index) for index in _PREFIX_SKIPS + _BODY_SKIPS))
+            .replace("@PREFIX_SKIPS@", ",".join(str(index) for index in _PREFIX_SKIPS))
+            .replace("@BODY_SKIPS@", ",".join(str(index) for index in _BODY_SKIPS)))
+    script.write_text(body)
+    script.chmod(0o755)
+    monkeypatch.setattr(fresh_setup_flow, "_resolve_claude_cli", lambda: str(script))
+    return fresh_setup_flow
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="the token command needs a pseudo-terminal")
+@pytest.mark.parametrize("code", ["prefix#code", "body#code"])
+async def test_a_token_the_ui_only_partly_redrew_is_saved_whole(diff_rendering_setup_token, tmp_path, code) -> None:
+    sf = diff_rendering_setup_token
+    home = tmp_path / "slot"
+    flow_key = "tok-" + code.split("#")[0]
+    state = await sf.start_oauth("token", flow_key=flow_key, home=home)
+    assert state.status == "awaiting_code"
+    result = await sf.submit_code(code, flow_key=flow_key)
+    assert result.status == "done", result.error
+    assert sf.read_oauth_token(home) == _VARIED_TOKEN
+
+
+# What the real setup-token 2.1.318 wrote on a 220x50 pty, played back in the same two halves:
+# up to the moment a wrong code was typed, and after it.
+_FAKE_REPLAYING_SETUP_TOKEN = '''#!@PYTHON@
+import os
+import tty
+
+with open("@FIXTURE@", "rb") as handle:
+    data = handle.read()
+typed_at = @TYPED_AT@
+tty.setraw(0)
+os.write(1, data[:typed_at])
+typed = b""
+while not typed.endswith(b"\\r"):
+    typed += os.read(0, 1024)
+os.write(1, data[typed_at:])
+os.read(0, 1)
+'''
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="the token command needs a pseudo-terminal")
+async def test_the_real_setup_token_output_gives_its_url_and_its_error(fresh_setup_flow, tmp_path, monkeypatch) -> None:
+    import sys
+    from pathlib import Path
+    sf = fresh_setup_flow
+    fixture = Path(__file__).parent / "fixtures" / "setup_token_wrong_code_2.1.318.bin"
+    script = tmp_path / "fake-claude-replay"
+    script.write_text(_FAKE_REPLAYING_SETUP_TOKEN
+                      .replace("@PYTHON@", sys.executable)
+                      .replace("@FIXTURE@", str(fixture))
+                      .replace("@TYPED_AT@", "2286"))
+    script.chmod(0o755)
+    monkeypatch.setattr(sf, "_resolve_claude_cli", lambda: str(script))
+    home = tmp_path / "slot"
+    state = await sf.start_oauth("token", flow_key="tok-real", home=home)
+    assert state.status == "awaiting_code"
+    assert state.url.startswith("https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-")
+    assert state.url.endswith("&state=LCa3gMLwNDhfEhxP9slqDzaZcPs0YcH2vgl7oI2eg0g")
+    result = await sf.submit_code("wrong#code", flow_key="tok-real")
+    assert result.status == "failed"
+    assert result.error == "OAuth error: That code wasn't accepted."
+    assert not sf.oauth_token_path(home).exists()
+    await sf.cancel_flow("tok-real")
 
 
 @pytest.mark.skipif(_IS_WINDOWS, reason="the token command needs a pseudo-terminal")

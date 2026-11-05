@@ -36,6 +36,7 @@ from typing import Literal, Optional
 
 import claude_cli
 import httpx
+import terminal_screen
 
 
 # os.chmod on a file descriptor needs os.fchmod, which doesn't exist on
@@ -740,45 +741,64 @@ _TOKEN_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxy
 # What a terminal UI puts between pieces of a wrapped string: whitespace and
 # the borders of a box (U+2500 to U+257F), plus a plain pipe.
 _TOKEN_FILLER = frozenset(" \t\r\n|") | frozenset(chr(c) for c in range(0x2500, 0x2580))
-_TUI_ESCAPES_RE = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Z0-9]")
+# The pseudo-terminal setup-token draws on. Wide enough that the URL and the
+# token come out on one line; the screen it is replayed onto must match.
+_PTY_COLUMNS = 220
+_PTY_ROWS = 50
+
+
+def _render_screen(raw: bytes) -> str:
+    """What setup-token's terminal shows after everything it wrote so far.
+
+    Its UI only rewrites the cells that changed since the last frame and
+    jumps the cursor over the rest, spaces included, so a character that is
+    already on screen is never sent again. Text has to be read off the
+    replayed screen, never out of the raw bytes: on 2026-11-05 the bytes
+    held "sk-ant-oa", a cursor jump, then "01-...", and a token was lost.
+    """
+    return terminal_screen.render(raw, _PTY_COLUMNS, _PTY_ROWS)
 
 
 def _tui_text(raw: bytes, limit: int = 300) -> str:
-    text = _TUI_ESCAPES_RE.sub(b"", raw).decode("utf-8", errors="replace")
-    return re.sub(r"\s+", " ", text).strip()[:limit]
+    return re.sub(r"\s+", " ", _render_screen(raw)).strip()[:limit]
 
 
-def _extract_token(raw: bytes) -> Optional[str]:
-    """The token as the terminal UI printed it.
+def _extract_token(screen: str) -> Optional[str]:
+    """The token as it appears on the replayed screen (``_render_screen``).
 
-    The UI wraps long strings onto several lines, may style the pieces and
-    may draw them inside a box, so the token is gathered from url-safe
+    The UI may wrap long strings onto several lines, style the pieces and
+    draw them inside a box, so the token is gathered from url-safe
     characters after its prefix, skipping whitespace and box borders,
-    until the known length is reached. Stopping at the length is what
-    keeps the next line's prose out of it.
+    until the known length is reached. The newest copy on screen wins, and
+    a token that runs on past that length is refused rather than cut.
     """
-    text = _TUI_ESCAPES_RE.sub(b"", raw).decode("utf-8", errors="replace")
-    start = text.find(_TOKEN_PREFIX)
+    start = screen.rfind(_TOKEN_PREFIX)
     while start != -1:
         body: list[str] = []
         i = start + len(_TOKEN_PREFIX)
-        while i < len(text) and len(body) < _TOKEN_BODY_LEN:
-            ch = text[i]
+        while i < len(screen) and len(body) < _TOKEN_BODY_LEN:
+            ch = screen[i]
             if ch in _TOKEN_ALPHABET:
                 body.append(ch)
             elif ch not in _TOKEN_FILLER:
                 break
             i += 1
-        if len(body) == _TOKEN_BODY_LEN:
+        # A token character straight after the last one means this is not a
+        # whole token of the known length; saving the first 108 would store
+        # a credential that looks right and fails on first use.
+        runs_on = i < len(screen) and screen[i] in _TOKEN_ALPHABET
+        if len(body) == _TOKEN_BODY_LEN and not runs_on:
             return _TOKEN_PREFIX + "".join(body)
-        start = text.find(_TOKEN_PREFIX, start + 1)
+        start = screen.rfind(_TOKEN_PREFIX, 0, start)
     return None
 
 
 def _dump_tui_for_diagnosis(flow_key: str, raw: bytes) -> None:
     """Keep what the UI printed when no token could be read, under the
-    sign-in debug directory if the host has one. May contain the token
-    in whatever shape defeated the parser; the directory is mode 0700."""
+    sign-in debug directory if the host has one. Holds the whole replayed
+    screen (sign-in URL, the masked code, and the token in whatever shape
+    defeated the parser) plus the raw tail; the directory is mode 0700 and
+    the file 0600."""
     root = os.environ.get("CLAUDE_WEB_SIGNIN_DEBUG_DIR", "").strip()
     if not root:
         return
@@ -787,8 +807,8 @@ def _dump_tui_for_diagnosis(flow_key: str, raw: bytes) -> None:
         base.mkdir(mode=0o700, parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", flow_key)
         path = base / f"setup-token-{safe}-{int(time.time())}.txt"
-        text = _TUI_ESCAPES_RE.sub(b"", raw).decode("utf-8", errors="replace")
-        _atomic_write_secret(path, f"RAW BYTES {len(raw)}\n\n{text}\n\n--- raw repr ---\n{raw[-4000:]!r}\n")
+        screen = _render_screen(raw)
+        _atomic_write_secret(path, f"RAW BYTES {len(raw)}\n\n--- screen ---\n{screen}\n\n--- raw repr ---\n{raw[-4000:]!r}\n")
     except Exception as e:  # noqa: BLE001 - diagnostics never fail the flow
         log.debug("setup-token dump failed: %s", type(e).__name__)
 
@@ -855,8 +875,7 @@ async def _drive_token(state: OAuthFlowState) -> None:
         env["CLAUDE_CONFIG_DIR"] = str(state.home)
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-        # Wide enough that the URL and the token come out on one line.
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 220, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", _PTY_ROWS, _PTY_COLUMNS, 0, 0))
         state.home.mkdir(parents=True, exist_ok=True)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -883,7 +902,7 @@ async def _drive_token(state: OAuthFlowState) -> None:
         # The paste prompt follows within a moment; input is accepted either
         # way. Publish the URL and the status together: start_oauth returns
         # the moment it sees a URL.
-        await _until(lambda: _PROMPT_MARKER in buf, 5)
+        await _until(lambda: _PROMPT_MARKER.decode() in _render_screen(bytes(buf)), 5)
         if state.status == "cancelled":
             return
         state.status = "awaiting_code"
@@ -907,23 +926,25 @@ async def _drive_token(state: OAuthFlowState) -> None:
         os.write(master, (state.code or "").strip().encode())
         await asyncio.sleep(0.6)
         os.write(master, b"\r")
-        await _until(lambda: _extract_token(bytes(buf[mark:])) or b"error" in buf[mark:].lower(),
+        # The whole buffer, never just what came after the code: the cells the
+        # UI skips hold characters from the frames before it.
+        await _until(lambda: _extract_token(_render_screen(bytes(buf))) or b"error" in buf[mark:].lower(),
                      EXCHANGE_TIMEOUT_SECONDS)
         if state.status == "cancelled":
             return
         # The UI keeps drawing for a moment after the token appears.
         await _until(lambda: False, 1.0)
-        token = _extract_token(bytes(buf[mark:]))
+        screen = _render_screen(bytes(buf))
+        token = _extract_token(screen)
         if token:
             save_oauth_token(token, home=None if state.flow_key == SHARED_FLOW_KEY else state.home)
             state.status = "done"
             return
         state.status = "failed"
-        tail = _tui_text(bytes(buf[mark:]))
-        err = re.search(r"OAuth error:[^.]*\.?", tail)
+        err = re.search(r"OAuth error:[^.\n]*\.?", screen)
         state.error = (err.group(0) if err else None) or "claude setup-token printed no token"
         if not err:
-            _dump_tui_for_diagnosis(state.flow_key, bytes(buf[mark:]))
+            _dump_tui_for_diagnosis(state.flow_key, bytes(buf))
     finally:
         if proc is not None:
             await _kill_and_reap(proc)

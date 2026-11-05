@@ -1,0 +1,28 @@
+7[r8[?25h[?25l[?2004h[?2031h[?1004hWelcome[9Gto[12GClaude[19GCode[24Gv2.1.318
+..........................................................
+
+[6G*[46G█████▓▓░
+[34G*[44G███▓░[54G░░
+[13G░░░░░░[43G███▓░
+[5G░░░[11G░░░░░░░░░░[43G███▓░
+[4G░░░░░░░░░░░░░░░░░░░[27G*[44G██▓░░[55G▓
+[46G░▓▓███▓▓░
+[2G*[36G░░░░
+[34G░░░░░░░░
+[32G░░░░░░░░░░░░░░░░
+[8G█████████[57G*
+[7G██▄█████▄██[42G*
+[8G█████████[23G*
+.......█[10G█[14G█[16G█..........................................
+
+[2GThis[7Gwill[12Gguide[18Gyou[22Gthrough[30Glong-lived[41G(1-year)[50Gauth[55Gtoken[61Gsetup[67Gfor[71Gyour[76GClaude[83Gaccount.[92GClaude[99Gsubscription[112Grequired.
+
+[2GBrowser[10Gdidn't[17Gopen?[23GUse[27Gthe[31Gurl[35Gbelow[41Gto[44Gsign[49Gin[52G(c[55Gto[58Gcopy)
+
+]8;id=11l873u;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=TReM4AxreZrtIH_KZ4YUhVW_ru4lxMI1upls4uMqwXg&code_challenge_method=S256&state=LCa3gMLwNDhfEhxP9slqDzaZcPs0YcH2vgl7oI2eg0ghttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_chal]8;;
+]8;id=11l873u;https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=user%3Ainference&code_challenge=TReM4AxreZrtIH_KZ4YUhVW_ru4lxMI1upls4uMqwXg&code_challenge_method=S256&state=LCa3gMLwNDhfEhxP9slqDzaZcPs0YcH2vgl7oI2eg0glenge=TReM4AxreZrtIH_KZ4YUhVW_ru4lxMI1upls4uMqwXg&code_challenge_method=S256&state=LCa3gMLwNDhfEhxP9slqDzaZcPs0YcH2vgl7oI2eg0g]8;;
+
+
+[2GPaste[8Gcode[13Ghere[18Gif[21Gprompted[30G>
+[>0q[?u]7501;?[c(B[?2004h[31C[1A*******************************-state
+[2K[1A[2K[1A[2K[G[1A[1C[4AOAuth error: That code wasn't accepted. It may[49Gbe[52Gincomplete,[64Gexpired,[73Galready[81Gused,[87Gor[90Gfrom[95Gan[98Gearlier[106Gsign-in[114Gattempt.[123GSign[128Gin[131Gagain[137Gto[140Gget[144Ga[146Gnew[150Gcode.[2B[K[1B Press Enter to retry.[K[1B[K[1B[K[1B[K[2A
