@@ -25,6 +25,15 @@ We use the Python `claude_agent_sdk` because we need the `can_use_tool` callback
 
 Session jsonl files at `$CLAUDE_HOME/projects/<sanitized-cwd>/*.jsonl` are the source of truth for transcripts. The web UI and any terminal `claude` CLI share state through these files. Sanitisation is the CLI's own rule — every character outside `[A-Za-z0-9]` of the resolved path becomes `-`, with a hash suffix past 200 characters — delegated to `claude_agent_sdk.project_key_for_directory` (`_sanitize_project_key`). Until 2026-10 the app replaced only `/`, `\` and `:`; that agreed with the CLI for `/workspace` but not for a Windows path with spaces, so `_startup_migrate_project_keys` rewrites `project_key` rows written under the old rule and folds any `projects/<old-key>` directory the app itself created into the CLI's directory.
 
+Reopening a session keeps the full transcript in the DOM for screen-reader
+heading navigation and browser find. `loadSession` replays it in short batches
+via `scheduler.yield()` (a timer fallback on other browsers), suppressing scroll
+geometry reads during each batch to avoid forced layout per message. Keep the
+loading gate until replay finishes, then tail-attach to `live_run.next_idx`.
+New chat cancels the fetch and invalidates the replay generation, so an older
+batch cannot append to a fresh conversation. Browser regressions live in
+`tests/test_local_ui.py`.
+
 ### Multi-project picker
 
 Set `CLAUDE_WEB_PROJECT_DIRS=/a,/b,/c` to enable the project picker. Legacy single-CWD mode (via `CLAUDE_PROJECT_DIR`) is the fallback.
