@@ -6671,9 +6671,97 @@ def _write_forged_session(cwd: Path, session_id: str, lines: list[str]) -> bool:
         return False
 
 
+def _switch_transcript_path(
+    switch_source: tuple[str, str], project_key: str, owner_sub: Optional[str],
+) -> Optional[Path]:
+    """The CLI's own transcript of a Claude source chat, if this user may read it.
+
+    A switch normally carries the canonical log. When that log covers only part
+    of the chat (a session older than the log, or one a resume split off into a
+    fresh partial record), the transcript on disk still holds all of it, so it
+    stands in. Gated like GET /api/sessions/{sid}: whatever this hands the
+    target, the user could already read there. Codex sources have no such file
+    read here and keep failing closed."""
+    provider, native = switch_source
+    if provider != "claude":
+        return None
+    if PER_USER_SESSIONS:
+        owner = _session_owner(native)
+        if owner is not None and owner != owner_sub:
+            return None
+    try:
+        return _find_session_path(native, project_key or "")
+    except HTTPException:
+        # A project no longer configured here: no transcript to read.
+        return None
+
+
+def _refuse_provider_switch(
+    switch_source: tuple[str, str], target_provider: str, reason: str,
+) -> HTTPException:
+    """The 409 for a refused switch, logged so the reason the user was shown
+    is in the journal too."""
+    logging.getLogger("claude-web").info(
+        "provider switch refused %s->%s session=%s: %s",
+        switch_source[0], target_provider, switch_source[1], reason)
+    return HTTPException(409, f"can't switch provider: {reason}")
+
+
+def _switch_source_problem(
+    switch_source: tuple[str, str], owner_sub: Optional[str], project_key: str,
+) -> Optional[str]:
+    """Why this chat can't be carried to the other provider, or None if it can.
+
+    Only state.db reads and a file lookup, so api_chat asks before it stops the
+    source chat's run: a refused switch must leave that chat as it was.
+    _wire_provider_switch asks again under the same conversation lock."""
+    source_provider, source_native = switch_source
+    src = _conversation_binding_by_native(source_provider, source_native)
+    if src is None:
+        return "source conversation was never captured"
+    source_conv_id, _src_bid, src_project = src
+    meta = _conversation_meta(source_conv_id)
+    conv_owner = meta[0] if meta else None
+    capture_state = meta[1] if meta else "incomplete"
+    # Authorize: carrying a conversation across providers exposes its whole
+    # transcript to the target, so in per-user mode only the owner may.
+    if PER_USER_SESSIONS and conv_owner and conv_owner != owner_sub:
+        return "not your conversation"
+    # Same project only — never seed a target in a different workspace.
+    if src_project and src_project != project_key:
+        return "source conversation belongs to a different project"
+    # Fail closed on partial capture unless the source's own transcript can
+    # stand in — never announce carryover we can't back.
+    if capture_state != "live_complete" and _switch_transcript_path(
+            switch_source, src_project, owner_sub) is None:
+        return f"conversation history is {capture_state}; can't carry it over"
+    return None
+
+
+async def _switch_source_transcript(
+    switch_source: tuple[str, str], owner_sub: Optional[str],
+) -> Optional[list[dict]]:
+    """The source chat's transcript read off disk (session_transcript entries)
+    when it's a Claude chat whose canonical log is partial; None when the log
+    is complete or no transcript may stand in. Read on a worker thread: long
+    chats run to tens of MB."""
+    src = _conversation_binding_by_native(*switch_source)
+    if src is None:
+        return None
+    meta = _conversation_meta(src[0])
+    if meta is not None and meta[1] == "live_complete":
+        return None
+    path = _switch_transcript_path(switch_source, src[2], owner_sub)
+    if path is None:
+        return None
+    return await asyncio.to_thread(
+        session_transcript, switch_source[1], path.parent.name)
+
+
 def _wire_provider_switch(
     run: "ActiveRun", switch_source: tuple[str, str], target_provider: str,
     cwd: Path, *, model_key: Optional[str] = None, claude_forge_ok: bool = True,
+    source_transcript: Optional[list[dict]] = None,
 ) -> tuple[str, Optional[str]]:
     """Seed a cross-provider switch. Returns a typed outcome:
 
@@ -6684,31 +6772,32 @@ def _wire_provider_switch(
       ("codex", None)     — handoff stashed on run.switch_handoff for the driver.
       ("reject", reason)  — the caller must abort the switch (HTTP 409).
 
+    ``source_transcript`` is the source chat's own transcript
+    (_switch_source_transcript). It's carried instead of the canonical log when
+    that log covers only part of the chat.
+
     Order matters: every precondition is checked and the destination is fully
     prepared BEFORE any state mutation (binding supersede/create,
     run.conversation_id) or the provider_switched announcement — so a failed
     forge or a rejected precondition can't leave a retired source binding and a
     context-free target claiming a successful handoff."""
+    problem = _switch_source_problem(switch_source, run.owner_sub, run.project_key)
+    if problem:
+        return ("reject", problem)
     source_provider, source_native = switch_source
     src = _conversation_binding_by_native(source_provider, source_native)
     if src is None:
         return ("reject", "source conversation was never captured")
-    source_conv_id, _src_bid, src_project = src
+    source_conv_id = src[0]
     meta = _conversation_meta(source_conv_id)
-    owner_sub = meta[0] if meta else None
     capture_state = meta[1] if meta else "incomplete"
-    # Authorize: carrying a conversation across providers exposes its whole
-    # transcript to the target, so in per-user mode only the owner may.
-    if PER_USER_SESSIONS and owner_sub and owner_sub != run.owner_sub:
-        return ("reject", "not your conversation")
-    # Fail closed on partial capture — never announce carryover we can't back.
-    if capture_state != "live_complete":
-        return ("reject",
-                f"conversation history is {capture_state}; can't carry it over")
-    # Same project only — never seed a target in a different workspace.
-    if src_project and src_project != run.project_key:
-        return ("reject", "source conversation belongs to a different project")
-    events = _load_conversation_events(source_conv_id)
+    if capture_state == "live_complete":
+        events = _load_conversation_events(source_conv_id)
+    else:
+        events = conversation_replay.events_from_transcript(source_transcript or [])
+        if not events:
+            return ("reject",
+                    f"conversation history is {capture_state}; can't carry it over")
     handoff, omitted = conversation_replay.render_handoff_text(events, source_provider)
     # Prepare destination BEFORE mutating any state. Forge an on-disk transcript
     # only when this CLI version is verified to ingest one; otherwise fall back
@@ -6730,7 +6819,14 @@ def _wire_provider_switch(
     nb = _conv_new_binding(source_conv_id, target_provider, run.project_key)
     if nb:
         run.binding_id = nb
-    if not use_forge:
+    if use_forge:
+        # The caller claims this id for the run before the CLI starts, so the
+        # CLI's init repeats it and the init hook sees nothing new to record.
+        # Record it here. Left provisional, the binding is invisible to the
+        # next resume of this chat, which then starts a separate, partial
+        # record that can't be switched back.
+        run.record_session_bindings(new_sid)
+    else:
         run.switch_handoff = handoff
     run.emit({
         "type": "provider_switched",
@@ -8830,6 +8926,38 @@ class ActiveRun:
         self.codex_turn_done = asyncio.Event()
         self.codex_turn_done.set()
 
+    def record_session_bindings(self, sid: str) -> None:
+        """Bookkeeping for a native session id this run is the first to drive.
+
+        Called from the init hook when the provider reports an id the run
+        didn't already hold, and by a Codex→Claude switch for the session it
+        forges: that run claims the forged id before the CLI starts, so the
+        CLI's init repeats it and the hook sees nothing new."""
+        # Activate the provisional canonical binding now that the native
+        # session id is known (Slice 0). Left provisional, the next resume of
+        # this id finds no binding and starts a separate, partial record.
+        if self.binding_id:
+            _conv_activate_binding(self.binding_id, sid)
+        # First-write-wins claim so PER_USER_SESSIONS mode knows who owns
+        # this transcript. Idempotent; no-op when disabled.
+        _claim_session_owner(sid, self.owner_sub, self.project_key)
+        # Persist the session→personality binding so a later request
+        # resolving by this session_id sees the same voice this run spawned
+        # under. Without this, a tab opened on a resumed session would
+        # resolve to the user-global default and silently respawn under the
+        # wrong personality.
+        if self.personality_id is not None:
+            _bind_session_personality(sid, self.owner_sub, self.personality_id)
+        # Same for the credential slot: a tab opening this resumed session
+        # must resolve to the account it actually spawned under, not the
+        # user-global default.
+        if self.requested_account_slot and self.provider != "local":
+            _bind_session_account(sid, self.owner_sub, self.requested_account_slot)
+        # And panel review, when the browser said on or off for this chat
+        # before it had a session id.
+        if self.panel_requested is not None and self.provider == "claude":
+            _panel_set_enabled(sid, self.owner_sub, self.panel_requested)
+
     def emit(self, event: dict) -> None:
         # Tag with a monotonic per-run index so the browser can dedupe an
         # event reaching the DOM twice (overlapping subscribers, replay
@@ -8853,35 +8981,8 @@ class ActiveRun:
                 if old and ACTIVE_RUNS_BY_SESSION.get(old) is self:
                     ACTIVE_RUNS_BY_SESSION.pop(old, None)
                 ACTIVE_RUNS_BY_SESSION[sid] = self
-                # Activate the provisional canonical binding now that the SDK
-                # has reported the native session id (Slice 0).
-                if self.binding_id:
-                    _conv_activate_binding(self.binding_id, sid)
                 meta_changed = True
-                # First-write-wins claim so PER_USER_SESSIONS mode knows who
-                # owns this transcript. Idempotent; no-op when disabled.
-                _claim_session_owner(sid, self.owner_sub, self.project_key)
-                # Persist the session→personality binding so a later
-                # request resolving by this session_id sees the same
-                # voice this run spawned under. Without this, a tab
-                # opened on a resumed session would resolve to the
-                # user-global default and silently respawn under the
-                # wrong personality.
-                if self.personality_id is not None:
-                    _bind_session_personality(
-                        sid, self.owner_sub, self.personality_id,
-                    )
-                # Same for the credential slot — a tab opening this resumed
-                # session must resolve to the account it actually spawned
-                # under, not the user-global default.
-                if self.requested_account_slot and self.provider != "local":
-                    _bind_session_account(
-                        sid, self.owner_sub, self.requested_account_slot,
-                    )
-                # And panel review, when the browser said on or off for this
-                # chat before it had a session id.
-                if self.panel_requested is not None and self.provider == "claude":
-                    _panel_set_enabled(sid, self.owner_sub, self.panel_requested)
+                self.record_session_bindings(sid)
             _record_local_session(self)
         if event.get("type") == "run_started":
             meta_changed = True
@@ -13742,11 +13843,17 @@ async def api_chat(
     if switch_source:
         _src = _conversation_binding_by_native(switch_source[0], switch_source[1])
         if _src is None:
-            raise HTTPException(
-                409, "can't switch provider: source conversation was never captured")
+            raise _refuse_provider_switch(
+                switch_source, provider, "source conversation was never captured")
         switch_lock = _session_lock("conv:" + _src[0])
         await switch_lock.acquire()
         try:
+            # Ask before stopping the source run: a refused switch must leave
+            # the chat it came from as it was.
+            _problem = _switch_source_problem(
+                switch_source, user.get("sub"), _sanitize_project_key(cwd))
+            if _problem:
+                raise _refuse_provider_switch(switch_source, provider, _problem)
             await _stop_source_run_for_switch(_src[0], switch_source[1], user)
         except BaseException:
             switch_lock.release()
@@ -14003,11 +14110,13 @@ async def api_chat(
             # Codex) the handoff rides the first message. A rejected
             # precondition aborts before any state was mutated.
             _forge_ok = await _claude_forge_capable() if provider == "claude" else True
+            _src_transcript = await _switch_source_transcript(
+                switch_source, run.owner_sub)
             _sw_kind, _sw_val = _wire_provider_switch(
                 run, switch_source, provider, cwd, model_key=(model or None),
-                claude_forge_ok=_forge_ok)
+                claude_forge_ok=_forge_ok, source_transcript=_src_transcript)
             if _sw_kind == "reject":
-                raise HTTPException(409, f"can't switch provider: {_sw_val}")
+                raise _refuse_provider_switch(switch_source, provider, _sw_val)
             if _sw_kind == "claude":  # forged resume — target resumes new_sid
                 sid_in = _sw_val
                 session_id = _sw_val

@@ -187,11 +187,14 @@ def test_switch_codex_to_claude_forges_resume_session(tmp_path) -> None:
     content = json.loads(lines[0])["message"]["content"]
     assert "PRIOR CONVERSATION" in content and "deploy the thing" in content
     db = app_module._state_db()
-    # A fresh provisional Claude binding is minted for the target provider…
-    claude_status = db.execute(
-        "SELECT status FROM conversation_binding WHERE conversation_id=? AND provider='claude'",
-        (cid,)).fetchone()[0]
-    assert claude_status == "provisional"
+    # A Claude binding is minted for the target provider, already active on
+    # the forged id: the run claims that id before the CLI starts, so the init
+    # hook never sees it as new and can't be the one to activate it.
+    claude_row = db.execute(
+        "SELECT status, native_session_id FROM conversation_binding "
+        "WHERE conversation_id=? AND provider='claude'",
+        (cid,)).fetchone()
+    assert claude_row == ("active", new_sid)
     # …while the source Codex binding stays active (its thread still exists and
     # is resumable). supersede only retires a PRIOR binding of the TARGET
     # provider, so the partial index still permits one active binding per
@@ -282,6 +285,224 @@ def test_forge_capable_probes_once_then_caches(monkeypatch) -> None:
     r2 = asyncio.run(app_module._claude_forge_capable())
     assert r1 is True and r2 is True
     assert calls["n"] == 1  # probed once, then served from cache
+
+
+# ── Switching back: a chat switched into Claude can go to Codex again ─────────
+# 2026-11-06: a chat went Codex→Claude, its Claude binding was never activated
+# (the run claims the forged id up front, so the CLI's init repeated it and the
+# hook saw nothing new), the next resume wrapped the session in a fresh
+# legacy_partial record, and switching it back to Codex was refused with
+# "conversation history is legacy_partial; can't carry it over".
+
+def _cli_init(run, sid: str) -> None:
+    run.emit({"type": "system", "subtype": "init", "session_id": sid})
+
+
+def _switch_into_claude(tmp_path, codex_thread: str, run_id: str):
+    """A Codex→Claude switch the way api_chat runs it: forge, claim the forged
+    id for the run, then the CLI's init reports that same id."""
+    pk = app_module._sanitize_project_key(tmp_path)
+    cid, _ = _source_conversation("codex", codex_thread, pk)
+    run = app_module.ActiveRun(run_id)
+    run.owner_sub = "sub-1"
+    run.provider = "claude"
+    run.project_key = pk
+    kind, sid = app_module._wire_provider_switch(
+        run, ("codex", codex_thread), "claude", tmp_path)
+    assert kind == "claude"
+    run.session_id = sid
+    _cli_init(run, sid)
+    return pk, cid, run, sid
+
+
+def test_forged_claude_session_resolves_to_its_conversation(tmp_path) -> None:
+    pk, cid, _run, sid = _switch_into_claude(tmp_path, "thread-rt-1", "run-rt-1")
+    found = app_module._conversation_binding_by_native("claude", sid)
+    assert found is not None and found[0] == cid
+    # A later run resuming the chat (api_chat's lazy wrap) joins the same
+    # conversation instead of starting a partial one.
+    assert app_module._conv_ensure_for_native("claude", pk, sid, "sub-1")[0] == cid
+
+
+def test_chat_switched_into_claude_switches_back_to_codex(tmp_path) -> None:
+    pk, cid, _run, sid = _switch_into_claude(tmp_path, "thread-rt-2", "run-rt-2a")
+    # Claude's own turn lands in the shared log.
+    app_module._conv_append_event(
+        cid, f"{sid}:a2", "claude", "assistant",
+        {"role": "assistant",
+         "content": [{"type": "text", "text": "claude finished the migration"}]},
+        raw="{}")
+    # Later, a fresh run picks the Claude chat back up, then the user switches.
+    app_module._conv_ensure_for_native("claude", pk, sid, "sub-1")
+    back = app_module.ActiveRun("run-rt-2b")
+    back.owner_sub = "sub-1"
+    back.provider = "codex"
+    back.project_key = pk
+    kind, _ = app_module._wire_provider_switch(back, ("claude", sid), "codex", tmp_path)
+    assert kind == "codex"
+    assert back.conversation_id == cid
+    assert "deploy the thing" in back.switch_handoff
+    assert "claude finished the migration" in back.switch_handoff
+
+
+def test_forged_claude_session_keeps_the_runs_picks(tmp_path) -> None:
+    """The same skipped hook dropped the personality and panel picks for the
+    forged session, so a later tab resolved the user defaults instead."""
+    pk = app_module._sanitize_project_key(tmp_path)
+    _source_conversation("codex", "thread-rt-3", pk)
+    run = app_module.ActiveRun("run-rt-3", personality_id=4242)
+    run.owner_sub = "sub-1"
+    run.provider = "claude"
+    run.project_key = pk
+    run.panel_requested = True
+    kind, sid = app_module._wire_provider_switch(
+        run, ("codex", "thread-rt-3"), "claude", tmp_path)
+    assert kind == "claude"
+    run.session_id = sid
+    _cli_init(run, sid)
+    assert app_module._session_owner(sid) == "sub-1"
+    assert app_module._session_personality_id(sid) == 4242
+    assert app_module._panel_load(sid).enabled is True
+
+
+# ── A Claude chat with a partial canonical log carries its own transcript ─────
+
+@pytest.fixture
+def project(tmp_path, monkeypatch):
+    """tmp_path as a configured project, so its transcripts can be looked up."""
+    pk = app_module._sanitize_project_key(tmp_path)
+    monkeypatch.setitem(app_module.PROJECT_KEYS, pk, tmp_path)
+    return tmp_path, pk
+
+
+def _write_claude_transcript(tmp_path, sid: str, records: list[dict]) -> None:
+    d = app_module._sessions_dir(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{sid}.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+
+_PARTIAL_CHAT = [
+    {"type": "user", "message": {"role": "user", "content": "rename the narrator voices"}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Renamed all four."},
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "git commit"}},
+    ]}},
+    {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "1 file changed"},
+    ]}},
+]
+
+
+async def test_partial_claude_chat_switches_using_its_transcript(project) -> None:
+    tmp_path, pk = project
+    sid = "sess-partial-1"
+    app_module._conv_ensure_for_native("claude", pk, sid, "sub-1", "T")  # legacy_partial
+    _write_claude_transcript(tmp_path, sid, _PARTIAL_CHAT)
+    run = app_module.ActiveRun("run-partial-1")
+    run.owner_sub = "sub-1"
+    run.provider = "codex"
+    run.project_key = pk
+    transcript = await app_module._switch_source_transcript(("claude", sid), "sub-1")
+    kind, _ = app_module._wire_provider_switch(
+        run, ("claude", sid), "codex", tmp_path, source_transcript=transcript)
+    assert kind == "codex"
+    handoff = run.switch_handoff
+    assert "USER: rename the narrator voices" in handoff
+    assert "ASSISTANT: Renamed all four." in handoff
+    assert "[called tool Bash]" in handoff
+    assert "1 file changed" in handoff
+
+
+async def test_complete_log_is_carried_without_reading_the_transcript(project) -> None:
+    """A complete canonical log is the record, even with a transcript on disk."""
+    tmp_path, pk = project
+    _source_conversation("claude", "sess-complete-1", pk)
+    _write_claude_transcript(tmp_path, "sess-complete-1", _PARTIAL_CHAT)
+    assert await app_module._switch_source_transcript(
+        ("claude", "sess-complete-1"), "sub-1") is None
+
+
+def test_partial_claude_chat_without_a_transcript_still_refuses(project) -> None:
+    tmp_path, pk = project
+    app_module._conv_ensure_for_native("claude", pk, "sess-gone", "sub-1", "T")
+    run = app_module.ActiveRun("run-partial-gone")
+    run.owner_sub = "sub-1"
+    run.provider = "codex"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("claude", "sess-gone"), "codex", tmp_path)
+    assert kind == "reject" and "legacy_partial" in reason
+    assert run.conversation_id is None
+
+
+async def test_partial_switch_never_reads_another_users_transcript(
+    project, monkeypatch,
+) -> None:
+    """The fallback hands the target exactly what GET /api/sessions/{sid}
+    would show this user: nothing, when the session is someone else's. (A
+    non-owner's resume attempt records the lazy wrap under their own sub
+    before its 403, so the conversation's owner alone doesn't settle it.)"""
+    monkeypatch.setattr(app_module, "PER_USER_SESSIONS", True)
+    tmp_path, pk = project
+    sid = "sess-partial-other"
+    app_module._claim_session_owner(sid, "sub-owner", pk)
+    app_module._conv_ensure_for_native("claude", pk, sid, "sub-intruder", "T")
+    _write_claude_transcript(tmp_path, sid, _PARTIAL_CHAT)
+    assert await app_module._switch_source_transcript(
+        ("claude", sid), "sub-intruder") is None
+    run = app_module.ActiveRun("run-partial-other")
+    run.owner_sub = "sub-intruder"
+    run.provider = "codex"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("claude", sid), "codex", tmp_path,
+        source_transcript=app_module.session_transcript(sid, pk))
+    assert kind == "reject" and "legacy_partial" in reason
+    assert run.switch_handoff is None
+
+
+def test_refused_switch_leaves_the_source_run_alone(client, monkeypatch) -> None:
+    """A refusal is decided before the source chat's run is stopped. Before,
+    the barrier stopped it first, and the refusal came after."""
+    monkeypatch.setattr(app_module, "PROVIDER_SWITCH_ENABLED", True)
+    monkeypatch.setattr(
+        app_module.codex_provider, "availability",
+        lambda *args, **kwargs: {"available": True, "reason": None})
+
+    class _Server:
+        async def models(self):
+            return []
+
+    async def _server_for_account(account, server_key=None):
+        return _Server()
+
+    stopped: list[str] = []
+
+    async def _fake_supersede(run, reason):
+        stopped.append(run.run_id)
+
+    monkeypatch.setattr(app_module, "_codex_server_for_account", _server_for_account)
+    monkeypatch.setattr(app_module, "_supersede_run_for_switch", _fake_supersede)
+    # The source chat lives in another project, so the switch is refused.
+    _source_conversation("claude", "sess-refused", "-another-project")
+    source = app_module.ActiveRun("run-refused-src", owner_sub="anonymous")
+    source.provider = "claude"
+    source.session_id = "sess-refused"
+    source.task = _LiveTask()
+    source.between_turns = True  # idle: the barrier would stop it, not refuse
+    app_module.ACTIVE_RUNS[source.run_id] = source
+    app_module.ACTIVE_RUNS_BY_SESSION["sess-refused"] = source
+    try:
+        r = client.post("/api/chat", data={
+            "message": "carry on", "provider": "codex", "session_id": "sess-refused",
+        })
+        assert r.status_code == 409
+        assert "different project" in r.text
+        assert stopped == []
+    finally:
+        app_module.ACTIVE_RUNS.pop(source.run_id, None)
+        app_module.ACTIVE_RUNS_BY_SESSION.pop("sess-refused", None)
 
 
 # ── Source-run barrier (_stop_source_run_for_switch, blocker #1) ──────────────

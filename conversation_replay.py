@@ -123,6 +123,51 @@ def _codex_agent_text(item: Any) -> str:
     return ""
 
 
+def events_from_transcript(messages: list[dict]) -> list[dict]:
+    """Map a Claude chat's on-disk transcript to canonical-shaped events.
+
+    ``messages`` are app.session_transcript entries (the list a reopened chat
+    renders). The result reads like a canonical log to ``render_handoff_text``,
+    for the switch that carries a chat whose canonical log is partial. The
+    review panel's answers and model notices are left out: neither is
+    something the user or the assistant said.
+    """
+    events: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "user":
+            events.append({
+                "event_type": "user_prompt",
+                "normalized": {
+                    "text": msg.get("text") or "",
+                    "image_count": msg.get("image_count") or 0,
+                },
+            })
+        elif role == "assistant":
+            events.append({
+                "event_type": "assistant",
+                "normalized": {
+                    "content": [{"type": "text", "text": msg.get("text") or ""}],
+                },
+            })
+        elif role == "tool_use":
+            events.append({
+                "event_type": "assistant",
+                "normalized": {
+                    "content": [{"type": "tool_use", "name": msg.get("name")}],
+                },
+            })
+        elif role == "tool_result":
+            events.append({
+                "event_type": "tool_result",
+                "normalized": {"is_error": bool(msg.get("is_error"))},
+                "raw": msg.get("text") or "",
+            })
+    return events
+
+
 def render_handoff_text(
     events: list[dict], source_provider: str,
     char_budget: int = DEFAULT_HANDOFF_BUDGET,
