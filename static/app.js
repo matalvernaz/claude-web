@@ -3971,8 +3971,9 @@
     } else if (obj.type === "provider_switched") {
       // The server carried this conversation into the other provider: the old
       // binding is superseded and a fresh native session was seeded with the
-      // prior turns (forged transcript for Claude, injected first message for
-      // Codex). That session's own system:init event adopts the new id above;
+      // prior turns (forged transcript for Claude; for Codex, history items
+      // injected into the new thread, or the handoff in front of the first
+      // message if that fails). That session's own system:init event adopts the new id above;
       // here we realign the picker to the destination and announce the boundary
       // for NVDA. The notice text comes from the server.
       if (providerSelect && obj.to &&
