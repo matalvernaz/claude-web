@@ -414,6 +414,78 @@ async def test_partial_claude_chat_switches_using_its_transcript(project) -> Non
     assert "1 file changed" in handoff
 
 
+def _codex_turns(cid: str, thread: str, count: int, *, size: int = 400) -> None:
+    for i in range(count):
+        app_module._conv_append_event(
+            cid, f"{thread}:a{i}", "codex", "agentMessage",
+            {"type": "agentMessage", "id": f"{thread}-{i}"},
+            raw=json.dumps({"type": "agentMessage",
+                            "text": f"codex step {i}: " + "x" * size}))
+
+
+async def test_split_chat_goes_to_codex_and_back_to_claude(project) -> None:
+    """A chat already split into a partial record goes to Codex on its
+    transcript, works there, and comes back. Its Codex side has no transcript
+    here, but everything since the split was captured live, so once that part
+    alone fills the handoff, the missing older turns would be cut anyway."""
+    tmp_path, pk = project
+    sid = "sess-split-1"
+    cid, _ = app_module._conv_ensure_for_native("claude", pk, sid, "sub-1", "T")
+    _write_claude_transcript(tmp_path, sid, _PARTIAL_CHAT)
+    to_codex = app_module.ActiveRun("run-split-1a")
+    to_codex.owner_sub = "sub-1"
+    to_codex.provider = "codex"
+    to_codex.project_key = pk
+    transcript = await app_module._switch_source_transcript(("claude", sid), "sub-1")
+    kind, _ = app_module._wire_provider_switch(
+        to_codex, ("claude", sid), "codex", tmp_path, source_transcript=transcript)
+    assert kind == "codex"
+    app_module._conv_activate_binding(to_codex.binding_id, "thread-split-1")
+    _codex_turns(cid, "thread-split-1", 40)
+    back = app_module.ActiveRun("run-split-1b")
+    back.owner_sub = "sub-1"
+    back.provider = "claude"
+    back.project_key = pk
+    kind, new_sid = app_module._wire_provider_switch(
+        back, ("codex", "thread-split-1"), "claude", tmp_path)
+    assert kind == "claude"
+    assert back.conversation_id == cid
+    forged = (app_module._sessions_dir(tmp_path) / f"{new_sid}.jsonl").read_text()
+    assert "codex step 39" in forged
+
+
+def test_split_codex_chat_with_little_captured_still_refuses(project) -> None:
+    """Too little captured to fill the handoff: the missing turns would have
+    been in it, so the switch still refuses rather than carry a gap."""
+    tmp_path, pk = project
+    cid, _ = app_module._conv_ensure_for_native("codex", pk, "thread-split-2", "sub-1", "T")
+    _codex_turns(cid, "thread-split-2", 3)
+    run = app_module.ActiveRun("run-split-2")
+    run.owner_sub = "sub-1"
+    run.provider = "claude"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("codex", "thread-split-2"), "claude", tmp_path)
+    assert kind == "reject" and "legacy_partial" in reason
+
+
+def test_codex_chat_with_a_capture_failure_still_refuses(project) -> None:
+    """'incomplete' means a write failed somewhere in the log, so a long
+    captured part is no promise the recent turns are whole."""
+    tmp_path, pk = project
+    cid, bid = app_module._conv_create_with_binding("codex", pk, "sub-1", "T")
+    app_module._conv_activate_binding(bid, "thread-holes")
+    _codex_turns(cid, "thread-holes", 40)
+    app_module._conv_mark_incomplete(cid, "test: a capture write failed")
+    run = app_module.ActiveRun("run-holes")
+    run.owner_sub = "sub-1"
+    run.provider = "claude"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("codex", "thread-holes"), "claude", tmp_path)
+    assert kind == "reject" and "incomplete" in reason
+
+
 async def test_complete_log_is_carried_without_reading_the_transcript(project) -> None:
     """A complete canonical log is the record, even with a transcript on disk."""
     tmp_path, pk = project
@@ -458,7 +530,33 @@ async def test_partial_switch_never_reads_another_users_transcript(
     kind, reason = app_module._wire_provider_switch(
         run, ("claude", sid), "codex", tmp_path,
         source_transcript=app_module.session_transcript(sid, pk))
-    assert kind == "reject" and "legacy_partial" in reason
+    assert kind == "reject" and "not your conversation" in reason
+    assert run.switch_handoff is None
+
+
+def test_split_chat_wrapped_by_someone_else_stays_the_owners(
+    project, monkeypatch,
+) -> None:
+    """The captured part of a split chat is the owner's own turns, even when
+    someone else's refused resume made the wrap and so owns the record."""
+    monkeypatch.setattr(app_module, "PER_USER_SESSIONS", True)
+    tmp_path, pk = project
+    sid = "sess-wrapped-by-other"
+    app_module._claim_session_owner(sid, "sub-owner", pk)
+    cid, _ = app_module._conv_ensure_for_native("claude", pk, sid, "sub-intruder", "T")
+    for i in range(40):
+        app_module._conv_append_event(
+            cid, f"{sid}:a{i}", "claude", "assistant",
+            {"role": "assistant",
+             "content": [{"type": "text", "text": f"owner step {i}: " + "x" * 400}]},
+            raw="{}")
+    run = app_module.ActiveRun("run-wrapped-other")
+    run.owner_sub = "sub-intruder"
+    run.provider = "codex"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("claude", sid), "codex", tmp_path)
+    assert kind == "reject" and "not your conversation" in reason
     assert run.switch_handoff is None
 
 

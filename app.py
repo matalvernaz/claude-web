@@ -6696,6 +6696,22 @@ def _switch_transcript_path(
         return None
 
 
+def _partial_log_events(
+    conversation_id: str, capture_state: str, source_provider: str,
+) -> Optional[list[dict]]:
+    """A legacy_partial conversation's events, when they alone fill the handoff.
+
+    Such a conversation was wrapped on a resume and captured live from then
+    on, so only turns older than the wrap are missing, and once the captured
+    part overflows the budget those would have been cut anyway. None
+    otherwise ('incomplete' capture can have gaps anywhere)."""
+    if capture_state != "legacy_partial":
+        return None
+    events = _load_conversation_events(conversation_id)
+    _text, omitted = conversation_replay.render_handoff_text(events, source_provider)
+    return events if omitted else None
+
+
 def _refuse_provider_switch(
     switch_source: tuple[str, str], target_provider: str, reason: str,
 ) -> HTTPException:
@@ -6724,16 +6740,24 @@ def _switch_source_problem(
     conv_owner = meta[0] if meta else None
     capture_state = meta[1] if meta else "incomplete"
     # Authorize: carrying a conversation across providers exposes its whole
-    # transcript to the target, so in per-user mode only the owner may.
-    if PER_USER_SESSIONS and conv_owner and conv_owner != owner_sub:
-        return "not your conversation"
+    # transcript to the target, so in per-user mode only the owner may. The
+    # native session's owner counts too, the rule GET /api/sessions/{sid}
+    # uses: a lazy wrap takes the owner_sub of whoever resumed first, and
+    # api_chat records it before its own 403 for someone else's session.
+    if PER_USER_SESSIONS:
+        session_owner = _session_owner(source_native)
+        if ((conv_owner and conv_owner != owner_sub)
+                or (session_owner is not None and session_owner != owner_sub)):
+            return "not your conversation"
     # Same project only — never seed a target in a different workspace.
     if src_project and src_project != project_key:
         return "source conversation belongs to a different project"
-    # Fail closed on partial capture unless the source's own transcript can
-    # stand in — never announce carryover we can't back.
-    if capture_state != "live_complete" and _switch_transcript_path(
-            switch_source, src_project, owner_sub) is None:
+    # Fail closed on partial capture unless the source's own transcript, or
+    # the captured part of the log, can stand in — never announce carryover
+    # we can't back.
+    if (capture_state != "live_complete"
+            and _switch_transcript_path(switch_source, src_project, owner_sub) is None
+            and _partial_log_events(source_conv_id, capture_state, source_provider) is None):
         return f"conversation history is {capture_state}; can't carry it over"
     return None
 
@@ -6774,7 +6798,9 @@ def _wire_provider_switch(
 
     ``source_transcript`` is the source chat's own transcript
     (_switch_source_transcript). It's carried instead of the canonical log when
-    that log covers only part of the chat.
+    that log covers only part of the chat; with no transcript (a Codex source),
+    a legacy_partial log is carried when its captured part fills the handoff
+    (_partial_log_events).
 
     Order matters: every precondition is checked and the destination is fully
     prepared BEFORE any state mutation (binding supersede/create,
@@ -6795,6 +6821,9 @@ def _wire_provider_switch(
         events = _load_conversation_events(source_conv_id)
     else:
         events = conversation_replay.events_from_transcript(source_transcript or [])
+        if not events:
+            events = _partial_log_events(
+                source_conv_id, capture_state, source_provider) or []
         if not events:
             return ("reject",
                     f"conversation history is {capture_state}; can't carry it over")
