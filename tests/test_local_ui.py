@@ -142,6 +142,151 @@ def assert_local_controls(page):
     playwright.expect(page.locator("#permission-mode-select")).to_have_value("default")
 
 
+def _long_saved_conversation(state, count=300):
+    state["session"] = {"provider": "claude", "messages": [
+        {"role": "assistant" if i % 2 else "user", "text": f"Message {i}\n\n**Saved text**"}
+        for i in range(count)
+    ]}
+
+
+@pytest.mark.parametrize("native_scheduler", [True, False])
+def test_long_history_yields_to_input_and_keeps_every_message(ui, native_scheduler):
+    page, state = ui
+    _long_saved_conversation(state)
+    page.add_init_script("""(() => {
+      const nativeScheduler = NATIVE_SCHEDULER;
+      window.historyProbe = [];
+      window.historyScrollReads = 0;
+      const height = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollHeight');
+      Object.defineProperty(Element.prototype, 'scrollHeight', {...height, get() {
+        if (this.id === 'transcript') window.historyScrollReads++;
+        return height.get.call(this);
+      }});
+      const probe = () => {
+        const transcript = document.getElementById('transcript');
+        const count = transcript?.querySelectorAll('.msg').length || 0;
+        if (count > 0 && count < 300) {
+          window.historyProbe.push({count, busy: transcript.getAttribute('aria-busy'),
+            disabled: document.getElementById('send').disabled});
+          const prompt = document.getElementById('prompt');
+          prompt.value = 'Keep this draft';
+          document.getElementById('chat-form').requestSubmit();
+        }
+      };
+      if (nativeScheduler) {
+        const scheduler = window.scheduler;
+        const realYield = scheduler.yield.bind(scheduler);
+        scheduler.yield = () => realYield().then(probe);
+      } else {
+        Object.defineProperty(window, 'scheduler', {value: undefined});
+        setInterval(probe, 0);
+      }
+    })();""".replace("NATIVE_SCHEDULER", json.dumps(native_scheduler)))
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#transcript .msg")).to_have_count(300)
+    playwright.expect(page.locator("#transcript")).to_have_attribute("aria-busy", "false")
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    playwright.expect(page.locator("#provider-status")).to_be_hidden()
+    playwright.expect(page.locator("#prompt")).to_have_value("Keep this draft")
+    probes = page.evaluate("window.historyProbe")
+    assert probes and all(p["busy"] == "true" and p["disabled"] for p in probes)
+    assert page.evaluate("window.historyScrollReads") < 20
+    assert state["posts"] == []
+    assert page.locator("#transcript .body").all_text_contents() == [
+        f"Message {i}\nSaved text\n" if i % 2 else f"Message {i}\n\n**Saved text**"
+        for i in range(300)
+    ]
+
+
+def test_new_chat_cancels_a_partly_rendered_history(ui):
+    page, state = ui
+    _long_saved_conversation(state)
+    page.add_init_script("""(() => {
+      window.scheduler.yield = () => new Promise(resolve => { window.finishHistoryYield = resolve; });
+    })();""")
+    page.goto("http://local-ui.test/?session=saved")
+    page.wait_for_function("typeof window.finishHistoryYield === 'function'")
+    assert 0 < page.locator("#transcript .msg").count() < 300
+    playwright.expect(page.locator("#provider-status")).to_contain_text("Loading conversation")
+    page.locator("#new-chat").click()
+    page.evaluate("window.finishHistoryYield()")
+    playwright.expect(page.locator("#transcript")).to_be_empty()
+    playwright.expect(page.locator("#transcript")).to_have_attribute("aria-busy", "false")
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    page.locator("#prompt").fill("Start fresh")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    assert len(state["posts"]) == 1
+    assert not state["posts"][0][1].get("session_id")
+    assert "Message " not in page.locator("#transcript").inner_text()
+
+
+def test_history_fetch_failure_clears_loading_state(ui):
+    page, state = ui
+    page.route("**/api/sessions/saved", lambda route: route.fulfill(status=503))
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#status")).to_contain_text("Could not load session: HTTP 503")
+    playwright.expect(page.locator("#transcript")).to_have_attribute("aria-busy", "false")
+    page.locator("#new-chat").click()
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    assert state["posts"] == []
+
+
+def test_new_chat_aborts_a_pending_history_fetch(ui):
+    page, state = ui
+    page.add_init_script("""(() => {
+      const realFetch = window.fetch;
+      window.fetch = (url, options) => {
+        if (!String(url).includes('/api/sessions/saved')) return realFetch(url, options);
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            window.historyFetchAborted = true;
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
+      };
+    })();""")
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#send")).to_be_disabled()
+    page.locator("#new-chat").click()
+    assert page.evaluate("window.historyFetchAborted")
+    playwright.expect(page.locator("#transcript")).to_be_empty()
+    playwright.expect(page.locator("#transcript")).to_have_attribute("aria-busy", "false")
+    playwright.expect(page.locator("#send")).to_be_enabled()
+    playwright.expect(page.locator("#status")).to_be_empty()
+    assert state["posts"] == []
+
+
+def test_long_history_attaches_to_live_events_only_after_replay(ui):
+    page, state = ui
+    _long_saved_conversation(state)
+    state["session"]["live_run"] = {
+        "run_id": "history-run", "active": True, "between_turns": False, "next_idx": 41,
+    }
+    events = [
+        {"type": "assistant", "_idx": 41,
+         "message": {"content": [{"type": "text", "text": "Latest reply"}]}},
+        {"type": "result", "_idx": 42}, {"type": "_done"},
+    ]
+    stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    page.add_init_script("""(() => {
+      const realFetch = window.fetch;
+      window.fetch = (url, options) => {
+        if (!String(url).includes('/api/chat/stream/history-run')) return realFetch(url, options);
+        window.historyCountAtAttach = document.querySelectorAll('#transcript .msg').length;
+        window.historyStreamURL = String(url);
+        return Promise.resolve(new Response(STREAM, {headers: {'Content-Type': 'text/event-stream'}}));
+      };
+    })();""".replace("STREAM", json.dumps(stream)))
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#transcript .msg")).to_have_count(301)
+    assert page.evaluate("window.historyCountAtAttach") == 300
+    assert page.evaluate("window.historyStreamURL").endswith("?start_index=41")
+    playwright.expect(page.locator("#transcript .body").last).to_have_text("Latest reply")
+    playwright.expect(page.locator("#transcript")).to_have_attribute("aria-busy", "false")
+    playwright.expect(page.locator("#send")).to_be_enabled()
+
+
 def _codex_question_session(page, state, *, live=False, closed=False):
     state["providers"]["providers"].append({
         "key": "codex", "label": "Codex", "available": True,

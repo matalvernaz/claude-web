@@ -39,6 +39,9 @@
   const searchModeEl = document.getElementById("search-mode");
   const searchModeLabel = document.getElementById("search-mode-label");
   const searchClearBtn = document.getElementById("search-clear");
+  // History batches mutate the DOM without reading scroll geometry after
+  // every message. Those reads otherwise force layout of the growing chat.
+  let renderingHistoryBatch = false;
 
   // AbortController for the in-flight chat stream — used by Stop and to
   // abandon a resume attempt. The SDK task lives server-side independently
@@ -559,12 +562,13 @@
   // actively scrolling away.
   const SCROLL_PIN_PX = 64;
   function isPinnedToBottom() {
+    if (renderingHistoryBatch) return false;
     const el = transcript;
     if (!el) return true;
     return (el.scrollHeight - el.scrollTop - el.clientHeight) < SCROLL_PIN_PX;
   }
   function maybeAutoScroll(force) {
-    if (!transcript) return;
+    if (!transcript || renderingHistoryBatch) return;
     if (force || isPinnedToBottom()) {
       transcript.scrollTop = transcript.scrollHeight;
     }
@@ -791,6 +795,8 @@
   // next message.
   let sessionProvider = null;
   let sessionLoadGeneration = 0;
+  let sessionLoadAbort = null;
+  let sessionLoading = false;
   let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
@@ -809,6 +815,7 @@
     }
   }
   function providerBlockReason() {
+    if (sessionLoading) return "Loading conversation… You can start a new chat to leave it.";
     if (!providersInitialized) return "Checking AI provider availability…";
     if (sessionId && !sessionProvider) return "Loading conversation. Start a new chat if it cannot be loaded.";
     const provider = currentProvider();
@@ -1680,11 +1687,50 @@
     document.title = title ? `${title} — Claude` : DEFAULT_PAGE_TITLE;
   }
 
+  function setSessionLoading(loading) {
+    sessionLoading = loading;
+    transcript.setAttribute("aria-busy", String(loading));
+    syncProviderAvailability();
+  }
+
+  function cancelSessionLoad() {
+    sessionLoadGeneration++;
+    if (sessionLoadAbort) sessionLoadAbort.abort();
+    sessionLoadAbort = null;
+    setSessionLoading(false);
+  }
+
+  function yieldToBrowser() {
+    // A resolved Promise only yields to microtasks, which still block input
+    // and paint. Use a new task, including on browsers without scheduler.
+    if (globalThis.scheduler && typeof globalThis.scheduler.yield === "function") {
+      return globalThis.scheduler.yield();
+    }
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
   async function loadSession(id, project) {
     const loadGeneration = ++sessionLoadGeneration;
+    if (sessionLoadAbort) sessionLoadAbort.abort();
+    const abort = new AbortController();
+    sessionLoadAbort = abort;
+    setSessionLoading(true);
+    setStatus("Loading conversation…");
+    try {
+      await restoreSession(id, project, loadGeneration, abort.signal);
+    } finally {
+      // A cancelled load must not clear a newer load's busy state.
+      if (loadGeneration === sessionLoadGeneration) {
+        sessionLoadAbort = null;
+        setSessionLoading(false);
+      }
+    }
+  }
+
+  async function restoreSession(id, project, loadGeneration, signal) {
     const url = new URL(`/api/sessions/${encodeURIComponent(id)}`, location.origin);
     if (project) url.searchParams.set("project", project);
-    const r = await fetch(url);
+    const r = await fetch(url, { signal });
     if (loadGeneration !== sessionLoadGeneration) return;
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
@@ -1704,6 +1750,7 @@
     currentRunId = null;
     safeRemove(sessionStorage, RUN_KEY);
     setStreaming(false);
+    stopGerunds();
     // Explicit navigation: a pending same-session queue re-bind belongs to
     // the conversation we're leaving, not the one we're loading.
     queueRebindFromRunId = null;
@@ -1771,41 +1818,63 @@
     // The panel tool's "sent to the panel" note is skipped: the panel's
     // answer follows as a panel_result.
     let skipPanelAck = false;
+    let batchStart = performance.now();
+    let batchCount = 0;
+    let rendered = 0;
     for (const m of data.messages) {
-      if (m.role === "tool_result" && skipPanelAck && !m.is_error && isPanelAck(m.text)) {
-        skipPanelAck = false;
-        continue;
+      // Bound both work time and batch size: inexpensive tool rows should
+      // still give input and rendering a turn. Full history stays in the DOM
+      // for screen-reader heading navigation and browser find.
+      if (batchCount >= 25 || performance.now() - batchStart >= 8) {
+        setStatus(`Loading conversation… ${rendered} of ${data.messages.length} messages`);
+        await yieldToBrowser();
+        if (loadGeneration !== sessionLoadGeneration) return;
+        batchStart = performance.now();
+        batchCount = 0;
       }
-      skipPanelAck = false;
-      if (m.role === "user") {
-        const body = appendMessage("user", m.text || "");
-        if (m.image_count) appendImagePlaceholder(body, m.image_count);
-        if (m.file_count) appendFilePlaceholder(body, m.file_count);
-      } else if (m.role === "panel_result") {
-        renderPanelResult(m.text || "");
-      } else if (m.role === "tool_use" && m.name === PANEL_TOOL) {
-        renderPanelSubmission(m.input || {});
-        skipPanelAck = true;
-      } else if (m.role === "assistant") {
-        appendMessage("assistant", m.text);
-      } else if (m.role === "async_question") {
-        renderAsyncQuestion({ ...m, session_id: id }, false);
-      } else if (m.role === "tool_use") {
-        if ((m.name === "Edit" || m.name === "Write") && m.input) {
-          insertDiffMessage(m.name, m.input);
-        } else {
-          insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
+      batchCount++;
+      rendered++;
+      renderingHistoryBatch = true;
+      try {
+        if (m.role === "tool_result" && skipPanelAck && !m.is_error && isPanelAck(m.text)) {
+          skipPanelAck = false;
+          continue;
         }
-      } else if (m.role === "tool_result") {
-        insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
-      } else if (m.role === "notice") {
-        appendNotice(m.title || "Notice", m.text || "");
+        skipPanelAck = false;
+        if (m.role === "user") {
+          const body = appendMessage("user", m.text || "");
+          if (m.image_count) appendImagePlaceholder(body, m.image_count);
+          if (m.file_count) appendFilePlaceholder(body, m.file_count);
+        } else if (m.role === "panel_result") {
+          renderPanelResult(m.text || "");
+        } else if (m.role === "tool_use" && m.name === PANEL_TOOL) {
+          renderPanelSubmission(m.input || {});
+          skipPanelAck = true;
+        } else if (m.role === "assistant") {
+          appendMessage("assistant", m.text);
+        } else if (m.role === "async_question") {
+          renderAsyncQuestion({ ...m, session_id: id }, false);
+        } else if (m.role === "tool_use") {
+          if ((m.name === "Edit" || m.name === "Write") && m.input) {
+            insertDiffMessage(m.name, m.input);
+          } else {
+            insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
+          }
+        } else if (m.role === "tool_result") {
+          insertToolMessage((m.is_error ? "✗ " : "← ") + m.text);
+        } else if (m.role === "notice") {
+          appendNotice(m.title || "Notice", m.text || "");
+        }
+      } finally {
+        renderingHistoryBatch = false;
       }
     }
     // Force-scroll on session load — we just replaced the entire transcript.
     maybeAutoScroll(true);
     markActive(sessionId);
     updatePageTitle();
+    setStatus("");
+    announce("Conversation loaded.");
     // If a live run owns this session, attach so currentRunId/RUN_KEY/
     // isStreaming reflect reality and later sends route correctly. Guard on
     // sessionId still matching what we loaded so a newer navigation wins
@@ -2351,7 +2420,7 @@
 
   newChatBtn.addEventListener("click", () => {
     // A late session fetch must not restore the chat/provider being left.
-    sessionLoadGeneration++;
+    cancelSessionLoad();
     sessionId = "";
     sessionProvider = null;
     // Clear the URL-pinned project so the picker takes over again. Without
@@ -6185,7 +6254,7 @@
         group.dataset.tools = seen.join(",");
       }
     }
-    const count = group.querySelectorAll(".tool-line").length;
+    const count = group.childElementCount - 1; // all children except the summary
     const tools = (group.dataset.tools || "").split(",").filter(Boolean);
     group.querySelector("summary").textContent = tools.length
       ? `Tools: ${tools.join(", ")} (${count})`
@@ -6338,6 +6407,7 @@
       li.remove();
       announce("Session deleted.");
       if (sessionId === id) {
+        cancelSessionLoad();
         sessionId = "";
         sessionProject = "";
         transcript.innerHTML = "";
