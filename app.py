@@ -6698,17 +6698,23 @@ def _switch_transcript_path(
 
 def _partial_log_events(
     conversation_id: str, capture_state: str, source_provider: str,
+    target_provider: str,
 ) -> Optional[list[dict]]:
     """A legacy_partial conversation's events, when they alone fill the handoff.
 
     Such a conversation was wrapped on a resume and captured live from then
     on, so only turns older than the wrap are missing, and once the captured
-    part overflows the budget those would have been cut anyway. None
-    otherwise ('incomplete' capture can have gaps anywhere)."""
+    part overflows the budget those would have been cut anyway. The budget is
+    the target's (Codex history items carry far more than the text handoff),
+    or the argument doesn't hold. None otherwise ('incomplete' capture can
+    have gaps anywhere)."""
     if capture_state != "legacy_partial":
         return None
     events = _load_conversation_events(conversation_id)
-    _text, omitted = conversation_replay.render_handoff_text(events, source_provider)
+    if target_provider == "codex":
+        _items, omitted = conversation_replay.render_handoff_items(events, source_provider)
+    else:
+        _text, omitted = conversation_replay.render_handoff_text(events, source_provider)
     return events if omitted else None
 
 
@@ -6725,6 +6731,7 @@ def _refuse_provider_switch(
 
 def _switch_source_problem(
     switch_source: tuple[str, str], owner_sub: Optional[str], project_key: str,
+    target_provider: str,
 ) -> Optional[str]:
     """Why this chat can't be carried to the other provider, or None if it can.
 
@@ -6757,7 +6764,8 @@ def _switch_source_problem(
     # we can't back.
     if (capture_state != "live_complete"
             and _switch_transcript_path(switch_source, src_project, owner_sub) is None
-            and _partial_log_events(source_conv_id, capture_state, source_provider) is None):
+            and _partial_log_events(
+                source_conv_id, capture_state, source_provider, target_provider) is None):
         return f"conversation history is {capture_state}; can't carry it over"
     return None
 
@@ -6793,7 +6801,8 @@ def _wire_provider_switch(
       ("claude_text", None) — Claude target, but forged-resume isn't verified on
                             this CLI version: handoff rides the first message to
                             a fresh session (run.switch_handoff), sid_in stays None.
-      ("codex", None)     — handoff stashed on run.switch_handoff for the driver.
+      ("codex", None)     — history items on run.switch_handoff_items for the
+                            driver to inject, run.switch_handoff as its fallback.
       ("reject", reason)  — the caller must abort the switch (HTTP 409).
 
     ``source_transcript`` is the source chat's own transcript
@@ -6807,7 +6816,8 @@ def _wire_provider_switch(
     run.conversation_id) or the provider_switched announcement — so a failed
     forge or a rejected precondition can't leave a retired source binding and a
     context-free target claiming a successful handoff."""
-    problem = _switch_source_problem(switch_source, run.owner_sub, run.project_key)
+    problem = _switch_source_problem(
+        switch_source, run.owner_sub, run.project_key, target_provider)
     if problem:
         return ("reject", problem)
     source_provider, source_native = switch_source
@@ -6823,11 +6833,16 @@ def _wire_provider_switch(
         events = conversation_replay.events_from_transcript(source_transcript or [])
         if not events:
             events = _partial_log_events(
-                source_conv_id, capture_state, source_provider) or []
+                source_conv_id, capture_state, source_provider, target_provider) or []
         if not events:
             return ("reject",
                     f"conversation history is {capture_state}; can't carry it over")
     handoff, omitted = conversation_replay.render_handoff_text(events, source_provider)
+    # Codex takes the conversation as history items, which carry far more than
+    # the text block; the block stays as its fallback (see _codex_driver).
+    items: Optional[list[dict]] = None
+    if target_provider == "codex":
+        items, omitted = conversation_replay.render_handoff_items(events, source_provider)
     # Prepare destination BEFORE mutating any state. Forge an on-disk transcript
     # only when this CLI version is verified to ingest one; otherwise fall back
     # to injecting the handoff as the first real message to a fresh session
@@ -6857,6 +6872,7 @@ def _wire_provider_switch(
         run.record_session_bindings(new_sid)
     else:
         run.switch_handoff = handoff
+        run.switch_handoff_items = items
     run.emit({
         "type": "provider_switched",
         "from": source_provider,
@@ -8938,10 +8954,14 @@ class ActiveRun:
         # None on runs created before the conversation layer wraps them.
         self.conversation_id: Optional[str] = None
         self.binding_id: Optional[str] = None
-        # Set on a cross-provider switch with a Codex target: the bounded
-        # handoff the driver injects as the first message. Claude targets get
-        # their handoff via a forged resume transcript instead.
+        # Set on a cross-provider switch with a Codex target: the bounded text
+        # handoff the driver puts in front of the first message when it can't
+        # inject history items. Claude targets get their handoff via a forged
+        # resume transcript instead.
         self.switch_handoff: Optional[str] = None
+        # Codex targets: the same conversation as history items, put into the
+        # new thread with thread/inject_items before the first turn.
+        self.switch_handoff_items: Optional[list[dict]] = None
         # Codex-only state. thread_id doubles as the session id; turn_id is
         # the in-flight turn (turn/interrupt needs both). effort/model are
         # the values the next turn/start will send (per-turn on Codex, so a
@@ -13079,8 +13099,15 @@ async def _codex_driver(
     first_prompt_title: str,
     account: dict,
     fork: bool = False,
+    handoff_text: str = "",
+    handoff_items: Optional[list[dict]] = None,
 ) -> None:
     """Own one Codex thread for the life of this run.
+
+    ``handoff_items``/``handoff_text`` carry a conversation switched in from
+    the other provider: the items go into the new thread's history before the
+    first turn, and the text rides in front of the first message only if that
+    fails.
 
     External contract matches the Claude driver: consumes
     run.user_input_queue (honouring canceled/committed ids and delivery
@@ -13250,7 +13277,31 @@ async def _codex_driver(
                 return False
             return True
 
-        if not await _start_turn(initial_text, initial_images):
+        first_text = initial_text
+        if handoff_items and not resume_thread_id:
+            # A switch always starts a fresh thread; never inject into a
+            # resumed or forked one. thread/inject_items is deliberately not
+            # in codex_provider.REQUIRED_PROTOCOL: without it, the handoff
+            # rides in front of the message as it did before.
+            try:
+                await server.request("thread/inject_items", {
+                    "threadId": thread_id, "items": handoff_items,
+                })
+            except Exception as e:
+                log.warning(
+                    "codex thread/inject_items failed for run %s, so the "
+                    "handoff rides in front of the first message: %s",
+                    run.run_id, e,
+                )
+                if handoff_text:
+                    first_text = (handoff_text
+                                  + conversation_replay.HANDOFF_MESSAGE_SEPARATOR
+                                  + initial_text)
+        elif handoff_text and not resume_thread_id:
+            first_text = (handoff_text
+                          + conversation_replay.HANDOFF_MESSAGE_SEPARATOR
+                          + initial_text)
+        if not await _start_turn(first_text, initial_images):
             return
 
         turn_started_mono = time.monotonic()
@@ -13880,7 +13931,7 @@ async def api_chat(
             # Ask before stopping the source run: a refused switch must leave
             # the chat it came from as it was.
             _problem = _switch_source_problem(
-                switch_source, user.get("sub"), _sanitize_project_key(cwd))
+                switch_source, user.get("sub"), _sanitize_project_key(cwd), provider)
             if _problem:
                 raise _refuse_provider_switch(switch_source, provider, _problem)
             await _stop_source_run_for_switch(_src[0], switch_source[1], user)
@@ -14235,20 +14286,14 @@ async def api_chat(
         # The Codex driver owns everything from here (thread lifecycle,
         # event translation, approvals); the rest of this handler is the
         # Claude SDK path.
-        # On a switch into Codex, lead the first turn with the bounded handoff
-        # (already framed as an untrusted read-only record) then the user's
-        # actual message in a clearly separated block.
-        _codex_initial = effective_message
-        if run.switch_handoff:
-            _codex_initial = (
-                run.switch_handoff
-                + "\n\n---\n\nThe user's new message follows:\n\n"
-                + effective_message
-            )
+        # On a switch into Codex the driver puts the carried conversation into
+        # the new thread before the user's message (see _codex_driver).
         run.task = asyncio.create_task(_codex_driver(
             run,
-            initial_text=_codex_initial,
+            initial_text=effective_message,
             initial_images=image_blocks,
+            handoff_text=run.switch_handoff or "",
+            handoff_items=run.switch_handoff_items,
             resume_thread_id=sid_in,
             model_id=(selected_model.get("model") or model or ""),
             effort=effort,

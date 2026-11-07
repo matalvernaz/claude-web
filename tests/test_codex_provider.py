@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import codex_provider
+import conversation_replay
 
 
 # ─── item_events translation ──────────────────────────────────────────────────
@@ -1943,3 +1944,109 @@ def test_expected_shutdown_does_not_log_a_warning():
 
     levels = [r.levelno for r in records if "exited" in r.getMessage()]
     assert levels == [logging.INFO, logging.WARNING]
+
+
+def _handoff_server(app_module, *, inject_error=None, resume=False):
+    class Server:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+            self.calls = []
+
+        async def request(self, method, params=None, timeout=None):
+            self.calls.append((method, params))
+            if method in ("thread/start", "thread/resume"):
+                return {"thread": {"id": "thread-switched-in"}}
+            if method == "thread/inject_items":
+                if inject_error is not None:
+                    raise inject_error
+                return {}
+            if method == "turn/start":
+                self.queue.put_nowait({"method": codex_provider.SERVER_EXITED_METHOD, "params": {}})
+                return {"turn": {"id": "first"}}
+            assert method == "thread/unsubscribe"
+            return {}
+
+        def subscribe(self, thread_id):
+            return self.queue
+
+        def set_request_handler(self, thread_id, handler):
+            pass
+
+        def unsubscribe(self, thread_id):
+            pass
+
+    return Server()
+
+
+_HANDOFF_ITEMS = [
+    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "carried over"}]},
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "deploy the thing"}]},
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "deployed ok"}]},
+]
+
+
+async def _drive_switched_in(app_module, monkeypatch, server, *, resume_thread_id=None):
+    async def server_for_account(*args, **kwargs):
+        return server
+
+    async def close_key(key):
+        pass
+
+    monkeypatch.setattr(app_module, "_codex_server_for_account", server_for_account)
+    monkeypatch.setattr(codex_provider.CodexAppServer, "close_key", close_key)
+    run = app_module.ActiveRun("run-switched-in", owner_sub="anonymous")
+    run.provider = "codex"
+    await asyncio.wait_for(app_module._codex_driver(
+        run, initial_text="carry on", initial_images=[],
+        resume_thread_id=resume_thread_id, model_id="gpt-test", effort="",
+        cwd=app_module.DEFAULT_CWD, personality_append="",
+        first_prompt_title="carry on", account={"server_key": "test"},
+        handoff_text="TEXT HANDOFF", handoff_items=_HANDOFF_ITEMS,
+    ), 3)
+    app_module._state_db().execute(
+        "DELETE FROM codex_session WHERE thread_id = ?", ("thread-switched-in",))
+    return [method for method, _ in server.calls], dict(server.calls)
+
+
+async def test_codex_driver_injects_switched_in_history_before_the_first_turn(
+    client, monkeypatch,
+):
+    """A switch into Codex puts the carried conversation into the new thread's
+    history, so the first turn is just the user's message."""
+    import app as app_module
+
+    server = _handoff_server(app_module)
+    methods, params = await _drive_switched_in(app_module, monkeypatch, server)
+    assert methods[:3] == ["thread/start", "thread/inject_items", "turn/start"]
+    assert params["thread/inject_items"] == {
+        "threadId": "thread-switched-in", "items": _HANDOFF_ITEMS,
+    }
+    assert params["turn/start"]["input"] == [{"type": "text", "text": "carry on"}]
+
+
+async def test_codex_driver_puts_the_handoff_in_front_when_inject_fails(
+    client, monkeypatch, caplog,
+):
+    """thread/inject_items isn't in REQUIRED_PROTOCOL, so a Codex without it
+    must still get the conversation: the text handoff rides in front."""
+    import app as app_module
+
+    server = _handoff_server(
+        app_module, inject_error=codex_provider.CodexError("thread/inject_items is not supported"))
+    with caplog.at_level("WARNING", logger="claude-web"):
+        methods, params = await _drive_switched_in(app_module, monkeypatch, server)
+    assert methods[:3] == ["thread/start", "thread/inject_items", "turn/start"]
+    expected = "TEXT HANDOFF" + conversation_replay.HANDOFF_MESSAGE_SEPARATOR + "carry on"
+    assert params["turn/start"]["input"] == [{"type": "text", "text": expected}]
+    assert "thread/inject_items failed" in caplog.text
+
+
+async def test_codex_driver_never_injects_into_a_resumed_thread(client, monkeypatch):
+    import app as app_module
+
+    server = _handoff_server(app_module, resume=True)
+    methods, params = await _drive_switched_in(
+        app_module, monkeypatch, server, resume_thread_id="thread-switched-in")
+    assert methods[0] == "thread/resume"
+    assert "thread/inject_items" not in methods
+    assert params["turn/start"]["input"] == [{"type": "text", "text": "carry on"}]

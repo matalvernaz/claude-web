@@ -146,6 +146,11 @@ def codex_home() -> Path:
 # (`codex app-server generate-json-schema`) that declares it. A CLI update that
 # drops one would break chats without an error, so the auto-updater checks
 # the new CLI against this list and rolls back on a miss.
+#
+# thread/inject_items (a provider switch's carried history) is used but left
+# out on purpose: when it fails the driver puts the text handoff in front of
+# the first message instead, and rolling back an update for it would also hold
+# back the newer models OpenAI only lists to newer CLIs.
 REQUIRED_PROTOCOL: dict[str, tuple[str, ...]] = {
     "ClientRequest": (
         "account/read", "account/usage/read", "account/rateLimits/read",

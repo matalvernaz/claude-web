@@ -215,6 +215,12 @@ def test_switch_claude_to_codex_stashes_handoff(tmp_path) -> None:
     assert kind == "codex" and val is None  # codex resumes via injected message
     assert run.conversation_id == cid
     assert run.switch_handoff and "deploy the thing" in run.switch_handoff
+    # The driver injects these as the new thread's history; the text above is
+    # only its fallback.
+    roles = [item["role"] for item in run.switch_handoff_items]
+    assert roles == ["developer", "user", "assistant"]
+    assert "deploy the thing" in run.switch_handoff_items[1]["content"][0]["text"]
+    assert "deployed ok" in run.switch_handoff_items[2]["content"][0]["text"]
     codex_status = app_module._state_db().execute(
         "SELECT status FROM conversation_binding WHERE conversation_id=? AND provider='codex'",
         (cid,)).fetchone()[0]
@@ -466,6 +472,30 @@ def test_split_codex_chat_with_little_captured_still_refuses(project) -> None:
     run.project_key = pk
     kind, reason = app_module._wire_provider_switch(
         run, ("codex", "thread-split-2"), "claude", tmp_path)
+    assert kind == "reject" and "legacy_partial" in reason
+
+
+def test_partial_gate_uses_the_targets_budget(project) -> None:
+    """The captured part has to overflow the budget of the handoff the target
+    actually gets. 20,000 characters overflow Claude's 12,000 but not Codex's
+    60,000, where the missing older turns would have been carried."""
+    tmp_path, pk = project
+    sid = "sess-split-budget"
+    cid, _ = app_module._conv_ensure_for_native("claude", pk, sid, "sub-1", "T")
+    for i in range(40):
+        app_module._conv_append_event(
+            cid, f"{sid}:a{i}", "claude", "assistant",
+            {"role": "assistant",
+             "content": [{"type": "text", "text": f"step {i}: " + "x" * 500}]},
+            raw="{}")
+    assert app_module._partial_log_events(cid, "legacy_partial", "claude", "claude")
+    assert app_module._partial_log_events(cid, "legacy_partial", "claude", "codex") is None
+    run = app_module.ActiveRun("run-split-budget")
+    run.owner_sub = "sub-1"
+    run.provider = "codex"
+    run.project_key = pk
+    kind, reason = app_module._wire_provider_switch(
+        run, ("claude", sid), "codex", tmp_path)
     assert kind == "reject" and "legacy_partial" in reason
 
 
