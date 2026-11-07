@@ -82,3 +82,26 @@ def test_empty_conversation_still_frames() -> None:
     text, omitted = cr.render_handoff_text([], "claude")
     assert omitted == 0
     assert cr._BEGIN in text and cr._END in text
+
+
+def test_transcript_entries_map_to_handoff_lines() -> None:
+    """A Claude chat's on-disk transcript (app.session_transcript entries)
+    renders like the canonical log; the review panel's answers and model
+    notices aren't anybody's words in the chat, so they stay out."""
+    messages = [
+        {"role": "user", "text": "make the voices quieter", "image_count": 2},
+        {"role": "assistant", "text": "Turning them down."},
+        {"role": "tool_use", "name": "Edit", "summary": "mix.py"},
+        {"role": "tool_result", "text": "edit failed: no match", "is_error": True},
+        {"role": "panel_result", "text": "PANEL SAYS SHIP IT"},
+        {"role": "notice", "title": "Model switched", "text": "fell back to Sonnet"},
+    ]
+    events = cr.events_from_transcript(messages)
+    text, omitted = cr.render_handoff_text(events, "claude")
+    assert omitted == 0
+    assert "USER: make the voices quieter [+2 image(s)]" in text
+    assert "ASSISTANT: Turning them down." in text
+    assert "ASSISTANT: [called tool Edit]" in text
+    assert "[tool result (error): edit failed: no match]" in text
+    assert "PANEL SAYS SHIP IT" not in text
+    assert "fell back to Sonnet" not in text
