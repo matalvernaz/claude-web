@@ -1,4 +1,4 @@
-"""The DeepSeek provider reads DeepSeek's live model list and routes Claude Code to DeepSeek's server.
+"""The DeepSeek provider reads DeepSeek's live model list and routes Claude Code to DeepSeek on the key of the account a chat uses.
 
 The /models and /user/balance payloads below are the real responses from 2026-11-07, so the parsing is tested against what DeepSeek actually sends.
 """
@@ -29,14 +29,15 @@ MODELS_PAYLOAD = {"object": "list", "data": [
 BALANCE_PAYLOAD = {"is_available": True, "balance_infos": [
     {"currency": "USD", "total_balance": "20.00", "granted_balance": "0.00", "topped_up_balance": "20.00"},
 ]}
+KEY = "sk-personal"
 
 
 @pytest.fixture(autouse=True)
 def deepseek_config(monkeypatch):
-    monkeypatch.setattr(deepseek_provider, "API_KEY", "sk-test")
+    monkeypatch.setattr(deepseek_provider, "ENABLED", True)
+    monkeypatch.setattr(deepseek_provider, "API_KEY", "")
     monkeypatch.setattr(deepseek_provider, "BASE_URL", "https://api.deepseek.com")
-    monkeypatch.setattr(deepseek_provider, "_models_cache",
-                        {"origin": None, "key": None, "fetched_at": 0.0, "models": []})
+    monkeypatch.setattr(deepseek_provider, "_models_cache", {})
 
 
 @pytest.fixture
@@ -48,7 +49,6 @@ def deepseek_api(monkeypatch):
     def respond(request):
         state["requests"].append(request)
         assert request.method == "GET"
-        assert request.headers["Authorization"] == f"Bearer {deepseek_provider.API_KEY}"
         if state["status"] != 200:
             return httpx.Response(state["status"], json={"error": {"message": "nope"}})
         if request.url.path == "/models":
@@ -69,17 +69,23 @@ def run(coroutine):
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-def test_no_key_says_how_to_turn_it_on(monkeypatch):
-    monkeypatch.setattr(deepseek_provider, "API_KEY", "")
+def test_off_unless_the_host_turns_it_on(monkeypatch):
+    monkeypatch.setattr(deepseek_provider, "ENABLED", False)
 
-    assert "CLAUDE_WEB_DEEPSEEK_API_KEY" in deepseek_provider.unavailable_reason()
+    assert "CLAUDE_WEB_DEEPSEEK_ENABLED" in deepseek_provider.unavailable_reason()
+
+
+def test_a_user_without_a_key_is_told_where_to_link_one():
+    assert deepseek_provider.unavailable_reason() is None
+    assert deepseek_provider.unavailable_reason("") == deepseek_provider.NO_KEY
+    assert deepseek_provider.unavailable_reason(KEY) is None
 
 
 @pytest.mark.parametrize("url", ["https://api.deepseek.com", "http://127.0.0.1:8123", "http://localhost:9"])
 def test_https_or_a_loopback_stand_in_is_accepted(monkeypatch, url):
     monkeypatch.setattr(deepseek_provider, "BASE_URL", url)
 
-    assert deepseek_provider.unavailable_reason() is None
+    assert deepseek_provider.unavailable_reason(KEY) is None
 
 
 @pytest.mark.parametrize("url", [
@@ -92,14 +98,15 @@ def test_https_or_a_loopback_stand_in_is_accepted(monkeypatch, url):
 def test_anything_else_is_refused(monkeypatch, url):
     monkeypatch.setattr(deepseek_provider, "BASE_URL", url)
 
-    assert deepseek_provider.unavailable_reason() == deepseek_provider.BAD_ORIGIN
+    assert deepseek_provider.unavailable_reason(KEY) == deepseek_provider.BAD_ORIGIN
 
 
 # ── The live model list ───────────────────────────────────────────────────────
 
 def test_the_live_list_becomes_picker_entries(deepseek_api):
-    flash, pro = run(deepseek_provider.list_models())
+    flash, pro = run(deepseek_provider.list_models(KEY))
 
+    assert deepseek_api["requests"][0].headers["Authorization"] == f"Bearer {KEY}"
     assert flash["key"] == "deepseek-flash"
     assert flash["label"] == "DeepSeek V4.1 Flash"
     assert flash["context"] == 1048576
@@ -116,7 +123,7 @@ def test_a_new_model_appears_without_a_code_change(deepseek_api):
     newest = dict(MODELS_PAYLOAD["data"][0], id="deepseek-v5-flash", name="DeepSeek-V5-Flash")
     deepseek_api["models"] = {"data": [newest] + MODELS_PAYLOAD["data"]}
 
-    keys = [model["key"] for model in run(deepseek_provider.list_models())]
+    keys = [model["key"] for model in run(deepseek_provider.list_models(KEY))]
 
     assert keys == ["deepseek-v5-flash", "deepseek-flash", "deepseek-v4-pro"]
 
@@ -126,7 +133,7 @@ def test_models_without_the_anthropic_endpoint_are_left_out(deepseek_api):
                      api_capabilities={"openai_chat": {}})
     deepseek_api["models"] = {"data": [chat_only, MODELS_PAYLOAD["data"][0]]}
 
-    models = run(deepseek_provider.list_models())
+    models = run(deepseek_provider.list_models(KEY))
 
     assert [model["key"] for model in models] == ["deepseek-flash"]
     assert models[0]["is_default"] is True
@@ -136,50 +143,58 @@ def test_effort_levels_the_sdk_cannot_send_are_dropped(deepseek_api):
     odd = dict(MODELS_PAYLOAD["data"][0], effort={"supported_levels": ["low", "ultra"], "default_level": "ultra"})
     deepseek_api["models"] = {"data": [odd]}
 
-    (model,) = run(deepseek_provider.list_models())
+    (model,) = run(deepseek_provider.list_models(KEY))
 
     assert model["efforts"] == ["low"]
     assert model["default_effort"] is None
 
 
-def test_the_list_is_cached_for_an_hour_and_per_key(deepseek_api, monkeypatch):
-    run(deepseek_provider.list_models())
-    run(deepseek_provider.list_models())
+def test_the_list_is_cached_for_an_hour_per_key(deepseek_api):
+    run(deepseek_provider.list_models(KEY))
+    run(deepseek_provider.list_models(KEY))
     assert len(deepseek_api["requests"]) == 1
 
-    run(deepseek_provider.list_models(force=True))
+    run(deepseek_provider.list_models(KEY, force=True))
     assert len(deepseek_api["requests"]) == 2
 
-    monkeypatch.setattr(deepseek_provider, "API_KEY", "sk-another")
-    run(deepseek_provider.list_models())
+    # Another account's key gets its own list, fetched with its own key.
+    run(deepseek_provider.list_models("sk-someone-else"))
     assert len(deepseek_api["requests"]) == 3
+    assert deepseek_api["requests"][2].headers["Authorization"] == "Bearer sk-someone-else"
 
 
-def test_a_refused_key_says_what_to_check(deepseek_api):
+def test_a_refused_key_says_what_to_do(deepseek_api):
     deepseek_api["status"] = 401
 
-    with pytest.raises(ValueError, match="refused the API key"):
-        run(deepseek_provider.list_models())
+    with pytest.raises(ValueError, match="refused this API key"):
+        run(deepseek_provider.list_models(KEY))
+
+
+def test_no_key_never_reaches_deepseek(deepseek_api):
+    with pytest.raises(ValueError, match="Link a DeepSeek API key"):
+        run(deepseek_provider.list_models(""))
+
+    assert deepseek_api["requests"] == []
 
 
 def test_an_empty_list_is_an_error_not_an_empty_picker(deepseek_api):
     deepseek_api["models"] = {"data": []}
 
     with pytest.raises(ValueError, match="no models"):
-        run(deepseek_provider.list_models())
+        run(deepseek_provider.list_models(KEY))
 
 
 def test_a_run_gets_the_model_asked_for_or_the_first_listed(deepseek_api):
-    assert run(deepseek_provider.model_for_run(""))["key"] == "deepseek-flash"
-    assert run(deepseek_provider.model_for_run("deepseek-v4-pro"))["key"] == "deepseek-v4-pro"
+    assert run(deepseek_provider.model_for_run("", KEY))["key"] == "deepseek-flash"
+    assert run(deepseek_provider.model_for_run("deepseek-v4-pro", KEY))["key"] == "deepseek-v4-pro"
     with pytest.raises(ValueError, match="no longer offers"):
-        run(deepseek_provider.model_for_run("deepseek-r1"))
+        run(deepseek_provider.model_for_run("deepseek-r1", KEY))
 
 
 # ── What a run is spawned with ────────────────────────────────────────────────
 
 def test_effort_reaches_the_sdk_and_images_follow_the_model(deepseek_api):
-    flash, pro = run(deepseek_provider.list_models())
+    flash, pro = run(deepseek_provider.list_models(KEY))
 
     options = deepseek_provider.sdk_options(flash, "max")
     assert options["effort"] == "max"
@@ -195,19 +210,19 @@ def test_effort_reaches_the_sdk_and_images_follow_the_model(deepseek_api):
 
 
 def test_an_effort_the_model_lacks_is_refused(deepseek_api):
-    flash, _pro = run(deepseek_provider.list_models())
+    flash, _pro = run(deepseek_provider.list_models(KEY))
 
     with pytest.raises(ValueError, match="does not support the selected effort"):
         deepseek_provider.sdk_options(flash, "medium")
 
 
-def test_the_child_goes_to_deepseek_with_every_slot_pinned(deepseek_api):
-    run(deepseek_provider.list_models())
+def test_the_child_goes_to_deepseek_on_the_accounts_key(deepseek_api):
+    run(deepseek_provider.list_models(KEY))
 
-    env = deepseek_provider.child_env("deepseek-flash")
+    env = deepseek_provider.child_env("deepseek-flash", KEY)
 
     assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == KEY
     # Blank, not absent: a leftover Anthropic key would send the request to Anthropic.
     assert env["ANTHROPIC_API_KEY"] == ""
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
@@ -222,14 +237,23 @@ def test_the_child_goes_to_deepseek_with_every_slot_pinned(deepseek_api):
 
 
 def test_a_model_without_a_listed_window_gets_no_suffix():
-    assert deepseek_provider.child_env("deepseek-flash")["ANTHROPIC_MODEL"] == "deepseek-flash"
+    assert deepseek_provider.child_env("deepseek-flash", KEY)["ANTHROPIC_MODEL"] == "deepseek-flash"
 
 
-# ── Balance ───────────────────────────────────────────────────────────────────
+# ── Balance and key checks ────────────────────────────────────────────────────
 
 def test_the_balance_is_read_as_deepseek_reports_it(deepseek_api):
-    balance = run(deepseek_provider.balance())
+    balance = run(deepseek_provider.balance(KEY))
 
+    assert deepseek_api["requests"][0].headers["Authorization"] == f"Bearer {KEY}"
     assert balance == {"sufficient": True, "balances": [
         {"currency": "USD", "total": "20.00", "granted": "0.00", "topped_up": "20.00"},
     ]}
+
+
+def test_a_key_is_checked_with_deepseek_before_saving(deepseek_api):
+    assert run(deepseek_provider.validate_key(KEY))["sufficient"] is True
+
+    deepseek_api["status"] = 401
+    with pytest.raises(ValueError, match="refused this API key"):
+        run(deepseek_provider.validate_key("sk-wrong"))

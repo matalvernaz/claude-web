@@ -891,12 +891,14 @@
     const accounts = PROVIDERS[provider] && PROVIDERS[provider].accounts;
     if (!accounts) return;
     accountSelect.innerHTML = "";
+    // DeepSeek accounts are API keys, so a missing one is "no key", not a sign-in.
+    const missing = provider === "deepseek" ? " (no key)" : " (not signed in)";
 
     const shared = document.createElement("option");
     shared.value = "shared";
     shared.textContent = accounts.shared_label || "Shared";
     shared.disabled = accounts.shared_configured === false;
-    if (shared.disabled) shared.textContent += " (not signed in)";
+    if (shared.disabled) shared.textContent += missing;
     accountSelect.appendChild(shared);
 
     for (const cred of accounts.credentials || []) {
@@ -904,7 +906,7 @@
       option.value = `cred:${cred.id}`;
       option.textContent = cred.label || option.value;
       option.disabled = !cred.configured;
-      if (option.disabled) option.textContent += " (not signed in)";
+      if (option.disabled) option.textContent += missing;
       accountSelect.appendChild(option);
     }
 
@@ -1125,7 +1127,8 @@
     const acctLabel = accountSelect && accountSelect.closest("label");
     if (acctLabel) acctLabel.hidden = !caps.accounts;
     const failoverLabel = document.getElementById("failover-toggle")?.closest("label");
-    if (failoverLabel) failoverLabel.hidden = !caps.accounts;
+    // Account failover is Claude's; a provider says failover: false when its accounts have none.
+    if (failoverLabel) failoverLabel.hidden = !caps.accounts || caps.failover === false;
     const manageAccounts = document.getElementById("manage-accounts");
     if (manageAccounts) manageAccounts.hidden = !caps.accounts;
     rebuildAccountOptions(provider, preferredAccount);
@@ -5651,7 +5654,11 @@
     if (currentProvider() === "deepseek") {
       let data = null;
       try {
-        const r = await fetch("/api/deepseek/usage");
+        const query = new URLSearchParams();
+        if (sessionId) query.set("session_id", sessionId);
+        if (accountSelect && accountSelect.value) query.set("account_slot", accountSelect.value);
+        const suffix = query.toString() ? "?" + query.toString() : "";
+        const r = await fetch("/api/deepseek/usage" + suffix);
         if (r.status === 401 || r.status === 403) {
           usageBody.textContent = "Session expired — redirecting to sign-in.";
           handleStreamError(new Error("HTTP " + r.status));
@@ -5727,10 +5734,9 @@
   // Codex usage view. Account rate-limits + token usage are ChatGPT-auth
   // only; an API-key login gets an explanation plus this conversation's
   // token totals (the one usage signal the app-server gives on any auth).
-  // DeepSeek usage view: the account balance, which is the only real money
-  // figure (the CLI prices DeepSeek turns as if they ran on Claude, so the
-  // header cost stays hidden). One host key serves everyone, so it's the
-  // same balance for every user.
+  // DeepSeek usage view: the balance of the account this chat runs on, which
+  // is the only real money figure (the CLI prices DeepSeek turns as if they
+  // ran on Claude, so the header cost stays hidden).
   function renderDeepseekUsage(data) {
     if (!data || !data.available) {
       const reason = (data && data.reason) || "unknown error";
@@ -5747,10 +5753,11 @@
     if (!data.sufficient) {
       summary += " DeepSeek says that isn't enough to run requests, so top it up before the next chat.";
     }
-    let html = "<h3>DeepSeek</h3>";
+    const heading = data.account_label ? `DeepSeek: ${data.account_label}` : "DeepSeek";
+    let html = `<h3>${htmlEscape(heading)}</h3>`;
     html += `<p class="usage-note">${htmlEscape(summary)}</p>`;
     html += `<p class="usage-note">${htmlEscape(
-      "Shared by everyone who picks DeepSeek here. Top up or see per-day spend at platform.deepseek.com.")}</p>`;
+      "Top up or see per-day spend at platform.deepseek.com.")}</p>`;
     usageBody.innerHTML = html;
     announce("DeepSeek balance: " + summary);
   }

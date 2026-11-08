@@ -56,6 +56,8 @@ for var in (
     # DeepSeek account.
     "CLAUDE_WEB_DEEPSEEK_API_KEY",
     "CLAUDE_WEB_DEEPSEEK_BASE_URL",
+    "CLAUDE_WEB_DEEPSEEK_ENABLED",
+    "CLAUDE_WEB_DEEPSEEK_SHARED_ACCOUNT_LABEL",
     # Both shape what the Claude CLI sends, and the API-key workspace check
     # reads the base URL; a developer's own values must not leak in.
     "ANTHROPIC_CUSTOM_HEADERS",

@@ -9,7 +9,7 @@ A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) 
 - One container, one `.env` file, no separate database.
 - Optional second AI provider: install the OpenAI `codex` CLI and sign in either the shared host slot or personal ChatGPT subscription accounts from `/account`. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, mid-chat model switching, and same-chat account switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
 - Optional local AI provider: connect an Ollama server for coding and writing with the existing file tools, command approvals, and saved conversations.
-- Optional DeepSeek provider: with a DeepSeek API key, DeepSeek's hosted models run through the same Claude Code tools, approval cards, plan mode and rewind, with the model list read live from DeepSeek.
+- Optional DeepSeek provider: each user links their own DeepSeek API keys on the Accounts page, and DeepSeek's hosted models run through the same Claude Code tools, approval cards, plan mode and rewind, with the model list read live from DeepSeek. Off unless the host turns it on.
 
 > ## Trust model — read this first
 >
@@ -116,10 +116,28 @@ after installing Chromium with `python -m playwright install chromium`.
 DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly,
 so a DeepSeek chat is an ordinary Claude Code session whose requests go to
 DeepSeek: the same tools, approval cards, plan mode, rewind and saved chats.
-Create a key at platform.deepseek.com, add credit, then configure the app:
+
+DeepSeek is off unless you turn it on, because of where its data goes (below):
+
+```dotenv
+CLAUDE_WEB_DEEPSEEK_ENABLED=true
+```
+
+Then each user links their own keys under **DeepSeek accounts** on the Accounts
+page, the way they add Claude and OpenAI accounts. A key is checked with
+DeepSeek before it's saved, kept in a file only the app's user can read
+(`<state dir>/deepseek-keys/`), used only for that person's chats, and never
+shown again. The account picker in the header chooses which key a chat uses,
+the Usage button shows that account's DeepSeek balance, and switching accounts
+between messages carries on with the new key. Create keys at
+platform.deepseek.com.
+
+Optionally, a host can add a key everyone may use, billed to whoever owns it.
+Setting it also turns DeepSeek on:
 
 ```dotenv
 CLAUDE_WEB_DEEPSEEK_API_KEY=sk-...
+CLAUDE_WEB_DEEPSEEK_SHARED_ACCOUNT_LABEL=Shared DeepSeek
 ```
 
 After restarting the app, choose **DeepSeek (China)**. The model picker lists
@@ -133,13 +151,12 @@ to train its models. Everything the model sees goes there: your messages, the
 project's files it reads, CLAUDE.md and memory files, and the output of every
 command it runs. The picker label says "China" for that reason.
 
-One key serves every user of the app, and the account it belongs to pays for all
-of them. The **Usage** button shows DeepSeek's own balance. The running cost
-figure is hidden for DeepSeek, because the CLI prices every turn as if it ran on
-Claude. DeepSeek chats have no account slots, failover, advisor or panel review,
-and switching to or from DeepSeek starts a new chat. A model or effort change
-takes effect on the next message. The app's own copy of the key is removed from
-every child process; the DeepSeek CLI process receives it as its own credential.
+The running cost figure is hidden for DeepSeek, because the CLI prices every
+turn as if it ran on Claude. DeepSeek chats have no failover, advisor or panel
+review, and switching to or from DeepSeek starts a new chat. A model or effort
+change takes effect on the next message. The shared key is removed from every
+child process, and a chat's key reaches only its own Claude Code process, never
+the command line.
 
 ## Running from source (no Docker)
 

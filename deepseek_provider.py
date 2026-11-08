@@ -1,8 +1,10 @@
 """DeepSeek's hosted models, run through the same Claude Code transport as the Local provider.
 
-DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly, so a DeepSeek chat is an ordinary Claude Code session whose requests go to DeepSeek instead of Anthropic: the same tools, approval cards, plan mode, rewind and saved transcripts. What it leaves out is everything tied to an Anthropic account: sign-in slots, failover, plan limits, the advisor and panel review.
+DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly, so a DeepSeek chat is an ordinary Claude Code session whose requests go to DeepSeek instead of Anthropic: the same tools, approval cards, plan mode, rewind and saved transcripts. What it leaves out is everything tied to an Anthropic account: failover, plan limits, the advisor and panel review.
 
-One API key, set by the host in CLAUDE_WEB_DEEPSEEK_API_KEY, serves every user who picks DeepSeek. The model list comes live from DeepSeek's /models endpoint, which also reports each model's context window, image support and effort levels, so nothing about the models is hardcoded here.
+DeepSeek is account-scoped like Claude and Codex. Each user links their own API keys on the Accounts page (app.py stores and resolves them); a host can also set a Shared key. Every call here takes the key of the account a run uses. The model list comes live from DeepSeek's /models endpoint, which also reports each model's context window, image support and effort levels, so nothing about the models is hardcoded here.
+
+DeepSeek is off unless the host turns it on, because its privacy policy says data is stored and processed in the People's Republic of China and a host may not want its users able to send work there.
 """
 from __future__ import annotations
 
@@ -16,11 +18,18 @@ import httpx
 import local_provider
 
 
+# The optional Shared account's key, set by the host.
 API_KEY = os.getenv("CLAUDE_WEB_DEEPSEEK_API_KEY", "").strip()
+# Setting a Shared key turns DeepSeek on by itself, so hosts configured before accounts existed keep working.
+ENABLED = (
+    os.getenv("CLAUDE_WEB_DEEPSEEK_ENABLED", "").strip().lower() in ("1", "true", "yes")
+    or bool(API_KEY)
+)
 # The API origin. Claude Code's requests go to /anthropic on it; /models and
 # /user/balance sit at its root.
 BASE_URL = os.getenv("CLAUDE_WEB_DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
 LABEL = "DeepSeek (China)"
+SHARED_LABEL = os.getenv("CLAUDE_WEB_DEEPSEEK_SHARED_ACCOUNT_LABEL", "Shared DeepSeek").strip() or "Shared DeepSeek"
 PERMISSION_MODES = list(local_provider.PERMISSION_MODES)
 # DeepSeek's model list changes when it ships a model, not from one request to the next.
 MODELS_CACHE_TTL_SECONDS = 3600
@@ -33,8 +42,12 @@ ONE_MILLION_TOKENS = 1_000_000
 AUTO_COMPACT_SHARE = 0.75
 # Plain http would send the API key in the clear, so it's only accepted for a stand-in server on this machine (the tests use one).
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+NOT_ENABLED = "DeepSeek is off on this server. Set CLAUDE_WEB_DEEPSEEK_ENABLED=true, then restart claude-web."
 BAD_ORIGIN = "CLAUDE_WEB_DEEPSEEK_BASE_URL must be an https server origin, such as https://api.deepseek.com."
-_models_cache: dict = {"origin": None, "key": None, "fetched_at": 0.0, "models": []}
+NO_KEY = "Link a DeepSeek API key on the Accounts page to use DeepSeek."
+REFUSED_KEY = "DeepSeek refused this API key. Check it on platform.deepseek.com and link it again."
+# One entry per (origin, key): {"fetched_at": float, "models": [...]}.
+_models_cache: dict[tuple[str, str], dict] = {}
 
 
 def anthropic_url() -> str:
@@ -42,10 +55,13 @@ def anthropic_url() -> str:
     return f"{BASE_URL}/anthropic"
 
 
-def unavailable_reason() -> Optional[str]:
-    """Why DeepSeek can't be offered on this host, or None when it can."""
-    if not API_KEY:
-        return "Set CLAUDE_WEB_DEEPSEEK_API_KEY to a DeepSeek API key, then restart claude-web."
+def unavailable_reason(api_key: Optional[str] = None) -> Optional[str]:
+    """Why DeepSeek can't run, or None when it can.
+
+    Without a key this answers for the host: off, or a bad server address. With one (an empty string counts) it also answers for that account, so a user with no key is told how to link one.
+    """
+    if not ENABLED:
+        return NOT_ENABLED
     try:
         parsed = urlsplit(BASE_URL)
         _ = parsed.port
@@ -54,23 +70,23 @@ def unavailable_reason() -> Optional[str]:
     if (not parsed.hostname or parsed.username or parsed.password
             or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
         return BAD_ORIGIN
-    if parsed.scheme == "https":
-        return None
-    if parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS:
-        return None
-    return BAD_ORIGIN
+    secure = parsed.scheme == "https"
+    loopback = parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS
+    if not (secure or loopback):
+        return BAD_ORIGIN
+    if api_key is not None and not api_key.strip():
+        return NO_KEY
+    return None
 
 
-async def _get(path: str) -> dict:
-    """GET one DeepSeek API path and return its JSON, turning a refused key into an error a person can act on."""
+async def _get(path: str, api_key: str) -> dict:
+    """GET one DeepSeek API path with this account's key, turning a refused key into an error a person can act on."""
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         response = await client.get(
-            f"{BASE_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}"},
+            f"{BASE_URL}{path}", headers={"Authorization": f"Bearer {api_key}"},
         )
     if response.status_code in (401, 403):
-        raise ValueError(
-            "DeepSeek refused the API key. Check CLAUDE_WEB_DEEPSEEK_API_KEY, then restart claude-web."
-        )
+        raise ValueError(REFUSED_KEY)
     response.raise_for_status()
     return response.json()
 
@@ -110,21 +126,17 @@ def _model_entry(raw: dict, is_default: bool) -> Optional[dict]:
     }
 
 
-async def list_models(force: bool = False) -> list[dict]:
-    """DeepSeek's current models, fetched live and kept for an hour."""
-    reason = unavailable_reason()
+async def list_models(api_key: str, force: bool = False) -> list[dict]:
+    """DeepSeek's current models as this account sees them, fetched live and kept for an hour."""
+    reason = unavailable_reason(api_key)
     if reason:
         raise ValueError(reason)
-    cache = _models_cache
+    cache_key = (BASE_URL, api_key)
+    cached = _models_cache.get(cache_key)
     now = time.monotonic()
-    fresh = (
-        not force and cache["models"]
-        and cache["origin"] == BASE_URL and cache["key"] == API_KEY
-        and now - cache["fetched_at"] < MODELS_CACHE_TTL_SECONDS
-    )
-    if fresh:
-        return [dict(model) for model in cache["models"]]
-    payload = await _get("/models")
+    if not force and cached and now - cached["fetched_at"] < MODELS_CACHE_TTL_SECONDS:
+        return [dict(model) for model in cached["models"]]
+    payload = await _get("/models", api_key)
     entries = []
     for raw in payload.get("data") or []:
         entry = _model_entry(raw, is_default=not entries)
@@ -132,29 +144,31 @@ async def list_models(force: bool = False) -> list[dict]:
             entries.append(entry)
     if not entries:
         raise ValueError("DeepSeek listed no models that work with Claude Code.")
-    cache.update(origin=BASE_URL, key=API_KEY, fetched_at=now, models=entries)
+    _models_cache[cache_key] = {"fetched_at": now, "models": entries}
     return [dict(model) for model in entries]
 
 
-async def check_model(name: str) -> dict:
+async def check_model(name: str, api_key: str) -> dict:
     """Metadata for one DeepSeek model, checked against the live list."""
-    for model in await list_models():
+    for model in await list_models(api_key):
         if model["key"] == name:
             return model
     raise ValueError(f"DeepSeek no longer offers {name!r}. Pick another DeepSeek model.")
 
 
-async def model_for_run(name: str) -> dict:
+async def model_for_run(name: str, api_key: Optional[str] = None) -> dict:
     """The model a run should use: the one asked for, or DeepSeek's first listed model when none was."""
+    api_key = api_key or ""
     if name:
-        return await check_model(name)
-    models = await list_models()
+        return await check_model(name, api_key)
+    models = await list_models(api_key)
     return next((model for model in models if model["is_default"]), models[0])
 
 
-def _cached_context(model: str) -> Optional[int]:
-    """The context window last listed for `model`, without a network call."""
-    for entry in _models_cache["models"]:
+def _cached_context(model: str, api_key: str) -> Optional[int]:
+    """The context window last listed for `model` on this account, without a network call."""
+    cached = _models_cache.get((BASE_URL, api_key)) or {}
+    for entry in cached.get("models") or []:
         if entry["key"] == model:
             return entry.get("context")
     return None
@@ -182,24 +196,25 @@ def sdk_options(metadata: dict, effort: str = "") -> dict:
     return options
 
 
-def child_env(model: str) -> dict[str, str]:
-    """Route this subprocess's Claude Code to DeepSeek, with every model slot on `model`.
+def child_env(model: str, api_key: Optional[str] = None) -> dict[str, str]:
+    """Route this subprocess's Claude Code to DeepSeek on this account's key, with every model slot on `model`.
 
-    The "[1m]" suffix depends on the model's listed window. Every path that spawns a run checks the model against the live list first (model_for_run), so the cache already holds it here.
+    The "[1m]" suffix depends on the model's listed window. Every path that spawns a run checks the model against the live list with the same key first (model_for_run), so the cache already holds it here.
     """
-    context = _cached_context(model)
+    api_key = api_key or ""
+    context = _cached_context(model, api_key)
     wire_model = model
     if context and context >= ONE_MILLION_TOKENS:
         wire_model = f"{model}[1m]"
-    return local_provider.routed_child_env(anthropic_url(), API_KEY, wire_model)
+    return local_provider.routed_child_env(anthropic_url(), api_key, wire_model)
 
 
-async def balance() -> dict:
-    """What's left on the DeepSeek account, as DeepSeek reports it."""
-    reason = unavailable_reason()
+async def balance(api_key: str) -> dict:
+    """What's left on the DeepSeek account behind this key, as DeepSeek reports it."""
+    reason = unavailable_reason(api_key)
     if reason:
         raise ValueError(reason)
-    payload = await _get("/user/balance")
+    payload = await _get("/user/balance", api_key)
     balances = [
         {
             "currency": str(item.get("currency") or ""),
@@ -211,3 +226,8 @@ async def balance() -> dict:
     ]
     # is_available is DeepSeek saying whether the balance can pay for a request.
     return {"sufficient": bool(payload.get("is_available")), "balances": balances}
+
+
+async def validate_key(api_key: str) -> dict:
+    """Check a key with DeepSeek before it's saved; returns its balance, raises ValueError if refused."""
+    return await balance(api_key)
