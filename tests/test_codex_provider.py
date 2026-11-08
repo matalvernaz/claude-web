@@ -1170,6 +1170,7 @@ def test_codex_credential_home_shares_only_rollouts_and_configuration(
     (shared / "sessions").mkdir(parents=True)
     (shared / "skills").mkdir()
     (shared / "config.toml").write_text('model = "gpt-test"\n')
+    (shared / "AGENTS.md").write_text("# House rules\n")
     (shared / "state_5.sqlite").write_text("private index")
     (shared / "auth.json").write_text("shared credential")
     monkeypatch.setattr(app_module, "CODEX_PERSONAL_HOMES_DIR", personal)
@@ -1180,6 +1181,9 @@ def test_codex_credential_home_shares_only_rollouts_and_configuration(
     assert os.path.samefile(home / "sessions", shared / "sessions")
     assert os.path.samefile(home / "skills", shared / "skills")
     assert os.path.samefile(home / "config.toml", shared / "config.toml")
+    # Codex reads global instructions from $CODEX_HOME/AGENTS.md, so a slot
+    # without the link runs without the house rules.
+    assert os.path.samefile(home / "AGENTS.md", shared / "AGENTS.md")
     assert not (home / "state_5.sqlite").exists()
     assert not (home / "auth.json").exists()
 

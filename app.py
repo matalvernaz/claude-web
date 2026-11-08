@@ -6450,7 +6450,11 @@ def _ensure_codex_credential_home(user_sub: str, cred_id: int) -> Path:
     shared_home = codex_provider.codex_home().resolve()
     shared_sessions = shared_home / "sessions"
     shared_sessions.mkdir(parents=True, exist_ok=True)
-    shared_entries = ("sessions", "config.toml", "skills", "rules", "prompts")
+    # AGENTS.md is Codex's global instructions file; it has to be in every
+    # slot's home or that slot starts without the house rules. On this host it
+    # points at CLAUDE.md, and project_doc_fallback_filenames covers the
+    # per-project CLAUDE.md files.
+    shared_entries = ("sessions", "config.toml", "AGENTS.md", "skills", "rules", "prompts")
     for name in shared_entries:
         source = shared_home / name
         if not source.exists() or source.is_symlink():
