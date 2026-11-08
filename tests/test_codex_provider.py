@@ -163,9 +163,52 @@ def test_file_change_uses_apply_patch_tool():
 
 
 def test_patch_input_accepts_dict_changes():
-    assert codex_provider.patch_input(
-        {"changes": {"x.py": {"kind": "update"}}}
-    ) == {"files": ["x.py"]}
+    got = codex_provider.patch_input(
+        {"changes": {"x.py": {"kind": "update",
+                              "diff": "--- a/x.py\n+++ b/x.py\n-old\n+new"}}}
+    )
+    assert got["files"] == ["x.py"]
+    assert got["changes"][0]["path"] == "x.py"
+    assert got["changes"][0]["kind"] == "update"
+    assert "+new" in got["changes"][0]["diff"]
+
+
+def test_patch_input_keeps_each_files_diff():
+    got = codex_provider.patch_input({"changes": [
+        {"path": "a.py", "kind": {"type": "update"},
+         "diff": "--- a/a.py\n+++ b/a.py\n-one\n+two"},
+        {"path": "b.py", "kind": {"type": "add"}, "diff": "+hello"},
+    ]})
+
+    assert got["files"] == ["a.py", "b.py"]
+    assert [c["kind"] for c in got["changes"]] == ["update", "add"]
+    assert "one" in got["changes"][0]["diff"]
+    assert got["changes"][1]["diff"] == "+hello"
+
+
+def test_the_browser_renders_an_apply_patch_as_a_diff():
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS
+    )
+    assert "function insertPatchMessage(" in source
+    assert 'm.name === "ApplyPatch"' in source
+    assert 'blk.name === "ApplyPatch"' in source
+    renderer = source[source.index("function insertPatchMessage("):]
+    renderer = renderer[:renderer.index("\n  }\n")]
+    # Added and removed lines carry the same spoken prefixes as Claude edits.
+    assert "Added line: " in renderer
+    assert "Removed line: " in renderer
+    assert "DIFF_COLLAPSE_THRESHOLD_LINES" in renderer
+
+
+def test_patch_input_caps_a_generated_file():
+    huge = "x" * (codex_provider.PATCH_DIFF_MAX_CHARS + 500)
+    got = codex_provider.patch_input({"changes": [
+        {"path": "big.py", "kind": "update", "diff": huge},
+    ]})
+
+    assert "500 more characters" in got["changes"][0]["diff"]
+    assert len(got["changes"][0]["diff"]) < len(huge)
 
 
 def test_todo_list_maps_to_todos_update():

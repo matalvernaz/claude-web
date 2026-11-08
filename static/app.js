@@ -1879,6 +1879,8 @@
         } else if (m.role === "tool_use") {
           if ((m.name === "Edit" || m.name === "Write") && m.input) {
             insertDiffMessage(m.name, m.input);
+          } else if (m.name === "ApplyPatch" && m.input) {
+            insertPatchMessage(m.input);
           } else {
             insertToolMessage("→ " + m.name + (m.summary ? " " + m.summary : ""), m.name);
           }
@@ -3885,6 +3887,8 @@
             renderPanelSubmission(blk.input || {});
           } else if (blk.name === "Edit" || blk.name === "Write") {
             insertDiffMessage(blk.name, blk.input || {});
+          } else if (blk.name === "ApplyPatch") {
+            insertPatchMessage(blk.input || {});
           } else {
             insertToolMessage("→ " + blk.name + " " + summariseToolInput(blk.input || {}), blk.name);
           }
@@ -6278,6 +6282,88 @@
       wrap.appendChild(pre);
     }
 
+    transcript.appendChild(wrap);
+    maybeAutoScroll();
+  }
+
+  // A Codex ApplyPatch: one or more files, each with the unified diff Codex
+  // reported. Rendered like the Claude Edit/Write block so a reader hears
+  // added and removed lines with their file named, rather than a list of
+  // filenames and no way to see what changed.
+  function insertPatchMessage(input) {
+    const changes = Array.isArray(input.changes) ? input.changes : [];
+    if (!changes.length) {
+      const files = Array.isArray(input.files) ? input.files : [];
+      insertToolMessage("→ ApplyPatch " + files.join(", "), "ApplyPatch");
+      return;
+    }
+    const wrap = document.createElement("article");
+    wrap.className = "msg diff";
+    const pre = document.createElement("pre");
+    pre.className = "diff-body";
+    let totalLines = 0;
+    let added = 0;
+    let removed = 0;
+
+    // Group each file's unified diff under its path.
+    for (const change of changes) {
+      const head = document.createElement("span");
+      head.className = "diff-file-head";
+      const kind = change.kind ? change.kind + " " : "";
+      head.textContent = `${kind}${change.path || "(unknown)"}`;
+      pre.appendChild(head);
+      totalLines += 1;
+      const lines = String(change.diff || "").split("\n");
+      for (const line of lines) {
+        // The ---/+++ header pair restates the path already above it.
+        if (line.startsWith("+++") || line.startsWith("---")) continue;
+        const span = document.createElement("span");
+        if (line.startsWith("@@")) {
+          span.className = "diff-ctx";
+          span.textContent = line;
+        } else if (line.startsWith("+")) {
+          span.className = "diff-add";
+          const sr = document.createElement("span");
+          sr.className = "sr-only";
+          sr.textContent = "Added line: ";
+          span.appendChild(sr);
+          span.appendChild(document.createTextNode(line.slice(1)));
+          added += 1;
+        } else if (line.startsWith("-")) {
+          span.className = "diff-del";
+          const sr = document.createElement("span");
+          sr.className = "sr-only";
+          sr.textContent = "Removed line: ";
+          span.appendChild(sr);
+          span.appendChild(document.createTextNode(line.slice(1)));
+          removed += 1;
+        } else {
+          span.className = "diff-ctx";
+          span.textContent = line;
+        }
+        pre.appendChild(span);
+        totalLines += 1;
+      }
+    }
+
+    const filesLabel = changes.length === 1 ? "1 file" : `${changes.length} files`;
+    const headerText = `✎ Patch ${filesLabel}  ·  +${added} −${removed}`;
+    if (totalLines > DIFF_COLLAPSE_THRESHOLD_LINES) {
+      const det = document.createElement("details");
+      det.className = "diff-collapsible";
+      const sum = document.createElement("summary");
+      sum.className = "diff-header";
+      sum.textContent = headerText;
+      det.appendChild(sum);
+      det.appendChild(pre);
+      wrap.appendChild(det);
+    } else {
+      const header = document.createElement("div");
+      header.className = "diff-header";
+      header.textContent = headerText;
+      wrap.appendChild(header);
+      wrap.appendChild(pre);
+    }
     transcript.appendChild(wrap);
     maybeAutoScroll();
   }

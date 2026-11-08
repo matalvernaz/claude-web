@@ -837,16 +837,56 @@ def _command_input(item: dict) -> dict:
     return out
 
 
+# One file's unified diff as the browser receives it. Long enough for an
+# ordinary edit, short enough that one generated file can't bloat an SSE
+# frame or the transcript that is rebuilt on every reopen.
+PATCH_DIFF_MAX_CHARS = 8000
+
+
+def _patch_change_kind(kind) -> str:
+    """The change kind as a plain word ("update", "add", "delete")."""
+    if isinstance(kind, dict):
+        return str(kind.get("type") or "")
+    if isinstance(kind, str):
+        return kind
+    return ""
+
+
 def patch_input(item: dict) -> dict:
+    """Tool input for a Codex fileChange item, including each file's diff.
+
+    Codex reports the real unified diff per file; keeping only the names made
+    a Codex edit a list of files with no way to see what changed, while the
+    equivalent Claude Edit/Write showed a diff.
+    """
     changes = item.get("changes")
     files: list[str] = []
+    entries: list[dict] = []
     if isinstance(changes, dict):
-        files = list(changes.keys())
+        for path, change in changes.items():
+            if not path:
+                continue
+            files.append(str(path))
+            entry = {"path": str(path), "kind": "", "diff": ""}
+            if isinstance(change, dict):
+                entry["kind"] = _patch_change_kind(change.get("kind"))
+                entry["diff"] = str(change.get("diff") or "")
+            entries.append(entry)
     elif isinstance(changes, list):
         for ch in changes:
             if isinstance(ch, dict) and ch.get("path"):
                 files.append(str(ch["path"]))
-    return {"files": files or ["(unknown)"]}
+                entries.append({
+                    "path": str(ch["path"]),
+                    "kind": _patch_change_kind(ch.get("kind")),
+                    "diff": str(ch.get("diff") or ""),
+                })
+    for entry in entries:
+        if len(entry["diff"]) > PATCH_DIFF_MAX_CHARS:
+            kept = entry["diff"][:PATCH_DIFF_MAX_CHARS]
+            dropped = len(entry["diff"]) - PATCH_DIFF_MAX_CHARS
+            entry["diff"] = f"{kept}\n… ({dropped} more characters)"
+    return {"files": files or ["(unknown)"], "changes": entries}
 
 
 def item_events(item: dict, *, completed: bool, session_id: Optional[str],
