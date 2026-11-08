@@ -1691,6 +1691,23 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
             })
             msgs.append({"role": "notice", "title": notice["title"],
                          "text": notice["message"]})
+        elif kind == "system" and obj.get("subtype") in (
+                "compact_boundary", "permission_denied"):
+            # The live view already showed these; a reopened chat should keep
+            # them where they happened, especially the compaction marker —
+            # without it, a chat that suddenly forgot things looks broken.
+            event = _system_status_event(obj["subtype"], {
+                **obj,
+                "compact_metadata": obj.get("compactMetadata"),
+            })
+            if event is not None:
+                msgs.append({"role": "notice", "title": event["title"],
+                             "text": event["message"]})
+        elif kind == "system" and obj.get("subtype") == "informational":
+            event = _system_status_event("informational", obj)
+            if event is not None:
+                msgs.append({"role": "notice", "title": event["title"],
+                             "text": event["message"]})
     return msgs
 
 
@@ -6433,7 +6450,11 @@ def _ensure_codex_credential_home(user_sub: str, cred_id: int) -> Path:
     shared_home = codex_provider.codex_home().resolve()
     shared_sessions = shared_home / "sessions"
     shared_sessions.mkdir(parents=True, exist_ok=True)
-    shared_entries = ("sessions", "config.toml", "skills", "rules", "prompts")
+    # AGENTS.md is Codex's global instructions file; it has to be in every
+    # slot's home or that slot starts without the house rules. On this host it
+    # points at CLAUDE.md, and project_doc_fallback_filenames covers the
+    # per-project CLAUDE.md files.
+    shared_entries = ("sessions", "config.toml", "AGENTS.md", "skills", "rules", "prompts")
     for name in shared_entries:
         source = shared_home / name
         if not source.exists() or source.is_symlink():
@@ -17073,6 +17094,143 @@ _MODEL_NOTICE_TITLES = {
 }
 
 
+def _first_key(data: dict, *names: str):
+    """First present, non-None value among ``names``.
+
+    The same frame has different spellings depending on where it is read:
+    the live stream-json frames use snake_case, the transcript jsonl keeps
+    camelCase as the CLI wrote it. Both are read here.
+    """
+    for name in names:
+        if name in data and data[name] is not None:
+            return data[name]
+    return None
+
+
+def _short_delay(delay_ms: int) -> str:
+    seconds = max(0.0, delay_ms / 1000)
+    if seconds < 10:
+        return f"{seconds:.1f} s"
+    return f"{round(seconds)} s"
+
+
+def _system_status_event(subtype: str, data: dict) -> Optional[dict]:
+    """Turn a CLI status frame into a ``status`` event the browser shows.
+
+    These frames used to be dropped: a turn that was retrying a dropped
+    connection or compacting its history looked exactly like a wedged one,
+    which is the worst case for someone hearing the page rather than seeing
+    it. Retries and the start of a compaction are transient line updates;
+    a finished compaction, an auto-mode denial and the CLI's own notices are
+    kept in the transcript as well (the jsonl copy is replayed on reload).
+    """
+    if subtype in ("api_retry", "api_error"):
+        attempt = _first_key(data, "attempt", "retry_attempt", "retryAttempt")
+        max_attempts = _first_key(data, "max_retries", "maxRetries")
+        delay_ms = _first_key(data, "retry_delay_ms", "retry_in_ms", "retryInMs")
+        error_status = _first_key(data, "error_status", "status")
+        error = data.get("error")
+        detail = ""
+        if isinstance(error, dict):
+            detail = error.get("formatted") or error.get("message") or ""
+        elif isinstance(error, str) and error != "rate_limit":
+            detail = error
+        delay = f" in {_short_delay(int(delay_ms))}" if isinstance(delay_ms, (int, float)) else ""
+        if isinstance(attempt, int) and isinstance(max_attempts, int):
+            counter = f" (attempt {attempt} of {max_attempts})"
+        else:
+            counter = ""
+        if error_status == 429:
+            message = f"Rate limited. Retrying{delay}{counter}."
+        elif detail:
+            message = f"{detail} Retrying{delay}{counter}."
+        else:
+            message = f"Connection problem. Retrying{delay}{counter}."
+        return {
+            "type": "status",
+            "kind": "retry",
+            "title": "Retrying",
+            "message": message,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "delay_ms": delay_ms,
+            "error_status": error_status,
+        }
+
+    if subtype == "status":
+        state = data.get("status") or ""
+        if state == "compacting":
+            return {
+                "type": "status",
+                "kind": "compacting",
+                "title": "Compacting",
+                "message": "Compacting the conversation. Older messages are being summarized.",
+            }
+        error = _first_key(data, "compact_error", "compactError")
+        if error:
+            return {
+                "type": "status",
+                "kind": "compaction_failed",
+                "title": "Compaction failed",
+                "message": f"The conversation could not be compacted: {error}",
+            }
+        # "requesting" and the rest describe every ordinary API call and
+        # would turn the status line into noise.
+        return None
+
+    if subtype == "compact_boundary":
+        meta = data.get("compact_metadata") or data.get("compactMetadata") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        before = _first_key(meta, "pre_tokens", "preTokens")
+        after = _first_key(meta, "post_tokens", "postTokens")
+        if isinstance(before, int) and isinstance(after, int):
+            message = (
+                f"Older messages were summarized: about {before:,} tokens of "
+                f"history became about {after:,}."
+            )
+        else:
+            message = "Older messages were summarized to keep the chat going."
+        return {
+            "type": "status",
+            "kind": "compaction",
+            "title": "Conversation compacted",
+            "message": message,
+            "pre_tokens": before,
+            "post_tokens": after,
+        }
+
+    if subtype == "permission_denied":
+        tool = data.get("tool_name") or data.get("toolName") or "a tool"
+        reason = data.get("message") or data.get("decision_reason") or ""
+        message = f"Auto mode denied {tool}."
+        if isinstance(reason, str) and reason.strip():
+            message = f"{message} {reason.strip()}"
+        return {
+            "type": "status",
+            "kind": "denied",
+            "title": "Tool denied",
+            "message": message,
+            "tool": tool,
+        }
+
+    if subtype == "informational":
+        content = data.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        level = str(data.get("level") or "notice")
+        title = "Warning" if level in ("warn", "warning", "error") else "Notice"
+        return {
+            "type": "status",
+            "kind": "info",
+            "title": title,
+            "message": content.strip(),
+            "level": level,
+        }
+
+    return None
+
+
 def _model_notice_event(subtype: str, data: dict) -> Optional[dict]:
     """Turn a CLI model-swap system message into a ``model_notice`` event.
 
@@ -17141,6 +17299,37 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
     init / result events from the v1 stream-json protocol, so we keep that
     shape rather than inventing a new one.
     """
+    # The task lifecycle frames are SystemMessage subclasses, so they have to
+    # be matched before the generic SystemMessage branch below. Until this was
+    # moved up, every task_started/task_progress/task_notification fell into
+    # that branch, matched no subtype there, and returned nothing: the task
+    # block, its Stop button and its completion cue never appeared even though
+    # the browser has always known how to render them.
+    if isinstance(msg, TaskStartedMessage):
+        return [{
+            "type": "task_started",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "task_type": msg.task_type,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskProgressMessage):
+        return [{
+            "type": "task_progress",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "last_tool_name": msg.last_tool_name,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskNotificationMessage):
+        return [{
+            "type": "task_notification",
+            "task_id": msg.task_id,
+            "status": msg.status,
+            "summary": msg.summary,
+            "output_file": msg.output_file,
+            "tool_use_id": msg.tool_use_id,
+        }]
     if isinstance(msg, SystemMessage):
         if msg.subtype == "init":
             data = msg.data or {}
@@ -17165,7 +17354,10 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 "permissionMode": data.get("permissionMode"),
             }]
         notice = _model_notice_event(msg.subtype, msg.data or {})
-        return [notice] if notice is not None else []
+        if notice is not None:
+            return [notice]
+        status = _system_status_event(msg.subtype, msg.data or {})
+        return [status] if status is not None else []
     if isinstance(msg, RateLimitEvent):
         if run is not None and run.provider in ROUTED_PROVIDERS:
             return []
@@ -17397,31 +17589,6 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             payload.extend(extra)
             return payload
         return []
-    if isinstance(msg, TaskStartedMessage):
-        return [{
-            "type": "task_started",
-            "task_id": msg.task_id,
-            "description": msg.description,
-            "task_type": msg.task_type,
-            "tool_use_id": msg.tool_use_id,
-        }]
-    if isinstance(msg, TaskProgressMessage):
-        return [{
-            "type": "task_progress",
-            "task_id": msg.task_id,
-            "description": msg.description,
-            "last_tool_name": msg.last_tool_name,
-            "tool_use_id": msg.tool_use_id,
-        }]
-    if isinstance(msg, TaskNotificationMessage):
-        return [{
-            "type": "task_notification",
-            "task_id": msg.task_id,
-            "status": msg.status,
-            "summary": msg.summary,
-            "output_file": msg.output_file,
-            "tool_use_id": msg.tool_use_id,
-        }]
     if isinstance(msg, ResultMessage):
         slot = run.account_slot if run is not None else "shared"
         owner = run.owner_sub if run is not None else None

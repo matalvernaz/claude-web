@@ -446,11 +446,13 @@ All paths are env-driven: `CLAUDE_PROJECT_DIR`, `CLAUDE_WEB_PROJECT_DIRS`, `CLAU
 
 ## Known bugs (open)
 
-### ScheduleWakeup pre-empts queued user message (2026-05-18)
+### ScheduleWakeup pre-empts queued user message (2026-05-18) — closed 2026-11-08, cannot reproduce
 
-If the model has a `ScheduleWakeup` pending and the user queues a message while the turn is ending, the harness dispatches the fired wakeup's sentinel (`<<autonomous-loop-dynamic>>` or `<<autonomous-loop>>`) into the next prompt slot **instead of** the user's queued message. The user sees a "1 QUEUED" indicator that never drains and has to manually cancel.
+The 2026-05-18 report said a fired wakeup's sentinel (`<<autonomous-loop-dynamic>>` or `<<autonomous-loop>>`) was dispatched into the next prompt slot instead of a queued user message, leaving a "1 QUEUED" chip that never drained.
 
-This is a claude-web bug, not upstream Claude Code — the next-prompt picker after a turn ends needs to prefer a queued user message over a fired scheduled wakeup. Fix is most likely in the run-lifecycle / agent-loop code in `app.py` that decides what to feed the SDK next.
+That mechanism no longer exists. Raw `--input-format stream-json` against CLI 2.1.319 shows a fired wakeup is the CLI starting a turn itself, on the same `session_id`: `command_lifecycle`, `system/init`, `assistant`, `result`. No sentinel and no user echo ever reach the harness, and `app.py` contains no code that sends one (the only synthesized prompt is `_compose_auto_fire_message`, which renders buffered task notifications and carries `AUTO_FIRE_MARKER`, not a sentinel). The queued message is popped by the driver after the wakeup turn's `ResultMessage`, or delivered as steering if the user typed mid-turn.
+
+Regression coverage: `tests/test_wakeup_queue.py` (message queued in the same wait round as the wakeup; message queued while the wakeup turn runs). Both pass. If the symptom ever returns, check whether a CLI upgrade changed the wire shape before looking in the run-loop.
 
 
 ## Local dev / CI
