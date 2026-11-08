@@ -2118,12 +2118,15 @@
     const message = obj.message || "";
     if (!message) return;
     if (obj.kind === "retry") {
+      // markVisibleActivity() blanks the status line when no todo is driving
+      // it, so it has to run before setStatus() or the retry text is wiped in
+      // the same tick and a sighted user never sees it.
+      markVisibleActivity();
       setStatus(message);
       if (!retryNoticed) {
         retryNoticed = true;
         announce(message);
       }
-      markVisibleActivity();
       return;
     }
     if (obj.kind === "compacting") {
@@ -2135,8 +2138,13 @@
       return;
     }
     appendNotice(obj.title || "Notice", message);
+    maybeAutoScroll();
     announce((obj.title ? obj.title + ". " : "") + message);
-    if (obj.kind === "compaction") compactingNoticed = false;
+    // A failed compaction never emits the "compaction" event that re-arms
+    // the announcement, so re-arm on it too or the next one starts silent.
+    if (obj.kind === "compaction" || obj.kind === "compaction_failed") {
+      compactingNoticed = false;
+    }
     markVisibleActivity();
   }
 
@@ -3773,6 +3781,11 @@
       // users but burned CPU and network.
       stopGerunds();
       setStreaming(false);
+      // A run that ended without a `result` (server restart, killed turn)
+      // never re-armed these, and they would swallow the next turn's first
+      // retry or compaction announcement.
+      retryNoticed = false;
+      compactingNoticed = false;
       // A queued message stranded by an abnormal end (server restart mid-turn,
       // run killed) never saw a `result`. Flush it now — currentRunId still
       // points at the finished run, so sendInExistingRun's 404 path falls back
@@ -4383,6 +4396,8 @@
       setActiveTodoLabel(null);
       stopGerunds();
       setStreaming(false);
+      retryNoticed = false;
+      compactingNoticed = false;
       const summary = obj.message || obj.exit_code || "see technical details";
       const detail = obj.stderr ? `${obj.message || "Error"}\n${obj.stderr}` : null;
       setStatus("Error: " + summary);
@@ -4437,6 +4452,14 @@
     const summary = block.querySelector("summary");
     const log = block.querySelector(".task-log");
 
+    // The SDK's task vocabulary is completed/failed/stopped (a task_updated
+    // patch says killed, which the server maps to stopped). Checking for
+    // success/error left every real completion with the neutral icon.
+    const wasDone = block.classList.contains("task-terminal");
+    const status = obj.status || "done";
+    const ok = status === "success" || status === "completed";
+    const bad = status === "error" || status === "failed";
+
     // Update summary with latest description + status.
     if (kind === "started") {
       summary.textContent = "▶ " + (obj.description || "task " + id);
@@ -4444,32 +4467,36 @@
       const base = obj.description || "task " + id;
       summary.textContent = "▶ " + base + (elapsed ? ` · ${elapsed}` : "");
     } else if (kind === "notification") {
-      const status = obj.status || "done";
-      const icon = status === "success" ? "✓" : status === "error" ? "✗" : "●";
+      const icon = ok ? "✓" : bad ? "✗" : "●";
       const took = elapsed ? ` in ${elapsed}` : "";
       summary.textContent = `${icon} ${obj.description || obj.summary || "task " + id} (${status}${took})`;
       taskStartedAt.delete(id);
-      block.classList.add("task-" + status);
+      block.classList.add(ok ? "task-success" : bad ? "task-error" : "task-" + status);
+      block.classList.add("task-terminal");
       const sb = block.querySelector(".task-stop");
       if (sb) sb.remove();
     }
 
-    // Append log line.
-    const line = document.createElement("div");
-    line.className = "task-line task-line-" + kind;
-    if (kind === "progress") {
-      line.textContent = (obj.last_tool_name ? `[${obj.last_tool_name}] ` : "") + (obj.description || "");
-    } else if (kind === "notification") {
-      line.textContent = (obj.summary || "(no summary)");
-    } else {
-      line.textContent = obj.description || "started";
+    // A terminal task_updated (stop_task reports killed there) can be
+    // followed by a task_notification for the same task. The second one only
+    // refreshes the summary; it must not add a second log line or cue.
+    if (!(kind === "notification" && wasDone)) {
+      const line = document.createElement("div");
+      line.className = "task-line task-line-" + kind;
+      if (kind === "progress") {
+        line.textContent = (obj.last_tool_name ? `[${obj.last_tool_name}] ` : "") + (obj.description || "");
+      } else if (kind === "notification") {
+        line.textContent = (obj.summary || "(no summary)");
+      } else {
+        line.textContent = obj.description || "started";
+      }
+      log.appendChild(line);
+      maybeAutoScroll();
+      markVisibleActivity();
     }
-    log.appendChild(line);
-    maybeAutoScroll();
-    markVisibleActivity();
-    if (kind === "notification") {
-      announce(`Background task ${id}: ${obj.status || "done"}`);
-      playCue(obj.status === "error" ? "task_error" : "task_done");
+    if (kind === "notification" && !wasDone) {
+      announce(`Background task ${id}: ${status}`);
+      playCue(bad ? "task_error" : "task_done");
     }
   }
 
@@ -5145,6 +5172,22 @@
     if (tool === "Bash" && input.command) {
       block.textContent = "$ " + input.command;
       parent.appendChild(block);
+      return;
+    }
+    if (tool === "ApplyPatch" || (Array.isArray(input.changes) && input.changes.length)) {
+      // A Codex fileChange approval carries the same per-file diffs as the
+      // rendered patch. Without this branch the card dumped every diff as
+      // escaped JSON, which is noise to listen to and unreadable on screen.
+      for (const change of input.changes || []) {
+        const head = document.createElement("p");
+        head.className = "permission-input-path";
+        head.textContent = (change.kind ? change.kind + " " : "") + (change.path || "(unknown)");
+        parent.appendChild(head);
+        const pre = document.createElement("pre");
+        pre.className = "permission-input";
+        appendPatchDiff(pre, change.diff, { lines: 0, added: 0, removed: 0 });
+        parent.appendChild(pre);
+      }
       return;
     }
     if (tool === "Edit") {
@@ -6290,6 +6333,43 @@
   // reported. Rendered like the Claude Edit/Write block so a reader hears
   // added and removed lines with their file named, rather than a list of
   // filenames and no way to see what changed.
+  // Render one file's unified diff into `pre`. The ---/+++ pair restates the
+  // path already in the file head, but only before the first hunk: a removed
+  // line whose text starts with "--" is emitted as "--- text" and must stay.
+  function appendPatchDiff(pre, diff, tally) {
+    let inHunk = false;
+    for (const line of String(diff || "").split("\n")) {
+      if (line.startsWith("@@")) inHunk = true;
+      if (!inHunk && (line.startsWith("+++ ") || line.startsWith("--- "))) continue;
+      const span = document.createElement("span");
+      if (line.startsWith("@@")) {
+        span.className = "diff-ctx";
+        span.textContent = line;
+      } else if (line.startsWith("+")) {
+        span.className = "diff-add";
+        const sr = document.createElement("span");
+        sr.className = "sr-only";
+        sr.textContent = "Added line: ";
+        span.appendChild(sr);
+        span.appendChild(document.createTextNode("+ " + line.slice(1)));
+        tally.added += 1;
+      } else if (line.startsWith("-")) {
+        span.className = "diff-del";
+        const sr = document.createElement("span");
+        sr.className = "sr-only";
+        sr.textContent = "Removed line: ";
+        span.appendChild(sr);
+        span.appendChild(document.createTextNode("- " + line.slice(1)));
+        tally.removed += 1;
+      } else {
+        span.className = "diff-ctx";
+        span.textContent = line;
+      }
+      pre.appendChild(span);
+      tally.lines += 1;
+    }
+  }
+
   function insertPatchMessage(input) {
     const changes = Array.isArray(input.changes) ? input.changes : [];
     if (!changes.length) {
@@ -6301,9 +6381,7 @@
     wrap.className = "msg diff";
     const pre = document.createElement("pre");
     pre.className = "diff-body";
-    let totalLines = 0;
-    let added = 0;
-    let removed = 0;
+    const tally = { lines: 0, added: 0, removed: 0 };
 
     // Group each file's unified diff under its path.
     for (const change of changes) {
@@ -6312,42 +6390,13 @@
       const kind = change.kind ? change.kind + " " : "";
       head.textContent = `${kind}${change.path || "(unknown)"}`;
       pre.appendChild(head);
-      totalLines += 1;
-      const lines = String(change.diff || "").split("\n");
-      for (const line of lines) {
-        // The ---/+++ header pair restates the path already above it.
-        if (line.startsWith("+++") || line.startsWith("---")) continue;
-        const span = document.createElement("span");
-        if (line.startsWith("@@")) {
-          span.className = "diff-ctx";
-          span.textContent = line;
-        } else if (line.startsWith("+")) {
-          span.className = "diff-add";
-          const sr = document.createElement("span");
-          sr.className = "sr-only";
-          sr.textContent = "Added line: ";
-          span.appendChild(sr);
-          span.appendChild(document.createTextNode(line.slice(1)));
-          added += 1;
-        } else if (line.startsWith("-")) {
-          span.className = "diff-del";
-          const sr = document.createElement("span");
-          sr.className = "sr-only";
-          sr.textContent = "Removed line: ";
-          span.appendChild(sr);
-          span.appendChild(document.createTextNode(line.slice(1)));
-          removed += 1;
-        } else {
-          span.className = "diff-ctx";
-          span.textContent = line;
-        }
-        pre.appendChild(span);
-        totalLines += 1;
-      }
+      tally.lines += 1;
+      appendPatchDiff(pre, change.diff, tally);
     }
 
+    const totalLines = tally.lines;
     const filesLabel = changes.length === 1 ? "1 file" : `${changes.length} files`;
-    const headerText = `✎ Patch ${filesLabel}  ·  +${added} −${removed}`;
+    const headerText = `✎ Patch ${filesLabel}  ·  +${tally.added} −${tally.removed}`;
     if (totalLines > DIFF_COLLAPSE_THRESHOLD_LINES) {
       const det = document.createElement("details");
       det.className = "diff-collapsible";

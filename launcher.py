@@ -661,6 +661,10 @@ def _settle_pending_update(argv: list[str]) -> bool:
 
 def _run(argv: list[str] | None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    # Before argparse, not just before importing app: _parse_args resolves the
+    # CLAUDE_WEB_HOST/PORT/FORWARDED_ALLOW_IPS defaults from os.environ, so a
+    # value in .env was otherwise silently ignored for those three settings.
+    loaded = _load_dotenv_files()
     args = _parse_args(argv_list)
 
     # Capture runtime exceptions to a file the user can attach to a bug
@@ -674,10 +678,9 @@ def _run(argv: list[str] | None) -> int:
     if _is_frozen() and _settle_pending_update(argv_list):
         return 0
 
-    # Load `.env` BEFORE importing app — app.py reads many env vars at
-    # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so a
-    # post-import load would be ignored.
-    loaded = _load_dotenv_files()
+    # Loaded above, before argparse — app.py also reads many env vars at
+    # import time (CLAUDE_HOME, PROJECT_DIRS, auth config, ...) so the load
+    # still has to happen before the app is imported.
     portable = _configure_portable_data()
     if not portable:
         _configure_bundled_tools()

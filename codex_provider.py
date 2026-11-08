@@ -841,6 +841,11 @@ def _command_input(item: dict) -> dict:
 # ordinary edit, short enough that one generated file can't bloat an SSE
 # frame or the transcript that is rebuilt on every reopen.
 PATCH_DIFF_MAX_CHARS = 8000
+# The whole patch's budget. The per-file cap alone still let a 200-file
+# fileChange put ~1.6 MB into one SSE frame, the conversation_event row and
+# every reopen of that thread. Paths past the budget stay listed with no diff
+# so the card still says what was touched.
+PATCH_DIFF_TOTAL_MAX_CHARS = 40000
 
 
 def _patch_change_kind(kind) -> str:
@@ -881,11 +886,20 @@ def patch_input(item: dict) -> dict:
                     "kind": _patch_change_kind(ch.get("kind")),
                     "diff": str(ch.get("diff") or ""),
                 })
+    budget = PATCH_DIFF_TOTAL_MAX_CHARS
     for entry in entries:
-        if len(entry["diff"]) > PATCH_DIFF_MAX_CHARS:
-            kept = entry["diff"][:PATCH_DIFF_MAX_CHARS]
-            dropped = len(entry["diff"]) - PATCH_DIFF_MAX_CHARS
+        diff = entry["diff"]
+        if budget <= 0 and diff:
+            entry["diff"] = "… (diff omitted: patch too large)"
+            continue
+        limit = min(PATCH_DIFF_MAX_CHARS, budget)
+        if len(diff) > limit:
+            kept = diff[:limit]
+            dropped = len(diff) - limit
             entry["diff"] = f"{kept}\n… ({dropped} more characters)"
+            budget = 0
+        else:
+            budget -= len(diff)
     return {"files": files or ["(unknown)"], "changes": entries}
 
 

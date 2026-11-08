@@ -47,7 +47,11 @@ SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE_SECONDS", "86400"))
 # than re-signing on every one; the cost is that the recorded stamp trails
 # actual last use by up to one interval, shortening the effective idle
 # tolerance by that much.
-SESSION_REFRESH_INTERVAL = max(3600, SESSION_MAX_AGE // 24)
+# Capped at an hour so a long session doesn't re-sign too often, but always a
+# small fraction of the lifetime: max(3600, ...) meant any SESSION_MAX_AGE
+# under an hour could never be refreshed, turning the documented idle window
+# back into a fixed clock that logs an active user out mid-session.
+SESSION_REFRESH_INTERVAL = min(3600, max(60, SESSION_MAX_AGE // 24))
 
 
 def _split_csv(value: str) -> set[str]:

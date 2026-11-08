@@ -13,6 +13,7 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskProgressMessage,
     TaskStartedMessage,
+    TaskUpdatedMessage,
 )
 
 import app as app_module
@@ -82,6 +83,58 @@ def test_task_notification_closes_it() -> None:
         "output_file": "/tmp/task-1.out",
         "tool_use_id": "toolu_1",
     }]
+
+
+def test_task_updated_killed_closes_the_block_as_stopped() -> None:
+    """stop_task() reports the end as a task_updated patch with status
+    "killed", and the matching notification is sometimes suppressed. Without
+    this the Stop button's block sat on "Stopping…" forever."""
+    events = app_module._sdk_message_to_events(TaskUpdatedMessage(
+        subtype="task_updated",
+        data={},
+        task_id="task-1",
+        patch={"summary": "Stopped by request"},
+        status="killed",
+    ))
+
+    assert events == [{
+        "type": "task_notification",
+        "status": "stopped",
+        "task_id": "task-1",
+        "summary": "Stopped by request",
+        "output_file": "",
+        "tool_use_id": None,
+        "from_task_updated": True,
+    }]
+
+
+def test_task_updated_non_terminal_status_stays_silent() -> None:
+    for status in ("pending", "running", "paused"):
+        assert app_module._sdk_message_to_events(TaskUpdatedMessage(
+            subtype="task_updated",
+            data={},
+            task_id="task-1",
+            patch={},
+            status=status,
+        )) == []
+
+
+def test_the_browser_reads_the_sdk_task_status_vocabulary() -> None:
+    """The SDK reports completed/failed/stopped; checking for success/error
+    left every real completion with the neutral dot (2026-11-08)."""
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text(
+        encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS
+    )
+    renderer = source[source.index("function renderTaskEvent("):]
+    renderer = renderer[:renderer.index("\n  }\n")]
+    assert 'status === "completed"' in renderer
+    assert 'status === "failed"' in renderer
+    # A terminal task_updated can be followed by the same task's
+    # notification; the second must not add a line, a cue or a block class.
+    assert '"task-terminal"' in renderer
+    assert "kind === \"notification\" && wasDone" in renderer
 
 
 def test_housekeeping_system_messages_stay_silent() -> None:

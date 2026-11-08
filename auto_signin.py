@@ -110,6 +110,22 @@ def mailbox_cmd_configured() -> bool:
     return bool(os.environ.get(ENV_MAILBOX_CMD, "").strip())
 
 
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the wrapper's whole session after a timeout or a cancel.
+
+    Must run before the child is reaped. The old finally-block killed the
+    group after communicate() had already collected the wrapper, and a pid
+    recycled as a new session leader would then have had its group killed.
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif proc.returncode is None:
+        proc.kill()
+
+
 async def _poll_mailbox(email: str, after_epoch: int, timeout_s: int) -> str:
     cmd = os.environ.get(ENV_MAILBOX_CMD, "").strip()
     if not cmd:
@@ -124,18 +140,15 @@ async def _poll_mailbox(email: str, after_epoch: int, timeout_s: int) -> str:
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + 15)
     except asyncio.TimeoutError:
+        _kill_process_group(proc)
+        await proc.wait()
         raise AutoSigninError("mailbox poll wrapper hung past its own timeout") from None
-    finally:
+    except asyncio.CancelledError:
         # Cancelling an attempt must also stop a shell wrapper's ssh/pwsh
         # children; otherwise retries leave mailbox readers running.
-        if os.name == "posix":
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif proc.returncode is None:
-            proc.kill()
+        _kill_process_group(proc)
         await proc.wait()
+        raise
     if proc.returncode == 0:
         url = (out or b"").decode("utf-8", errors="replace").strip()
         if url.startswith("https://claude.ai/magic-link#"):

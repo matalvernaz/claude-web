@@ -47,6 +47,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -55,6 +56,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import review_contract
+
+log = logging.getLogger("claude-web")
 
 MAX_ROUNDS = max(1, int(os.getenv("CLAUDE_WEB_PANEL_MAX_ROUNDS", "3")))
 EFFORT = os.getenv("CLAUDE_WEB_PANEL_EFFORT", "medium")
@@ -511,6 +514,11 @@ class PanelState:
         try:
             data = json.loads(raw or "{}")
         except ValueError:
+            data = {}
+        # Valid JSON that isn't an object ("null", "[]", a bare string) would
+        # otherwise raise AttributeError on .items() and 500 every panel path
+        # for that chat, on every request, until someone edits the row.
+        if not isinstance(data, dict):
             data = {}
         fields = {f.name for f in dataclasses.fields(cls)}
         state = cls(**{k: v for k, v in data.items() if k in fields})
@@ -1029,6 +1037,17 @@ async def run_round(
     Malformed or incomplete reports get one private correction attempt in the
     same round. A failed correction retains the unverified report and findings.
     """
+    # One unknown key in CLAUDE_WEB_PANEL_PARTICIPANTS (a typo, or a provider
+    # the installed roundtable library doesn't register) used to raise
+    # KeyError and abort every round in every panel chat. Review with the
+    # participants that do exist instead.
+    known = [p for p in participants if p in core.PARTICIPANTS]
+    for p in participants:
+        if p not in core.PARTICIPANTS:
+            log.warning("panel participant %r is not registered; skipping it", p)
+    if not known:
+        raise ValueError("no registered roundtable participants are configured")
+    participants = known
     labels = {p: core.PARTICIPANTS[p]["label"] for p in participants}
     tid = thread_id
     if tid is not None:

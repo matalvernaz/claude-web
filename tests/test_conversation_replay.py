@@ -156,6 +156,17 @@ def test_items_keep_the_most_recent_within_budget() -> None:
     assert sum(len(_texts(item)) for item in items[1:]) <= 4_000
 
 
+def test_a_reply_trimmed_inside_itself_says_so() -> None:
+    """No whole turn was dropped, so the count is 0, but thousands of
+    characters went: the note has to say the reply was trimmed."""
+    events = [_ev("user_prompt", {"role": "user", "text": "z" * 1_000})]
+    items, omitted = cr.render_handoff_items(
+        events, "codex", char_budget=350, item_cap=100,
+    )
+    assert omitted == 0
+    assert "earliest turn here was shortened" in _texts(items[0])
+
+
 def test_a_long_stretch_splits_into_items_and_keeps_its_end() -> None:
     """Hundreds of tool calls between two prompts split into several assistant
     items instead of one cut short, so the newest work is still there."""

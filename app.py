@@ -54,6 +54,8 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskProgressMessage,
     TaskStartedMessage,
+    TaskUpdatedMessage,
+    TERMINAL_TASK_STATUSES,
     UserMessage,
     list_sessions as sdk_list_sessions,
 )
@@ -6433,6 +6435,41 @@ def _codex_server_key(user_sub: str, cred_id: int) -> str:
     return f"cred:{_safe_sub(user_sub)}:{cred_id}"
 
 
+def _shared_codex_entry_source(entry: Path) -> Optional[Path]:
+    """Resolve one shared CODEX_HOME entry for rebroadcast into a slot home.
+
+    A plain entry is returned as-is. A symlink is followed only when its
+    target stays outside the per-user credential homes: a shared-instance
+    deployment lets every signed-in user write into CODEX_HOME through the
+    Bash tool, so a planted link there could otherwise rebroadcast another
+    user's credentials into the planter's own home. The host's own
+    ``AGENTS.md -> CLAUDE.md`` link is the case this exists for; refusing
+    every symlink left each credential home without the house rules.
+    """
+    if not entry.is_symlink():
+        return entry if entry.exists() else None
+    try:
+        target = entry.resolve(strict=True)
+    except OSError:
+        return None
+    for guarded in (PERSONAL_HOMES_DIR, CODEX_PERSONAL_HOMES_DIR):
+        try:
+            # macOS hands out /private/... from resolve() for a /var or /tmp
+            # path, so both sides have to be resolved to compare.
+            guarded = guarded.resolve()
+        except OSError:
+            pass
+        try:
+            target.relative_to(guarded)
+        except ValueError:
+            continue
+        log.warning(
+            "refusing Codex entry %s: symlink resolves into %s", entry, guarded,
+        )
+        return None
+    return target
+
+
 def _ensure_codex_credential_home(user_sub: str, cred_id: int) -> Path:
     """Create a private Codex auth/state home with shared rollout history.
 
@@ -6456,18 +6493,13 @@ def _ensure_codex_credential_home(user_sub: str, cred_id: int) -> Path:
     # per-project CLAUDE.md files.
     shared_entries = ("sessions", "config.toml", "AGENTS.md", "skills", "rules", "prompts")
     for name in shared_entries:
-        source = shared_home / name
-        if not source.exists() or source.is_symlink():
-            if source.is_symlink():
-                log.warning(
-                    "skipping symlinked Codex entry %s while creating account home",
-                    source,
-                )
+        source = _shared_codex_entry_source(shared_home / name)
+        if source is None:
             continue
         link = home / name
         if link.exists() or link.is_symlink():
             continue
-        _link_or_copy(source.absolute(), link)
+        _link_or_copy(source, link)
     return home
 
 
@@ -17329,6 +17361,31 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             "summary": msg.summary,
             "output_file": msg.output_file,
             "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskUpdatedMessage):
+        # stop_task()'s docstring is explicit: the terminal state arrives as a
+        # task_updated patch with status "killed", and the matching notification
+        # is sometimes suppressed. Without this branch the Stop button's block
+        # sat on "Stopping…" forever. Non-terminal patches carry nothing the
+        # started/progress events don't already show.
+        status = msg.status or (msg.patch or {}).get("status")
+        if status not in TERMINAL_TASK_STATUSES:
+            return []
+        patch = msg.patch or {}
+        return [{
+            "type": "task_notification",
+            # The browser's vocabulary is the notification's ("stopped"), and
+            # a later notification for the same task must not be read as a
+            # second completion.
+            "status": "stopped" if status == "killed" else status,
+            "task_id": msg.task_id,
+            "summary": (
+                patch.get("summary") or patch.get("description")
+                or patch.get("error") or ""
+            ),
+            "output_file": patch.get("output_file") or "",
+            "tool_use_id": patch.get("tool_use_id"),
+            "from_task_updated": True,
         }]
     if isinstance(msg, SystemMessage):
         if msg.subtype == "init":

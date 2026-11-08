@@ -594,11 +594,16 @@ def apply_staged(staged: Staged, install: Path | None = None, argv: list[str] | 
             "bundled helper. Refusing to launch a possibly tampered helper."
         )
     upgrade_manager.prepare_for_upgrade(install, flat_zip, staged.tag, exe_name=APP_EXE)
+    # Spawn before clearing the marker. The helper blocks until every
+    # claude-web process has exited, so it cannot relaunch ahead of the
+    # unlink; and a failed spawn (UAC declined) leaves the marker in place,
+    # so the staged workdir can still be discarded instead of being orphaned
+    # while the pending-upgrade marker claims an upgrade that never ran.
+    _spawn_extractor(extractor_tmp, flat_zip, install, install / APP_EXE, list(argv or []))
     try:
         _staged_path(install).unlink()
     except OSError:
         pass
-    _spawn_extractor(extractor_tmp, flat_zip, install, install / APP_EXE, list(argv or []))
     logger.info("self-update: helper launched for %s; exiting so it can swap files", staged.tag)
 
 

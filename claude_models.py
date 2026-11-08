@@ -284,10 +284,16 @@ def load_cache(path: Path) -> Optional[dict]:
     accounts = data.get("accounts")
     if not isinstance(accounts, dict):
         accounts = {"shared": data.get("rows")}
-    accounts = {
-        key: usable_rows(rows) for key, rows in accounts.items()
-        if isinstance(key, str) and usable_rows(rows)
-    }
+    # One pass: the comprehension this replaced called usable_rows() twice per
+    # account, rebuilding every filtered list and duplicate set for nothing.
+    cleaned: dict[str, list[dict]] = {}
+    for key, rows in accounts.items():
+        if not isinstance(key, str):
+            continue
+        usable = usable_rows(rows)
+        if usable:
+            cleaned[key] = usable
+    accounts = cleaned
     if not accounts:
         return None
     return {"accounts": accounts, "cli_version": data.get("cli_version"),
