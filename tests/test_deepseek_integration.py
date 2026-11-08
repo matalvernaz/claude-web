@@ -128,7 +128,9 @@ def test_a_deepseek_chat_runs_claude_code_against_deepseek(client, sdk_capture, 
     assert "sk-test" not in options.settings
     assert sdk_capture["overlay"]["env"]["ANTHROPIC_AUTH_TOKEN"] == "sk-test"
     assert sdk_capture["overlay"]["env"]["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
-    assert sdk_capture["overlay_mode"] == 0o600
+    if os.name == "posix":
+        # Windows has no permission bits; the state folder sits in the user's own profile there.
+        assert sdk_capture["overlay_mode"] == 0o600
     assert not Path(options.settings).exists(), "the overlay outlived its run"
     assert sdk_capture["asked"] == ["Write", "Bash"]
     assert isinstance(sdk_capture["decisions"][0], PermissionResultAllow)
