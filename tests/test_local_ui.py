@@ -1514,7 +1514,7 @@ DEEPSEEK_ACCOUNTS = {
 
 def _with_deepseek(state):
     state["providers"]["providers"].append({
-        "key": "deepseek", "label": "DeepSeek (China)", "available": True,
+        "key": "deepseek", "label": "DeepSeek", "available": True,
         "models": DEEPSEEK_MODELS, "capabilities": DEEPSEEK_CAPS, "accounts": DEEPSEEK_ACCOUNTS,
     })
 

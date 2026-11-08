@@ -441,7 +441,7 @@ def test_the_provider_list_offers_deepseek_with_the_users_accounts(client, deeps
 
     entry = providers["deepseek"]
     assert entry["available"] is True
-    assert entry["label"] == "DeepSeek (China)"
+    assert entry["label"] == "DeepSeek"
     assert [m["key"] for m in entry["models"]] == ["deepseek-flash", "deepseek-v4-pro"]
     assert entry["capabilities"]["accounts"] is True
     assert entry["capabilities"]["failover"] is False

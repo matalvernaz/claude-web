@@ -29,7 +29,7 @@ ENABLED = (
 # The API origin. Claude Code's requests go to /anthropic on it; /models and
 # /user/balance sit at its root.
 BASE_URL = os.getenv("CLAUDE_WEB_DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
-LABEL = "DeepSeek (China)"
+LABEL = "DeepSeek"
 SHARED_LABEL = os.getenv("CLAUDE_WEB_DEEPSEEK_SHARED_ACCOUNT_LABEL", "Shared DeepSeek").strip() or "Shared DeepSeek"
 PERMISSION_MODES = list(local_provider.PERMISSION_MODES)
 # DeepSeek's model list changes when it ships a model, not from one request to the next.

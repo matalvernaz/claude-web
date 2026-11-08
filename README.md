@@ -117,7 +117,7 @@ DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly,
 so a DeepSeek chat is an ordinary Claude Code session whose requests go to
 DeepSeek: the same tools, approval cards, plan mode, rewind and saved chats.
 
-DeepSeek is off unless you turn it on, because of where its data goes (below):
+DeepSeek is off unless you turn it on:
 
 ```dotenv
 CLAUDE_WEB_DEEPSEEK_ENABLED=true
@@ -140,16 +140,10 @@ CLAUDE_WEB_DEEPSEEK_API_KEY=sk-...
 CLAUDE_WEB_DEEPSEEK_SHARED_ACCOUNT_LABEL=Shared DeepSeek
 ```
 
-After restarting the app, choose **DeepSeek (China)**. The model picker lists
+After restarting the app, choose **DeepSeek**. The model picker lists
 whatever DeepSeek's API currently offers (read from its `/models` endpoint and
 kept for an hour), so a new DeepSeek model appears without an update. Effort
 offers the levels each model declares. Images work on models that accept them.
-
-Before turning it on, know where the data goes. DeepSeek's privacy policy says it
-stores and processes data in the People's Republic of China and may use inputs
-to train its models. Everything the model sees goes there: your messages, the
-project's files it reads, CLAUDE.md and memory files, and the output of every
-command it runs. The picker label says "China" for that reason.
 
 The running cost figure is hidden for DeepSeek, because the CLI prices every
 turn as if it ran on Claude. DeepSeek chats have no failover, advisor or panel
