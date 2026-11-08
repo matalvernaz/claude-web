@@ -1451,12 +1451,14 @@ def test_default_names_the_model_of_the_account_picked(ui):
 
 
 # ── DeepSeek ──────────────────────────────────────────────────────────────────
-# Another provider that runs Claude Code against someone else's server. It
-# takes the ordinary effort picker (its levels are named), shows its balance
-# in the Usage dialog, and like Local it is fixed to its own chats.
+# Another provider that runs Claude Code against someone else's server, with
+# accounts like Claude and Codex: each person links their own API keys. It
+# takes the ordinary effort picker (its levels are named), shows the picked
+# account's balance in the Usage dialog, and like Local it is fixed to its own chats.
 
 DEEPSEEK_CAPS = {
-    "plan_mode": True, "fork": True, "rewind": True, "accounts": False, "usage": False, "advisor": False,
+    "plan_mode": True, "fork": True, "rewind": True, "accounts": True, "usage": False, "advisor": False,
+    "failover": False,
     "permission_modes": ["default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"],
 }
 DEEPSEEK_MODELS = [
@@ -1465,12 +1467,20 @@ DEEPSEEK_MODELS = [
     {"key": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "efforts": ["low", "high", "max"],
      "default_effort": "high", "context": 1048576},
 ]
+DEEPSEEK_ACCOUNTS = {
+    "enabled": True, "active": "cred:7", "shared_label": "Shared DeepSeek", "shared_configured": False,
+    "credentials": [
+        {"id": 7, "label": "Personal", "configured": True},
+        {"id": 8, "label": "Work", "configured": True},
+        {"id": 9, "label": "Old", "configured": False},
+    ],
+}
 
 
 def _with_deepseek(state):
     state["providers"]["providers"].append({
         "key": "deepseek", "label": "DeepSeek (China)", "available": True,
-        "models": DEEPSEEK_MODELS, "capabilities": DEEPSEEK_CAPS,
+        "models": DEEPSEEK_MODELS, "capabilities": DEEPSEEK_CAPS, "accounts": DEEPSEEK_ACCOUNTS,
     })
 
 
@@ -1482,7 +1492,6 @@ def test_deepseek_takes_the_ordinary_effort_picker_and_sends_its_choices(ui):
     playwright.expect(page.locator("#provider-select")).to_have_value("deepseek")
     playwright.expect(page.locator("#local-effort-control")).to_be_hidden()
     playwright.expect(page.locator("#effort-select-label")).to_be_visible()
-    playwright.expect(page.locator("#account-select")).to_be_hidden()
     playwright.expect(page.locator("#show-usage")).to_be_visible()
     playwright.expect(page.locator("#model-select")).to_have_value("deepseek-flash")
     page.locator("#model-select").select_option("deepseek-v4-pro")
@@ -1495,21 +1504,44 @@ def test_deepseek_takes_the_ordinary_effort_picker_and_sends_its_choices(ui):
         page.locator("#send").click()
     fields = state["posts"][0][1]
     assert (fields["provider"], fields["model"], fields["effort"]) == ("deepseek", "deepseek-v4-pro", "max")
+    assert fields["account_slot"] == "cred:7"
+
+
+def test_the_header_offers_each_persons_deepseek_accounts(ui):
+    page, state = ui
+    _with_deepseek(state)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'deepseek')")
+    page.goto("http://local-ui.test/")
+    accounts = page.locator("#account-select")
+    playwright.expect(accounts).to_be_visible()
+    playwright.expect(accounts).to_have_value("cred:7")
+    labels = accounts.locator("option").all_text_contents()
+    # No shared key here, and an account without a key says so plainly.
+    assert labels == ["Shared DeepSeek (no key)", "Personal", "Work", "Old (no key)"]
+    # Account failover is Claude's, so its toggle stays out of the way.
+    playwright.expect(page.locator("#failover-toggle")).to_be_hidden()
 
 
 @pytest.mark.parametrize("sufficient", [True, False])
-def test_the_usage_dialog_reads_out_the_deepseek_balance(ui, sufficient):
+def test_the_usage_dialog_reads_out_the_balance_of_the_account_in_use(ui, sufficient):
     page, state = ui
     _with_deepseek(state)
-    page.route("**/api/deepseek/usage", lambda r: r.fulfill(json={
-        "available": True, "sufficient": sufficient, "balances": [
-            {"currency": "USD", "total": "19.97", "granted": "0.00", "topped_up": "19.97"}]}))
+    asked = []
+
+    def balance(route):
+        asked.append(parse_qs(urlparse(route.request.url).query))
+        route.fulfill(json={
+            "available": True, "sufficient": sufficient, "account_slot": "cred:7", "account_label": "Personal",
+            "balances": [{"currency": "USD", "total": "19.97", "granted": "0.00", "topped_up": "19.97"}]})
+
+    page.route("**/api/deepseek/usage*", balance)
     page.add_init_script("localStorage.setItem('claude-web.provider', 'deepseek')")
     page.goto("http://local-ui.test/")
     page.locator("#show-usage").click()
     body = page.locator("#usage-body")
+    playwright.expect(body).to_contain_text("DeepSeek: Personal")
     playwright.expect(body).to_contain_text("19.97 USD left")
-    playwright.expect(body).to_contain_text("Shared by everyone who picks DeepSeek")
+    assert asked[0]["account_slot"] == ["cred:7"]
     if sufficient:
         playwright.expect(body).not_to_contain_text("top it up")
     else:
@@ -1520,12 +1552,99 @@ def test_a_reopened_deepseek_chat_restores_its_settings_and_leaving_it_starts_fr
     page, state = ui
     _with_deepseek(state)
     state["session"] = {"provider": "deepseek", "model": "deepseek-v4-pro", "effort": "low",
+                        "account_slot": "cred:8",
                         "messages": [{"role": "user", "text": "Saved conversation"}]}
     page.goto("http://local-ui.test/?session=saved")
     playwright.expect(page.locator("#provider-select")).to_have_value("deepseek")
     playwright.expect(page.locator("#model-select")).to_have_value("deepseek-v4-pro")
     playwright.expect(page.locator("#effort-select")).to_have_value("low")
+    playwright.expect(page.locator("#account-select")).to_have_value("cred:8")
     # Provider switching is on in this fixture, and still a DeepSeek chat can't carry over.
     page.locator("#provider-select").select_option("claude")
     playwright.expect(page).to_have_url("http://local-ui.test/")
     playwright.expect(page.locator("#transcript")).to_be_empty()
+
+
+def _deepseek_account_page(page, state, deepseek_account):
+    template = Environment(loader=FileSystemLoader(ROOT / "templates")).get_template("account.html")
+    html = template.render(
+        asset_version=lambda _: "test", user={"sub": "test"},
+        account={"shared_label": "Shared", "credentials": []}, codex_account={"credentials": []},
+        deepseek_account=deepseek_account,
+    )
+    state.setdefault("posts", [])
+
+    def route(request_route):
+        request = request_route.request
+        path = urlparse(request.url).path
+        if path == "/account":
+            request_route.fulfill(content_type="text/html", body=html)
+        elif path.startswith("/static/"):
+            asset = ROOT / path.lstrip("/")
+            request_route.fulfill(path=asset) if asset.is_file() else request_route.fulfill(status=404)
+        elif path.startswith("/api/account/deepseek/"):
+            state["posts"].append((request.method, path, request.post_data_json))
+            request_route.fulfill(status=state.get("status", 200), json=state.get("reply", {}))
+        else:
+            request_route.fulfill(json={})
+
+    page.route("**/*", route)
+    page.goto("http://account-ui.test/account")
+
+
+def test_a_deepseek_key_is_linked_from_the_accounts_page(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    state = {"status": 400, "reply": {"detail": "DeepSeek refused this API key. Check it on platform.deepseek.com and link it again."}}
+    try:
+        _deepseek_account_page(page, state, dict(DEEPSEEK_ACCOUNTS, credentials=[]))
+        playwright.expect(page.get_by_role("heading", name="DeepSeek accounts")).to_be_visible()
+        playwright.expect(page.locator("#deepseek-none")).to_contain_text("haven't linked")
+        key = page.get_by_label("DeepSeek API key", exact=True)
+        playwright.expect(key).to_have_attribute("type", "password")
+        page.get_by_label("Show the DeepSeek key", exact=True).check()
+        playwright.expect(key).to_have_attribute("type", "text")
+        page.get_by_label("Name for this account").fill("Personal")
+        key.fill("sk-typed-in")
+        page.get_by_role("button", name="Check and save key").click()
+        # A refused key is said out loud and nothing is kept.
+        alert = page.locator("#deepseek-add-error")
+        playwright.expect(alert).to_have_attribute("role", "alert")
+        playwright.expect(alert).to_contain_text("refused this API key")
+        assert state["posts"] == [("POST", "/api/account/deepseek/credentials",
+                                   {"label": "Personal", "api_key": "sk-typed-in"})]
+    finally:
+        context.close()
+
+
+def test_a_deepseek_key_is_replaced_in_a_hidden_field(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    state = {}
+    try:
+        _deepseek_account_page(page, state, DEEPSEEK_ACCOUNTS)
+        items = page.locator("#deepseek-cred-list .cred-item")
+        playwright.expect(items).to_have_count(3)
+        playwright.expect(items.nth(0)).to_contain_text("Key saved. Your default")
+        playwright.expect(items.nth(2)).to_contain_text("No key")
+        items.nth(1).get_by_role("button", name="Replace key").click()
+        playwright.expect(page.get_by_role("heading", name="New key for Work")).to_be_visible()
+        replace = page.locator("#deepseek-replace-key")
+        playwright.expect(replace).to_be_focused()
+        playwright.expect(replace).to_have_attribute("type", "password")
+        replace.fill("sk-new-work")
+        with page.expect_navigation():
+            page.locator("#deepseek-replace-submit").click()
+        assert state["posts"][0] == ("POST", "/api/account/deepseek/credentials/8/apikey", {"api_key": "sk-new-work"})
+    finally:
+        context.close()
+
+
+def test_the_accounts_page_has_no_deepseek_section_where_it_is_off(browser):
+    context = browser.new_context()
+    page = context.new_page()
+    try:
+        _deepseek_account_page(page, {}, {"enabled": False, "credentials": []})
+        playwright.expect(page.get_by_role("heading", name="DeepSeek accounts")).to_have_count(0)
+    finally:
+        context.close()

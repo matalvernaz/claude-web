@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -151,8 +152,11 @@ async def check_model(name: str) -> dict:
     return dict(entry)
 
 
-async def model_for_run(name: str) -> dict:
-    """The model a run should use: the one asked for, or the first configured model when none was."""
+async def model_for_run(name: str, api_key: Optional[str] = None) -> dict:
+    """The model a run should use: the one asked for, or the first configured model when none was.
+
+    `api_key` keeps the routed-provider calls alike; Ollama has no accounts and ignores it.
+    """
     name = name or (MODEL_NAMES[0] if MODEL_NAMES else "")
     if name not in MODEL_NAMES:
         raise ValueError("unknown local model")
@@ -251,8 +255,8 @@ def routed_child_env(base_url: str, token: str, model: str) -> dict[str, str]:
     return env
 
 
-def child_env(model: str) -> dict[str, str]:
-    """Override inherited cloud routing and credentials for this subprocess only."""
+def child_env(model: str, api_key: Optional[str] = None) -> dict[str, str]:
+    """Override inherited cloud routing and credentials for this subprocess only (`api_key` is ignored)."""
     env = routed_child_env(BASE_URL, "ollama", model)
     env.update({
         # The CLI leaves the runtime's own idle timeout on for non-Anthropic

@@ -772,6 +772,10 @@ VALID_PROVIDERS = ("claude", "codex", "local", "deepseek")
 # same calls: unavailable_reason, model_for_run, check_model, sdk_options,
 # child_env, LABEL and PERMISSION_MODES.
 ROUTED_PROVIDERS = {"local": local_provider, "deepseek": deepseek_provider}
+# Providers whose chats run on a per-user account slot ("shared" or "cred:<id>"),
+# picked in the header, bound to the session and switched between turns.
+# DeepSeek is routed and has accounts; Local is routed and has none.
+ACCOUNT_PROVIDERS = ("claude", "codex", "deepseek")
 
 # Codex thread ids double as claude-web session ids. Runtime knobs like
 # approval policy and sandbox mode live in codex_provider.py.
@@ -877,10 +881,16 @@ async def _providers_payload(
         },
     }
     deepseek_reason = deepseek_provider.unavailable_reason()
+    deepseek_enabled = deepseek_reason is None
     deepseek_models = []
+    if deepseek_enabled:
+        # Listed with the key the user's next chat would use; a user with no
+        # key gets the Accounts-page hint as the reason.
+        deepseek_account = _resolve_deepseek_account_for_run(user)
+        deepseek_reason = deepseek_provider.unavailable_reason(deepseek_account["api_key"])
     if deepseek_reason is None:
         try:
-            deepseek_models = await deepseek_provider.list_models()
+            deepseek_models = await deepseek_provider.list_models(deepseek_account["api_key"])
         except ValueError as exc:
             deepseek_reason = str(exc)
         except httpx.HTTPError as exc:
@@ -889,14 +899,17 @@ async def _providers_payload(
     deepseek_entry = {
         "key": "deepseek", "label": deepseek_provider.LABEL,
         "available": deepseek_reason is None, "reason": deepseek_reason,
-        "models": deepseek_models, "accounts": {},
+        "models": deepseek_models,
+        "accounts": _deepseek_account_payload(user) if deepseek_enabled else {},
         "capabilities": {
             "plan_mode": True, "fork": True, "rewind": True,
             "permission_modes": list(deepseek_provider.PERMISSION_MODES),
             # usage gates the header cost figure, which the CLI works out at
             # Claude's prices. The Usage button shows DeepSeek's own balance
-            # instead (/api/deepseek/usage).
-            "accounts": False, "usage": False, "advisor": False,
+            # instead (/api/deepseek/usage). failover is Claude's account
+            # failover, which DeepSeek doesn't have.
+            "accounts": deepseek_enabled, "usage": False, "advisor": False,
+            "failover": False,
         },
     }
     return [claude_entry, codex_entry, local_entry, deepseek_entry]
@@ -2238,6 +2251,24 @@ def _state_db() -> sqlite3.Connection:
             "CREATE INDEX IF NOT EXISTS idx_codex_credential_sub "
             "ON codex_credential(user_sub)"
         )
+        # DeepSeek account slots mirror the OpenAI pair. Their API keys live
+        # in private files (DEEPSEEK_KEYS_DIR), never in this database.
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_deepseek_account (
+            user_sub TEXT PRIMARY KEY,
+            active TEXT NOT NULL DEFAULT 'shared',
+            updated_at REAL NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS deepseek_credential (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_sub TEXT NOT NULL,
+            label TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(user_sub, label)
+        )""")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deepseek_credential_sub "
+            "ON deepseek_credential(user_sub)"
+        )
         # Roundtable thread → project binding. The roundtable library itself
         # is project-agnostic (its SQLite store at ~/.claude-roundtable/ has
         # no notion of claude-web projects). This claude-web-side table maps
@@ -2587,6 +2618,251 @@ def _clear_routed_settings() -> None:
                 leftover.unlink()
 
 
+# DeepSeek accounts. Each user links their own API keys; the host may add a
+# Shared key (deepseek_provider.API_KEY). A key is kept in a file only this
+# user can read, one per slot, the way a Claude slot keeps .anthropic_api_key
+# in its home. Nothing here ever returns a key to the browser.
+DEEPSEEK_KEYS_DIR = USAGE_DIR / "deepseek-keys"
+
+
+def _deepseek_key_path(user_sub: str, cred_id: int) -> Path:
+    return DEEPSEEK_KEYS_DIR / _safe_sub(user_sub) / f"{cred_id}.key"
+
+
+def _save_deepseek_key(user_sub: str, cred_id: int, api_key: str) -> None:
+    """Write one slot's key to its private file, replacing any old key in one step."""
+    path = _deepseek_key_path(user_sub, cred_id)
+    for directory in (DEEPSEEK_KEYS_DIR, path.parent):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    staging = path.with_suffix(".key.new")
+    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        os.chmod(staging, 0o600)
+        handle.write(api_key)
+    os.replace(staging, path)
+
+
+def _read_deepseek_key(user_sub: str, cred_id: int) -> str:
+    try:
+        return _deepseek_key_path(user_sub, cred_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _delete_deepseek_key(user_sub: str, cred_id: int) -> None:
+    with contextlib.suppress(OSError):
+        _deepseek_key_path(user_sub, cred_id).unlink()
+
+
+def _list_deepseek_credentials(user_sub: str) -> list[dict]:
+    if not user_sub:
+        return []
+    try:
+        rows = _state_db().execute(
+            "SELECT id, label, created_at FROM deepseek_credential "
+            "WHERE user_sub = ? ORDER BY id",
+            (user_sub,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [{"id": row[0], "label": row[1], "created_at": row[2]} for row in rows]
+
+
+def _get_deepseek_credential(user_sub: str, cred_id: int) -> Optional[dict]:
+    if not user_sub:
+        return None
+    try:
+        row = _state_db().execute(
+            "SELECT id, label, created_at FROM deepseek_credential "
+            "WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "label": row[1], "created_at": row[2]}
+
+
+def _checked_deepseek_label(label: str) -> str:
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "Give the account a name.")
+    if len(label) > 80:
+        raise HTTPException(400, "That name is too long; keep it under 80 characters.")
+    return label
+
+
+def _create_deepseek_credential(user_sub: str, label: str) -> dict:
+    label = _checked_deepseek_label(label)
+    try:
+        cursor = _state_db().execute(
+            "INSERT INTO deepseek_credential(user_sub, label, created_at) VALUES(?, ?, ?)",
+            (user_sub, label, time.time()),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "You already have a DeepSeek account with that name.") from exc
+    except sqlite3.Error as exc:
+        log.warning("create_deepseek_credential failed: %s", exc)
+        raise HTTPException(500, "Couldn't add the DeepSeek account.") from exc
+    return {"id": int(cursor.lastrowid), "label": label}
+
+
+def _rename_deepseek_credential(user_sub: str, cred_id: int, label: str) -> dict:
+    label = _checked_deepseek_label(label)
+    try:
+        _state_db().execute(
+            "UPDATE deepseek_credential SET label = ? WHERE user_sub = ? AND id = ?",
+            (label, user_sub, cred_id),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "You already have a DeepSeek account with that name.") from exc
+    except sqlite3.Error as exc:
+        log.warning("rename_deepseek_credential failed: %s", exc)
+        raise HTTPException(500, "Couldn't rename the DeepSeek account.") from exc
+    return {"id": cred_id, "label": label}
+
+
+def _delete_deepseek_credential(user_sub: str, cred_id: int) -> None:
+    try:
+        _state_db().execute(
+            "DELETE FROM deepseek_credential WHERE user_sub = ? AND id = ?",
+            (user_sub, cred_id),
+        )
+    except sqlite3.Error as exc:
+        log.warning("delete_deepseek_credential failed: %s", exc)
+        raise HTTPException(500, "Couldn't remove the DeepSeek account.") from exc
+    _delete_deepseek_key(user_sub, cred_id)
+    if _deepseek_user_active_slot(user_sub) == f"cred:{cred_id}":
+        _set_deepseek_user_active(user_sub, "shared")
+
+
+def _require_owned_deepseek_credential(user_sub: str, cred_id: int) -> dict:
+    cred = _get_deepseek_credential(user_sub, cred_id)
+    if cred is None:
+        raise HTTPException(404, "no such DeepSeek account")
+    return cred
+
+
+def _deepseek_credential_is_configured(user_sub: str, cred_id: int) -> bool:
+    return bool(_read_deepseek_key(user_sub, cred_id))
+
+
+def _deepseek_credential_live_runs(user_sub: str, cred_id: int) -> list["ActiveRun"]:
+    slot = f"cred:{cred_id}"
+    return [
+        run for run in ACTIVE_RUNS.values()
+        if not run.done and run.provider == "deepseek"
+        and run.owner_sub == user_sub and run.account_slot == slot
+    ]
+
+
+def _deepseek_user_active_slot(user_sub: Optional[str]) -> str:
+    if not user_sub:
+        return "shared"
+    try:
+        row = _state_db().execute(
+            "SELECT active FROM user_deepseek_account WHERE user_sub = ?", (user_sub,),
+        ).fetchone()
+    except sqlite3.Error:
+        return "shared"
+    return row[0] if row else "shared"
+
+
+def _set_deepseek_user_active(user_sub: str, active: str) -> None:
+    try:
+        _state_db().execute(
+            """INSERT INTO user_deepseek_account(user_sub, active, updated_at)
+               VALUES(?, ?, ?)
+               ON CONFLICT(user_sub) DO UPDATE SET
+                   active=excluded.active, updated_at=excluded.updated_at""",
+            (user_sub, active, time.time()),
+        )
+    except sqlite3.Error as exc:
+        log.warning("set_deepseek_user_active failed: %s", exc)
+
+
+def _deepseek_account_slot_visible(user_sub: Optional[str], slot: Optional[str]) -> bool:
+    if slot == "shared":
+        return bool(deepseek_provider.API_KEY)
+    cred_id = _parse_cred_active(slot or "")
+    return (
+        cred_id is not None and bool(user_sub)
+        and _get_deepseek_credential(user_sub, cred_id) is not None
+    )
+
+
+def _effective_deepseek_active_slot(user_sub: Optional[str]) -> str:
+    """The user's default slot if it has a key, else Shared, else their first slot with a key."""
+    active = _deepseek_user_active_slot(user_sub)
+    cred_id = _parse_cred_active(active)
+    if cred_id is not None and user_sub and _deepseek_credential_is_configured(user_sub, cred_id):
+        return active
+    if deepseek_provider.API_KEY:
+        return "shared"
+    if user_sub:
+        for cred in _list_deepseek_credentials(user_sub):
+            if _deepseek_credential_is_configured(user_sub, cred["id"]):
+                return f"cred:{cred['id']}"
+    return "shared"
+
+
+def _deepseek_account_payload(user: dict) -> dict:
+    """The user's DeepSeek accounts for the header picker and the Accounts page; never a key."""
+    sub = (user or {}).get("sub")
+    credentials = _list_deepseek_credentials(sub) if sub else []
+    for cred in credentials:
+        cred["configured"] = _deepseek_credential_is_configured(sub, cred["id"])
+    return {
+        "user_sub": sub,
+        "enabled": deepseek_provider.unavailable_reason() is None,
+        "active": _effective_deepseek_active_slot(sub),
+        "shared_label": deepseek_provider.SHARED_LABEL,
+        "shared_configured": bool(deepseek_provider.API_KEY),
+        "credentials": credentials,
+    }
+
+
+def _resolve_deepseek_account_for_run(
+    user: dict,
+    session_id: Optional[str] = None,
+    override_slot: Optional[str] = None,
+) -> dict:
+    """The DeepSeek slot and key a run uses: the one picked, the session's, or the default.
+
+    Returns slot, label and api_key; api_key is empty when no slot has a key,
+    which unavailable_reason turns into "link a key on the Accounts page".
+    """
+    sub = (user or {}).get("sub")
+    candidates: list[str] = []
+    if override_slot and _deepseek_account_slot_visible(sub, override_slot):
+        candidates.append(override_slot)
+    bound = _session_account_slot(session_id)
+    if bound is not None and _deepseek_account_slot_visible(sub, bound):
+        candidates.append(bound)
+    candidates.append(_effective_deepseek_active_slot(sub))
+    for slot in candidates:
+        if slot == "shared" and deepseek_provider.API_KEY:
+            return {"slot": "shared", "label": deepseek_provider.SHARED_LABEL,
+                    "api_key": deepseek_provider.API_KEY}
+        cred_id = _parse_cred_active(slot)
+        if cred_id is None or not sub:
+            continue
+        cred = _get_deepseek_credential(sub, cred_id)
+        key = _read_deepseek_key(sub, cred_id) if cred else ""
+        if key:
+            return {"slot": slot, "label": cred["label"], "api_key": key}
+    return {"slot": candidates[-1], "label": deepseek_provider.SHARED_LABEL, "api_key": ""}
+
+
+def _key_fingerprint(api_key: str) -> Optional[str]:
+    """A short hash that tells two keys apart without holding either; None for no key."""
+    if not api_key:
+        return None
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
 def _routed_session_row(session_id: str) -> Optional[dict]:
     """The routed provider, model and effort a chat runs on, or None for a Claude or Codex chat."""
     row = _state_db().execute(
@@ -2607,20 +2883,30 @@ def _record_routed_session(run: "ActiveRun") -> None:
         )
 
 
-def _routed_account_for_run(user: dict, provider: str, model: str) -> dict:
+def _routed_account_for_run(
+    user: dict, provider: str, model: str, account: Optional[dict] = None,
+) -> dict:
+    """The account a routed run spawns under: Local's fixed one, or the resolved DeepSeek slot with its key in the child env only."""
     module = ROUTED_PROVIDERS[provider]
+    if provider == "deepseek" and account is not None:
+        return {"slot": account["slot"], "label": account["label"],
+                "key_fingerprint": _key_fingerprint(account["api_key"]), "env": {
+            **_identity_env_for(user), **module.child_env(model, account["api_key"]),
+        }}
     return {"slot": provider, "label": _PROVIDER_LABELS[provider], "env": {
         **_identity_env_for(user), **module.child_env(model),
     }}
 
 
-async def _routed_model_for_run(provider: str, model: str, effort: str) -> dict:
+async def _routed_model_for_run(
+    provider: str, model: str, effort: str, api_key: Optional[str] = None,
+) -> dict:
     module = ROUTED_PROVIDERS[provider]
-    reason = module.unavailable_reason()
+    reason = module.unavailable_reason(api_key) if provider == "deepseek" else module.unavailable_reason()
     if reason:
         raise HTTPException(503, reason)
     try:
-        metadata = await module.model_for_run(model)
+        metadata = await module.model_for_run(model, api_key)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except httpx.HTTPError as exc:
@@ -8875,6 +9161,10 @@ class ActiveRun:
         # plan window was spent doesn't become the session's standing choice
         # and strand the user on the fallback after their own account resets.
         self.requested_account_slot = account_slot
+        # Fingerprint of the API key a routed run's CLI was spawned with
+        # (DeepSeek). Replacing an account's key changes it, and the next
+        # message respawns the CLI on the new key.
+        self.key_fingerprint: Optional[str] = None
         # Which personality the CLI was spawned with. The system_prompt
         # is baked in at SDK init, so a mid-conversation personality flip
         # has to respawn the run with the new append. Compared in api_chat.
@@ -9125,7 +9415,7 @@ class ActiveRun:
         # Same for the credential slot: a tab opening this resumed session
         # must resolve to the account it actually spawned under, not the
         # user-global default.
-        if self.requested_account_slot and self.provider not in ROUTED_PROVIDERS:
+        if self.requested_account_slot and self.provider in ACCOUNT_PROVIDERS:
             _bind_session_account(sid, self.owner_sub, self.requested_account_slot)
         # And panel review, when the browser said on or off for this chat
         # before it had a session id.
@@ -11822,6 +12112,20 @@ async def api_account_set_active(
             raise HTTPException(400, "OpenAI account is not signed in yet")
         _set_codex_user_active(sub, active)
         return _codex_account_payload(user)
+    if provider == "deepseek":
+        if active == "shared":
+            if not deepseek_provider.API_KEY:
+                raise HTTPException(400, "this server has no shared DeepSeek key")
+            _set_deepseek_user_active(sub, "shared")
+            return _deepseek_account_payload(user)
+        cred_id = _parse_cred_active(active)
+        if cred_id is None:
+            raise HTTPException(400, "invalid slot")
+        _require_owned_deepseek_credential(sub, cred_id)
+        if not _deepseek_credential_is_configured(sub, cred_id):
+            raise HTTPException(400, "that DeepSeek account has no key yet")
+        _set_deepseek_user_active(sub, active)
+        return _deepseek_account_payload(user)
     if provider != "claude":
         raise HTTPException(400, "unknown provider")
     if active == "shared":
@@ -12339,6 +12643,111 @@ def _codex_credential_lock(user_sub: str, cred_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _CODEX_CREDENTIAL_LOCKS[key] = lock
     return lock
+
+
+def _require_deepseek_on() -> None:
+    reason = deepseek_provider.unavailable_reason()
+    if reason:
+        raise HTTPException(409, reason)
+
+
+async def _checked_deepseek_key(api_key: str) -> str:
+    """A pasted key, checked with DeepSeek before it's saved."""
+    key = (api_key or "").strip()
+    if not key:
+        raise HTTPException(400, "Paste a DeepSeek API key.")
+    if len(key) > 512 or any(character.isspace() for character in key):
+        raise HTTPException(400, "That doesn't look like a DeepSeek API key.")
+    try:
+        await deepseek_provider.validate_key(key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            502, "Couldn't reach DeepSeek to check the key. Try again in a minute.",
+        ) from exc
+    return key
+
+
+@app.get("/api/account/deepseek")
+async def api_deepseek_account(user: dict = Depends(auth.require_user)):
+    return _deepseek_account_payload(user)
+
+
+@app.post("/api/account/deepseek/credentials")
+async def api_deepseek_credentials_create(
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Link a DeepSeek API key as a new account; it becomes the user's default."""
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    _require_deepseek_on()
+    body = await request.json()
+    label = _checked_deepseek_label(body.get("label") or "")
+    key = await _checked_deepseek_key(body.get("api_key") or "")
+    cred = _create_deepseek_credential(sub, label)
+    try:
+        _save_deepseek_key(sub, cred["id"], key)
+    except OSError as exc:
+        _delete_deepseek_credential(sub, cred["id"])
+        log.warning("saving a DeepSeek key failed: %s", exc)
+        raise HTTPException(500, "Couldn't save the key on this server.") from exc
+    _set_deepseek_user_active(sub, f"cred:{cred['id']}")
+    return _deepseek_account_payload(user)
+
+
+@app.patch("/api/account/deepseek/credentials/{cred_id}")
+async def api_deepseek_credentials_rename(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    body = await request.json()
+    _require_owned_deepseek_credential(sub, cred_id)
+    _rename_deepseek_credential(sub, cred_id, body.get("label") or "")
+    return _deepseek_account_payload(user)
+
+
+@app.post("/api/account/deepseek/credentials/{cred_id}/apikey")
+async def api_deepseek_credentials_replace_key(
+    cred_id: int,
+    request: Request,
+    user: dict = Depends(auth.require_user),
+):
+    """Swap the key behind an account; chats on it pick the new key up with their next message."""
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    _require_deepseek_on()
+    _require_owned_deepseek_credential(sub, cred_id)
+    body = await request.json()
+    key = await _checked_deepseek_key(body.get("api_key") or "")
+    try:
+        _save_deepseek_key(sub, cred_id, key)
+    except OSError as exc:
+        log.warning("saving a DeepSeek key failed: %s", exc)
+        raise HTTPException(500, "Couldn't save the key on this server.") from exc
+    return _deepseek_account_payload(user)
+
+
+@app.delete("/api/account/deepseek/credentials/{cred_id}")
+async def api_deepseek_credentials_delete(
+    cred_id: int,
+    user: dict = Depends(auth.require_user),
+):
+    sub = user.get("sub")
+    if not sub:
+        raise HTTPException(401, "no user identity")
+    _require_owned_deepseek_credential(sub, cred_id)
+    if _deepseek_credential_live_runs(sub, cred_id):
+        raise HTTPException(409, "This DeepSeek account is in use by a chat that's running. Stop it first.")
+    _delete_deepseek_credential(sub, cred_id)
+    return _deepseek_account_payload(user)
 
 
 @app.get("/api/account/codex")
@@ -13946,6 +14355,16 @@ async def api_chat(
                  "detail": _codex_avail["reason"]},
                 status_code=503,
             )
+    elif provider == "deepseek":
+        account = _resolve_deepseek_account_for_run(
+            user,
+            session_id=session_id or None,
+            override_slot=account_slot or None,
+        )
+        reason = deepseek_provider.unavailable_reason(account["api_key"])
+        if reason:
+            return JSONResponse(
+                {"error": "deepseek_not_configured", "detail": reason}, status_code=503)
     elif provider in ROUTED_PROVIDERS:
         reason = ROUTED_PROVIDERS[provider].unavailable_reason()
         if reason:
@@ -14010,7 +14429,8 @@ async def api_chat(
                 and effort not in (selected_model.get("efforts") or [])):
             raise HTTPException(400, "model does not support this effort level")
     elif provider in ROUTED_PROVIDERS:
-        selected_model = await _routed_model_for_run(provider, model, effort)
+        selected_model = await _routed_model_for_run(
+            provider, model, effort, (account or {}).get("api_key"))
         model = selected_model["key"]
         effort = effort or selected_model.get("default_effort") or ""
         if permission_mode not in ROUTED_PROVIDERS[provider].PERMISSION_MODES:
@@ -14085,7 +14505,7 @@ async def api_chat(
         # session lock — without this, one bad call would deadlock the
         # session for the worker's lifetime.
         if provider in ROUTED_PROVIDERS:
-            account = _routed_account_for_run(user, provider, model)
+            account = _routed_account_for_run(user, provider, model, account)
         elif provider == "claude":
             account = _resolve_account_for_run(
                 user,
@@ -14144,7 +14564,7 @@ async def api_chat(
         # substitution is re-decided every turn from live plan state; persisting
         # it would quietly rewrite the user's standing choice the first time
         # their account hit a limit, and they'd never drift back once it reset.
-        if session_id and account_slot and provider not in ROUTED_PROVIDERS:
+        if session_id and account_slot and provider in ACCOUNT_PROVIDERS:
             _bind_session_account(
                 session_id, user.get("sub"),
                 substitution["from_slot"] if substitution else account["slot"],
@@ -14171,7 +14591,8 @@ async def api_chat(
         # below forks; Codex resumes the same thread id in a fresh app-server.
         swap_respawn = False
         if (existing is not None and provider in ROUTED_PROVIDERS
-                and (existing.model != model or existing.effort != effort)):
+                and (existing.model != model or existing.effort != effort
+                     or existing.key_fingerprint != account.get("key_fingerprint"))):
             _require_owner(existing, user)
             await _supersede_run_for_switch(existing, "local_settings_changed")
             existing = None
@@ -14299,6 +14720,7 @@ async def api_chat(
             personality_id=active_personality_id,
         )
         run.provider = provider
+        run.key_fingerprint = account.get("key_fingerprint")
         if substitution is not None:
             run.requested_account_slot = substitution["from_slot"]
         # Seed the permission-mode mirror with the user's initial pick and
@@ -15649,12 +16071,19 @@ async def api_chat_send(
         session_id=run.session_id,
         override_personality_id=personality_id,
     )
+    routed_account = None
+    if run.provider == "deepseek":
+        routed_account = _resolve_deepseek_account_for_run(
+            user, session_id=run.session_id, override_slot=account_slot or None,
+        )
     if run.provider in ROUTED_PROVIDERS:
         routed_form = await request.form()
         requested_model = str(routed_form.get("model") or run.model or "")
         prior_effort = run.effort if requested_model == run.model else ""
         requested_effort = str(routed_form.get("effort", prior_effort) or "").lower()
-        metadata = await _routed_model_for_run(run.provider, requested_model, requested_effort)
+        metadata = await _routed_model_for_run(
+            run.provider, requested_model, requested_effort,
+            (routed_account or {}).get("api_key"))
         requested_effort = requested_effort or metadata.get("default_effort") or ""
         changed = ("model_changed" if metadata["key"] != run.model else
                    "effort_changed" if requested_effort != run.effort else None)
@@ -15668,7 +16097,7 @@ async def api_chat_send(
             override_slot=account_slot or None,
         )
     elif run.provider in ROUTED_PROVIDERS:
-        account = _routed_account_for_run(user, run.provider, run.model)
+        account = _routed_account_for_run(user, run.provider, run.model, routed_account)
     else:
         account = _resolve_account_for_run(
             user,
@@ -15682,6 +16111,9 @@ async def api_chat_send(
         )
     if run.provider == "codex" or run.provider in ROUTED_PROVIDERS:
         handoff = "account_changed" if run.account_slot != account["slot"] else None
+        if handoff is None and run.key_fingerprint != account.get("key_fingerprint"):
+            # Same account, new key: the CLI still holds the old one.
+            handoff = "account_changed"
     else:
         # Claude follow-ups take the same failover preflight api_chat gives a
         # fresh spawn, so a run whose slot was just observed spent is respawned
@@ -18899,20 +19331,28 @@ async def api_usage_request(
 
 
 @app.get("/api/deepseek/usage")
-async def api_deepseek_usage(user: dict = Depends(auth.require_user)):
-    """The DeepSeek account balance for the Usage dialog's DeepSeek view.
+async def api_deepseek_usage(
+    session_id: str = "",
+    account_slot: str = "",
+    user: dict = Depends(auth.require_user),
+):
+    """The balance of the DeepSeek account a chat uses, for the Usage dialog.
 
     The CLI prices a DeepSeek turn as if it ran on Claude, so the header cost
-    stays hidden for DeepSeek; this is the one real money figure there is.
-    Every user sees the same balance, because one host key serves them all."""
+    stays hidden for DeepSeek; this is the one real money figure there is."""
+    clean_session_id = _safe_id(session_id) if session_id else ""
+    account = _resolve_deepseek_account_for_run(
+        user, session_id=clean_session_id or None, override_slot=account_slot or None,
+    )
+    named = {"account_slot": account["slot"], "account_label": account["label"]}
     try:
-        payload = await deepseek_provider.balance()
+        payload = await deepseek_provider.balance(account["api_key"])
     except ValueError as exc:
-        return {"available": False, "reason": str(exc)}
+        return {"available": False, "reason": str(exc), **named}
     except httpx.HTTPError as exc:
         detail = str(exc) or type(exc).__name__
-        return {"available": False, "reason": f"Couldn't reach DeepSeek ({detail})."}
-    return {"available": True, **payload}
+        return {"available": False, "reason": f"Couldn't reach DeepSeek ({detail}).", **named}
+    return {"available": True, **payload, **named}
 
 
 @app.get("/api/codex/usage")
@@ -18969,6 +19409,7 @@ async def account_page(request: Request, user: dict = Depends(auth.require_user)
             "user": user,
             "account": _account_payload(user),
             "codex_account": _codex_account_payload(user),
+            "deepseek_account": _deepseek_account_payload(user),
             "site_title": SITE_TITLE,
             "shared_reauth_allowed": _shared_reauth_allowed(user),
         },

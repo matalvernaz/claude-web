@@ -294,9 +294,100 @@
         <p id="codex-login-error" class="setup-error" role="alert" hidden></p>
       </div>
     </section>
+
+    {% if deepseek_account and deepseek_account.enabled %}
+    <section aria-labelledby="deepseek-creds-heading" class="setup-card">
+      <h2 id="deepseek-creds-heading">DeepSeek accounts</h2>
+      <p>
+        Link a DeepSeek API key to use DeepSeek's models in chats. Each key is
+        yours alone: it's kept in a private file on this server, used only for
+        your chats, and never shown again after you save it. Create a key at
+        <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer">platform.deepseek.com</a>
+        (opens in a new tab).
+      </p>
+      <p>
+        DeepSeek's privacy policy says it stores and processes data in China.
+        Everything a DeepSeek chat sees goes there: your messages, the files it
+        reads and the output of the commands it runs.
+      </p>
+      <ul id="deepseek-cred-list" class="cred-list" aria-live="polite">
+        {% if deepseek_account.shared_configured %}
+        <li class="cred-item cred-shared">
+          <span class="cred-label">{{ deepseek_account.shared_label }}</span>
+          <span class="cred-meta">
+            Shared with everyone, key set by the server's admin{% if deepseek_account.active == 'shared' %}. Your default{% endif %}
+          </span>
+        </li>
+        {% endif %}
+        {% for c in deepseek_account.credentials %}
+          <li class="cred-item" data-deepseek-cred-id="{{ c.id }}">
+            <span class="cred-label">{{ c.label }}</span>
+            <span class="cred-meta">
+              {% if c.configured %}Key saved{% else %}No key{% endif %}{% if deepseek_account.active == 'cred:' ~ c.id %}. Your default{% endif %}
+            </span>
+            <span class="cred-actions">
+              <button type="button" class="deepseek-replace" data-deepseek-cred-id="{{ c.id }}">Replace key</button>
+              <button type="button" class="deepseek-rename" data-deepseek-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Rename</button>
+              <button type="button" class="deepseek-delete" data-deepseek-cred-id="{{ c.id }}" data-current-label="{{ c.label }}">Remove</button>
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+      {% if not deepseek_account.credentials and not deepseek_account.shared_configured %}
+        <p id="deepseek-none">You haven't linked a DeepSeek key yet.</p>
+      {% endif %}
+
+      <form id="deepseek-add-form">
+        <h3>Add a DeepSeek account</h3>
+        <p>
+          <label for="deepseek-add-label">Name for this account</label><br>
+          <input type="text" id="deepseek-add-label" name="label" maxlength="80"
+            autocomplete="off" placeholder="e.g. Personal" required>
+        </p>
+        <p>
+          <label for="deepseek-add-key">DeepSeek API key</label><br>
+          <input type="password" id="deepseek-add-key" name="api_key" autocomplete="off"
+            autocapitalize="off" autocorrect="off" spellcheck="false" required>
+        </p>
+        <p>
+          <label class="checkbox-row">
+            <input type="checkbox" id="deepseek-add-show">
+            Show the DeepSeek key
+          </label>
+        </p>
+        <p><button type="submit" id="deepseek-add-submit">Check and save key</button></p>
+      </form>
+      <p id="deepseek-add-error" class="setup-error" role="alert" hidden></p>
+      <p id="deepseek-add-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section id="deepseek-replace-section" aria-labelledby="deepseek-replace-heading" class="setup-card" hidden>
+      <h2 id="deepseek-replace-heading">New key for <span id="deepseek-replace-label"></span></h2>
+      <form id="deepseek-replace-form">
+        <p>
+          <label for="deepseek-replace-key">New DeepSeek API key</label><br>
+          <input type="password" id="deepseek-replace-key" name="api_key" autocomplete="off"
+            autocapitalize="off" autocorrect="off" spellcheck="false" required>
+        </p>
+        <p>
+          <label class="checkbox-row">
+            <input type="checkbox" id="deepseek-replace-show">
+            Show the new DeepSeek key
+          </label>
+        </p>
+        <p>
+          <button type="submit" id="deepseek-replace-submit">Check and save key</button>
+          <button type="button" id="deepseek-replace-cancel">Cancel</button>
+        </p>
+      </form>
+      <p id="deepseek-replace-error" class="setup-error" role="alert" hidden></p>
+      <p id="deepseek-replace-status" role="status" aria-live="polite"></p>
+    </section>
+    {% endif %}
   </main>
 
   <script src="/static/account.js?v={{ asset_version('account.js') }}"></script>
   <script src="/static/codex-account.js?v={{ asset_version('codex-account.js') }}"></script>
+  <script src="/static/deepseek-account.js?v={{ asset_version('deepseek-account.js') }}"></script>
 </body>
 </html>

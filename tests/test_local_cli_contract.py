@@ -118,8 +118,8 @@ def contract_app(client, monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "_remove_routed_settings", lambda run_id: None)
     account_for_run = app_module._routed_account_for_run
 
-    def isolated_account(user, provider, model):
-        account = account_for_run(user, provider, model)
+    def isolated_account(user, provider, model, account=None):
+        account = account_for_run(user, provider, model, account)
         account["env"]["CLAUDE_CONFIG_DIR"] = str(config)
         return account
 
@@ -214,6 +214,8 @@ def deepseek_options(contract_app, client, monkeypatch):
     def build(origin, conflict_origin, source, model, effort):
         _write_conflicting_settings(contract_app, source, conflict_origin)
         _block_incidental_network(monkeypatch, conflict_origin)
+        # Runs on the Shared account, so no per-user key files are needed here.
+        monkeypatch.setattr(deepseek_provider, "ENABLED", True)
         monkeypatch.setattr(deepseek_provider, "API_KEY", "contract-key")
         monkeypatch.setattr(deepseek_provider, "BASE_URL", origin)
         entries = [
@@ -221,7 +223,7 @@ def deepseek_options(contract_app, client, monkeypatch):
             for index, raw in enumerate(DEEPSEEK_MODELS["data"])
         ]
         monkeypatch.setattr(deepseek_provider, "_models_cache", {
-            "origin": origin, "key": "contract-key", "fetched_at": time.monotonic(), "models": entries,
+            (origin, "contract-key"): {"fetched_at": time.monotonic(), "models": entries},
         })
         response = client.post("/api/chat", headers={"Origin": "http://testserver"}, data={
             "message": "Say OK.", "provider": "deepseek", "model": model, "effort": effort,

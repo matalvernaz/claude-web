@@ -369,9 +369,12 @@ installed CLI. The Linux/Python 3.13 CI job installs Chromium and sets
 Local and DeepSeek are both "routed providers": Claude Code itself, sent to
 another company's Anthropic-compatible server. `ROUTED_PROVIDERS` in app.py maps
 each key to its module, and every place that used to test `provider == "local"`
-asks for membership instead (no account slots, failover, usage log, rate-limit
-events, overage prompt, advisor or panel; respawn on a model or effort change;
-shielded teardown; a provider change starts a new chat) or calls the module.
+asks for membership instead (no failover, usage log, rate-limit events,
+overage prompt, advisor or panel; respawn on a model or effort change; shielded
+teardown; a provider change starts a new chat) or calls the module. Accounts are
+a separate question: `ACCOUNT_PROVIDERS` (claude, codex, deepseek) decides who
+binds a session to a slot and gets the header account picker. Local is routed
+without accounts; DeepSeek is routed with them.
 Each module offers `unavailable_reason`, `model_for_run`, `check_model`,
 `sdk_options`, `child_env`, `LABEL` and `PERMISSION_MODES`. A third routed
 provider is a module plus a registry entry, a `VALID_PROVIDERS` and
@@ -381,9 +384,28 @@ of the child environment: inherited cloud routing and credentials blanked
 (`INHERITED_ROUTING_NAMES`; an empty string, because an unset name inherits),
 every model slot pinned (`MODEL_SLOT_NAMES`), fallback and telemetry off.
 
-`deepseek_provider.py` reads models live from DeepSeek's `GET /models` (context
-window, image input, effort levels, Anthropic-endpoint support), cached for an
-hour and keyed on origin and key, so new DeepSeek models need no release.
+DeepSeek is account-scoped like Codex and off unless the host sets
+`CLAUDE_WEB_DEEPSEEK_ENABLED` (or a shared key). `deepseek_credential` and
+`user_deepseek_account` mirror the OpenAI pair; each slot's key lives in
+`DEEPSEEK_KEYS_DIR/<safe_sub>/<id>.key` (dir 0700, file 0600, written through a
+staging file and `os.replace`), checked with DeepSeek (`validate_key`, i.e.
+`/user/balance`) before it is saved. `_resolve_deepseek_account_for_run` tries
+the picked slot, then the session's bound slot, then the user's default (shared
+when the host set a key, else their first slot with a key) and returns slot,
+label and key; an empty key becomes "link a key on the Accounts page". In
+`api_chat` it runs before model selection, because the model list is fetched
+with that key. The key only ever reaches the child env and the private settings
+overlay: the account payloads, `/api/deepseek/usage` and logs carry labels and
+`configured` flags, never a key. Linking a key makes it the user's default, as
+finishing a Codex sign-in does; deleting it erases the file and refuses while a
+chat runs on it. The Accounts page section is `templates/account.html` +
+`static/deepseek-account.js`; the header picker, send path and default-account
+POST are the generic ones.
+
+`deepseek_provider.py` takes the account's key on every call. It reads models
+live from DeepSeek's `GET /models` (context window, image input, effort levels,
+Anthropic-endpoint support), cached for an hour per origin and key, so new
+DeepSeek models need no release.
 Requests go to `<base>/anthropic`. `child_env` adds Claude Code's `[1m]` suffix
 for a model listed at a million tokens or more: the CLI strips it before
 sending (CLI 2.1.319) and sizes compaction to match, and `sdk_options` sets
@@ -394,10 +416,10 @@ treats as on. Local's half-hour watchdogs are deliberately not copied: they
 exist for CPU inference, and on DeepSeek they would turn a hung request into a
 dead chat. The CLI's cost figure is Claude-priced, so capability `usage` is false
 (header cost hidden) and the Usage dialog shows `/api/deepseek/usage`, the
-balance from `GET /user/balance`. Plain http is accepted only for a loopback
-stand-in, so the key never travels in the clear. `CLAUDE_WEB_DEEPSEEK_API_KEY`
-is in `_CHILD_ENV_SCRUB_DEFAULT`: no MCP server needs it, and the DeepSeek child
-gets it as `ANTHROPIC_AUTH_TOKEN`. `tests/test_local_cli_contract.py` also proves
+balance from `GET /user/balance` for the account in use. Plain http is accepted
+only for a loopback stand-in, so a key never travels in the clear. The shared
+`CLAUDE_WEB_DEEPSEEK_API_KEY` is in `_CHILD_ENV_SCRUB_DEFAULT`: no MCP server
+needs it, and a DeepSeek child gets its account's key as `ANTHROPIC_AUTH_TOKEN`. `tests/test_local_cli_contract.py` also proves
 the DeepSeek wire contract through the installed CLI (`CLAUDE_WEB_TEST_LOCAL_CLI=1`).
 
 ### Self-update (portable Windows build)
