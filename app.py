@@ -11795,15 +11795,22 @@ async def api_session(
             "pending_prompts": _pending_prompts_for_run(live),
         }
     routed_session = _routed_session_row(sid)
+    if routed_session and routed_session["provider"] == "deepseek":
+        # The picker must show the account the chat is bound to, not the
+        # user's default: whatever it shows is sent with the next message as
+        # an explicit pick, which would move the chat (and its billing) over.
+        session_slot = _resolve_deepseek_account_for_run(user, session_id=sid)["slot"]
+    elif routed_session:
+        session_slot = None
+    else:
+        session_slot = _resolve_account_for_run(user, session_id=sid)["slot"]
     return {
         "id": sid,
         "project": project_key,
         "messages": messages,
         "live_run": live_run,
         "provider": "claude",
-        "account_slot": None if routed_session else _resolve_account_for_run(
-            user, session_id=sid,
-        )["slot"],
+        "account_slot": session_slot,
         "panel": None if routed_session else _panel_payload(sid),
         # A routed chat's row carries its provider, model and effort; its
         # provider replaces the "claude" above.

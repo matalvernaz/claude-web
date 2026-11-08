@@ -8,6 +8,7 @@ DeepSeek is off unless the host turns it on, because its privacy policy says dat
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Optional
@@ -46,8 +47,26 @@ NOT_ENABLED = "DeepSeek is off on this server. Set CLAUDE_WEB_DEEPSEEK_ENABLED=t
 BAD_ORIGIN = "CLAUDE_WEB_DEEPSEEK_BASE_URL must be an https server origin, such as https://api.deepseek.com."
 NO_KEY = "Link a DeepSeek API key on the Accounts page to use DeepSeek."
 REFUSED_KEY = "DeepSeek refused this API key. Check it on platform.deepseek.com and link it again."
-# One entry per (origin, key): {"fetched_at": float, "models": [...]}.
+# One entry per (origin, key fingerprint): {"fetched_at": float, "models": [...]}.
+# The key is hashed so a key whose account is deleted doesn't sit in plaintext
+# here until the process restarts.
 _models_cache: dict[tuple[str, str], dict] = {}
+# The list is small, but a host can see many keys over a long lifetime; keep the
+# cache from growing without bound.
+MODELS_CACHE_MAX_ENTRIES = 200
+
+
+def cache_key(api_key: str) -> tuple[str, str]:
+    """The _models_cache key for this account: the origin and a hash of the key."""
+    digest = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()
+    return (BASE_URL, digest)
+
+
+def _remember_models(key: tuple[str, str], entry: dict) -> None:
+    _models_cache[key] = entry
+    while len(_models_cache) > MODELS_CACHE_MAX_ENTRIES:
+        oldest = min(_models_cache, key=lambda k: _models_cache[k]["fetched_at"])
+        del _models_cache[oldest]
 
 
 def anthropic_url() -> str:
@@ -131,8 +150,8 @@ async def list_models(api_key: str, force: bool = False) -> list[dict]:
     reason = unavailable_reason(api_key)
     if reason:
         raise ValueError(reason)
-    cache_key = (BASE_URL, api_key)
-    cached = _models_cache.get(cache_key)
+    key = cache_key(api_key)
+    cached = _models_cache.get(key)
     now = time.monotonic()
     if not force and cached and now - cached["fetched_at"] < MODELS_CACHE_TTL_SECONDS:
         return [dict(model) for model in cached["models"]]
@@ -144,7 +163,7 @@ async def list_models(api_key: str, force: bool = False) -> list[dict]:
             entries.append(entry)
     if not entries:
         raise ValueError("DeepSeek listed no models that work with Claude Code.")
-    _models_cache[cache_key] = {"fetched_at": now, "models": entries}
+    _remember_models(key, {"fetched_at": now, "models": entries})
     return [dict(model) for model in entries]
 
 
@@ -167,7 +186,7 @@ async def model_for_run(name: str, api_key: Optional[str] = None) -> dict:
 
 def _cached_context(model: str, api_key: str) -> Optional[int]:
     """The context window last listed for `model` on this account, without a network call."""
-    cached = _models_cache.get((BASE_URL, api_key)) or {}
+    cached = _models_cache.get(cache_key(api_key)) or {}
     for entry in cached.get("models") or []:
         if entry["key"] == model:
             return entry.get("context")
@@ -192,21 +211,35 @@ def sdk_options(metadata: dict, effort: str = "") -> dict:
     context = metadata.get("context")
     if context:
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(context * AUTO_COMPACT_SHARE))
+        # The env's model slots carry "[1m]", but an explicit --model wins over
+        # them, so the flag has to carry it too or the CLI sizes this run to (or
+        # silently trims) a 200k window.
+        model = metadata.get("model")
+        if model and context >= ONE_MILLION_TOKENS:
+            options["model"] = f"{model}[1m]"
     options["env"] = env
     return options
 
 
-def child_env(model: str, api_key: Optional[str] = None) -> dict[str, str]:
-    """Route this subprocess's Claude Code to DeepSeek on this account's key, with every model slot on `model`.
+def wire_model_name(model: str, api_key: Optional[str] = None) -> str:
+    """The model name to hand Claude Code: with "[1m]" when the listed window is a million tokens.
 
-    The "[1m]" suffix depends on the model's listed window. Every path that spawns a run checks the model against the live list with the same key first (model_for_run), so the cache already holds it here.
+    The CLI reads the suffix as "size context handling to a million tokens" and
+    strips it before sending. Every path that spawns a run checks the model
+    against the live list with the same key first (model_for_run), so the cache
+    already holds it here.
     """
-    api_key = api_key or ""
-    context = _cached_context(model, api_key)
-    wire_model = model
+    context = _cached_context(model, api_key or "")
     if context and context >= ONE_MILLION_TOKENS:
-        wire_model = f"{model}[1m]"
-    return local_provider.routed_child_env(anthropic_url(), api_key, wire_model)
+        return f"{model}[1m]"
+    return model
+
+
+def child_env(model: str, api_key: Optional[str] = None) -> dict[str, str]:
+    """Route this subprocess's Claude Code to DeepSeek on this account's key, with every model slot on `model`."""
+    return local_provider.routed_child_env(
+        anthropic_url(), api_key or "", wire_model_name(model, api_key),
+    )
 
 
 async def balance(api_key: str) -> dict:

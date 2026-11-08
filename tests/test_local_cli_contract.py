@@ -223,7 +223,8 @@ def deepseek_options(contract_app, client, monkeypatch):
             for index, raw in enumerate(DEEPSEEK_MODELS["data"])
         ]
         monkeypatch.setattr(deepseek_provider, "_models_cache", {
-            (origin, "contract-key"): {"fetched_at": time.monotonic(), "models": entries},
+            deepseek_provider.cache_key("contract-key"):
+                {"fetched_at": time.monotonic(), "models": entries},
         })
         response = client.post("/api/chat", headers={"Origin": "http://testserver"}, data={
             "message": "Say OK.", "provider": "deepseek", "model": model, "effort": effort,

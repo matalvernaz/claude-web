@@ -50,7 +50,7 @@ def _seed_models(key: str) -> None:
         deepseek_provider._model_entry(raw, is_default=index == 0)
         for index, raw in enumerate(MODELS_PAYLOAD["data"])
     ]
-    deepseek_provider._models_cache[(deepseek_provider.BASE_URL, key)] = {
+    deepseek_provider._models_cache[deepseek_provider.cache_key(key)] = {
         "fetched_at": time.monotonic(), "models": entries,
     }
 
@@ -249,7 +249,8 @@ def test_a_chat_runs_claude_code_against_deepseek_on_the_users_key(client, sdk_c
     assert response.status_code == 200
     assert '"type":"error"' not in response.text.replace(" ", "")
     options = sdk_capture["options"]
-    assert options.model == "deepseek-flash"
+    # --model wins over ANTHROPIC_MODEL, so it carries the "[1m]" tag too.
+    assert options.model == "deepseek-flash[1m]"
     assert options.effort == "high"
     assert options.thinking == {"type": "adaptive"}
     assert options.fallback_model is None
@@ -289,7 +290,7 @@ def test_the_account_picked_in_the_header_is_the_one_used(client, sdk_capture):
 
     assert response.status_code == 200
     assert sdk_capture["options"].env["ANTHROPIC_AUTH_TOKEN"] == PERSONAL_KEY
-    assert sdk_capture["options"].model == "deepseek-v4-pro"
+    assert sdk_capture["options"].model == "deepseek-v4-pro[1m]"
     assert sdk_capture["options"].effort == "max"
     assert sdk_capture["run"].account_slot != f"cred:{work}"
 
@@ -327,11 +328,37 @@ def test_a_reopened_deepseek_chat_resumes_on_its_own_account(client, sdk_capture
     assert response.status_code == 200
     assert sdk_capture["run"].provider == "deepseek"
     assert sdk_capture["options"].resume == "ds-existing"
-    assert sdk_capture["options"].model == "deepseek-v4-pro"
+    assert sdk_capture["options"].model == "deepseek-v4-pro[1m]"
     assert sdk_capture["options"].effort == "low"
     # The session's account wins over the newer default.
     assert app_module._deepseek_user_active_slot(USER) == f"cred:{work}"
     assert sdk_capture["options"].env["ANTHROPIC_AUTH_TOKEN"] == PERSONAL_KEY
+
+
+def test_reopening_a_deepseek_chat_shows_the_account_it_is_bound_to(
+    client, deepseek, monkeypatch, tmp_path,
+):
+    """The picker's value is sent with the next message as an explicit pick,
+    so a reopened chat that shows the user's newer default would move the
+    chat (and its billing) onto that account without the user choosing to."""
+    _link(client, "Personal", PERSONAL_KEY)
+    work = _link(client, "Work", SECOND_KEY).json()["credentials"][1]["id"]
+    first = app_module._list_deepseek_credentials(USER)[0]["id"]
+    app_module._state_db().execute(
+        "INSERT INTO local_session(session_id, model, effort, provider) "
+        "VALUES('ds-reopen', 'deepseek-v4-pro', 'low', 'deepseek')")
+    app_module._bind_session_account("ds-reopen", USER, f"cred:{first}")
+    path = tmp_path / "project" / "ds-reopen.jsonl"
+    path.parent.mkdir()
+    path.write_text("")
+    monkeypatch.setattr(app_module, "_find_session_path", lambda *a: path)
+    monkeypatch.setattr(app_module, "session_transcript", lambda *a: [])
+
+    response = client.get("/api/sessions/ds-reopen")
+
+    assert response.status_code == 200
+    assert response.json()["account_slot"] == f"cred:{first}"
+    assert app_module._deepseek_user_active_slot(USER) == f"cred:{work}"
 
 
 def test_switching_accounts_between_turns_respawns_on_the_new_key(client, monkeypatch, deepseek):

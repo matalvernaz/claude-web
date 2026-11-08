@@ -838,6 +838,9 @@
     const provider = currentProvider();
     const details = PROVIDERS[provider];
     if ((details && details.available === false) || (!details && provider !== "claude")) {
+      // The server's reason is a finished sentence naming the fix (link a key,
+      // turn the provider on); "Reload to retry" over it hides that.
+      if (details && details.reason) return details.reason;
       return assistantLabel(provider) + " is unavailable. Reload to retry or choose another provider.";
     }
     return "";
@@ -5178,17 +5181,31 @@
       // A Codex fileChange approval carries the same per-file diffs as the
       // rendered patch. Without this branch the card dumped every diff as
       // escaped JSON, which is noise to listen to and unreadable on screen.
-      for (const change of input.changes || []) {
+      const changes = Array.isArray(input.changes) ? input.changes : [];
+      if (changes.length) {
+        for (const change of changes) {
+          const head = document.createElement("p");
+          head.className = "permission-input-path";
+          head.textContent = (change.kind ? change.kind + " " : "") + (change.path || "(unknown)");
+          parent.appendChild(head);
+          const pre = document.createElement("pre");
+          pre.className = "permission-input";
+          appendPatchDiff(pre, change.diff, { lines: 0, added: 0, removed: 0 });
+          parent.appendChild(pre);
+        }
+        return;
+      }
+      // An approval that arrived without its diffs still names the files;
+      // with nothing to name, fall through to the raw input below rather
+      // than leaving an empty card.
+      const files = Array.isArray(input.files) ? input.files.filter(Boolean) : [];
+      if (files.some((name) => name !== "(unknown)")) {
         const head = document.createElement("p");
         head.className = "permission-input-path";
-        head.textContent = (change.kind ? change.kind + " " : "") + (change.path || "(unknown)");
+        head.textContent = files.join(", ");
         parent.appendChild(head);
-        const pre = document.createElement("pre");
-        pre.className = "permission-input";
-        appendPatchDiff(pre, change.diff, { lines: 0, added: 0, removed: 0 });
-        parent.appendChild(pre);
+        return;
       }
-      return;
     }
     if (tool === "Edit") {
       const path = input.file_path || input.path || "";

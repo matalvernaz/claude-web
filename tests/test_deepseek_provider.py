@@ -163,6 +163,29 @@ def test_the_list_is_cached_for_an_hour_per_key(deepseek_api):
     assert deepseek_api["requests"][2].headers["Authorization"] == "Bearer sk-someone-else"
 
 
+def test_the_cache_keeps_a_hash_not_the_key(deepseek_api, monkeypatch):
+    """A key whose account is deleted must not sit in plaintext in module
+    state for the rest of the process's life."""
+    run(deepseek_provider.list_models(KEY))
+
+    stored = " ".join(
+        f"{origin} {fingerprint}"
+        for origin, fingerprint in deepseek_provider._models_cache
+    )
+    assert KEY not in stored
+    assert deepseek_provider._cached_context("deepseek-flash", KEY) == 1048576
+
+
+def test_the_cache_drops_the_oldest_entry_past_its_cap(deepseek_api, monkeypatch):
+    monkeypatch.setattr(deepseek_provider, "MODELS_CACHE_MAX_ENTRIES", 2)
+    run(deepseek_provider.list_models("sk-one"))
+    run(deepseek_provider.list_models("sk-two"))
+    run(deepseek_provider.list_models("sk-three"))
+
+    assert len(deepseek_provider._models_cache) == 2
+    assert deepseek_provider.cache_key("sk-one") not in deepseek_provider._models_cache
+
+
 def test_a_refused_key_says_what_to_do(deepseek_api):
     deepseek_api["status"] = 401
 
@@ -203,10 +226,23 @@ def test_effort_reaches_the_sdk_and_images_follow_the_model(deepseek_api):
         "thinking,adaptive_thinking,effort,vision")
     # DeepSeek's own Claude Code guide compacts at 786432 on these models.
     assert options["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "786432"
+    # --model wins over ANTHROPIC_MODEL, so it carries the "[1m]" tag too or
+    # the CLI sizes the run to a 200k window.
+    assert options["model"] == "deepseek-flash[1m]"
 
     pro_options = deepseek_provider.sdk_options(pro, "")
     assert pro_options["effort"] == "high"
     assert "vision" not in pro_options["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"]
+
+
+def test_a_model_under_a_million_tokens_is_left_alone():
+    options = deepseek_provider.sdk_options(
+        {"model": "deepseek-small", "context": 200_000, "efforts": [],
+         "thinking": False, "vision": False},
+        "",
+    )
+    assert "model" not in options
+    assert options["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
 
 
 def test_an_effort_the_model_lacks_is_refused(deepseek_api):

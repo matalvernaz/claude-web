@@ -420,6 +420,23 @@ def test_codex_question_from_live_stream_stays_answerable_after_result(ui):
     assert state["posts"][1][1]["session_id"] == "saved"
 
 
+def test_an_apply_patch_approval_without_diffs_names_its_files(ui):
+    """A fileChange approval can arrive without the per-file diffs (the item
+    was never seen, so the input is just the file list). The card must say
+    which files, not render empty."""
+    page, state = ui
+    state["chat_sse"] = "".join(f"data: {json.dumps(e)}\n\n" for e in [
+        {"type": "system", "subtype": "init", "session_id": "saved"},
+        {"type": "permission_request", "id": "patch-1", "tool": "ApplyPatch",
+         "input": {"files": ["a.py", "b.py"]}, "allow_session_supported": True},
+    ])
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Fix both files")
+    page.locator("#send").click()
+    playwright.expect(page.locator(".permission-input-path")).to_have_text("a.py, b.py")
+    playwright.expect(page.locator("article.msg.permission")).to_contain_text("a.py")
+
+
 def _account_page_with_link_request(page, state, flow):
     """Serve /account for one slot whose link request answers with ``flow``
     on every status poll; a pasted code lands in ``state["code"]``."""
@@ -701,6 +718,24 @@ def test_saved_local_unavailable_never_falls_back_to_cloud(ui, availability):
     with page.expect_response("**/api/chat"):
         page.locator("#send").click()
     assert state["posts"][0][1]["provider"] == "claude"
+
+
+def test_an_unavailable_provider_shows_the_servers_reason(ui):
+    """The reason names the fix (start Ollama, link a key). Replacing it with
+    "Reload to retry" hides the one thing the user needs to do."""
+    page, state = ui
+    state["providers"]["providers"][1].update(
+        available=False, models=[],
+        reason="No local model is running. Start Ollama, then reload.",
+    )
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'local')")
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#provider-status")).to_contain_text(
+        "No local model is running. Start Ollama, then reload."
+    )
+    playwright.expect(page.locator("#provider-status")).not_to_contain_text(
+        "Reload to retry"
+    )
 
 
 @pytest.mark.parametrize("switch_to_cloud", [False, True])
