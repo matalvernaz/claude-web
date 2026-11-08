@@ -705,15 +705,24 @@ def test_converter_captures_untruncated_tool_result() -> None:
     assert truncated == 0
 
 
-def test_converter_assistant_excludes_thinking_from_replay() -> None:
+@pytest.mark.parametrize(("model", "reasoning"), [
+    # The CLI asks Claude for thinking with its content omitted, so real
+    # reasoning arrives as an empty, signed block. A Claude thinking block
+    # with words in it is a message to the reader instead (see
+    # test_replies_filed_as_thinking.py).
+    ("claude-opus-4-8", ""),
+    # A Local model's thinking block holds its full reasoning.
+    ("qwen3.5:35b-32k", "hidden reasoning"),
+])
+def test_converter_assistant_excludes_thinking_from_replay(model: str, reasoning: str) -> None:
     run, cid = _run_with_conv("run-asst")
     msg = app_module.AssistantMessage(
         content=[
-            app_module.ThinkingBlock(thinking="hidden reasoning", signature="s"),
+            app_module.ThinkingBlock(thinking=reasoning, signature="s"),
             app_module.TextBlock(text="hello"),
             app_module.ToolUseBlock(id="call-1", name="Bash", input={"command": "ls"}),
         ],
-        model="claude-opus-4-8", uuid="a-1", session_id="sess-1",
+        model=model, uuid="a-1", session_id="sess-1",
     )
     app_module._sdk_message_to_events(msg, run)
     row = _row(cid, "claude:assistant:a-1")
