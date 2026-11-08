@@ -50,6 +50,11 @@
   // Run-id of the in-flight turn. Persisted to sessionStorage so a reload
   // can rejoin via /api/chat/stream/{run_id}.
   let currentRunId = null;
+  // A retry streak and a compaction each produce a burst of frames. The
+  // visible status line follows every frame, but the screen reader hears the
+  // problem once rather than ten times in a row.
+  let retryNoticed = false;
+  let compactingNoticed = false;
   // Monotonic stream generation token. Bumped every time a new stream is
   // opened (sendOne / sendInExistingRun / tryResume / loadSession). Late
   // events from an aborted stream check this before mutating UI state, so
@@ -2103,6 +2108,36 @@
     return article;
   }
 
+  // A transient or persisted status from the CLI: a retry, a compaction, an
+  // auto-mode denial, or one of the CLI's own notices. Retries and the start
+  // of a compaction update the visible status line and are spoken once per
+  // streak; the rest become notice articles so they survive a reload.
+  function renderStatusEvent(obj) {
+    const message = obj.message || "";
+    if (!message) return;
+    if (obj.kind === "retry") {
+      setStatus(message);
+      if (!retryNoticed) {
+        retryNoticed = true;
+        announce(message);
+      }
+      markVisibleActivity();
+      return;
+    }
+    if (obj.kind === "compacting") {
+      setStatus(message);
+      if (!compactingNoticed) {
+        compactingNoticed = true;
+        announce(message);
+      }
+      return;
+    }
+    appendNotice(obj.title || "Notice", message);
+    announce((obj.title ? obj.title + ". " : "") + message);
+    if (obj.kind === "compaction") compactingNoticed = false;
+    markVisibleActivity();
+  }
+
   function appendMessage(role, text) {
     const wasPinned = isPinnedToBottom();
     const el = document.createElement("article");
@@ -3806,6 +3841,9 @@
         markVisibleActivity();
       }
     } else if (obj.type === "assistant" && obj.message) {
+      // The connection recovered: a later retry burst is a new problem and
+      // should be spoken again rather than swallowed by the old streak.
+      retryNoticed = false;
       discardPartial(ctx);
       const blocks = obj.message.content || [];
       for (const blk of blocks) {
@@ -4039,6 +4077,8 @@
       maybeAutoScroll();
       announce(obj.summary || obj.message || "The model for this chat changed.");
       markVisibleActivity();
+    } else if (obj.type === "status") {
+      renderStatusEvent(obj);
     } else if (obj.type === "_overflow") {
       // The server's per-subscriber queue filled. When it tells us which idx
       // didn't fit, resume from exactly there: keep the dedup watermark and
@@ -4271,6 +4311,8 @@
       announce("Auto-responding to background events.");
       playCue("autofire");
     } else if (obj.type === "result") {
+      retryNoticed = false;
+      compactingNoticed = false;
       discardPartial(ctx);
       ctx.lastResult = obj;
       // The windows this turn's models really have, by canonical id. The

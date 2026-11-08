@@ -126,8 +126,10 @@ def test_a_subagent_fallback_says_the_chat_model_is_unchanged() -> None:
 
 
 def test_other_system_subtypes_stay_silent() -> None:
-    # Housekeeping frames must not start appearing in the transcript.
-    for subtype in ("per_turn_effort_changed", "status", "compact_boundary"):
+    # Housekeeping frames must not start appearing in the transcript. Status
+    # and compact_boundary are handled by _system_status_event now, so they
+    # are not in this list.
+    for subtype in ("per_turn_effort_changed", "stop_hook_summary"):
         assert app_module._sdk_message_to_events(_system(subtype)) == []
 
 
