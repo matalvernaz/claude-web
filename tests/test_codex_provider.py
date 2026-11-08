@@ -193,12 +193,23 @@ def test_the_browser_renders_an_apply_patch_as_a_diff():
     assert "function insertPatchMessage(" in source
     assert 'm.name === "ApplyPatch"' in source
     assert 'blk.name === "ApplyPatch"' in source
-    renderer = source[source.index("function insertPatchMessage("):]
-    renderer = renderer[:renderer.index("\n  }\n")]
+    renderer = source[source.index("function appendPatchDiff("):]
+    renderer = renderer[:renderer.index("function insertPatchMessage(")]
+    tail = source[source.index("function insertPatchMessage("):]
+    renderer += tail[:tail.index("\n  }\n")]
     # Added and removed lines carry the same spoken prefixes as Claude edits.
     assert "Added line: " in renderer
     assert "Removed line: " in renderer
+    assert '"+ " + line.slice(1)' in renderer
+    # Only the header pair before the first hunk is dropped; a removed line
+    # whose text starts with "--" renders as "--- ..." and must survive.
+    assert "let inHunk = false;" in renderer
+    assert 'line.startsWith("+++ ") || line.startsWith("--- ")' in renderer
     assert "DIFF_COLLAPSE_THRESHOLD_LINES" in renderer
+    # The approval card renders the same diffs instead of escaped JSON.
+    card = source[source.index("function appendPermissionPayload("):]
+    card = card[:card.index("\n  }\n")]
+    assert "appendPatchDiff(pre, change.diff" in card
 
 
 def test_patch_input_caps_a_generated_file():
@@ -209,6 +220,21 @@ def test_patch_input_caps_a_generated_file():
 
     assert "500 more characters" in got["changes"][0]["diff"]
     assert len(got["changes"][0]["diff"]) < len(huge)
+
+
+def test_patch_input_caps_the_whole_patch_not_just_each_file():
+    """The per-file cap alone let a 200-file patch put ~1.6 MB into one SSE
+    frame and into every reopen of the thread."""
+    per_file = "y" * codex_provider.PATCH_DIFF_MAX_CHARS
+    got = codex_provider.patch_input({"changes": [
+        {"path": f"f{i}.py", "kind": "update", "diff": per_file}
+        for i in range(20)
+    ]})
+
+    total = sum(len(c["diff"]) for c in got["changes"])
+    assert total < codex_provider.PATCH_DIFF_TOTAL_MAX_CHARS + 2000
+    assert len(got["files"]) == 20
+    assert any("diff omitted" in c["diff"] for c in got["changes"])
 
 
 def test_todo_list_maps_to_todos_update():
@@ -1186,6 +1212,34 @@ def test_codex_credential_home_shares_only_rollouts_and_configuration(
     assert os.path.samefile(home / "AGENTS.md", shared / "AGENTS.md")
     assert not (home / "state_5.sqlite").exists()
     assert not (home / "auth.json").exists()
+
+
+def test_a_symlinked_agents_md_is_followed_but_credential_links_are_not(
+    client, monkeypatch, tmp_path,
+):
+    """This host keeps AGENTS.md as a link to CLAUDE.md. Refusing every
+    symlink left each slot home without the house rules (2026-11-08). The
+    refusal still has to hold for a link planted into a credential home."""
+    import app as app_module
+
+    shared = tmp_path / "shared-codex"
+    personal = tmp_path / "personal-codex"
+    shared.mkdir()
+    rules = tmp_path / "CLAUDE.md"
+    rules.write_text("# House rules\n")
+    (shared / "AGENTS.md").symlink_to(rules)
+    victim = personal / "other-user" / "9"
+    victim.mkdir(parents=True)
+    (victim / ".credentials.json").write_text("another user's secret")
+    (shared / "planted").symlink_to(victim / ".credentials.json")
+    monkeypatch.setattr(app_module, "CODEX_PERSONAL_HOMES_DIR", personal)
+    monkeypatch.setattr(codex_provider, "codex_home", lambda: shared)
+
+    home = app_module._ensure_codex_credential_home("user-link", 42)
+
+    assert os.path.samefile(home / "AGENTS.md", rules)
+    assert not (home / "planted").exists()
+    assert not (home / "planted").is_symlink()
 
 
 def test_codex_device_login_api_marks_account_active(client, monkeypatch):

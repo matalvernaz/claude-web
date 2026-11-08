@@ -115,3 +115,11 @@ def test_the_browser_handles_the_status_event() -> None:
     handler = handler[:handler.index("\n  }\n")]
     assert "if (!retryNoticed)" in handler
     assert "appendNotice(" in handler
+    # markVisibleActivity() blanks the status line when no todo drives it, so
+    # the retry text only survives if the status is set after it.
+    assert handler.index("markVisibleActivity();") < handler.index("setStatus(message);")
+    # Notices are inserted into the transcript like every other append.
+    assert "maybeAutoScroll();" in handler
+    # A failed compaction never emits the "compaction" event that re-arms the
+    # announcement, so it has to re-arm the flag itself.
+    assert '"compaction_failed"' in handler

@@ -138,6 +138,11 @@ def test_state_round_trips_and_survives_junk():
                           rounds={"plan": 2, "changes": 1}, approvals={"/r": {"a.py": "x"}})
     assert panel.PanelState.from_json(st.to_json()) == st
     assert panel.PanelState.from_json("not json") == panel.PanelState()
+    # Valid JSON that isn't an object used to raise AttributeError on .items()
+    # and 500 every panel path for that chat until someone fixed the row.
+    assert panel.PanelState.from_json("null") == panel.PanelState()
+    assert panel.PanelState.from_json("[]") == panel.PanelState()
+    assert panel.PanelState.from_json('"nope"') == panel.PanelState()
     assert panel.PanelState.from_json('{"enabled": true, "unknown": 1}').enabled is True
     st.end_cycle()
     assert st.plan_ok is False and st.rounds == {"plan": 0, "changes": 0}

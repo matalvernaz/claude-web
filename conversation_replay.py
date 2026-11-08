@@ -213,12 +213,16 @@ def render_handoff_text(
     """
     lines = [ln for ev in events if (ln := _render_one(ev))]
     omitted = 0
-    # Trim from the front (oldest) until within budget.
-    def _size(ls: list[str]) -> int:
-        return sum(len(x) + 1 for x in ls)
-    while lines and _size(lines) > char_budget:
-        lines.pop(0)
-        omitted += 1
+    # Trim from the front (oldest) until within budget. Keep the running size:
+    # re-summing the shrinking list on every pop is quadratic, and a long chat
+    # reaches enough lines to freeze the event loop during a provider switch.
+    size = sum(len(x) + 1 for x in lines)
+    cut = 0
+    while cut < len(lines) and size > char_budget:
+        size -= len(lines[cut]) + 1
+        cut += 1
+    lines = lines[cut:]
+    omitted = cut
     body_parts = []
     if omitted:
         body_parts.append(f"[… {omitted} earlier turn(s) omitted for length …]")
@@ -267,17 +271,29 @@ def render_handoff_items(
         for chunk in _chunks(text, item_cap)
     ]
     size = sum(len(chunk) + 1 for _, _, chunk in pieces)
-    while pieces and size > char_budget:
-        size -= len(pieces.pop(0)[2]) + 1
+    cut = 0
+    dropped_parts: set[int] = set()
+    while cut < len(pieces) and size > char_budget:
+        dropped_parts.add(pieces[cut][0])
+        size -= len(pieces[cut][2]) + 1
+        cut += 1
+    pieces = pieces[cut:]
     if not pieces:
         return [], len(parts)
+    # `omitted` counts turns dropped whole. A cut inside one long reply drops
+    # no whole turn (the index of the first kept part is 0), so say that the
+    # reply was trimmed instead of telling the model nothing was left out.
     omitted = pieces[0][0]
+    trimmed = pieces[0][0] in dropped_parts
     source = {"claude": "Claude", "codex": "Codex (OpenAI)"}.get(
         source_provider, source_provider or "the previous assistant")
     note = _ITEMS_NOTE.format(
         source=source,
-        omitted=(f" The {omitted} earliest turn(s) were left out for length."
-                 if omitted else ""))
+        omitted=(
+            (f" The {omitted} earliest turn(s) were left out for length."
+             if omitted else "")
+            + (" The earliest turn here was shortened for length."
+               if trimmed else "")))
     items = [_history_item("developer", note)]
     role_now: Optional[str] = None
     lines: list[str] = []
