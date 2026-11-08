@@ -17141,6 +17141,37 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
     init / result events from the v1 stream-json protocol, so we keep that
     shape rather than inventing a new one.
     """
+    # The task lifecycle frames are SystemMessage subclasses, so they have to
+    # be matched before the generic SystemMessage branch below. Until this was
+    # moved up, every task_started/task_progress/task_notification fell into
+    # that branch, matched no subtype there, and returned nothing: the task
+    # block, its Stop button and its completion cue never appeared even though
+    # the browser has always known how to render them.
+    if isinstance(msg, TaskStartedMessage):
+        return [{
+            "type": "task_started",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "task_type": msg.task_type,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskProgressMessage):
+        return [{
+            "type": "task_progress",
+            "task_id": msg.task_id,
+            "description": msg.description,
+            "last_tool_name": msg.last_tool_name,
+            "tool_use_id": msg.tool_use_id,
+        }]
+    if isinstance(msg, TaskNotificationMessage):
+        return [{
+            "type": "task_notification",
+            "task_id": msg.task_id,
+            "status": msg.status,
+            "summary": msg.summary,
+            "output_file": msg.output_file,
+            "tool_use_id": msg.tool_use_id,
+        }]
     if isinstance(msg, SystemMessage):
         if msg.subtype == "init":
             data = msg.data or {}
@@ -17397,31 +17428,6 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
             payload.extend(extra)
             return payload
         return []
-    if isinstance(msg, TaskStartedMessage):
-        return [{
-            "type": "task_started",
-            "task_id": msg.task_id,
-            "description": msg.description,
-            "task_type": msg.task_type,
-            "tool_use_id": msg.tool_use_id,
-        }]
-    if isinstance(msg, TaskProgressMessage):
-        return [{
-            "type": "task_progress",
-            "task_id": msg.task_id,
-            "description": msg.description,
-            "last_tool_name": msg.last_tool_name,
-            "tool_use_id": msg.tool_use_id,
-        }]
-    if isinstance(msg, TaskNotificationMessage):
-        return [{
-            "type": "task_notification",
-            "task_id": msg.task_id,
-            "status": msg.status,
-            "summary": msg.summary,
-            "output_file": msg.output_file,
-            "tool_use_id": msg.tool_use_id,
-        }]
     if isinstance(msg, ResultMessage):
         slot = run.account_slot if run is not None else "shared"
         owner = run.owner_sub if run is not None else None
