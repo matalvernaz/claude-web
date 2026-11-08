@@ -318,8 +318,10 @@ Claude SDK driver and the same approval callback, with local routing and model
 defaults applied only to the child process. They bypass Claude account selection,
 paid fallback, billing logs, and entitlement/overage handling.
 
-`local_session` stores the native Claude JSONL session's local model and effort;
-the canonical binding uses provider `local`. Reopen/search/list paths must retain
+`local_session` stores the native Claude JSONL session's model, effort and
+`provider` (`local` or `deepseek`; the table name predates DeepSeek, and
+`_migrate_local_session_provider` adds the column to older databases); the
+canonical binding uses that provider. Reopen/search/list paths must retain
 that provider. Switching between Local and a cloud provider requires a new chat.
 Model/effort changes respawn on the next message, since subagent defaults and
 thinking overrides are fixed in the child environment.
@@ -361,6 +363,42 @@ requires `CLAUDE_WEB_TEST_LOCAL_SILENT_SECONDS=420` and takes at least seven min
 Use these after CLI/SDK upgrades. The normal suite remains independent of an
 installed CLI. The Linux/Python 3.13 CI job installs Chromium and sets
 `CLAUDE_WEB_REQUIRE_BROWSER=1`, making missing browser coverage a failure there.
+
+### Routed providers and DeepSeek
+
+Local and DeepSeek are both "routed providers": Claude Code itself, sent to
+another company's Anthropic-compatible server. `ROUTED_PROVIDERS` in app.py maps
+each key to its module, and every place that used to test `provider == "local"`
+asks for membership instead (no account slots, failover, usage log, rate-limit
+events, overage prompt, advisor or panel; respawn on a model or effort change;
+shielded teardown; a provider change starts a new chat) or calls the module.
+Each module offers `unavailable_reason`, `model_for_run`, `check_model`,
+`sdk_options`, `child_env`, `LABEL` and `PERMISSION_MODES`. A third routed
+provider is a module plus a registry entry, a `VALID_PROVIDERS` and
+`_PROVIDER_LABELS` entry, an `/api/providers` entry, and the browser's
+`ROUTED_PROVIDERS` list. `local_provider.routed_child_env` does the shared part
+of the child environment: inherited cloud routing and credentials blanked
+(`INHERITED_ROUTING_NAMES`; an empty string, because an unset name inherits),
+every model slot pinned (`MODEL_SLOT_NAMES`), fallback and telemetry off.
+
+`deepseek_provider.py` reads models live from DeepSeek's `GET /models` (context
+window, image input, effort levels, Anthropic-endpoint support), cached for an
+hour and keyed on origin and key, so new DeepSeek models need no release.
+Requests go to `<base>/anthropic`. `child_env` adds Claude Code's `[1m]` suffix
+for a model listed at a million tokens or more: the CLI strips it before
+sending (CLI 2.1.319) and sizes compaction to match, and `sdk_options` sets
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` to three quarters of the window, as DeepSeek's
+own Claude Code guide does. Effort reaches the wire as `output_config.effort`
+(DeepSeek's levels are low, high and max); thinking is adaptive, which DeepSeek
+treats as on. Local's half-hour watchdogs are deliberately not copied: they
+exist for CPU inference, and on DeepSeek they would turn a hung request into a
+dead chat. The CLI's cost figure is Claude-priced, so capability `usage` is false
+(header cost hidden) and the Usage dialog shows `/api/deepseek/usage`, the
+balance from `GET /user/balance`. Plain http is accepted only for a loopback
+stand-in, so the key never travels in the clear. `CLAUDE_WEB_DEEPSEEK_API_KEY`
+is in `_CHILD_ENV_SCRUB_DEFAULT`: no MCP server needs it, and the DeepSeek child
+gets it as `ANTHROPIC_AUTH_TOKEN`. `tests/test_local_cli_contract.py` also proves
+the DeepSeek wire contract through the installed CLI (`CLAUDE_WEB_TEST_LOCAL_CLI=1`).
 
 ### Self-update (portable Windows build)
 
@@ -424,6 +462,8 @@ This is a claude-web bug, not upstream Claude Code — the next-prompt picker af
 | `app.py` | routes, SSE, permission Future plumbing, `state.db`, run lifecycle, per-user-account API, personality CRUD + mirror writer, roundtable assistant + apply, picker-driven run cancellation, MEMORY.md auto-edit at startup, `_codex_driver` |
 | `review_contract.py` | evidence validation, readable review reports, and reviewer-owned finding resolutions |
 | `panel.py` | panel review: repository state digests, `git commit` spotting, verdict parsing, per-chat state record, one review round against the roundtable library, and the text the panel and Claude see; stdlib-only, no app.py imports |
+| `local_provider.py` | Local (Ollama) routed provider: server/model allowlist, capability discovery, effort mapping, and `routed_child_env`, the child environment every routed provider shares |
+| `deepseek_provider.py` | DeepSeek routed provider: live model list from `/models`, effort and image capabilities, `[1m]` routing, balance |
 | `codex_provider.py` | OpenAI Codex provider: `codex app-server` JSON-RPC client (singleton), availability probe, notification→SSE translation, thread/read transcript reader; stdlib-only, no app.py imports |
 | `auth.py` | OIDC code+PKCE via authlib |
 | `setup_flow.py` | in-browser sign-in flows for the bundled CLI, keyed per-credential |

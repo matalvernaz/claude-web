@@ -111,8 +111,8 @@ def test_local_spawn_preserves_approval_gate_without_cloud_account(client, sdk_c
     assert sdk_capture["asked"] == ["Write", "Bash"]
     assert isinstance(sdk_capture["decisions"][0], PermissionResultAllow)
     assert isinstance(sdk_capture["decisions"][1], PermissionResultDeny)
-    assert app_module._local_session_row("local-test-session") == {
-        "model": "local-general", "effort": "off",
+    assert app_module._routed_session_row("local-test-session") == {
+        "model": "local-general", "effort": "off", "provider": "local",
     }
     binding = app_module._conversation_binding_by_native("local", "local-test-session")
     assert binding is not None
@@ -120,7 +120,7 @@ def test_local_spawn_preserves_approval_gate_without_cloud_account(client, sdk_c
 
 def test_local_resume_infers_provider_and_model(client, sdk_capture):
     app_module._state_db().execute(
-        "INSERT INTO local_session VALUES('existing-local', 'local-coder', 'off')")
+        "INSERT INTO local_session(session_id, model, effort) VALUES('existing-local', 'local-coder', 'off')")
     response = client.post("/api/chat", data={"message": "Continue", "session_id": "existing-local"})
     assert response.status_code == 200
     assert sdk_capture["options"].resume == "existing-local"
@@ -137,7 +137,7 @@ def test_local_page_does_not_require_claude_signin(client, monkeypatch, local_mo
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 def test_local_session_cannot_switch_to_cloud(client, local_model, provider):
-    app_module._state_db().execute("INSERT INTO local_session VALUES('local-id','local-general','on')")
+    app_module._state_db().execute("INSERT INTO local_session(session_id, model, effort) VALUES('local-id','local-general','on')")
     response = client.post("/api/chat", data={
         "message": "Continue", "session_id": "local-id", "provider": provider,
     })
@@ -211,7 +211,7 @@ def test_local_errors_do_not_offer_cloud_failover(monkeypatch):
 
 
 def test_local_session_reopens_without_cloud_credentials(client, monkeypatch, tmp_path):
-    app_module._state_db().execute("INSERT INTO local_session VALUES('local-id','local-general','off')")
+    app_module._state_db().execute("INSERT INTO local_session(session_id, model, effort) VALUES('local-id','local-general','off')")
     path = tmp_path / "project" / "local-id.jsonl"
     path.parent.mkdir()
     path.write_text("")

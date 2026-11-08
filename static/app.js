@@ -67,7 +67,20 @@
   const PERM_MODE_KEY = "claude-web.permission-mode";
   const PROJECT_KEY = "claude-web.project";
   const PROVIDER_KEY = "claude-web.provider";
-  const PROVIDERS = { claude: null, codex: null, local: null };
+  const PROVIDERS = { claude: null, codex: null, local: null, deepseek: null };
+  // Providers that run Claude Code itself against another company's server
+  // (the server's ROUTED_PROVIDERS). A chat on one is fixed to it, switching
+  // to or from one starts a new chat, and a model or effort change applies
+  // with the next message, because the CLI is respawned for it.
+  const ROUTED_PROVIDERS = ["local", "deepseek"];
+  function isRoutedProvider(provider) {
+    return ROUTED_PROVIDERS.includes(provider);
+  }
+  // Each routed provider remembers its own effort pick, so Claude's level
+  // isn't carried onto a model that names its levels differently.
+  function effortKeyFor(provider) {
+    return isRoutedProvider(provider) ? EFFORT_KEY + "." + provider : EFFORT_KEY;
+  }
   // Per-provider model memory: each provider's model list is disjoint, so
   // remembering one pick per provider means toggling back and forth doesn't
   // lose either choice. "claude-web.model" stays Claude's key for
@@ -685,8 +698,8 @@
   // variant still needs a fresh chat to pick up the beta.
   async function pushModelChange(modelKey) {
     if (!sessionId) return;
-    if (currentProvider() === "local") {
-      announce("Local model change takes effect on your next message.");
+    if (isRoutedProvider(currentProvider())) {
+      announce(assistantLabel() + " model change takes effect on your next message.");
       return;
     }
     try {
@@ -755,9 +768,8 @@
       effortSelect.value = savedEffort;
     }
     effortSelect.addEventListener("change", () => {
-      const local = currentProvider() === "local";
-      if (local) syncLocalEffort();
-      safeSet(localStorage, local ? EFFORT_KEY + ".local" : EFFORT_KEY, effortSelect.value);
+      if (currentProvider() === "local") syncLocalEffort();
+      safeSet(localStorage, effortKeyFor(currentProvider()), effortSelect.value);
     });
     syncEffortVisibility();
   }
@@ -843,12 +855,13 @@
       const opt = [...providerSelect.options].find((o) => o.value === p);
       if (opt) return opt.textContent.replace(/\s*\(.*\)$/, "");
     }
-    return p === "local" ? "Local" : p === "codex" ? "Codex" : "Claude";
+    const fallback = { local: "Local", codex: "Codex", deepseek: "DeepSeek" };
+    return fallback[p] || "Claude";
   }
   function providerCapabilities(key) {
     const provider = key || currentProvider();
     const p = PROVIDERS[provider];
-    if (provider === "local" && !(p && p.capabilities)) {
+    if (isRoutedProvider(provider) && !(p && p.capabilities)) {
       return {
         plan_mode: false, fork: false, rewind: false,
         permission_modes: ["default"], accounts: false, usage: false,
@@ -921,7 +934,7 @@
   function rebuildModelOptions(provider) {
     if (!modelSelect) return;
     const p = PROVIDERS[provider];
-    if ((!p || !p.models) && provider !== "local") return;
+    if ((!p || !p.models) && !isRoutedProvider(provider)) return;
     const models = (p && p.models) || [];
     modelSelect.innerHTML = "";
     if (!models.length) {
@@ -1065,9 +1078,9 @@
   function rebuildEffortOptions() {
     if (!effortSelect) return;
     const efforts = MODEL_EFFORTS[(modelSelect && modelSelect.value) || ""] || [];
-    const local = currentProvider() === "local";
-    const saved = safeGet(localStorage, local ? EFFORT_KEY + ".local" : EFFORT_KEY)
-      ?? (local ? "" : effortSelect.value);
+    const routed = isRoutedProvider(currentProvider());
+    const saved = safeGet(localStorage, effortKeyFor(currentProvider()))
+      ?? (routed ? "" : effortSelect.value);
     effortSelect.innerHTML = "";
     const dflt = document.createElement("option");
     dflt.value = "";
@@ -1132,7 +1145,7 @@
 
   async function initProviders() {
     const saved = safeGet(localStorage, PROVIDER_KEY);
-    selectProvider(["claude", "codex", "local"].includes(saved) ? saved : currentProvider());
+    selectProvider(saved in PROVIDERS ? saved : currentProvider());
     syncProviderAvailability();
     if (!sessionId) applyProviderUI(currentProvider());
     providerSelect?.addEventListener("change", () => {
@@ -1140,7 +1153,8 @@
       safeSet(localStorage, PROVIDER_KEY, provider);
       const label = [...providerSelect.options].find((o) => o.value === provider);
       const name = label ? label.textContent : provider;
-      if (sessionId && providerSwitchEnabled && provider !== "local" && sessionProvider !== "local") {
+      if (sessionId && providerSwitchEnabled && !isRoutedProvider(provider)
+          && !isRoutedProvider(sessionProvider)) {
         // Carry this conversation across providers. Keep the session id: the
         // next send posts the new provider WITH it, the server supersedes the
         // old binding, seeds the destination with a handoff, and confirms via
@@ -1170,7 +1184,8 @@
     if (providerSelect) {
       providerSelect.title = providerSwitchEnabled
         ? "Which AI runs this conversation. Switching between Claude and Codex carries"
-          + " the conversation over on your next message. Switching to or from Local starts a new chat."
+          + " the conversation over on your next message. Switching to or from Local or DeepSeek"
+          + " starts a new chat."
         : "Which AI runs this conversation. Providers appear when configured and available."
           + " Switching provider starts a new chat.";
       // Preserve changes made while discovery was pending, including a saved
@@ -1737,8 +1752,7 @@
     if (loadGeneration !== sessionLoadGeneration) return;
     await providersReady;
     if (loadGeneration !== sessionLoadGeneration) return;
-    const sessProvider = ["claude", "codex", "local"].includes(data.provider)
-      ? data.provider : "claude";
+    const sessProvider = data.provider in PROVIDERS ? data.provider : "claude";
     if (sessProvider === "codex" && data.account_slot) {
       try { await refreshCodexProvider(data.account_slot); } catch (_) {}
       if (loadGeneration !== sessionLoadGeneration) return;
@@ -1771,7 +1785,7 @@
       providerSelect.value = sessProvider;
       safeSet(localStorage, PROVIDER_KEY, sessProvider);
       applyProviderUI(sessProvider, data.account_slot || undefined);
-      if (sessProvider === "local" && modelSelect && data.model) {
+      if (isRoutedProvider(sessProvider) && modelSelect && data.model) {
         const modelAvailable = [...modelSelect.options].some((o) => o.value === data.model);
         if (!modelAvailable) {
           const option = document.createElement("option");
@@ -2858,7 +2872,7 @@
         fd.append("account_slot", accountSelect.value);
       }
       fd.append("provider", currentProvider());
-      if (currentProvider() === "local") {
+      if (isRoutedProvider(currentProvider())) {
         if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
         if (effortSelect && effortSupported()) fd.append("effort", effortSelect.value);
       }
@@ -2923,8 +2937,8 @@
         }
         // A picker change while this POST was pending applies to the next
         // message. Retrying this message must keep its submitted settings.
-        const retrySelection = fd.get("provider") === "local" ? {
-          provider: "local", model: fd.get("model"), effort: fd.get("effort"),
+        const retrySelection = isRoutedProvider(fd.get("provider")) ? {
+          provider: fd.get("provider"), model: fd.get("model"), effort: fd.get("effort"),
         } : null;
         const sent = await sendOne({ ...entry, text: fd.get("message") }, retrySelection);
         // Only report "fresh" (which drops the chip) when the fresh send
@@ -5634,6 +5648,23 @@
       usageBody.textContent = "This conversation runs on the local model server. Cloud account usage does not apply.";
       return;
     }
+    if (currentProvider() === "deepseek") {
+      let data = null;
+      try {
+        const r = await fetch("/api/deepseek/usage");
+        if (r.status === 401 || r.status === 403) {
+          usageBody.textContent = "Session expired — redirecting to sign-in.";
+          handleStreamError(new Error("HTTP " + r.status));
+          return;
+        }
+        data = r.ok ? await r.json() : { available: false, reason: "HTTP " + r.status };
+      } catch (e) {
+        data = { available: false, reason: "network error" };
+      }
+      if (seq !== usageOpenSeq) return;
+      renderDeepseekUsage(data);
+      return;
+    }
     if (currentProvider() === "codex") {
       let data = null;
       try {
@@ -5696,6 +5727,34 @@
   // Codex usage view. Account rate-limits + token usage are ChatGPT-auth
   // only; an API-key login gets an explanation plus this conversation's
   // token totals (the one usage signal the app-server gives on any auth).
+  // DeepSeek usage view: the account balance, which is the only real money
+  // figure (the CLI prices DeepSeek turns as if they ran on Claude, so the
+  // header cost stays hidden). One host key serves everyone, so it's the
+  // same balance for every user.
+  function renderDeepseekUsage(data) {
+    if (!data || !data.available) {
+      const reason = (data && data.reason) || "unknown error";
+      usageBody.innerHTML = `<p class="usage-note">${htmlEscape("DeepSeek balance unavailable: " + reason)}</p>`;
+      announce("DeepSeek balance unavailable.");
+      return;
+    }
+    const lines = (data.balances || []).map((b) => {
+      let line = `${b.total} ${b.currency} left`;
+      if (Number(b.granted) > 0) line += `, ${b.granted} of it free credit`;
+      return line;
+    });
+    let summary = (lines.length ? lines.join("; ") : "No balance reported") + ".";
+    if (!data.sufficient) {
+      summary += " DeepSeek says that isn't enough to run requests, so top it up before the next chat.";
+    }
+    let html = "<h3>DeepSeek</h3>";
+    html += `<p class="usage-note">${htmlEscape(summary)}</p>`;
+    html += `<p class="usage-note">${htmlEscape(
+      "Shared by everyone who picks DeepSeek here. Top up or see per-day spend at platform.deepseek.com.")}</p>`;
+    usageBody.innerHTML = html;
+    announce("DeepSeek balance: " + summary);
+  }
+
   function renderCodexUsage(data) {
     if (!data || !data.available) {
       usageBody.innerHTML = `<p class="usage-note">${htmlEscape(

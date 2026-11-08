@@ -52,6 +52,10 @@ for var in (
     "GEMINI_API_KEY",
     "CLAUDE_WEB_OLLAMA_URL",
     "CLAUDE_WEB_OLLAMA_MODELS",
+    # A run inside the service would otherwise list and bill the host's real
+    # DeepSeek account.
+    "CLAUDE_WEB_DEEPSEEK_API_KEY",
+    "CLAUDE_WEB_DEEPSEEK_BASE_URL",
     # Both shape what the Claude CLI sends, and the API-key workspace check
     # reads the base URL; a developer's own values must not leak in.
     "ANTHROPIC_CUSTOM_HEADERS",

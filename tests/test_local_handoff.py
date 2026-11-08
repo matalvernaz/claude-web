@@ -65,7 +65,7 @@ async def delayed_sdk(monkeypatch, tmp_path):
 
     monkeypatch.setattr(app_module, "_sdk_client", sdk_client)
     app_module._state_db().execute(
-        "INSERT INTO local_session VALUES(?, 'local-general', 'on')", (SESSION_ID,),
+        "INSERT INTO local_session(session_id, model, effort) VALUES(?, 'local-general', 'on')", (SESSION_ID,),
     )
     try:
         yield state

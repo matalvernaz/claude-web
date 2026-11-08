@@ -1,6 +1,6 @@
 """Opt-in checks of the installed Claude CLI's Local wire contract.
 
-Run the fast cases after a CLI/SDK upgrade:
+Run the fast cases (Local and DeepSeek) after a CLI/SDK upgrade:
     CLAUDE_WEB_TEST_LOCAL_CLI=1 .venv/bin/pytest -q tests/test_local_cli_contract.py -k 'not silent'
 
 The separate silent-response check takes at least seven minutes:
@@ -20,12 +20,15 @@ import shutil
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 from claude_agent_sdk import ClaudeSDKClient, ResultMessage, SystemMessage
 
 import app as app_module
+import deepseek_provider
 import local_provider
+from tests.test_deepseek_provider import MODELS_PAYLOAD as DEEPSEEK_MODELS
 
 
 pytestmark = pytest.mark.skipif(
@@ -89,7 +92,8 @@ def capture_servers():
 
 
 @pytest.fixture
-def assembled_options(client, monkeypatch, tmp_path):
+def contract_app(client, monkeypatch, tmp_path):
+    """An app with isolated state whose spawns are captured instead of run."""
     assert shutil.which("claude"), "opt-in CLI contract tests require claude on PATH"
     project = tmp_path / "project"
     config = tmp_path / "config"
@@ -107,14 +111,19 @@ def assembled_options(client, monkeypatch, tmp_path):
         "id": None, "append": "",
     })
     monkeypatch.setenv("CLAUDECODE", "")
-    account_for_run = app_module._local_account_for_run
+    # The captured run ends before the test starts the real CLI with its
+    # options, and a finished run deletes its settings overlay. In a live run
+    # the CLI starts while the overlay exists, so keep it here too.
+    monkeypatch.setattr(app_module, "ROUTED_SETTINGS_DIR", tmp_path / "routed-settings")
+    monkeypatch.setattr(app_module, "_remove_routed_settings", lambda run_id: None)
+    account_for_run = app_module._routed_account_for_run
 
-    def isolated_account(user, model):
-        account = account_for_run(user, model)
+    def isolated_account(user, provider, model):
+        account = account_for_run(user, provider, model)
         account["env"]["CLAUDE_CONFIG_DIR"] = str(config)
         return account
 
-    monkeypatch.setattr(app_module, "_local_account_for_run", isolated_account)
+    monkeypatch.setattr(app_module, "_routed_account_for_run", isolated_account)
     captured = {}
 
     @contextlib.asynccontextmanager
@@ -135,34 +144,51 @@ def assembled_options(client, monkeypatch, tmp_path):
         yield Client()
 
     monkeypatch.setattr(app_module, "_sdk_client", capture_options)
+    yield SimpleNamespace(project=project, config=config, captured=captured)
+    if app_module._STATE_DB is not None:
+        app_module._STATE_DB.close()
+
+
+def _write_conflicting_settings(app, source, conflict_origin):
+    """Settings files that try to send the request somewhere else; routing must win."""
+    settings = {
+        "env": {
+            "ANTHROPIC_BASE_URL": conflict_origin,
+            "ANTHROPIC_AUTH_TOKEN": "conflicting-settings-token",
+            "ANTHROPIC_MODEL": "conflicting-model",
+            "CLAUDE_CODE_EXTRA_BODY": json.dumps({
+                "thinking": {"type": "enabled", "budget_tokens": 8192},
+                "output_config": {"effort": "high"},
+            }),
+            "API_FORCE_IDLE_TIMEOUT": "true",
+            "API_TIMEOUT_MS": "1000",
+        },
+    }
+    settings_path = {
+        "user": app.config / "settings.json",
+        "project": app.project / ".claude" / "settings.json",
+        "local": app.project / ".claude" / "settings.local.json",
+    }[source]
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings))
+
+
+def _block_incidental_network(monkeypatch, conflict_origin):
+    # Block incidental CLI network requests through a loopback proxy too.
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, conflict_origin)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+
+
+@pytest.fixture
+def assembled_options(contract_app, client, monkeypatch):
+    captured = contract_app.captured
 
     def build(origin, conflict_origin, source, model, family, effort):
-        settings = {
-            "env": {
-                "ANTHROPIC_BASE_URL": conflict_origin,
-                "ANTHROPIC_AUTH_TOKEN": "conflicting-settings-token",
-                "ANTHROPIC_MODEL": "conflicting-model",
-                "CLAUDE_CODE_EXTRA_BODY": json.dumps({
-                    "thinking": {"type": "enabled", "budget_tokens": 8192},
-                    "output_config": {"effort": "high"},
-                }),
-                "API_FORCE_IDLE_TIMEOUT": "true",
-                "API_TIMEOUT_MS": "1000",
-            },
-        }
-        settings_path = {
-            "user": config / "settings.json",
-            "project": project / ".claude" / "settings.json",
-            "local": project / ".claude" / "settings.local.json",
-        }[source]
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(settings))
+        _write_conflicting_settings(contract_app, source, conflict_origin)
         monkeypatch.setattr(local_provider, "BASE_URL", origin)
         monkeypatch.setattr(local_provider, "MODEL_NAMES", (model,))
-        # Block incidental CLI network requests through a loopback proxy too.
-        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-            monkeypatch.setenv(name, conflict_origin)
-        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        _block_incidental_network(monkeypatch, conflict_origin)
 
         async def check_model(name):
             return local_provider._model_metadata(name, {
@@ -177,9 +203,34 @@ def assembled_options(client, monkeypatch, tmp_path):
         assert "options" in captured, response.text
         return captured["options"]
 
-    yield build
-    if app_module._STATE_DB is not None:
-        app_module._STATE_DB.close()
+    return build
+
+
+@pytest.fixture
+def deepseek_options(contract_app, client, monkeypatch):
+    """Options /api/chat assembles for a DeepSeek run, pointed at a loopback stand-in."""
+    captured = contract_app.captured
+
+    def build(origin, conflict_origin, source, model, effort):
+        _write_conflicting_settings(contract_app, source, conflict_origin)
+        _block_incidental_network(monkeypatch, conflict_origin)
+        monkeypatch.setattr(deepseek_provider, "API_KEY", "contract-key")
+        monkeypatch.setattr(deepseek_provider, "BASE_URL", origin)
+        entries = [
+            deepseek_provider._model_entry(raw, is_default=index == 0)
+            for index, raw in enumerate(DEEPSEEK_MODELS["data"])
+        ]
+        monkeypatch.setattr(deepseek_provider, "_models_cache", {
+            "origin": origin, "key": "contract-key", "fetched_at": time.monotonic(), "models": entries,
+        })
+        response = client.post("/api/chat", headers={"Origin": "http://testserver"}, data={
+            "message": "Say OK.", "provider": "deepseek", "model": model, "effort": effort,
+        })
+        assert response.status_code == 200, response.text
+        assert "options" in captured, response.text
+        return captured["options"]
+
+    return build
 
 
 async def _query_installed_cli(options, timeout):
@@ -241,3 +292,29 @@ def test_installed_cli_survives_silent_local_response(assembled_options, capture
     assert requests[0]["answered"] is not None
     assert all(r["arrived"] >= requests[0]["answered"] for r in requests[1:]), \
         "CLI retried after dropping the original silent connection"
+
+
+@pytest.mark.parametrize("source", ["user", "project", "local"])
+@pytest.mark.parametrize("model,effort", [
+    ("deepseek-flash", "low"),
+    ("deepseek-flash", "max"),
+    ("deepseek-v4-pro", "high"),
+])
+def test_installed_cli_sends_deepseek_requests_to_deepseek(
+    deepseek_options, capture_servers, source, model, effort,
+):
+    origin, requests = capture_servers()
+    conflict_origin, conflicts = capture_servers()
+    options = deepseek_options(origin, conflict_origin, source, model, effort)
+    result = asyncio.run(_query_installed_cli(options, CLI_STARTUP_ALLOWANCE_SECONDS))
+    assert result.is_error and CAPTURE_STOP in (result.result or "")
+    assert conflicts == [], "loaded settings redirected the DeepSeek request"
+    assert requests
+    for request in requests:
+        assert request["path"].split("?")[0] == "/anthropic/v1/messages"
+        assert request["authorization"] == "Bearer contract-key"
+        assert not request["api_key"]
+        # The "[1m]" suffix that sizes the CLI's context handling never reaches DeepSeek.
+        assert request["body"]["model"] == model
+        assert request["body"]["thinking"]["type"] == "adaptive"
+        assert request["body"]["output_config"]["effort"] == effort
