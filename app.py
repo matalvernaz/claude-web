@@ -1498,6 +1498,28 @@ def _user_turn_entries(text: str, image_count: int = 0) -> list[dict]:
     return entries
 
 
+def _is_message_filed_as_thinking(model: Optional[str], thinking: Optional[str]) -> bool:
+    """True for a thinking block that is really a message to the reader.
+
+    Opus 5.5 and Fable 5.1 sometimes send back the text they write between
+    tool calls as a thinking block holding a shortened version of it, instead
+    of as a text block: 6,637 of 33,459 Opus 5.5 tool-call messages on this
+    host between 2026-10-08 and 2026-11-07, none on Opus 4.8 or Opus 5. The
+    CLI asks for thinking with its content omitted, so real reasoning arrives
+    empty and these are the only thinking blocks with words in them. Showing
+    them as ordinary text is the only way the reader sees those messages at
+    all. The original wording isn't in the transcript, only this version.
+
+    Claude models only: a Local or other routed model's thinking blocks hold
+    its raw reasoning. If a future CLI stops omitting thinking content, real
+    reasoning summaries would pass this test too, and this is where to
+    tighten it.
+    """
+    if not thinking or not thinking.strip():
+        return False
+    return (model or "").startswith("claude-")
+
+
 def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
     """Return ordered messages for replay, including tool dance.
 
@@ -1569,7 +1591,10 @@ def session_transcript(session_id: str, project_key: str = "") -> list[dict]:
             for blk in content:
                 if not isinstance(blk, dict):
                     continue
-                if blk.get("type") == "text":
+                if (blk.get("type") == "thinking"
+                        and _is_message_filed_as_thinking(message.get("model"), blk.get("thinking"))):
+                    msgs.append({"role": "assistant", "text": blk["thinking"]})
+                elif blk.get("type") == "text":
                     text = blk.get("text", "")
                     if text:
                         msgs.append({"role": "assistant", "text": text})
@@ -16649,6 +16674,9 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         out = []
         message_blocks = []
         for blk in msg.content:
+            if isinstance(blk, ThinkingBlock) and _is_message_filed_as_thinking(msg.model, blk.thinking):
+                # A message to the reader that came back filed as thinking.
+                blk = TextBlock(text=blk.thinking)
             if isinstance(blk, TextBlock):
                 message_blocks.append({"type": "text", "text": blk.text})
                 # The last non-empty assistant text of the turn is the summary
