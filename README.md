@@ -9,6 +9,7 @@ A small, self-hostable web UI for [Claude Code](https://claude.com/claude-code) 
 - One container, one `.env` file, no separate database.
 - Optional second AI provider: install the OpenAI `codex` CLI and sign in either the shared host slot or personal ChatGPT subscription accounts from `/account`. Codex conversations get the same streamed events, per-command approval prompts, interrupt, resume, mid-chat model switching, and same-chat account switching; commands run with the same trust model as the Claude path (approval prompt, no sandbox).
 - Optional local AI provider: connect an Ollama server for coding and writing with the existing file tools, command approvals, and saved conversations.
+- Optional DeepSeek provider: with a DeepSeek API key, DeepSeek's hosted models run through the same Claude Code tools, approval cards, plan mode and rewind, with the model list read live from DeepSeek.
 
 > ## Trust model — read this first
 >
@@ -104,11 +105,41 @@ CLAUDE_WEB_TEST_LOCAL_CLI=1 .venv/bin/pytest -q tests/test_local_cli_contract.py
 CLAUDE_WEB_TEST_LOCAL_CLI=1 CLAUDE_WEB_TEST_LOCAL_SILENT_SECONDS=420 .venv/bin/pytest -q tests/test_local_cli_contract.py -k silent
 ```
 
-The second check holds a request silent for seven minutes to catch runtime idle
-timeouts. The ordinary suite skips these explicit compatibility checks. Browser
+The fast check covers DeepSeek as well. The second check holds a request silent
+for seven minutes to catch runtime idle timeouts. The ordinary suite skips these explicit compatibility checks. Browser
 regressions run with Chromium required in the Linux/Python 3.13 CI job; run them
 locally with `CLAUDE_WEB_REQUIRE_BROWSER=1 .venv/bin/pytest -q tests/test_local_ui.py`
 after installing Chromium with `python -m playwright install chromium`.
+
+## DeepSeek
+
+DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly,
+so a DeepSeek chat is an ordinary Claude Code session whose requests go to
+DeepSeek: the same tools, approval cards, plan mode, rewind and saved chats.
+Create a key at platform.deepseek.com, add credit, then configure the app:
+
+```dotenv
+CLAUDE_WEB_DEEPSEEK_API_KEY=sk-...
+```
+
+After restarting the app, choose **DeepSeek (China)**. The model picker lists
+whatever DeepSeek's API currently offers (read from its `/models` endpoint and
+kept for an hour), so a new DeepSeek model appears without an update. Effort
+offers the levels each model declares. Images work on models that accept them.
+
+Before turning it on, know where the data goes. DeepSeek's privacy policy says it
+stores and processes data in the People's Republic of China and may use inputs
+to train its models. Everything the model sees goes there: your messages, the
+project's files it reads, CLAUDE.md and memory files, and the output of every
+command it runs. The picker label says "China" for that reason.
+
+One key serves every user of the app, and the account it belongs to pays for all
+of them. The **Usage** button shows DeepSeek's own balance. The running cost
+figure is hidden for DeepSeek, because the CLI prices every turn as if it ran on
+Claude. DeepSeek chats have no account slots, failover, advisor or panel review,
+and switching to or from DeepSeek starts a new chat. A model or effort change
+takes effect on the next message. The app's own copy of the key is removed from
+every child process; the DeepSeek CLI process receives it as its own credential.
 
 ## Running from source (no Docker)
 
@@ -428,7 +459,7 @@ The ownership filter is not an OS security boundary. All model processes still r
 |---|---|---|
 | `CLAUDE_WEB_CSRF_STRICT` | `true` | Reject mutating requests without a matching `Origin` or `Referer` header. Set `false` only for command-line testing. |
 | `CLAUDE_WEB_MAX_SUBSCRIBER_QUEUE` | `1000` | Bound on in-memory SSE event queue per subscriber. A replay longer than this overflows and the client resumes from the `next_index` the marker carries. |
-| `CLAUDE_WEB_CHILD_ENV_SCRUB` | *(empty)* | Extra env var names to strip from every spawned child, comma-separated. This app's own secrets (`SESSION_SECRET`, `OIDC_CLIENT_SECRET`, `OIDC_CLIENT_ID`, `CLAUDE_WEB_PUSHOVER_*`) are always stripped. Provider keys are not, by default — MCP servers registered without their own `env` inherit them from the child. |
+| `CLAUDE_WEB_CHILD_ENV_SCRUB` | *(empty)* | Extra env var names to strip from every spawned child, comma-separated. This app's own secrets (`SESSION_SECRET`, `OIDC_CLIENT_SECRET`, `OIDC_CLIENT_ID`, `CLAUDE_WEB_PUSHOVER_*`, `CLAUDE_WEB_DEEPSEEK_API_KEY`) are always stripped. Other provider keys are not, by default — MCP servers registered without their own `env` inherit them from the child. |
 
 A spawned agent runs shell commands, so treat anything in the server's
 environment as readable by the model and by anything it executes.

@@ -801,7 +801,7 @@ def test_api_providers_payload(client, monkeypatch):
     # Every provider states the advisor outright rather than leaving the
     # browser to read a missing key as false.
     assert {k: p["capabilities"].get("advisor") for k, p in provs.items()} == {
-        "claude": True, "codex": False, "local": False,
+        "claude": True, "codex": False, "local": False, "deepseek": False,
     }
 
 

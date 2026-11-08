@@ -1448,3 +1448,84 @@ def test_default_names_the_model_of_the_account_picked(ui):
 
     playwright.expect(default).to_have_text("Default (Opus 5.5)")
     assert state["posts"][-1][0] == "/api/account/active"
+
+
+# ── DeepSeek ──────────────────────────────────────────────────────────────────
+# Another provider that runs Claude Code against someone else's server. It
+# takes the ordinary effort picker (its levels are named), shows its balance
+# in the Usage dialog, and like Local it is fixed to its own chats.
+
+DEEPSEEK_CAPS = {
+    "plan_mode": True, "fork": True, "rewind": True, "accounts": False, "usage": False, "advisor": False,
+    "permission_modes": ["default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"],
+}
+DEEPSEEK_MODELS = [
+    {"key": "deepseek-flash", "label": "DeepSeek V4.1 Flash", "efforts": ["low", "high", "max"],
+     "default_effort": "high", "context": 1048576, "is_default": True},
+    {"key": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "efforts": ["low", "high", "max"],
+     "default_effort": "high", "context": 1048576},
+]
+
+
+def _with_deepseek(state):
+    state["providers"]["providers"].append({
+        "key": "deepseek", "label": "DeepSeek (China)", "available": True,
+        "models": DEEPSEEK_MODELS, "capabilities": DEEPSEEK_CAPS,
+    })
+
+
+def test_deepseek_takes_the_ordinary_effort_picker_and_sends_its_choices(ui):
+    page, state = ui
+    _with_deepseek(state)
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'deepseek')")
+    page.goto("http://local-ui.test/")
+    playwright.expect(page.locator("#provider-select")).to_have_value("deepseek")
+    playwright.expect(page.locator("#local-effort-control")).to_be_hidden()
+    playwright.expect(page.locator("#effort-select-label")).to_be_visible()
+    playwright.expect(page.locator("#account-select")).to_be_hidden()
+    playwright.expect(page.locator("#show-usage")).to_be_visible()
+    playwright.expect(page.locator("#model-select")).to_have_value("deepseek-flash")
+    page.locator("#model-select").select_option("deepseek-v4-pro")
+    page.locator("#effort-select").select_option("max")
+    # DeepSeek keeps its own effort pick, so Claude's isn't overwritten.
+    assert page.evaluate("localStorage.getItem('claude-web.effort.deepseek')") == "max"
+    assert page.evaluate("localStorage.getItem('claude-web.effort')") is None
+    page.locator("#prompt").fill("Hello DeepSeek")
+    with page.expect_response("**/api/chat"):
+        page.locator("#send").click()
+    fields = state["posts"][0][1]
+    assert (fields["provider"], fields["model"], fields["effort"]) == ("deepseek", "deepseek-v4-pro", "max")
+
+
+@pytest.mark.parametrize("sufficient", [True, False])
+def test_the_usage_dialog_reads_out_the_deepseek_balance(ui, sufficient):
+    page, state = ui
+    _with_deepseek(state)
+    page.route("**/api/deepseek/usage", lambda r: r.fulfill(json={
+        "available": True, "sufficient": sufficient, "balances": [
+            {"currency": "USD", "total": "19.97", "granted": "0.00", "topped_up": "19.97"}]}))
+    page.add_init_script("localStorage.setItem('claude-web.provider', 'deepseek')")
+    page.goto("http://local-ui.test/")
+    page.locator("#show-usage").click()
+    body = page.locator("#usage-body")
+    playwright.expect(body).to_contain_text("19.97 USD left")
+    playwright.expect(body).to_contain_text("Shared by everyone who picks DeepSeek")
+    if sufficient:
+        playwright.expect(body).not_to_contain_text("top it up")
+    else:
+        playwright.expect(body).to_contain_text("top it up")
+
+
+def test_a_reopened_deepseek_chat_restores_its_settings_and_leaving_it_starts_fresh(ui):
+    page, state = ui
+    _with_deepseek(state)
+    state["session"] = {"provider": "deepseek", "model": "deepseek-v4-pro", "effort": "low",
+                        "messages": [{"role": "user", "text": "Saved conversation"}]}
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.locator("#provider-select")).to_have_value("deepseek")
+    playwright.expect(page.locator("#model-select")).to_have_value("deepseek-v4-pro")
+    playwright.expect(page.locator("#effort-select")).to_have_value("low")
+    # Provider switching is on in this fixture, and still a DeepSeek chat can't carry over.
+    page.locator("#provider-select").select_option("claude")
+    playwright.expect(page).to_have_url("http://local-ui.test/")
+    playwright.expect(page.locator("#transcript")).to_be_empty()

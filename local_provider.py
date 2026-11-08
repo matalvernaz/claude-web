@@ -14,6 +14,7 @@ MODEL_NAMES = tuple(dict.fromkeys(
     name.strip() for name in os.getenv("CLAUDE_WEB_OLLAMA_MODELS", "").split(",")
     if name.strip()
 ))
+LABEL = "Local (Ollama)"
 PERMISSION_MODES = ["default", "plan", "acceptEdits", "dontAsk", "bypassPermissions"]
 # Verified against Ollama's Anthropic converter in this release. Older
 # releases turn an explicit disabled thinking setting back into enabled.
@@ -25,7 +26,7 @@ SDK_THINKING_BUDGET = 1024
 # at thirty minutes inside the CLI.
 STREAM_TIMEOUT_MS = 30 * 60 * 1000
 REQUEST_TIMEOUT_MS = 60 * 60 * 1000
-_CAPABILITY_ENV_NAMES = tuple(
+CAPABILITY_ENV_NAMES = tuple(
     f"ANTHROPIC_DEFAULT_{tier}_MODEL_SUPPORTED_CAPABILITIES"
     for tier in ("FABLE", "OPUS", "SONNET", "HAIKU")
 )
@@ -150,6 +151,14 @@ async def check_model(name: str) -> dict:
     return dict(entry)
 
 
+async def model_for_run(name: str) -> dict:
+    """The model a run should use: the one asked for, or the first configured model when none was."""
+    name = name or (MODEL_NAMES[0] if MODEL_NAMES else "")
+    if name not in MODEL_NAMES:
+        raise ValueError("unknown local model")
+    return await check_model(name)
+
+
 def sdk_options(metadata: dict, effort: str = "") -> dict:
     """Map verified model controls to SDK options, rejecting unsupported effort."""
     if effort and effort not in metadata.get("efforts", []):
@@ -177,44 +186,75 @@ def sdk_options(metadata: dict, effort: str = "") -> dict:
         capabilities.append("vision")
     options["env"] = {
         "CLAUDE_CODE_EXTRA_BODY": json.dumps(body),
-        **dict.fromkeys(_CAPABILITY_ENV_NAMES, ",".join(capabilities)),
+        **dict.fromkeys(CAPABILITY_ENV_NAMES, ",".join(capabilities)),
     }
     return options
 
 
+# Inherited routing, credentials and request shaping that a routed child must
+# not see: a leftover Anthropic key or OAuth token would send the request to
+# Anthropic instead, and the cloud keys would be readable by the model's own
+# shell commands on a server that never needs them.
+INHERITED_ROUTING_NAMES = (
+    "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_BETAS", "ANTHROPIC_UNIX_SOCKET",
+    "ANTHROPIC_API_HOST", "ANTHROPIC_CUSTOM_MODEL_OPTION",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
+    "CLAUDE_CODE_EXTRA_BODY", "CLAUDE_CODE_EXTRA_METADATA",
+    "CLAUDE_CODE_DISABLE_THINKING", "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+    "CLAUDE_CODE_MODEL_CATALOG", "CLAUDE_CODE_MODEL_CATALOG_URL",
+    *CAPABILITY_ENV_NAMES,
+)
+# Every slot the CLI picks a model for on its own (main loop, quick helper
+# calls, subagents, the auto-mode classifier). Left unset, any of them would
+# ask the routed server for a Claude model name it doesn't have.
+MODEL_SLOT_NAMES = (
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+    "CLAUDE_CODE_AUTO_MODE_MODEL",
+    "CLAUDE_CODE_BG_CLASSIFIER_MODEL",
+)
+
+
+def routed_child_env(base_url: str, token: str, model: str) -> dict[str, str]:
+    """Send one Claude CLI child to another Anthropic-compatible server.
+
+    Blanks inherited cloud routing and credentials, pins every model slot to
+    `model`, and turns off the CLI's model fallback and telemetry. Shared by
+    every provider that runs Claude Code against someone else's server.
+    """
+    env = dict.fromkeys(INHERITED_ROUTING_NAMES, "")
+    env["ANTHROPIC_BASE_URL"] = base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = token
+    env.update(dict.fromkeys(MODEL_SLOT_NAMES, model))
+    env.update({
+        "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
+        "CLAUDE_CODE_USE_BEDROCK": "0",
+        "CLAUDE_CODE_USE_VERTEX": "0",
+        "CLAUDE_CODE_USE_FOUNDRY": "0",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DISABLE_ERROR_REPORTING": "1",
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+    })
+    return env
+
+
 def child_env(model: str) -> dict[str, str]:
     """Override inherited cloud routing and credentials for this subprocess only."""
-    env = {
-        name: "" for name in (
-            "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-            "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_FOUNDRY_API_KEY",
-            "ANTHROPIC_BETAS", "ANTHROPIC_UNIX_SOCKET",
-            "ANTHROPIC_API_HOST", "ANTHROPIC_CUSTOM_MODEL_OPTION",
-            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
-            "OPENAI_API_KEY", "OPENAI_BASE_URL", "GEMINI_API_KEY", "GOOGLE_API_KEY",
-            "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
-            "CLAUDE_CODE_EXTRA_BODY", "CLAUDE_CODE_EXTRA_METADATA",
-            "CLAUDE_CODE_DISABLE_THINKING", "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
-            "CLAUDE_CODE_MODEL_CATALOG", "CLAUDE_CODE_MODEL_CATALOG_URL",
-            *_CAPABILITY_ENV_NAMES,
-        )
-    }
+    env = routed_child_env(BASE_URL, "ollama", model)
     env.update({
-        "ANTHROPIC_BASE_URL": BASE_URL,
-        "ANTHROPIC_AUTH_TOKEN": "ollama",
-        "ANTHROPIC_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-        "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
-        "ANTHROPIC_DEFAULT_MODEL": model,
-        "ANTHROPIC_SMALL_FAST_MODEL": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
-        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": model,
-        "CLAUDE_CODE_AUTO_MODE_MODEL": model,
-        "CLAUDE_CODE_BG_CLASSIFIER_MODEL": model,
-        "CLAUDE_CODE_NO_MODEL_FALLBACK": "1",
         # The CLI leaves the runtime's own idle timeout on for non-Anthropic
         # routes; it dropped silent connections at six minutes regardless
         # of the stream watchdog settings below.
@@ -223,12 +263,5 @@ def child_env(model: str) -> dict[str, str]:
         "CLAUDE_STREAM_IDLE_TIMEOUT_MS": str(STREAM_TIMEOUT_MS),
         "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(STREAM_TIMEOUT_MS),
         "API_TIMEOUT_MS": str(REQUEST_TIMEOUT_MS),
-        "CLAUDE_CODE_USE_BEDROCK": "0",
-        "CLAUDE_CODE_USE_VERTEX": "0",
-        "CLAUDE_CODE_USE_FOUNDRY": "0",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "DISABLE_TELEMETRY": "1",
-        "DISABLE_ERROR_REPORTING": "1",
-        "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
     })
     return env
