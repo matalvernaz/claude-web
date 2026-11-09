@@ -6,6 +6,9 @@ main.setup {
   padding: 1.5rem 1rem 3rem;
 }
 
+main.setup code { overflow-wrap: anywhere; }
+.setup-card .radio-row label { display: inline; }
+
 .setup-intro,
 .setup-already {
   margin: 0 0 1.5rem;

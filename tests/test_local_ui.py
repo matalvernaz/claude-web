@@ -420,6 +420,55 @@ def test_codex_question_from_live_stream_stays_answerable_after_result(ui):
     assert state["posts"][1][1]["session_id"] == "saved"
 
 
+@pytest.mark.parametrize("kind,word", [("add", "Added"), ("delete", "Removed")])
+def test_patch_whole_file_content_preserves_literal_prefixes(ui, kind, word):
+    page, state = ui
+    state["session"] = {"provider": "codex", "messages": [
+        {"role": "tool_use", "name": "ApplyPatch", "input": {"changes": [
+            {"path": "notes.txt", "kind": kind, "diff": "plain\n-negative\n+positive\n"},
+        ]}},
+    ]}
+    page.goto("http://local-ui.test/?session=saved")
+    body = page.locator(".diff-body")
+    playwright.expect(body).to_contain_text(f"{word} line: ")
+    assert body.text_content().count(f"{word} line: ") == 3
+    assert "-negative" in body.inner_text()
+    assert "+positive" in body.inner_text()
+    assert ("Removed line:" if kind == "add" else "Added line:") not in body.inner_text()
+
+
+def test_patch_approval_keeps_newlines(ui):
+    page, state = ui
+    event = {"type": "permission_request", "id": "patch-lines", "tool": "ApplyPatch",
+             "input": {"changes": [{"path": "a.py", "kind": "update", "diff": "@@ -1 +1 @@\n-old\n+new"}]}}
+    state["chat_sse"] = f"data: {json.dumps(event)}\n\n"
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Fix it")
+    page.locator("#send").click()
+    pre = page.locator(".permission-input")
+    playwright.expect(pre).to_contain_text("new")
+    assert "\n" in pre.text_content()
+
+
+def test_partial_question_answers_explicitly_include_unanswered_questions(ui):
+    page, state = ui
+    event = {"type": "question_request", "id": "three-questions", "questions": [
+        {"question": f"Question {number}", "multiSelect": number != 2,
+         "options": [{"label": "Yes"}, {"label": "No"}]} for number in range(1, 4)
+    ]}
+    state["chat_sse"] = f"data: {json.dumps(event)}\n\n"
+    page.goto("http://local-ui.test/")
+    page.locator("#prompt").fill("Ask me")
+    page.locator("#send").click()
+    page.get_by_role("group", name="Question 1", exact=True).get_by_label("Yes", exact=True).check()
+    page.get_by_role("group", name="Question 3", exact=True).get_by_label("No", exact=True).check()
+    with page.expect_response("**/api/permission/three-questions"):
+        page.get_by_role("button", name="Submit answers", exact=True).click()
+    sent = json.loads(state["posts"][-1][1]["payload"])
+    assert sent["answers"] == {"Question 1": ["Yes"], "Question 2": "", "Question 3": ["No"]}
+    playwright.expect(page.locator(".permission-resolved")).to_contain_text("Question 2: Not answered")
+
+
 def test_an_apply_patch_approval_without_diffs_names_its_files(ui):
     """A fileChange approval can arrive without the per-file diffs (the item
     was never seen, so the input is just the file list). The card must say

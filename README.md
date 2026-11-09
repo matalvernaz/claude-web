@@ -113,6 +113,20 @@ after installing Chromium with `python -m playwright install chromium`.
 
 ## DeepSeek
 
+Roundtable also offers `deepseek-pro` and `deepseek-flash` as optional reviewers
+or synthesizers. They use the shared `CLAUDE_WEB_DEEPSEEK_API_KEY`, or
+`DEEPSEEK_API_KEY` for a standalone MCP server. `DEEPSEEK_API_KEY_FILE` can name
+a private key file, keeping the key out of MCP configuration files. Personal
+chat-account keys are not used by the shared review panel.
+
+Choose a DeepSeek participant under Roundtable's **Override panel**, pass its
+key to the MCP tools, or include it in `CLAUDE_WEB_PANEL_PARTICIPANTS` for chat
+reviews. The default lineup is unchanged. Repository reads use the same
+permission checks and `CLAUDE_ROUNDTABLE_PANEL_TOOLS` setting as other API
+reviewers. DeepSeek Pro supports web search; Flash reports an error if asked
+to search. The panel's medium effort maps to DeepSeek's high effort. Model
+pins use `CLAUDE_ROUNDTABLE_MODEL_DEEPSEEK_PRO` / `_DEEPSEEK_FLASH`.
+
 DeepSeek serves an Anthropic-compatible API that Claude Code talks to directly,
 so a DeepSeek chat is an ordinary Claude Code session whose requests go to
 DeepSeek: the same tools, approval cards, plan mode, rewind and saved chats.

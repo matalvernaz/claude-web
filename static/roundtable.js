@@ -258,7 +258,10 @@
   updateTaskControls();
 
   newConvBtn.addEventListener("click", () => {
+    if (asstSubmit.disabled) return;
     assistantThreadId = null;
+    assistantStreamId = null;
+    try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
     asstHistory.querySelectorAll(".asst-turn").forEach((el) => el.remove());
     asstEmpty.hidden = false;
     asstInput.value = "";
@@ -446,7 +449,8 @@
         }
       } else {
         const skipped = document.createElement("p");
-        skipped.textContent = `Skipped: ${verification.reason || "verification unavailable"}`;
+        const label = verification.status === "failed" ? "Failed" : "Skipped";
+        skipped.textContent = `${label}: ${verification.reason || "verification unavailable"}`;
         section.appendChild(skipped);
       }
       article.appendChild(section);
@@ -913,9 +917,14 @@
 
   // Shared by the live POST stream and the rejoin path: one handler
   // updating one assistant shell. state.doneSeen tells the read loop a
-  // clean `done` arrived (vs a dropped connection worth rejoining).
+  // terminal event arrived (vs a dropped connection worth rejoining).
   const RT_STREAM_KEY = "claude-web.rt-stream";
   let assistantStreamId = null;
+
+  function setAssistantBusy(busy) {
+    asstSubmit.disabled = busy;
+    newConvBtn.disabled = busy;
+  }
 
   function assistantEventHandler(state, asstArticle, progress) {
     return (event, data) => {
@@ -978,7 +987,8 @@
               `${data.summary.refuted || 0} refuted, ` +
               `${data.summary.unresolved || 0} unresolved. Synthesizing…`;
           } else {
-            progress.textContent = `Verification skipped: ${data.reason}. Synthesizing…`;
+            const status = data.status === "failed" ? "failed" : "skipped";
+            progress.textContent = `Verification ${status}: ${data.reason}. Synthesizing…`;
           }
           announce(progress.textContent);
           break;
@@ -1009,6 +1019,7 @@
           break;
         case "done":
           state.doneSeen = true;
+          assistantStreamId = null;
           try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
           assistantThreadId = data.thread_id;
           // Drop the streamed plain-text placeholder before finalize renders
@@ -1047,6 +1058,8 @@
           break;
         }
         case "error":
+          state.doneSeen = true;
+          assistantStreamId = null;
           try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
           progress.textContent = `Error: ${data.message}`;
           announce(`Assistant error: ${data.message}`);
@@ -1057,8 +1070,11 @@
 
   asstForm.addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (asstSubmit.disabled) return;
     const prompt = asstInput.value.trim();
     if (!prompt) return;
+    assistantStreamId = null;
+    try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
     asstError.hidden = true;
 
     const fileNames = Array.from(asstFile.files || []).map(f => f.name);
@@ -1089,7 +1105,7 @@
     // a file; guarantee a name so the upload isn't silently dropped.
     for (const f of asstFile.files || []) formData.append("files", f, f.name || "attachment");
 
-    asstSubmit.disabled = true;
+    setAssistantBusy(true);
     asstStatus.textContent = "Asking the panel…";
     announce("Asking the panel. Streaming progress as it happens.");
 
@@ -1105,7 +1121,7 @@
       asstError.textContent = `Network error: ${err.message}`;
       asstError.hidden = false;
       announce(`Network error: ${err.message}`);
-      asstSubmit.disabled = false;
+      setAssistantBusy(false);
       asstArticle.remove();
       return;
     }
@@ -1117,7 +1133,7 @@
       asstError.textContent = `Ask failed: ${detail}`;
       asstError.hidden = false;
       announce(`Ask failed: ${detail}`);
-      asstSubmit.disabled = false;
+      setAssistantBusy(false);
       asstArticle.remove();
       return;
     }
@@ -1155,7 +1171,7 @@
     }
 
     asstStatus.textContent = "";
-    asstSubmit.disabled = false;
+    setAssistantBusy(false);
     asstInput.value = "";
     asstFile.value = "";
     updateFileList();
@@ -1167,7 +1183,7 @@
       // panel…" and then nothing. The 'error' SSE event announces itself; this
       // covers the case where the stream just dies without one.
       announce("The panel run ended before completion. Try asking again.");
-      asstSubmit.disabled = false;
+      setAssistantBusy(false);
     }
   });
 
@@ -1524,20 +1540,22 @@
     let sid = null;
     try { sid = sessionStorage.getItem(RT_STREAM_KEY); } catch (_) {}
     if (!sid || !asstForm) return;
-    let r;
+    setAssistantBusy(true);
+    asstStatus.textContent = "Rejoining the panel run…";
     try {
-      r = await fetch(`/api/roundtable/assistant/stream/${encodeURIComponent(sid)}`, { credentials: "same-origin" });
-    } catch (_) { return; }
-    if (!r.ok) {
-      try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
-      return;
-    }
-    announce("Rejoining a panel run that was still in flight.");
-    assistantStreamId = sid;
-    const { article, progress } = createAssistantShell();
-    const state = { doneSeen: false };
-    const parser = makeSSEParser(assistantEventHandler(state, article, progress));
-    try {
+      const r = await fetch(`/api/roundtable/assistant/stream/${encodeURIComponent(sid)}`, { credentials: "same-origin" });
+      if (!r.ok) {
+        if (r.status === 404) {
+          try { sessionStorage.removeItem(RT_STREAM_KEY); } catch (_) {}
+          throw new Error("The saved stream is no longer available. Check its thread in Advanced view.");
+        }
+        throw new Error(`HTTP ${r.status}. Reload to try again.`);
+      }
+      announce("Rejoining a panel run that was still in flight.");
+      assistantStreamId = sid;
+      const { article, progress } = createAssistantShell();
+      const state = { doneSeen: false };
+      const parser = makeSSEParser(assistantEventHandler(state, article, progress));
       const reader = r.body.getReader();
       const decoder = new TextDecoder();
       while (true) {
@@ -1546,6 +1564,14 @@
         parser(decoder.decode(value, { stream: true }));
       }
       parser(decoder.decode());
-    } catch (_) { /* dropped again; the saved id allows another reload */ }
+      if (!state.doneSeen) throw new Error("The connection ended before completion. Reload to reconnect.");
+    } catch (err) {
+      asstError.textContent = `Could not rejoin the panel run: ${err.message}`;
+      asstError.hidden = false;
+      announce(asstError.textContent);
+    } finally {
+      asstStatus.textContent = "";
+      setAssistantBusy(false);
+    }
   })();
 })();

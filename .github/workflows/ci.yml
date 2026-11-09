@@ -69,10 +69,9 @@ jobs:
           CLAUDE_WEB_REQUIRE_BROWSER: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13' && '1' || '0' }}
         run: pytest -q
       - name: JS syntax check
-        # `node --check` is the same command on every platform; the
-        # default shell on windows-latest is PowerShell, which accepts
-        # this exactly as written (no shebangs needed).
+        # Check every shipped script, including roundtable and provider pages.
+        shell: bash
         run: |
-          node --check static/app.js
-          node --check static/setup.js
-          node --check static/account.js
+          for source in static/*.js; do
+            node --check "$source" || exit 1
+          done

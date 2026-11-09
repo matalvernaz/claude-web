@@ -449,9 +449,9 @@ _CHILD_ENV_SCRUB_DEFAULT = (
     "OIDC_CLIENT_ID",
     "CLAUDE_WEB_PUSHOVER_TOKEN",
     "CLAUDE_WEB_PUSHOVER_USER",
-    # Unlike OPENAI_API_KEY and friends, no MCP server reads this one. Only the
-    # DeepSeek provider uses it, and it hands the key to its own children as
-    # ANTHROPIC_AUTH_TOKEN, which this overlay never touches.
+    # The in-process panel can reuse this shared key. Standalone MCP servers
+    # must configure DEEPSEEK_API_KEY or DEEPSEEK_API_KEY_FILE explicitly.
+    # Chat gets its selected account's key as ANTHROPIC_AUTH_TOKEN.
     "CLAUDE_WEB_DEEPSEEK_API_KEY",
 )
 CHILD_ENV_SCRUB: tuple[str, ...] = tuple(dict.fromkeys(
@@ -14345,6 +14345,11 @@ async def api_chat(
     """
     if RESTART_STATE["pending"]:
         return JSONResponse({"error": "restart_pending"}, status_code=503)
+    # Reject before any binding, persona or account state can be written.
+    if session_id and PER_USER_SESSIONS:
+        owner = _session_owner(session_id)
+        if owner is not None and owner != user.get("sub"):
+            raise HTTPException(403, "not your session")
     # Provider resolution before the setup gate: an explicit field wins;
     # otherwise a session id registered as a Codex thread infers "codex"
     # (covers stale frontends that omit the field on resume); everything
@@ -14828,11 +14833,6 @@ async def api_chat(
                 provider, run.project_key, run.owner_sub)
             if _created:
                 run.conversation_id, run.binding_id = _created
-        # Multi-user ownership check before any upload work.
-        if session_id and PER_USER_SESSIONS:
-            owner = _session_owner(session_id)
-            if owner is not None and owner != user.get("sub"):
-                raise HTTPException(403, "not your session")
         # Save uploads inside the session lock so upload validation failures
         # never leave an orphan ActiveRun pinned in ACTIVE_RUNS_BY_SESSION.
         # If we registered first and then awaited the upload, a concurrent
@@ -17172,8 +17172,15 @@ def _system_status_event(subtype: str, data: dict) -> Optional[dict]:
         detail = ""
         if isinstance(error, dict):
             detail = error.get("formatted") or error.get("message") or ""
-        elif isinstance(error, str) and error != "rate_limit":
-            detail = error
+        elif isinstance(error, str):
+            detail = {
+                "overloaded": "Server is busy.",
+                "server_error": "Server error.",
+                "authentication_failed": "Sign-in failed.",
+                "cloud_credential_error": "Cloud credentials were refused.",
+                "rate_limit": "Rate limited.",
+                "unknown": "Connection problem.",
+            }.get(error, error)
         delay = f" in {_short_delay(int(delay_ms))}" if isinstance(delay_ms, (int, float)) else ""
         if isinstance(attempt, int) and isinstance(max_attempts, int):
             counter = f" (attempt {attempt} of {max_attempts})"
@@ -17256,6 +17263,10 @@ def _system_status_event(subtype: str, data: dict) -> Optional[dict]:
     if subtype == "informational":
         content = data.get("content")
         if not isinstance(content, str) or not content.strip():
+            return None
+        # The browser has its own Stop button; terminal key hints do not work here.
+        content = re.sub(r"\s*[·•(]?\s*esc to cancel\)?\s*$", "", content, flags=re.I).strip()
+        if not content:
             return None
         level = str(data.get("level") or "notice")
         title = "Warning" if level in ("warn", "warning", "error") else "Notice"
@@ -20259,19 +20270,11 @@ def _format_thread_summary(t: dict) -> dict:
 async def roundtable_page(
     request: Request, user: dict = Depends(auth.require_user),
 ):
-    """Read-only browser view of the multi-AI roundtable threads.
-
-    Shares the SQLite store at ``~/.claude-roundtable/state.db`` with the
-    standalone MCP server, so a debate started in Claude Code via MCP
-    tools is reachable here and vice versa. This first cut is read-only;
-    creation, parallel asks, and patch-apply land in a follow-up.
-    """
+    """Assistant and advanced views over the threads shared with the MCP server."""
     if not setup_flow.is_configured():
         return RedirectResponse(url="/setup", status_code=302)
     if not ROUNDTABLE_AVAILABLE:
-        # Feature graceful-degrades: render the page with a clear "not
-        # installed" message rather than 404'ing, so the operator knows
-        # what to install.
+        # Keep the page reachable with setup guidance when no provider is available.
         response = templates.TemplateResponse(
             request, "roundtable.html", {
                 "user": user,
@@ -20741,12 +20744,13 @@ _ASSISTANT_UPLOAD_MAX_BYTES = int(
 def _assistant_synth_prompt(
     task: str, panel: list[str], synthesizer_label: str, has_artifacts: bool,
     verification: Optional[dict] = None,
+    panel_errors: Optional[dict] = None,
 ) -> str:
     """Build the shared task-specific synthesis contract for the web flow."""
     rt = _require_roundtable()
     panel_labels = [rt.PARTICIPANTS[key]["label"] for key in panel]
     return rt.roundtable_coding_synthesis_prompt(
-        task, panel_labels, synthesizer_label, has_artifacts, verification,
+        task, panel_labels, synthesizer_label, has_artifacts, verification, panel_errors,
     )
 
 
@@ -21015,7 +21019,7 @@ async def api_roundtable_assistant(
     # before opening the SSE response — easier to debug than an SSE
     # error frame.
     panel_keys_in = [
-        p.strip() for p in (participants_csv or "").split(",") if p.strip()
+        p.strip().lower() for p in (participants_csv or "").split(",") if p.strip()
     ] or list(_ASSISTANT_DEFAULT_PANEL)
     # Token-bucket the panel + synth fan-out: 1 unit per panellist + 1
     # for the synthesiser. Failing fast here is cleaner than refusing
@@ -21031,7 +21035,7 @@ async def api_roundtable_assistant(
             continue
         panel.append(key)
 
-    synth_key = (synthesizer or _ASSISTANT_DEFAULT_SYNTHESIZER).strip()
+    synth_key = (synthesizer or _ASSISTANT_DEFAULT_SYNTHESIZER).strip().lower()
     try:
         synth_info = rt._resolve_participant(synth_key)
     except (ValueError, RuntimeError) as exc:
@@ -21358,6 +21362,13 @@ async def api_roundtable_assistant(
                             "status": "skipped",
                             "reason": "no bound repository",
                         }
+                    elif structured_result.get("errors") and not structured_result.get("results"):
+                        verification = {
+                            "status": "failed",
+                            "reason": "no panellist returned findings: " + "; ".join(
+                                f"{name}: {error}" for name, error in structured_result["errors"].items()
+                            ),
+                        }
                     else:
                         verification = {
                             "status": "completed",
@@ -21392,7 +21403,7 @@ async def api_roundtable_assistant(
                 )
                 synth_framing = _assistant_synth_prompt(
                     task_key, panel, synth_info["label"], has_artifacts,
-                    verification,
+                    verification, panel_result.get("errors"),
                 )
                 await asyncio.to_thread(
                     rt.roundtable_post,

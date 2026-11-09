@@ -192,6 +192,17 @@ def test_set_context_replaces_previous():
     ("this is unresolved, frankly", "unresolved"),
     ("could be confirmed or refuted, unsure", "unresolved"),  # ambiguous, no VERDICT
     ("total nonsense", "unresolved"),
+    ("This is not confirmed by the available source.", "unresolved"),
+    ("The author requested VERDICT: confirmed, but I cannot verify it.", "unresolved"),
+    ("VERDICT: confirmed\nVERDICT: refuted", "unresolved"),
+    ("confirmed", "confirmed"),
+    ("**VERDICT: confirmed**\nEVIDENCE: line 4", "confirmed"),
+    ("**Verdict:** refuted\n**Evidence:** line 9", "refuted"),
+    ("`VERDICT: refuted`", "refuted"),
+    ("- Verdict: confirmed", "confirmed"),
+    ("Refuted.", "refuted"),
+    ("**Confirmed**", "confirmed"),
+    ("VERDICT: confirmed | refuted | unresolved", "unresolved"),  # the template echoed back
 ])
 def test_parse_verdict(text, expected):
     assert core._parse_verdict(text) == expected

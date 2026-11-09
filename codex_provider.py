@@ -860,7 +860,7 @@ def _patch_change_kind(kind) -> str:
 def patch_input(item: dict) -> dict:
     """Tool input for a Codex fileChange item, including each file's diff.
 
-    Codex reports the real unified diff per file; keeping only the names made
+    Codex reports a unified diff for updates and full contents for adds/deletes; keeping only the names made
     a Codex edit a list of files with no way to see what changed, while the
     equivalent Claude Edit/Write showed a diff.
     """
@@ -897,7 +897,7 @@ def patch_input(item: dict) -> dict:
             kept = diff[:limit]
             dropped = len(diff) - limit
             entry["diff"] = f"{kept}\n… ({dropped} more characters)"
-            budget = 0
+            budget -= limit
         else:
             budget -= len(diff)
     return {"files": files or ["(unknown)"], "changes": entries}

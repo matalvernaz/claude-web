@@ -25,6 +25,17 @@ def _seqs_for(conv_id: str) -> list[int]:
     ]
 
 
+def test_refused_resume_does_not_claim_a_conversation(client, monkeypatch):
+    monkeypatch.setattr(app_module, "PER_USER_SESSIONS", True)
+    monkeypatch.setattr(app_module.setup_flow, "is_configured", lambda *args: True)
+    session_id = "f52e2932-052b-4b73-a563-f8f7fbfe8344"
+    project_key = app_module._sanitize_project_key(app_module.DEFAULT_CWD)
+    app_module._claim_session_owner(session_id, "another-user", project_key)
+    response = client.post("/api/chat", data={"message": "hello", "session_id": session_id})
+    assert response.status_code == 403
+    assert app_module._conversation_binding_by_native("claude", session_id) is None
+
+
 def test_create_binding_and_seq_monotonic() -> None:
     cid, bid = app_module._conv_create_with_binding("claude", "-proj", "sub-1", "t")
     assert cid and bid

@@ -291,7 +291,7 @@
 }
 
 .action-form-row label {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   min-width: 6rem;
 }
 
@@ -752,6 +752,8 @@ body.mode-advanced .assistant       { display: none; }
 }
 
 .assistant-turn-knobs .action-form-row {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   display: flex;
   align-items: center;

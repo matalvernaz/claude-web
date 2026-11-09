@@ -5190,7 +5190,7 @@
           parent.appendChild(head);
           const pre = document.createElement("pre");
           pre.className = "permission-input";
-          appendPatchDiff(pre, change.diff, { lines: 0, added: 0, removed: 0 });
+          appendPatchDiff(pre, change.diff, { lines: 0, added: 0, removed: 0 }, change.kind);
           parent.appendChild(pre);
         }
         return;
@@ -5573,7 +5573,8 @@
             vals.push(c.value);
           }
         }
-        if (vals.length) answers[qtext] = fm.multi ? vals : vals[0];
+        // Keep every question visible to the model and in the receipt, even when unanswered.
+        answers[qtext] = fm.multi ? vals : (vals[0] || "");
       }
       card.dataset.state = "deciding";
       card.querySelectorAll("button, input").forEach((el) => (el.disabled = true));
@@ -5582,7 +5583,7 @@
         // Nothing selected is a genuine skip — send `dismiss` so the model
         // gets the same signal the Skip button sends, instead of an empty
         // `answer` payload while the UI claims "Question skipped".
-        if (entries.length) {
+        if (entries.some(([, value]) => Array.isArray(value) ? value.length : value)) {
           if (req.async) await sendAsyncQuestionAnswer(req, answers);
           else await postDecision(req.id, "answer", { answers });
           // Never echo a secret answer back into the transcript summary.
@@ -5592,7 +5593,10 @@
             if (t && fm.q.isSecret) secretByText[t] = true;
           });
           replaceCardWithSummary(card,
-            `Answered — ${entries.map(([k, v]) => `${k}: ${secretByText[k] ? "•••" : (Array.isArray(v) ? v.join(", ") : v)}`).join("; ")}`);
+            `Answered — ${entries.map(([k, v]) => {
+              const answer = Array.isArray(v) ? v.join(", ") : v;
+              return `${k}: ${answer ? (secretByText[k] ? "•••" : answer) : "Not answered"}`;
+            }).join("; ")}`);
         } else {
           if (!req.async) await postDecision(req.id, "dismiss", null);
           replaceCardWithSummary(card, "Question skipped");
@@ -6353,11 +6357,16 @@
   // Render one file's unified diff into `pre`. The ---/+++ pair restates the
   // path already in the file head, but only before the first hunk: a removed
   // line whose text starts with "--" is emitted as "--- text" and must stay.
-  function appendPatchDiff(pre, diff, tally) {
+  function appendPatchDiff(pre, diff, tally, kind) {
+    // Add/delete payloads are whole files, so a literal +/- is source text.
+    const wholeFile = kind === "add" || kind === "delete";
+    const lines = String(diff || "").split("\n");
+    if (lines[lines.length - 1] === "") lines.pop();
     let inHunk = false;
-    for (const line of String(diff || "").split("\n")) {
+    for (const content of lines) {
+      const line = wholeFile ? (kind === "add" ? "+" : "-") + content : content;
       if (line.startsWith("@@")) inHunk = true;
-      if (!inHunk && (line.startsWith("+++ ") || line.startsWith("--- "))) continue;
+      if (!wholeFile && !inHunk && (line.startsWith("+++ ") || line.startsWith("--- "))) continue;
       const span = document.createElement("span");
       if (line.startsWith("@@")) {
         span.className = "diff-ctx";
@@ -6383,6 +6392,7 @@
         span.textContent = line;
       }
       pre.appendChild(span);
+      pre.appendChild(document.createTextNode("\n"));
       tally.lines += 1;
     }
   }
@@ -6408,7 +6418,7 @@
       head.textContent = `${kind}${change.path || "(unknown)"}`;
       pre.appendChild(head);
       tally.lines += 1;
-      appendPatchDiff(pre, change.diff, tally);
+      appendPatchDiff(pre, change.diff, tally, change.kind);
     }
 
     const totalLines = tally.lines;
