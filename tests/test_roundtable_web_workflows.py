@@ -143,6 +143,25 @@ def test_review_sse_captures_diff_and_emits_verified_ledger(
     assert done["synthesis"] == "Verified review result"
 
 
+def test_failed_reviewers_cannot_be_reported_as_a_clean_review(client, tmp_path, monkeypatch):
+    rt = app_module.roundtable_core
+    repo = _git_repo(tmp_path / "failed-review")
+    monkeypatch.setattr(rt, "_participant_provider_available", lambda *_: True)
+    monkeypatch.setattr(app_module, "_resolve_project_path", lambda key: repo)
+    monkeypatch.setattr(rt, "roundtable_ask_structured", lambda *a, **k: {
+        "results": {}, "errors": {"gemini-pro": "provider unavailable"},
+    })
+    monkeypatch.setattr(rt, "roundtable_ask", lambda *a, **k: "Review unavailable")
+    response = client.post("/api/roundtable/assistant", data={
+        "prompt": "Review this change", "task": "review", "project_key": "test-project",
+        "participants_csv": "gemini-pro", "capture_working_diff": "true", "verify_review": "true",
+    }, headers={"Origin": "http://testserver"})
+    events = dict(_sse_events(response.text))
+    assert events["verify_done"]["status"] == "failed"
+    history = rt.roundtable_history(events["done"]["thread_id"])
+    assert "gemini-pro (provider unavailable)" in history
+
+
 def test_frontend_posts_task_and_explicit_review_booleans():
     source = (Path(__file__).parents[1] / "static" / "roundtable.js").read_text(
         encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS

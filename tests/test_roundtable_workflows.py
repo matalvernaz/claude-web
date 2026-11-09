@@ -33,6 +33,55 @@ def _git_repo(path):
     return path
 
 
+def test_invalid_rebinding_never_reviews_the_previous_repository(tmp_path, monkeypatch):
+    _allow_all_participants(monkeypatch)
+    thread_id = core.roundtable_create("review", participants=["gemini-pro"])["thread_id"]
+    core.roundtable_bind_repo(thread_id, str(tmp_path))
+    monkeypatch.setattr(core, "roundtable_ask_parallel", lambda *a, **k: pytest.fail("reviewed stale binding"))
+    with pytest.raises(ValueError, match="not an existing directory"):
+        core.roundtable_coding_task("review", thread_id=thread_id,
+                                   working_directory=str(tmp_path / "missing"),
+                                   participants=["gemini-pro"])
+
+
+def test_unbindable_server_directory_warns_when_no_path_was_given(monkeypatch):
+    # With no explicit path and no earlier binding there is nothing stale to review, so the old warning path stands.
+    _allow_all_participants(monkeypatch)
+
+    def refuse(*args, **kwargs):
+        raise ValueError("outside the allowlist")
+
+    monkeypatch.setattr(core, "roundtable_bind_repo", refuse)
+    monkeypatch.setattr(core, "roundtable_ask_parallel", lambda *a, **k: {"responses": {}, "errors": {}})
+    monkeypatch.setattr(core, "roundtable_ask", lambda *a, **k: "reviewed")
+    result = core.roundtable_coding_task("review", working_directory="", participants=["gemini-pro"])
+    assert result["grounding"]["repo_bound"] is False
+    assert "repository not bound" in result["grounding"]["warning"]
+
+
+def test_explicit_bad_path_on_a_fresh_call_closes_the_empty_thread(tmp_path, monkeypatch):
+    _allow_all_participants(monkeypatch)
+    monkeypatch.setattr(core, "roundtable_ask_parallel", lambda *a, **k: pytest.fail("reviewed without a repository"))
+    before = {row.get("thread_id", row.get("id")) for row in core.roundtable_list(open_only=False, limit=1000)}
+    with pytest.raises(ValueError, match="not an existing directory"):
+        core.roundtable_coding_task("review", working_directory=str(tmp_path / "missing"),
+                                   participants=["gemini-pro"])
+    created = [row.get("thread_id", row.get("id")) for row in core.roundtable_list(open_only=False, limit=1000)
+               if row.get("thread_id", row.get("id")) not in before]
+    assert len(created) == 1
+    assert core._thread_row(created[0])["closed_at"]
+
+
+def test_coding_workflow_normalizes_participant_names(tmp_path, monkeypatch):
+    _allow_all_participants(monkeypatch)
+    monkeypatch.setattr(core, "roundtable_ask_parallel", lambda *a, **k: {"responses": {}, "errors": {}})
+    monkeypatch.setattr(core, "roundtable_ask", lambda *a, **k: "reviewed")
+    result = core.roundtable_coding_task("review", working_directory=str(tmp_path),
+                                       participants=[" Gemini-Pro "], synthesizer=" CLAUDE-OPUS ")
+    assert result["panel"] == ["gemini-pro"]
+    assert result["synthesizer"] == "claude-opus"
+
+
 def test_coding_profiles_are_stable_and_validate_unknown_tasks():
     profiles = core.roundtable_coding_profiles()
     assert list(profiles) == [

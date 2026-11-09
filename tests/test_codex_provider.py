@@ -222,6 +222,14 @@ def test_patch_input_caps_a_generated_file():
     assert len(got["changes"][0]["diff"]) < len(huge)
 
 
+def test_large_first_patch_preserves_later_small_diffs():
+    got = codex_provider.patch_input({"changes": [
+        {"path": "generated.py", "kind": "update", "diff": "x" * 9000},
+        {"path": "fix.py", "kind": "update", "diff": "-wrong\n+right\n"},
+    ]})
+    assert got["changes"][1]["diff"] == "-wrong\n+right\n"
+
+
 def test_patch_input_caps_the_whole_patch_not_just_each_file():
     """The per-file cap alone let a 200-file patch put ~1.6 MB into one SSE
     frame and into every reopen of the thread."""

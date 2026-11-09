@@ -29,6 +29,27 @@ def test_retry_says_what_failed_and_when_it_tries_again() -> None:
     assert "0.6 s" in event["message"]
 
 
+def test_retry_categories_are_readable() -> None:
+    categories = {
+        "overloaded": "Server is busy.",
+        "server_error": "Server error.",
+        "authentication_failed": "Sign-in failed.",
+        "cloud_credential_error": "Cloud credentials were refused.",
+        "rate_limit": "Rate limited.",
+        "unknown": "Connection problem.",
+    }
+    for category, expected in categories.items():
+        event = app_module._system_status_event("api_retry", {"error": category})
+        assert event["message"].startswith(expected), event["message"]
+
+
+def test_informational_notices_do_not_offer_terminal_shortcuts() -> None:
+    event = app_module._system_status_event("informational", {
+        "content": "Retrying automatically · esc to cancel",
+    })
+    assert event["message"] == "Retrying automatically"
+
+
 def test_rate_limit_retry_names_the_limit() -> None:
     event = app_module._system_status_event("api_retry", {
         "attempt": 1,

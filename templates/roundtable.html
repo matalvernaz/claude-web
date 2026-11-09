@@ -30,16 +30,14 @@
       <section aria-labelledby="unavailable-heading">
         <h2 id="unavailable-heading">Roundtable isn't enabled in this deployment</h2>
         <p>
-          The <code>roundtable</code> Python package needs to be installed
-          alongside claude-web. From the claude-web venv:
+          Roundtable needs the dependencies included with claude-web and
+          at least one configured review provider. From the claude-web venv:
         </p>
-        <pre><code>pip install -e /path/to/roundtable-mcp</code></pre>
+        <pre><code>pip install -r requirements.txt</code></pre>
         <p>
-          Roundtable is a multi-AI threaded-conversation library. When
-          installed it shares the SQLite store at
-          <code>~/.claude-roundtable/state.db</code> with the standalone
-          MCP server, so debates started in Claude Code are visible here
-          and vice versa.
+          Configure a shared Gemini, OpenAI, or DeepSeek API key, or sign in
+          to the Claude CLI for subscription access, then restart claude-web.
+          Roundtable is bundled with the app; no separate checkout is needed.
         </p>
       </section>
     </main>
@@ -165,7 +163,7 @@
             <p class="action-form-row">
               <label for="override-web-search">
                 <input type="checkbox" id="override-web-search">
-                Web search (Google / OpenAI / Anthropic hosted web_search)
+                Web search
               </label>
             </p>
           </div>
@@ -178,7 +176,8 @@
               <code>claude-sonnet</code> and <code>gemini-pro</code> as the
               panel, <code>claude-opus</code> as the synthesizer. Every
               participant runs its provider's newest model. Override below to
-              use a different lineup.
+              use a different lineup. When a DeepSeek key is configured,
+              <code>deepseek-pro</code> and <code>deepseek-flash</code> are also available.
             </p>
             <p class="action-form-row">
               <label for="override-participants">Panel</label>
@@ -190,6 +189,9 @@
               <select id="override-synthesizer">
                 <option value="">claude-opus (default)</option>
                 <option value="claude-sonnet">claude-sonnet (faster)</option>
+                {% for participant in participants if participant.provider == 'deepseek' and participant.available %}
+                <option value="{{ participant.key }}">{{ participant.label }}</option>
+                {% endfor %}
                 <option value="claude-opus">claude-opus</option>
                 <option value="claude-fable">claude-fable (most capable; may need usage credits)</option>
               </select>

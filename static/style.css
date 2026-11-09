@@ -17,6 +17,7 @@ body {
   background: var(--bg);
 }
 .skip-links { position: relative; }
+a { color: var(--accent); }
 .skip {
   position: absolute;
   left: -9999px;
@@ -804,7 +805,10 @@ details.diff-collapsible:not([open]) > summary.diff-header { border-bottom: 0; }
   overflow: auto;
   white-space: pre;
 }
-.diff-body span { display: block; padding: 0 0.25rem; }
+/* Each line is one span followed by a newline text node. inline-block at full width keeps
+   the add/remove background across the whole row without display:block, which with
+   white-space: pre turned every newline node into a blank line. */
+.diff-body > span:not(.diff-file-head) { display: inline-block; width: 100%; box-sizing: border-box; vertical-align: top; padding: 0 0.25rem; }
 .diff-add { color: #b6e3b6; background: rgba(110, 180, 110, 0.10); }
 .diff-del { color: #d96868; background: rgba(217, 104, 104, 0.10); }
 .diff-ctx { color: #888; }

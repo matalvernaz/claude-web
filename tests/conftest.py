@@ -50,6 +50,8 @@ for var in (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "OPENAI_API_KEY",
     "GEMINI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_API_KEY_FILE",
     "CLAUDE_WEB_OLLAMA_URL",
     "CLAUDE_WEB_OLLAMA_MODELS",
     # A run inside the service would otherwise list and bill the host's real

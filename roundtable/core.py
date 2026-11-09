@@ -69,6 +69,13 @@ logger = logging.getLogger(__name__)
 _gemini_key = os.environ.get("GEMINI_API_KEY")
 _openai_key = os.environ.get("OPENAI_API_KEY")
 _anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+# Reuse an operator's shared key; personal account files remain private to chat.
+_deepseek_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("CLAUDE_WEB_DEEPSEEK_API_KEY")
+if not _deepseek_key and os.environ.get("DEEPSEEK_API_KEY_FILE"):
+    try:
+        _deepseek_key = Path(os.environ["DEEPSEEK_API_KEY_FILE"]).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        logger.warning("DeepSeek key file could not be read; participant unavailable")
 
 # Discover the Claude Code CLI so Anthropic-provider turns can be routed
 # through the user's OAuth subscription (Pro / Team plan) instead of
@@ -114,10 +121,10 @@ _anthropic_available = bool(_anthropic_key) or _CLAUDE_CLI is not None
 
 
 def providers_configured() -> bool:
-    """True if at least one provider is routable: a Gemini/OpenAI/Anthropic API
+    """True if at least one provider is routable: a Gemini/OpenAI/DeepSeek/Anthropic API
     key, or a ``claude``/``claude-ha`` binary on PATH for the subscription
     transport."""
-    return bool(_gemini_key or _openai_key or _anthropic_available)
+    return bool(_gemini_key or _openai_key or _deepseek_key or _anthropic_available)
 
 
 def ensure_routable() -> None:
@@ -125,7 +132,7 @@ def ensure_routable() -> None:
     should refuse to start with nothing to route to."""
     if not providers_configured():
         raise RuntimeError(
-            "Need at least one of: GEMINI_API_KEY, OPENAI_API_KEY, "
+            "Need at least one of: GEMINI_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, "
             "ANTHROPIC_API_KEY, or a 'claude'/'claude-ha' binary on PATH "
             "(for the subscription-auth transport). Nothing to route to "
             "without one of these."
@@ -138,6 +145,7 @@ def ensure_routable() -> None:
 # google-genai already defaults to no retries (tenacity stop_after_attempt(1)).
 _gemini = genai.Client(api_key=_gemini_key) if _gemini_key else None
 _openai = OpenAI(api_key=_openai_key, max_retries=0) if _openai_key else None
+_deepseek = OpenAI(api_key=_deepseek_key, base_url="https://api.deepseek.com", max_retries=0) if _deepseek_key else None
 _anthropic = anthropic.Anthropic(api_key=_anthropic_key, max_retries=0) if _anthropic_key else None
 
 
@@ -217,6 +225,16 @@ PARTICIPANTS: dict[str, dict] = {
         "provider": "anthropic",
         "model": "fable",
         "label": "Claude Fable",
+    },
+    "deepseek-flash": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "label": "DeepSeek Flash",
+    },
+    "deepseek-pro": {
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "label": "DeepSeek Pro",
     },
 }
 
@@ -337,6 +355,8 @@ def _participant_provider_available(name: str) -> bool:
         return _gemini is not None
     if provider == "openai":
         return _openai is not None
+    if provider == "deepseek":
+        return _deepseek is not None
     if provider == "anthropic":
         # Availability depends on the configured transport. In "auto" mode
         # either path is acceptable. In "cli" mode we require the binary
@@ -1373,10 +1393,57 @@ def _call_gemini(
     )
 
 
+# Optional cap on a DeepSeek reply, reasoning included. Unset, DeepSeek's own
+# default applies: 64K tokens in thinking mode, 128K at max effort (its docs).
+_DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.environ.get("CLAUDE_ROUNDTABLE_DEEPSEEK_MAX_OUTPUT_TOKENS", "0") or 0)
+
+
+def _responses_options(provider: str, model: str, effort: Optional[str], web_search: bool = False) -> tuple:
+    """Select a Responses client without changing another concurrent participant's credentials."""
+    client = _deepseek if provider == "deepseek" else _openai
+    if client is None:
+        raise RuntimeError(f"{provider} API key is not configured")
+    options = {}
+    if provider == "deepseek":
+        pro_model = _participant_model("deepseek-pro", PARTICIPANTS["deepseek-pro"])
+        if web_search and model != pro_model:
+            raise ValueError("DeepSeek web search requires the deepseek-pro participant")
+        # DeepSeek accepts low/high/max; the panel's medium maps to high.
+        effort = {"medium": "high"}.get(effort, effort)
+        # Reasoning counts against the output budget: a cap of 16384 made a
+        # high-effort review of a 76K-char transcript spend it all thinking
+        # and return no text (2026-11-08), so the provider default stands.
+        if _DEEPSEEK_MAX_OUTPUT_TOKENS > 0:
+            options["max_output_tokens"] = _DEEPSEEK_MAX_OUTPUT_TOKENS
+    if effort:
+        options["reasoning"] = {"effort": effort}
+    return client, options
+
+
+def _require_complete(resp, label: str) -> None:
+    """Raise when a Responses reply stopped early and carries no text.
+
+    Reasoning counts against ``max_output_tokens``, so a hard think on a long
+    transcript can use the whole budget and come back empty. Validation
+    would otherwise report that as "not valid JSON" and retry the same way.
+    """
+    if getattr(resp, "status", None) != "incomplete" or (getattr(resp, "output_text", "") or "").strip():
+        return
+    details = getattr(resp, "incomplete_details", None)
+    reason = getattr(details, "reason", None) or "unknown reason"
+    usage = _extract_usage("openai", resp) or {}
+    raise RuntimeError(
+        f"{label} stopped early ({reason}) with no visible text after "
+        f"{usage.get('output_tokens', '?')} output tokens. Lower the effort "
+        "or raise max_output_tokens."
+    )
+
+
 def _call_openai(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str] = None, web_search: bool = False,
     on_delta: "Optional[StreamDelta]" = None,
+    *, provider: str = "openai",
 ) -> ProviderResult:
     """Send the conversation to OpenAI via the Responses API.
 
@@ -1397,6 +1464,7 @@ def _call_openai(
     attach the hosted ``web_search`` tool so the model can fetch current
     information instead of refusing on no-live-access grounds.
     """
+    client, provider_options = _responses_options(provider, model, effort, web_search)
     user_msg = transcript
     if instruction:
         user_msg += f"\n\n[orchestrator]:\n{instruction}"
@@ -1416,8 +1484,9 @@ def _call_openai(
             system_prompt.encode("utf-8")
         ).hexdigest()[:32],
     }
-    if effort:
-        kwargs["reasoning"] = {"effort": effort}
+    kwargs.update(provider_options)
+    if provider == "deepseek":
+        kwargs.pop("prompt_cache_key", None)
     if web_search:
         kwargs["tools"] = [{"type": "web_search"}]
 
@@ -1428,7 +1497,7 @@ def _call_openai(
         def _do_stream() -> ProviderResult:
             parts: list[str] = []
             final = None
-            with _openai.responses.stream(**kwargs) as stream:
+            with client.responses.stream(**kwargs) as stream:
                 for event in stream:
                     etype = getattr(event, "type", "")
                     if etype == "response.output_text.delta":
@@ -1450,12 +1519,13 @@ def _call_openai(
                 raw=final,
             )
 
-        return _call_with_wall_cap(f"openai/{model}/stream", _do_stream)
+        return _call_with_wall_cap(f"{provider}/{model}/stream", _do_stream)
 
     def _do_call():
-        return _openai.responses.create(**kwargs)
+        return client.responses.create(**kwargs)
 
-    resp = _provider_call(f"openai/{model}", _do_call)
+    resp = _provider_call(f"{provider}/{model}", _do_call)
+    _require_complete(resp, f"{provider}/{model}")
     return ProviderResult(
         text=resp.output_text or "", usage=_extract_usage("openai", resp),
         raw=resp,
@@ -3620,10 +3690,12 @@ def _call_openai_with_tools(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str], web_search: bool,
     tools: _RepoTools,
+    *, provider: str = "openai",
 ) -> ProviderResult:
     """OpenAI participant turn with a manual function-calling loop over the
     read-only repo tools, via the Responses API. Every function call routes
     through ``tools.execute`` (permission-gated)."""
+    client, provider_options = _responses_options(provider, model, effort, web_search)
     tool_specs = [
         {
             "type": "function", "name": d["name"], "description": d["description"],
@@ -3641,16 +3713,15 @@ def _call_openai_with_tools(
         "tools": tool_specs,
         "timeout": PROVIDER_TIMEOUT_SEC,
     }
-    if effort:
-        base_kwargs["reasoning"] = {"effort": effort}
+    base_kwargs.update(provider_options)
 
     def _do_call() -> ProviderResult:
         last = None
         exhausted = True
         for _round in range(_PANEL_TOOL_MAX_ROUNDS):
             resp = _provider_call(
-                f"openai-tools/{model}",
-                lambda: _openai.responses.create(input=input_items, **base_kwargs),
+                f"{provider}-tools/{model}",
+                lambda: client.responses.create(input=input_items, **base_kwargs),
             )
             last = resp
             fn_calls = [
@@ -3688,8 +3759,8 @@ def _call_openai_with_tools(
                 {"role": "user", "content": _TOOL_BUDGET_FINAL_INSTRUCTION}
             )
             last = _provider_call(
-                f"openai-tools/{model}/final",
-                lambda: _openai.responses.create(
+                f"{provider}-tools/{model}/final",
+                lambda: client.responses.create(
                     input=input_items, tool_choice="none", **base_kwargs,
                 ),
             )
@@ -3704,7 +3775,7 @@ def _call_openai_with_tools(
             text=text, usage=_extract_usage("openai", last) if last else None, raw=last,
         )
 
-    return _call_with_wall_cap(f"openai-tools/{model}", _do_call)
+    return _call_with_wall_cap(f"{provider}-tools/{model}", _do_call)
 
 
 def _run_turn(
@@ -3746,7 +3817,7 @@ def _run_turn(
     # by the env flag. Tool-use turns are not streamed (the text arrives
     # interleaved with tool calls), so on_delta is ignored on this path.
     panel_tools = (
-        have_repo and PANEL_TOOLS_ENABLED and provider in ("gemini", "openai")
+        have_repo and PANEL_TOOLS_ENABLED and provider in ("gemini", "openai", "deepseek")
     )
     system_prompt = _build_system_prompt(
         thread, info["label"], thread.get("participants") or [],
@@ -3765,6 +3836,11 @@ def _run_turn(
                 info["model"], system_prompt, transcript, instruction,
                 effort, web_search, repo_tools,
             )
+        if provider == "deepseek":
+            return _call_openai_with_tools(
+                info["model"], system_prompt, transcript, instruction,
+                effort, web_search, repo_tools, provider="deepseek",
+            )
         return _call_openai_with_tools(
             info["model"], system_prompt, transcript, instruction,
             effort, web_search, repo_tools,
@@ -3773,6 +3849,11 @@ def _run_turn(
         return _call_gemini(
             info["model"], system_prompt, transcript, instruction,
             effort, web_search, on_delta=on_delta,
+        )
+    if provider == "deepseek":
+        return _call_openai(
+            info["model"], system_prompt, transcript, instruction,
+            effort, web_search, on_delta=on_delta, provider="deepseek",
         )
     if provider == "openai":
         return _call_openai(
@@ -4119,6 +4200,7 @@ _STRUCTURED_PROMPT_CONTRACT = (
 def _call_openai_structured(
     model: str, system_prompt: str, transcript: str, instruction: str,
     effort: Optional[str], schema: dict,
+    *, provider: str = "openai",
 ) -> ProviderResult:
     """OpenAI structured turn via the Responses API ``json_schema`` format.
 
@@ -4128,6 +4210,7 @@ def _call_openai_structured(
     400 we retry non-strict — the local validation in the caller is the
     real contract either way.
     """
+    client, provider_options = _responses_options(provider, model, effort)
     user_msg = transcript
     if instruction:
         user_msg += f"\n\n[orchestrator]:\n{instruction}"
@@ -4137,8 +4220,7 @@ def _call_openai_structured(
         "input": user_msg,
         "timeout": PROVIDER_TIMEOUT_SEC,
     }
-    if effort:
-        kwargs["reasoning"] = {"effort": effort}
+    kwargs.update(provider_options)
 
     def _fmt(strict: bool) -> dict:
         return {
@@ -4153,8 +4235,8 @@ def _call_openai_structured(
     import openai as _o
     try:
         resp = _provider_call(
-            f"openai-structured/{model}",
-            lambda: _openai.responses.create(text=_fmt(True), **kwargs),
+            f"{provider}-structured/{model}",
+            lambda: client.responses.create(text=_fmt(True), **kwargs),
         )
     except _o.BadRequestError as exc:
         # Schema outside the strict subset — retry without constrained
@@ -4164,9 +4246,10 @@ def _call_openai_structured(
             "retrying non-strict", model, exc,
         )
         resp = _provider_call(
-            f"openai-structured/{model}/lax",
-            lambda: _openai.responses.create(text=_fmt(False), **kwargs),
+            f"{provider}-structured/{model}/lax",
+            lambda: client.responses.create(text=_fmt(False), **kwargs),
         )
+    _require_complete(resp, f"{provider}-structured/{model}")
     return ProviderResult(
         text=resp.output_text or "", usage=_extract_usage("openai", resp),
         raw=resp,
@@ -4324,6 +4407,11 @@ def _structured_turn(
     schema_text = json.dumps(schema, indent=2)
 
     def _dispatch(instr: str) -> ProviderResult:
+        if provider == "deepseek":
+            return _call_openai_structured(
+                info["model"], system_prompt, transcript, instr, effort, schema,
+                provider="deepseek",
+            )
         if provider == "openai":
             return _call_openai_structured(
                 info["model"], system_prompt, transcript, instr, effort, schema,
@@ -4585,15 +4673,20 @@ _CONVERGE_SYSTEM_PROMPT = (
 def _parse_verdict(text: str) -> str:
     """Map a verifier reply to one of _VALID_VERDICTS; default unresolved.
 
-    An explicit ``VERDICT: x`` line wins. Otherwise a single unambiguous
-    verdict keyword is taken; anything ambiguous or absent is unresolved.
+    Only standalone verdict lines or a bare verdict count. Mentions in prose
+    (including negations or quoted instructions) must not confirm a finding.
     """
-    t = (text or "").lower()
-    m = re.search(r"verdict\s*[:\-]\s*(confirmed|refuted|unresolved)", t)
-    if m:
-        return m.group(1)
-    present = {v for v in _VALID_VERDICTS if re.search(rf"\b{v}\b", t)}
-    return present.pop() if len(present) == 1 else "unresolved"
+    reply = (text or "").strip().lower()
+    # Markdown dressing (**VERDICT:** confirmed, `VERDICT: refuted`, a bullet)
+    # still counts as a standalone line; anything after the verdict word does not.
+    verdicts = set(re.findall(
+        r"^[\s*_`#>\-]*verdict[\s*_`]*[:\-][\s*_`]*(confirmed|refuted|unresolved)[\s*_`.!]*$",
+        reply, flags=re.MULTILINE,
+    ))
+    if verdicts:
+        return verdicts.pop() if len(verdicts) == 1 else "unresolved"
+    bare = reply.strip(" *_`.!")
+    return bare if bare in _VALID_VERDICTS else "unresolved"
 
 
 def _oneshot_text(
@@ -4626,6 +4719,8 @@ def _oneshot_text(
         res = _call_gemini(model, system_prompt, user_msg, "")
     elif provider == "openai":
         res = _call_openai(model, system_prompt, user_msg, "")
+    elif provider == "deepseek":
+        res = _call_openai(model, system_prompt, user_msg, "", provider="deepseek")
     else:
         raise RuntimeError(f"one-shot turn: unsupported provider {provider!r}")
     return (res.text or "").strip()
@@ -5645,10 +5740,14 @@ def roundtable_coding_task(
     panel lenses and a task-specific synthesis contract.
 
     ``working_directory`` binds repository context read-only. Leave it empty to
-    use the MCP server's current working directory; pass it explicitly when the
-    active project is ambiguous. Review mode also captures the working diff
-    against ``diff_base`` by default. A clean or non-git tree falls back to
-    repo tools without failing the whole workflow.
+    use the thread's existing binding or the MCP server's current working
+    directory; pass it explicitly when the active project is ambiguous. A path
+    you name that cannot be bound (missing, or outside the allowlist) fails
+    the call, as does a failed rebind of an already bound thread, rather than
+    running the panel against the previously bound repository.
+    Review mode also captures the working diff against ``diff_base`` by
+    default. A clean or non-git tree falls back to repo tools without failing
+    the whole workflow.
 
     Review mode requests schema-validated findings when an artifact is
     available, caps them by severity, checks each cited ``file:line`` against
@@ -5664,8 +5763,9 @@ def roundtable_coding_task(
     if not prompt:
         raise ValueError("prompt is required")
     task_key, profile = _coding_task_profile(task)
+    synthesizer = synthesizer.strip().lower()
     synth_info = _resolve_participant(synthesizer)
-    panel = list(participants) if participants is not None else _default_coding_panel(synthesizer)
+    panel = [name.strip().lower() for name in participants] if participants is not None else _default_coding_panel(synthesizer)
     if len(set(panel)) != len(panel):
         raise ValueError(f"Duplicate participants in {panel!r}.")
     panel = [name for name in panel if name != synthesizer]
@@ -5701,25 +5801,36 @@ def roundtable_coding_task(
         "diff": None,
         "warning": None,
     }
+    # A failed rebind must not leave a previous repository in use, and a path
+    # the caller named must bind or the call fails. With no path and no earlier
+    # binding there is nothing stale to fall back to, so the server's own
+    # directory being unbindable only warns, as before.
     try:
         bound = roundtable_bind_repo(tid, root, permission_policy="readonly")
+    except (ValueError, RuntimeError) as exc:
+        if (working_directory or "").strip() or existing_binding:
+            if thread_was_new:
+                # Nothing was posted yet; don't leave an empty open thread behind.
+                roundtable_close(tid)
+            raise
+        bound = None
+        grounding["warning"] = f"repository not bound: {exc}"
+    if bound is not None:
         grounding["working_directory"] = bound["working_directory"]
         grounding["repo_bound"] = True
-        if task_key == "review" and capture_working_diff and profile["capture_diff"]:
-            try:
-                grounding["diff"] = roundtable_bind_diff(tid, root, base=diff_base)
-            except (ValueError, RuntimeError) as exc:
-                grounding["warning"] = f"working diff not captured: {exc}"
-                roundtable_post(
-                    tid,
-                    "Repository grounding note: "
-                    f"{grounding['warning']}. Inspect the current repository "
-                    "with tools; do not treat an older working-diff artifact "
-                    "as the current change.",
-                    speaker="orchestrator",
-                )
-    except (ValueError, RuntimeError) as exc:
-        grounding["warning"] = f"repository not bound: {exc}"
+    if bound is not None and task_key == "review" and capture_working_diff and profile["capture_diff"]:
+        try:
+            grounding["diff"] = roundtable_bind_diff(tid, root, base=diff_base)
+        except (ValueError, RuntimeError) as exc:
+            grounding["warning"] = f"working diff not captured: {exc}"
+            roundtable_post(
+                tid,
+                "Repository grounding note: "
+                f"{grounding['warning']}. Inspect the current repository "
+                "with tools; do not treat an older working-diff artifact "
+                "as the current change.",
+                speaker="orchestrator",
+            )
 
     roundtable_post(tid, prompt, speaker="user")
     panel_prompt = roundtable_coding_panel_prompt(task_key, panel)
