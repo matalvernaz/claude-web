@@ -73,7 +73,7 @@ def test_sync_swaps_to_plan_model_and_back() -> None:
     assert run.live_sdk_model == "fable"
     assert run.events[-1]["type"] == "plan_model"
     assert run.events[-1]["active"] is True
-    assert run.events[-1]["label"] == "Planning on Fable 5.1."
+    assert run.events[-1]["label"] == "Planning on Fable 5.2."
 
     run.permission_mode = "acceptEdits"
     asyncio.run(app_module._sync_plan_model(run))

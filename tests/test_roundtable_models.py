@@ -11,12 +11,14 @@ retried from scratch.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import claude_models
 from roundtable import core
 
 # What OpenAI's /v1/models lists for the roundtable key (trimmed, 2026-10-04),
@@ -115,11 +117,27 @@ def test_api_transport_alias_still_resolves_without_a_listing(monkeypatch) -> No
     assert core._anthropic_api_model("fable").startswith("claude-fable-")
 
 
+def test_api_fallback_runs_what_the_cli_aliases_run() -> None:
+    # Without a listing the API transport runs these ids, so a CLI seat and an
+    # API seat named "Claude Fable" must be the same model. They drifted when
+    # CLI 2.1.321 moved fable to 5.2 and haiku to 5.5. The fixture is a real
+    # CLI model list; refresh both together.
+    fixture = Path(__file__).parent / "fixtures" / "cli_models_2.1.322.json"
+    rows = json.loads(fixture.read_text(encoding="utf-8"))["rows"]
+    runs = {
+        row["value"]: claude_models.canonical_model_id(row["resolvedModel"])
+        for row in rows
+    }
+    for alias, model in core._ANTHROPIC_ALIAS_FALLBACK.items():
+        assert model == runs[alias], alias
+
+
 def test_effort_reaches_every_current_claude_model() -> None:
     # The gate named only opus-4-8, so Opus 5.5 / Fable 5.1 / Sonnet 5.5 on the
     # API transport silently lost the effort setting.
-    for model in ("claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5",
-                  "claude-opus-4-8", "claude-sonnet-4-6"):
+    for model in ("claude-opus-5-5", "claude-fable-5-2", "claude-fable-5-1",
+                  "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-4-8",
+                  "claude-sonnet-4-6"):
         assert core._anthropic_supports_effort(model), model
     for model in ("claude-haiku-4-5-20251001", "claude-3-7-sonnet", "claude-opus-4-1"):
         assert not core._anthropic_supports_effort(model), model

@@ -1,4 +1,8 @@
-claude-agent-sdk>=0.2.152
+# 0.2.180 bundles Claude Code 2.1.321, the first that knows Fable 5.2. An
+# install without its own Claude Code runs the bundled one, and
+# `pip install -r requirements.txt` keeps an older version that meets the
+# floor, so the floor is what moves an existing install on.
+claude-agent-sdk>=0.2.180
 fastapi>=0.115
 uvicorn[standard]>=0.30
 jinja2>=3.1

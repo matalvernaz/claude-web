@@ -260,12 +260,13 @@ _ANTHROPIC_LATEST: dict = {"at": 0.0, "by_family": {}}
 # snapshot), gpt-5.5-pro or a -chat-latest variant, which behave differently.
 _OPENAI_TIER_RE = re.compile(r"^gpt-(\d+)(?:\.(\d+))?-(sol|luna|terra|astra)$")
 # The CLI's family aliases, and the ids the API transport falls back to when
-# it cannot list models.
+# it cannot list models: what each alias runs in the CLI (2.1.321 moved
+# ``fable`` to Fable 5.2 and ``haiku`` to Haiku 5.5).
 _ANTHROPIC_ALIAS_FALLBACK = {
     "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5-5",
-    "fable": "claude-fable-5-1",
-    "haiku": "claude-haiku-4-5",
+    "fable": "claude-fable-5-2",
+    "haiku": "claude-haiku-5-5",
 }
 
 

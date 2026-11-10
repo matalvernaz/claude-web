@@ -3,8 +3,9 @@
 claude-web used to carry the list by hand and fell behind (Sonnet 5.5 shipped
 in CLI 2.1.289 and never appeared). It now reads the rows the CLI's SDK
 initialize response lists, the same ones its /model picker shows. The fixture
-is that list from a real 2.1.289, and conftest preloads it as the cache, so
-KNOWN_MODELS here is what a host serves after its first fetch.
+is that list from a real 2.1.322 (the first with Fable 5.2 behind ``fable``),
+and conftest preloads it as the cache, so KNOWN_MODELS here is what a host
+serves after its first fetch.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import app as app_module
 import claude_models
 
 FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "cli_models_2.1.289.json").read_text(encoding="utf-8"),
+    (Path(__file__).parent / "fixtures" / "cli_models_2.1.322.json").read_text(encoding="utf-8"),
 )
 ROWS = FIXTURE["rows"]
 KNOWN_MODELS = app_module.KNOWN_MODELS
@@ -37,7 +38,10 @@ def restore_models():
 def test_the_picker_is_the_cli_list_with_aliases_first() -> None:
     keys = [m["key"] for m in KNOWN_MODELS]
     assert keys[:6] == ["", "opus", "fable", "fableplan", "sonnet", "haiku"]
+    # 2.1.321 moved `fable` to 5.2 and `haiku` to 5.5, and lists the models
+    # they used to run as explicit rows.
     assert keys[6:] == [
+        "claude-fable-5-1", "claude-haiku-4-5-20251001",
         "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8",
         "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6",
     ]
@@ -50,7 +54,9 @@ def test_alias_rows_reach_the_cli_as_the_alias() -> None:
         assert app_module.MODELS_BY_KEY[alias]["model"] == alias
     assert app_module.MODELS_BY_KEY["opus"]["resolved"] == "claude-opus-5-5"
     assert app_module.MODELS_BY_KEY["sonnet"]["label"] == "Sonnet 5.5"
-    assert app_module.MODELS_BY_KEY["fable"]["label"] == "Fable 5.1"
+    assert app_module.MODELS_BY_KEY["fable"]["label"] == "Fable 5.2"
+    assert app_module.MODELS_BY_KEY["fable"]["resolved"] == "claude-fable-5-2"
+    assert app_module.MODELS_BY_KEY["claude-fable-5-1"]["label"] == "Fable 5.1"
 
 
 def test_default_entry_names_the_model_it_runs() -> None:
@@ -67,13 +73,15 @@ def test_default_entry_names_the_model_it_runs() -> None:
 def test_fableplan_tracks_the_newest_fable_and_opus() -> None:
     entry = app_module.MODELS_BY_KEY["fableplan"]
     assert (entry["model"], entry["plan_model"]) == ("opus", "fable")
-    assert entry["label"] == "Fableplan (Fable 5.1 plans, Opus 5.5 builds)"
+    assert entry["label"] == "Fableplan (Fable 5.2 plans, Opus 5.5 builds)"
 
 
 def test_effort_levels_come_from_the_cli() -> None:
     # Opus 4.7 and Sonnet 4.6 took effort all along; the hand-kept list said
     # they did not and hid the control.
-    assert app_module.MODELS_BY_KEY["haiku"]["efforts"] == []
+    assert app_module.MODELS_BY_KEY["claude-haiku-4-5-20251001"]["efforts"] == []
+    # Haiku 5.5, behind `haiku` since 2.1.321, takes every level.
+    assert app_module.MODELS_BY_KEY["haiku"]["efforts"] == app_module.EFFORT_LEVELS
     assert app_module.MODELS_BY_KEY["claude-sonnet-4-6"]["efforts"] == [
         "low", "medium", "high", "max"]
     assert app_module.MODELS_BY_KEY["claude-opus-4-7"]["efforts"] == app_module.EFFORT_LEVELS
@@ -105,9 +113,13 @@ def test_every_entry_switches_mid_chat() -> None:
 @pytest.mark.parametrize("saved, expected", [
     ("claude-opus-5-5", ("opus", False)),
     ("claude-sonnet-5-5", ("sonnet", False)),
-    ("claude-fable-5-1", ("fable", False)),
-    # The CLI resolves Haiku to a dated id; a saved bare id must still match.
-    ("claude-haiku-4-5", ("haiku", False)),
+    ("claude-fable-5-2", ("fable", False)),
+    ("claude-haiku-5-5", ("haiku", False)),
+    # The CLI lists the Fable `fable` used to run as its own row, so a pick of
+    # it stays on it, as `/model claude-fable-5-1` does in the CLI.
+    ("claude-fable-5-1", ("claude-fable-5-1", False)),
+    # The CLI lists Haiku 4.5 by a dated id; a saved bare id must still match.
+    ("claude-haiku-4-5", ("claude-haiku-4-5-20251001", False)),
     ("claude-opus-4-8", ("claude-opus-4-8", False)),
     ("claude-opus-4-7-1m", ("claude-opus-4-7", False)),
     # Retired combo keys chain onward through the explicit id they named.
@@ -146,7 +158,7 @@ def test_a_refresh_rebuilds_the_list_in_place(restore_models) -> None:
     assert app_module.MODELS_BY_KEY["opus"]["label"] == "Opus 6"
     assert app_module.MODELS_BY_KEY[""]["label"] == "Default (Opus 6)"
     assert app_module.MODELS_BY_KEY["fableplan"]["label"] == (
-        "Fableplan (Fable 5.1 plans, Opus 6 builds)")
+        "Fableplan (Fable 5.2 plans, Opus 6 builds)")
     # A saved pick of the Opus it used to be follows the alias forward.
     assert app_module.resolve_model_key("claude-opus-6") == ("opus", False)
 
@@ -188,10 +200,13 @@ def test_turn_usage_teaches_the_meter_each_window(restore_models, tmp_path, monk
 
     assert windows == {"claude-sonnet-5-5": 1000000, "claude-haiku-4-5": 200000}
     assert app_module.MODELS_BY_KEY["sonnet"]["context"] == 1000000
-    assert app_module.MODELS_BY_KEY["haiku"]["context"] == 200000
+    haiku_45 = "claude-haiku-4-5-20251001"
+    assert app_module.MODELS_BY_KEY[haiku_45]["context"] == 200000
+    # `haiku` runs Haiku 5.5 now; Haiku 4.5's window is not its window.
+    assert app_module.MODELS_BY_KEY["haiku"].get("context") != 200000
     # Kept for the next boot, whose list has no windows of its own.
     app_module._apply_cli_model_rows(ROWS)
-    assert app_module.MODELS_BY_KEY["haiku"]["context"] == 200000
+    assert app_module.MODELS_BY_KEY[haiku_45]["context"] == 200000
 
 
 def test_result_event_carries_the_turns_context_windows(tmp_path, monkeypatch) -> None:
@@ -210,7 +225,8 @@ def test_payload_tells_the_browser_what_each_row_resolves_to() -> None:
     payload = {m["key"]: m for m in app_module._models_payload()}
     assert payload["opus"]["resolved"] == "claude-opus-5-5"
     assert payload[""]["resolved"] == "claude-opus-5-5"
-    assert payload["haiku"]["resolved"] == "claude-haiku-4-5-20251001"
+    assert payload["haiku"]["resolved"] == "claude-haiku-5-5"
+    assert payload["fable"]["resolved"] == "claude-fable-5-2"
 
 
 def test_frontend_gates_the_advisor_on_a_capability_not_a_provider_name() -> None:

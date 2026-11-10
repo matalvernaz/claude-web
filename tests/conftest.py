@@ -123,7 +123,7 @@ for d in (
 ):
     os.makedirs(d, exist_ok=True)
 shutil.copyfile(
-    os.path.join(os.path.dirname(__file__), "fixtures", "cli_models_2.1.289.json"),
+    os.path.join(os.path.dirname(__file__), "fixtures", "cli_models_2.1.322.json"),
     os.path.join(os.environ["CLAUDE_WEB_STATE_DIR"], "cli_models.json"),
 )
 

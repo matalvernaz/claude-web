@@ -4,7 +4,7 @@
    "value": "default",
    "resolvedModel": "claude-opus-5-5",
    "displayName": "Default (recommended)",
-   "description": "Opus 5.5 \u00b7 Best for everyday, complex tasks",
+   "description": "Opus 5.5 · Best for everyday, complex tasks",
    "supportsEffort": true,
    "supportedEffortLevels": [
     "low",
@@ -15,7 +15,8 @@
    ],
    "supportsAdaptiveThinking": true,
    "supportsFastMode": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
   },
   {
    "value": "opus",
@@ -32,12 +33,13 @@
    ],
    "supportsAdaptiveThinking": true,
    "supportsFastMode": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
   },
   {
    "value": "fable",
-   "resolvedModel": "claude-fable-5-1",
-   "displayName": "Fable 5.1",
+   "resolvedModel": "claude-fable-5-2",
+   "displayName": "Fable 5.2",
    "description": "For your toughest challenges",
    "supportsEffort": true,
    "supportedEffortLevels": [
@@ -48,7 +50,9 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsFastMode": true,
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
   },
   {
    "value": "sonnet",
@@ -64,13 +68,49 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
   },
   {
    "value": "haiku",
+   "resolvedModel": "claude-haiku-5-5",
+   "displayName": "Haiku 5.5",
+   "description": "Fastest for quick answers",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
+  },
+  {
+   "value": "claude-fable-5-1",
+   "resolvedModel": "claude-fable-5-1",
+   "displayName": "Fable 5.1",
+   "description": "Most capable for your hardest and longest-running tasks",
+   "supportsEffort": true,
+   "supportedEffortLevels": [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+   ],
+   "supportsAdaptiveThinking": true,
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
+  },
+  {
+   "value": "claude-haiku-4-5-20251001",
    "resolvedModel": "claude-haiku-4-5-20251001",
    "displayName": "Haiku 4.5",
-   "description": "Fastest for quick answers"
+   "description": "Fastest for quick answers",
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-sonnet-5",
@@ -86,7 +126,8 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-opus-5",
@@ -103,7 +144,8 @@
    ],
    "supportsAdaptiveThinking": true,
    "supportsFastMode": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-fable-5",
@@ -119,7 +161,8 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": false
   },
   {
    "value": "claude-opus-4-8",
@@ -136,7 +179,8 @@
    ],
    "supportsAdaptiveThinking": true,
    "supportsFastMode": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-opus-4-7",
@@ -152,7 +196,8 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-opus-4-6",
@@ -167,7 +212,8 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   },
   {
    "value": "claude-sonnet-4-6",
@@ -182,9 +228,10 @@
     "max"
    ],
    "supportsAdaptiveThinking": true,
-   "supportsAutoMode": true
+   "supportsAutoMode": true,
+   "supportsThinkingOff": true
   }
  ],
- "cli_version": "2.1.289 (Claude Code)",
+ "cli_version": "2.1.322 (Claude Code)",
  "fetched_at": 0
 }
