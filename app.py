@@ -86,6 +86,7 @@ import currency
 import setup_flow
 import auto_signin
 import panel
+import task_list
 
 log = logging.getLogger("claude-web")
 
@@ -497,6 +498,12 @@ _CHILD_ENV_DEFAULTS = {"CLAUDE_CODE_ENABLE_TODO_TOOLS": "1"}
 def _child_env_defaults() -> dict[str, str]:
     """Defaults for a chat's CLI that this process's environment doesn't set."""
     return {name: value for name, value in _CHILD_ENV_DEFAULTS.items() if name not in os.environ}
+
+
+# Names the task list a CLI uses. Left unset, the CLI uses one named after its
+# own session id, which is right until a chat changes session id and has to
+# keep its list (see _prepare_run_task_list).
+TASK_LIST_ID_ENV = "CLAUDE_CODE_TASK_LIST_ID"
 
 # Cap how many synth-message turns can chain off background tool notifications
 # before we stop and wait for the human. Prevents a notification-emitting tool
@@ -2377,6 +2384,18 @@ def _state_db() -> sqlite3.Connection:
             session_id TEXT PRIMARY KEY,
             user_sub TEXT,
             state_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )""")
+        # Which Claude Code task list a chat is on, when that is not simply
+        # the list named after the chat (see _prepare_run_task_list).
+        # ``history_from`` is set for a chat the user branched off another:
+        # everything in its saved conversation from before that moment is the
+        # other chat's history and says nothing about this chat's own list.
+        conn.execute("""CREATE TABLE IF NOT EXISTS session_task_list (
+            session_id TEXT PRIMARY KEY,
+            user_sub TEXT,
+            list_id TEXT NOT NULL,
+            history_from REAL,
             updated_at REAL NOT NULL
         )""")
         # Ordered ring of credential slots the app may substitute for the
@@ -6201,6 +6220,24 @@ def _ensure_shared_projects_dir() -> Optional[Path]:
     return shared
 
 
+def _ensure_shared_tasks_dir() -> None:
+    """Create ``CLAUDE_HOME/tasks`` so every credential home links to one store.
+
+    The CLI makes this directory the first time a chat uses a task list. If
+    that first time is under a credential home, the home gets a private one,
+    and a chat moved to another account would be told to stay on a list the
+    other account's CLI cannot see (see _prepare_run_task_list). A home that
+    already has a private one is left as it is.
+    """
+    shared = CLAUDE_HOME / "tasks"
+    if shared.is_symlink():
+        return
+    try:
+        shared.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create shared tasks dir %s: %s", shared, e)
+
+
 # What the CLI keeps per signed-in account, so a credential home holds its own
 # copy rather than a link to CLAUDE_HOME's. Until 2026-10 only the credentials
 # were private and every account read and wrote one .claude.json, which holds
@@ -6399,6 +6436,7 @@ def _ensure_credential_home(user_sub: str, cred_id: int) -> Path:
     home = _credential_home_path(user_sub, cred_id)
     home.mkdir(parents=True, exist_ok=True)
     _ensure_shared_projects_dir()
+    _ensure_shared_tasks_dir()
     try:
         entries = list(CLAUDE_HOME.iterdir())
     except FileNotFoundError:
@@ -6657,6 +6695,62 @@ def _session_account_slot(session_id: Optional[str]) -> Optional[str]:
     except sqlite3.Error:
         return None
     return row[0] if row else None
+
+
+def _session_task_list_binding(
+    session_id: Optional[str],
+) -> tuple[Optional[str], Optional[float]]:
+    """The task list recorded for this chat and where its own history starts.
+
+    Each is None when nothing is recorded, which is the usual case: the chat
+    is on the list named after itself and its whole saved conversation counts.
+    """
+    if not session_id:
+        return None, None
+    try:
+        row = _state_db().execute(
+            "SELECT list_id, history_from FROM session_task_list WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None, None
+    if not row:
+        return None, None
+    # The id goes into a CLI's environment, so it is held to the same shape
+    # as every other session id here.
+    list_id = row[0] if _ID_RE.fullmatch(row[0] or "") else None
+    return list_id, row[1]
+
+
+def _bind_session_task_list(
+    session_id: str, user_sub: Optional[str], list_id: str,
+    history_from: Optional[float],
+) -> None:
+    """Record which task list a chat is on.
+
+    Best-effort like the other per-chat records. A lost write costs the chat
+    its list the next time it is started, which is where things stood before
+    this record existed.
+    """
+    if not session_id or not _ID_RE.fullmatch(list_id or ""):
+        return
+    try:
+        _state_db().execute(
+            "INSERT INTO session_task_list"
+            "(session_id, user_sub, list_id, history_from, updated_at) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "user_sub = excluded.user_sub, "
+            "list_id = excluded.list_id, "
+            "history_from = excluded.history_from, "
+            "updated_at = excluded.updated_at",
+            (session_id, user_sub, list_id, history_from, time.time()),
+        )
+    except sqlite3.Error as e:
+        log.warning(
+            "_bind_session_task_list failed session=%s list=%s: %s",
+            session_id, list_id, e,
+        )
 
 
 def _bind_session_account(
@@ -9331,16 +9425,23 @@ class ActiveRun:
         # allow_session grant, so the user is prompted once per call. Same
         # lifetime as session_allowlist — per-run and ephemeral.
         self.sig_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # Task ledger for the new TaskCreate/TaskUpdate tool family (replaces
-        # TodoWrite from CLI 2.1.126+). The CLI assigns task ids in its tool
-        # *result* ("Task #N created successfully: ..."), not in the tool_use
-        # input, so creates land in pending_task_creates keyed by tool_use_id
-        # and migrate to tasks once the result parses out the id. Insertion
-        # order is preserved via _task_order so the panel renders in the
-        # order the model added them, not lexicographic id order.
-        self.tasks: dict[str, dict] = {}
-        self.pending_task_creates: dict[str, dict] = {}
-        self._task_order: int = 0
+        # The chat's task list, rebuilt from the task tool calls and their
+        # results (see task_list.py). A run that picks up a saved chat starts
+        # with the list that chat already had: _seed_run_task_list.
+        self.task_ledger = task_list.TaskLedger()
+        # The last list sent to the browser, whichever tool or provider it
+        # came from. A page that loads mid-run attaches past the event that
+        # carried it, so the page-load answers hand this over instead. None
+        # means this run has had no list.
+        self.todos_snapshot: Optional[list[dict]] = None
+        # The task list this run's CLI is told to use, or None to leave the
+        # CLI on the one named after its session. And, for a chat the user
+        # branched off another, the moment its own history starts. Both are
+        # worked out by _prepare_run_task_list and written down for the next
+        # start once the CLI reports a session id the run did not have.
+        self.task_list_id: Optional[str] = None
+        self.task_history_from: Optional[float] = None
+        self.task_list_branched: bool = False
         # Long-lived conversation state.
         self.user_input_queue: asyncio.Queue = asyncio.Queue()
         # Explicit Send now input bypasses the between-turn queue on Claude.
@@ -9474,6 +9575,18 @@ class ActiveRun:
         # before it had a session id.
         if self.panel_requested is not None and self.provider == "claude":
             _panel_set_enabled(sid, self.owner_sub, self.panel_requested)
+        # And its task list, for a chat that is not on the list named after
+        # itself: every later start of this session has to name the same one.
+        if self.task_list_branched:
+            # The CLI has taken its copy of the old chat by now, and nothing
+            # in the branch has had time to touch a task. This, not the moment
+            # the branch was asked for, is where its own history starts: the
+            # old chat may have been mid-turn, still writing, in between.
+            self.task_history_from = time.time()
+        if self.task_list_id or self.task_history_from is not None:
+            _bind_session_task_list(
+                sid, self.owner_sub, self.task_list_id or sid, self.task_history_from,
+            )
 
     def emit(self, event: dict) -> None:
         # Tag with a monotonic per-run index so the browser can dedupe an
@@ -9503,6 +9616,8 @@ class ActiveRun:
             _record_routed_session(self)
         if event.get("type") == "run_started":
             meta_changed = True
+        if event.get("type") == "todos_update":
+            self.todos_snapshot = event.get("todos") or []
         self.last_activity = time.time()
 
         # Persist FIRST, then notify subscribers. The previous "notify, then
@@ -11747,6 +11862,9 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         "project": row.get("project_key"),
         "messages": messages,
         "live_run": live_run,
+        # Only a running Codex chat has a plan to hand over: its plan steps
+        # are not in what thread/read returns.
+        "tasks": await _session_task_list(sid, None),
         "provider": "codex",
         "account_slot": account["slot"],
     }
@@ -11809,6 +11927,10 @@ async def api_session(
         "project": project_key,
         "messages": messages,
         "live_run": live_run,
+        # The page attaches to a running chat past every event already sent,
+        # and a chat that is not running sends none, so its task list has to
+        # travel with the page load.
+        "tasks": await _session_task_list(sid, path),
         "provider": "claude",
         "account_slot": session_slot,
         "panel": None if routed_session else _panel_payload(sid),
@@ -11889,6 +12011,7 @@ async def api_delete_session(
     try:
         _state_db().execute("DELETE FROM session_owners WHERE session_id = ?", (sid,))
         _state_db().execute("DELETE FROM local_session WHERE session_id = ?", (sid,))
+        _state_db().execute("DELETE FROM session_task_list WHERE session_id = ?", (sid,))
     except sqlite3.Error:
         pass
     return {"ok": True}
@@ -14833,6 +14956,14 @@ async def api_chat(
                 provider, run.project_key, run.owner_sub)
             if _created:
                 run.conversation_id, run.binding_id = _created
+        # A chat being picked up again already has a task list. Codex keeps
+        # its plan in its own thread store, so this is for the Claude CLI's
+        # saved conversations only.
+        if sid_in and provider != "codex":
+            await _prepare_run_task_list(
+                run, sid_in, _sessions_dir(cwd) / f"{sid_in}.jsonl",
+                branched=fork, moved=swap_respawn,
+            )
         # Save uploads inside the session lock so upload validation failures
         # never leave an orphan ActiveRun pinned in ACTIVE_RUNS_BY_SESSION.
         # If we registered first and then awaited the upload, a concurrent
@@ -14890,6 +15021,10 @@ async def api_chat(
         "image_count": len(image_blocks),
         "file_count": len(file_metas),
     })
+    if fork and run.todos_snapshot == []:
+        # A branch starts on an empty task list (_prepare_run_task_list), and
+        # the page that asked for it is still showing the old chat's.
+        run.emit({"type": "todos_update", "todos": []})
     # Canonical capture (Slice 0): the initial user turn of this run, captured
     # at submission (provider-agnostic). Keyed on run_id (one per run) → idempotent.
     _capture_canonical(
@@ -15201,7 +15336,8 @@ async def api_chat(
     # PATH/HOME/etc. survive. Set unconditionally: even a shared-slot run with
     # no account env needs the CHILD_ENV_SCRUB overlay and the task-list default.
     options_kwargs["env"] = _scrubbed_child_env({
-        **_child_env_defaults(), **account["env"], **options_kwargs.get("env", {}),
+        **_child_env_defaults(), **_task_list_env(run),
+        **account["env"], **options_kwargs.get("env", {}),
     })
     if provider in ROUTED_PROVIDERS:
         # Loaded settings.env overrides the inherited subprocess environment.
@@ -16271,6 +16407,9 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         # state (the last replayed result read as "turn over").
         "between_turns": run.between_turns,
         "next_idx": run._next_idx,
+        # None when this run has had no task list; the page then leaves its
+        # panel as it is.
+        "tasks": run.todos_snapshot,
     }
 
 
@@ -16890,24 +17029,100 @@ def _denial_dict(d) -> dict:
     }
 
 
-_TASK_CREATED_RE = re.compile(r"^\s*Task #(\d+)\s+created", re.IGNORECASE)
+def _task_list_env(run: "ActiveRun") -> dict[str, str]:
+    """The setting that keeps a run's CLI on the task list its chat already has.
 
-
-def _tasks_to_todos(run: "ActiveRun") -> list[dict]:
-    """Render a run's task ledger into the legacy TodoWrite payload shape so
-    the existing browser ``updateTodosPanel`` consumer works unchanged.
-
-    ``subject`` maps to ``content`` (the old key the renderer reads); the
-    other fields keep their names.
+    Empty for the usual chat, which is on the list named after itself. An
+    operator who sets the name for the whole service gets what they set: the
+    SDK lays this over the inherited environment, so theirs is left out here
+    rather than overwritten.
     """
-    items = []
-    for t in sorted(run.tasks.values(), key=lambda v: v.get("_order", 0)):
-        items.append({
-            "content": t.get("subject") or "",
-            "activeForm": t.get("activeForm") or "",
-            "status": t.get("status") or "pending",
-        })
-    return items
+    if not run.task_list_id or TASK_LIST_ID_ENV in os.environ:
+        return {}
+    return {TASK_LIST_ID_ENV: run.task_list_id}
+
+
+async def _prepare_run_task_list(
+    run: "ActiveRun", session_id: str, transcript: Path, *,
+    branched: bool, moved: bool,
+) -> None:
+    """Work out which task list a run that picks up a saved chat is on, and
+    what is in it.
+
+    Claude Code names a chat's task list after its session id. Three things
+    can happen to a saved chat, and they differ in exactly that:
+
+    - It is started again as itself (it was closed for being idle). Same
+      session id, same list.
+    - It is moved to another account or personality mid-chat. That is the
+      same conversation carrying on, but the CLI can only do it as a branch
+      with a new session id, and a branch gets a new, empty list. So the CLI
+      is told by name to stay on the list the chat had, now and on every
+      later start of the new session id. Before this, Claude lost its whole
+      list at every such move while the conversation still showed it.
+    - The user branches it (/fork). Both chats live on, so the branch keeps
+      the empty list the CLI gives it. Its saved conversation starts with a
+      copy of the old chat's, which is not about that list: nothing from
+      before this moment counts.
+    """
+    list_id, history_from = _session_task_list_binding(session_id)
+    if branched:
+        run.task_list_branched = True
+        run.task_history_from = time.time()
+        # Known to be empty, which is not the same as not known: a page that
+        # was showing the old chat's list is told (see api_chat).
+        run.todos_snapshot = []
+        return
+    run.task_history_from = history_from
+    if moved:
+        run.task_list_id = list_id or session_id
+    elif list_id and list_id != session_id:
+        run.task_list_id = list_id
+    await _seed_run_task_list(run, transcript)
+
+
+async def _seed_run_task_list(run: "ActiveRun", path: Path) -> None:
+    """Give a run that picks up a saved chat the task list that chat already had.
+
+    Without this the run started from nothing: the panel dropped every task
+    made before the restart, and a task whose only later change was its
+    status showed with no name. Nothing is sent to the browser here; an open
+    page already shows this list, and re-sending it would read the task in
+    progress out again at the start of every restarted chat.
+    """
+    # A long chat's file is tens of megabytes; keep the read off the event loop.
+    try:
+        found = await asyncio.to_thread(
+            task_list.tasks_from_transcript, path, run.task_history_from,
+        )
+    except Exception as exc:  # noqa: BLE001 - the task list must never stop a chat starting
+        log.warning("could not rebuild the task list from %s: %s", path, exc)
+        return
+    run.task_ledger = found.ledger
+    run.todos_snapshot = found.todos
+
+
+async def _session_task_list(session_id: str, path: Optional[Path]) -> Optional[list[dict]]:
+    """The task list to draw when a chat's page loads.
+
+    A running chat answers from what it last sent. Otherwise the list is
+    rebuilt from the saved conversation. None means there is nothing to say
+    (a Codex chat that is not running), and the page leaves its panel alone.
+    """
+    live = _existing_run_for_session(session_id)
+    if live is not None and live.todos_snapshot is not None:
+        return live.todos_snapshot
+    if path is None:
+        return None
+    _list_id, history_from = _session_task_list_binding(session_id)
+    try:
+        found = await asyncio.to_thread(
+            task_list.tasks_from_transcript, path, history_from,
+        )
+    except Exception as exc:  # noqa: BLE001 - nor stop a chat being opened
+        log.warning("could not rebuild the task list from %s: %s", path, exc)
+        return None
+    return found.todos
 
 
 def _maybe_record_checkpoint(run: "ActiveRun", msg) -> None:
@@ -17543,48 +17758,13 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                     run.permission_mode = "plan"
                     out.append({"type": "plan_mode", "active": True})
                 # The TaskCreate/TaskUpdate family replaced TodoWrite from CLI
-                # 2.1.126 onward. Same panel, different plumbing: the assigned
-                # task id arrives in the tool *result*, so TaskCreate parks a
-                # partial entry keyed by tool_use_id and the result-handler
-                # below promotes it once the id parses out. TaskUpdate merges
-                # in place and emits the refreshed list immediately.
-                elif blk.name == "TaskCreate" and run is not None:
-                    inp = blk.input or {}
-                    run.pending_task_creates[blk.id] = {
-                        "subject": inp.get("subject") or "",
-                        "description": inp.get("description") or "",
-                        "activeForm": inp.get("activeForm") or "",
-                        "status": "pending",
-                    }
-                elif blk.name == "TaskUpdate" and run is not None:
-                    inp = blk.input or {}
-                    tid = str(inp.get("taskId") or "")
-                    if tid:
-                        status = inp.get("status")
-                        if status == "deleted":
-                            run.tasks.pop(tid, None)
-                        else:
-                            t = run.tasks.get(tid)
-                            if t is None:
-                                # TaskUpdate against a task we never saw a
-                                # TaskCreate for — usually a resume with
-                                # truncated history. Placeholder keeps the
-                                # status flowing instead of being silently
-                                # dropped; the subject will fill in if a
-                                # later TaskCreate replay arrives.
-                                run._task_order += 1
-                                t = {
-                                    "subject": "",
-                                    "description": "",
-                                    "activeForm": "",
-                                    "status": "pending",
-                                    "_order": run._task_order,
-                                }
-                                run.tasks[tid] = t
-                            for k in ("status", "subject", "description", "activeForm"):
-                                if k in inp and inp[k] is not None:
-                                    t[k] = inp[k]
-                        out.append({"type": "todos_update", "todos": _tasks_to_todos(run)})
+                # 2.1.126 onward. Same panel, different plumbing: a call says
+                # what Claude asked for, and only its result says what the CLI
+                # did (the task's number, or that an update was refused), so
+                # the call is just remembered here. The result branch below
+                # applies it and sends the refreshed list.
+                elif blk.name in task_list.TASK_TOOL_NAMES and run is not None:
+                    run.task_ledger.note_call(blk.id, blk.name, blk.input)
         out.append({
             "type": "assistant",
             "message": {"content": message_blocks},
@@ -17615,6 +17795,11 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
         # Tool results coming back from Claude's tool runs.
         results = []
         extra: list[dict] = []
+        # The CLI sends each tool's own result object beside the text the
+        # model saw. It belongs to the message, not to a block, so it is only
+        # trusted when the message holds a single result (always, so far).
+        result_blocks = [blk for blk in msg.content if isinstance(blk, ToolResultBlock)]
+        structured_result = getattr(msg, "tool_use_result", None) if len(result_blocks) == 1 else None
         for blk in msg.content:
             if isinstance(blk, ToolResultBlock):
                 content = blk.content
@@ -17642,21 +17827,13 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                          "is_error": bool(blk.is_error)},
                         raw=text, replayable=True,
                     )
-                # Finish a TaskCreate: the CLI's tool result carries the
-                # assigned id ("Task #1 created successfully: <subject>").
-                # Migrate the pending entry into the live ledger and emit a
-                # refreshed panel. Errors drop the pending entry without
-                # adding anything.
-                if run is not None and blk.tool_use_id in run.pending_task_creates:
-                    partial = run.pending_task_creates.pop(blk.tool_use_id)
-                    if not blk.is_error:
-                        m = _TASK_CREATED_RE.match(text or "")
-                        if m:
-                            tid = m.group(1)
-                            run._task_order += 1
-                            partial["_order"] = run._task_order
-                            run.tasks[tid] = partial
-                            extra.append({"type": "todos_update", "todos": _tasks_to_todos(run)})
+                # Finish a task tool call: the result says whether it took
+                # and, for a new task, which number the CLI gave it. A refused
+                # or failed call changes nothing.
+                if run is not None and run.task_ledger.note_result(
+                    blk.tool_use_id, text, bool(blk.is_error), structured_result,
+                ):
+                    extra.append({"type": "todos_update", "todos": run.task_ledger.as_todos()})
         if results or extra:
             payload: list[dict] = []
             if results:

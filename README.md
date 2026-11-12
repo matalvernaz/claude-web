@@ -402,6 +402,8 @@ The schema is stable — keys are always set, only their values are empty when t
 
 Claude Code only offers its task-list tools to Opus 4.7 and older on its own, which would leave the task panel empty on every newer model. claude-web sets `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` for every chat unless the server's environment already sets it, so `CLAUDE_CODE_ENABLE_TODO_TOOLS=0` leaves the choice to Claude Code.
 
+The Tasks section under the conversation shows the list as Claude Code holds it: the heading gives the totals, each row carries the task's own number (the one the tool lines use), its status and its name, and a task in progress also says what Claude is doing on it now. Tick **Show descriptions** to read each task's description. The list comes back when a page loads and when a chat that was closed for being idle is picked up again, because it is rebuilt from the task tool results in the saved conversation. A chat that is moved to another account or personality mid-conversation keeps its list too: Claude Code would otherwise start it on an empty one, so claude-web names the list for it (`CLAUDE_CODE_TASK_LIST_ID`; set that yourself in the server's environment and yours is used instead). A chat you branch with `/fork` starts with an empty list of its own. A Codex chat shows its plan the same way while it is running.
+
 ### Multi-user
 
 | Variable | Default | Notes |

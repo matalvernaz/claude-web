@@ -429,23 +429,57 @@ body[data-plan-mode="1"]::before {
   overflow-y: auto;
 }
 #todos-panel h2 {
+  display: inline-block;
   font-size: 0.85rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: #aaa;
   margin: 0.25rem 0;
 }
+/* The totals read as a sentence, not as a shouted label. */
+#todos-panel .task-counts {
+  text-transform: none;
+  letter-spacing: 0;
+}
+.task-descriptions-toggle {
+  display: inline-block;
+  margin-left: 1rem;
+  font-size: 0.85rem;
+  color: #aaa;
+}
+.task-descriptions-toggle[hidden] { display: none; }
+/* Each row writes its own task number, so the list's markers are off. */
 #todos-list {
   margin: 0;
-  padding-left: 1.5rem;
+  padding-left: 0;
+  list-style: none;
 }
 #todos-list li {
   margin: 0.15rem 0;
   font-size: 0.95rem;
 }
+#todos-list .task-number {
+  display: inline-block;
+  min-width: 1.5rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 #todos-list .task-status {
   font-weight: 600;
   margin-right: 0.15rem;
+}
+/* What is being done right now, and the description when asked for, sit
+   under the task's name in a quieter voice. */
+#todos-list .task-activity,
+#todos-list .task-description {
+  margin-left: 1.9rem;
+  font-size: 0.875rem;
+  font-weight: 400;
+  text-decoration: none;
+}
+#todos-list .task-description {
+  color: #aaa;
+  white-space: pre-wrap;
 }
 #todos-list li.completed { color: #888; }
 #todos-list li.completed .task-label { text-decoration: line-through; }
