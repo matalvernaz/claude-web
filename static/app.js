@@ -1896,6 +1896,13 @@
         renderingHistoryBatch = false;
       }
     }
+    // The chat's task list as it stands. A running chat is joined past the
+    // events that carried it, and one that is not running sends none, so it
+    // comes with the page load. A server from before this sends no list, and
+    // the panel is left as it is.
+    if (Array.isArray(data.tasks)) {
+      drawTodosPanel(data.tasks);
+    }
     // Force-scroll on session load — we just replaced the entire transcript.
     maybeAutoScroll(true);
     markActive(sessionId);
@@ -3441,6 +3448,11 @@
     }
     if (info.panel && typeof info.panel.enabled === "boolean") {
       syncPanelControl(info.panel.enabled);
+    }
+    // A run that picked up a saved chat holds that chat's task list without
+    // ever having sent it, so the replay below would not bring it back.
+    if (Array.isArray(info.tasks)) {
+      drawTodosPanel(info.tasks);
     }
     // Incremental resume: if we still hold this run's high-watermark (the
     // highest _idx already rendered), resume from watermark+1 and keep the
@@ -5693,53 +5705,124 @@
   // ─── Tasks panel ────────────────────────────────────────────────────────
   const todosPanel = document.getElementById("todos-panel");
   const todosList = document.getElementById("todos-list");
+  const todosHeading = document.getElementById("todos-heading");
 
   const STATUS_LABELS = {
     pending: "To do",
     in_progress: "In progress",
     completed: "Done",
   };
+  // Stands where a task's name should be when nothing ever said it: a task
+  // made before the saved conversation begins and only updated since.
+  const NAMELESS_TASK = "(name not known)";
+  const SHOW_DESCRIPTIONS_KEY = "claude-web.tasks.descriptions";
 
+  // Each row carries its own number as text, so the list's markers are turned
+  // off in the stylesheet. Safari drops the list role along with the markers
+  // unless it is stated.
+  todosList.setAttribute("role", "list");
+  // The totals sit inside the heading, so jumping to it by heading reads them.
+  const todosCounts = document.createElement("span");
+  todosCounts.className = "task-counts";
+  todosHeading.appendChild(todosCounts);
+  // One switch for every description, off until asked for. A control on each
+  // row would be one more thing to step past on every task.
+  const descriptionsToggle = document.createElement("label");
+  descriptionsToggle.className = "task-descriptions-toggle";
+  descriptionsToggle.hidden = true;
+  const descriptionsBox = document.createElement("input");
+  descriptionsBox.type = "checkbox";
+  descriptionsBox.id = "todos-show-descriptions";
+  descriptionsBox.checked = safeGet(localStorage, SHOW_DESCRIPTIONS_KEY) === "1";
+  descriptionsToggle.append(descriptionsBox, " Show descriptions");
+  todosHeading.after(descriptionsToggle);
+  // The list last drawn, kept so the switch can redraw it.
+  let shownTodos = [];
+  descriptionsBox.addEventListener("change", () => {
+    safeSet(localStorage, SHOW_DESCRIPTIONS_KEY, descriptionsBox.checked ? "1" : "");
+    drawTodosPanel(shownTodos);
+  });
+
+  function todoStatus(todo) {
+    return todo.status || "pending";
+  }
+
+  // A list that arrives while Claude works. The task in progress also drives
+  // the status line, the way the CLI's spinner shows it.
   function updateTodosPanel(todos) {
-    // The CLI uses the in_progress todo's activeForm as the spinner label.
-    // Keep the spinner in sync with the panel from a single source.
-    const inProgress = todos.find((t) => (t.status || "pending") === "in_progress");
+    const inProgress = todos.find((todo) => todoStatus(todo) === "in_progress");
     setActiveTodoLabel(inProgress ? (inProgress.activeForm || inProgress.content || "") : null);
-    if (!todos.length) {
-      todosPanel.hidden = true;
-      todosList.innerHTML = "";
-      return;
-    }
-    // Hide the panel once everything is done. The TodoWrite tool calls are
-    // still visible as chips in the transcript for anyone who wants to scroll
-    // back, so we lose nothing by collapsing the live panel.
-    const allDone = todos.every((t) => (t.status || "pending") === "completed");
-    if (allDone) {
-      todosPanel.hidden = true;
-      todosList.innerHTML = "";
-      return;
-    }
-    todosPanel.hidden = false;
+    drawTodosPanel(todos);
+  }
+
+  // Draw the list and touch nothing else. A page load calls this directly:
+  // the saved list of a chat that is doing nothing must not start the status
+  // line, or be read out over "Conversation loaded."
+  function drawTodosPanel(todos) {
+    shownTodos = todos;
     todosList.innerHTML = "";
-    for (const t of todos) {
+    const total = todos.length;
+    const done = todos.filter((todo) => todoStatus(todo) === "completed").length;
+    // Nothing to show, or nothing left to do: the panel goes. The tool lines
+    // in the conversation still say what each task was.
+    if (!total || done === total) {
+      todosPanel.hidden = true;
+      todosCounts.textContent = "";
+      descriptionsToggle.hidden = true;
+      return;
+    }
+    const inProgress = todos.filter((todo) => todoStatus(todo) === "in_progress").length;
+    let counts = `: ${done} of ${total} done`;
+    if (inProgress) {
+      counts += `, ${inProgress} in progress`;
+    }
+    todosCounts.textContent = counts;
+    // TodoWrite and Codex lists have no descriptions; the switch stays away.
+    const anyDescription = todos.some((todo) => todo.description);
+    descriptionsToggle.hidden = !anyDescription;
+    const showDescriptions = anyDescription && descriptionsBox.checked;
+    todosPanel.hidden = false;
+    todos.forEach((todo, index) => {
       const li = document.createElement("li");
-      const status = t.status || "pending";
+      const status = todoStatus(todo);
       li.className = status;
-      const label = status === "in_progress" && t.activeForm ? t.activeForm : (t.content || "");
+      // The CLI's own task number where there is one, since that is what the
+      // tool lines call the task ("Updated task #14 status"). A list without
+      // numbers of its own gets each row's place instead.
+      const numberEl = document.createElement("span");
+      numberEl.className = "task-number";
+      numberEl.textContent = (todo.id || String(index + 1)) + ".";
       // Status conveyed in real text (not just CSS) so NVDA reads "Done:
       // Foo" / "In progress: Bar" / "To do: Baz" instead of the same flat
       // string for every item.
       const statusEl = document.createElement("span");
       statusEl.className = "task-status";
       statusEl.textContent = STATUS_LABELS[status] || status;
-      const sep = document.createTextNode(": ");
+      const name = todo.content || todo.activeForm || NAMELESS_TASK;
       const labelEl = document.createElement("span");
       labelEl.className = "task-label";
-      labelEl.textContent = label;
-      li.append(statusEl, sep, labelEl);
-      if (status === "in_progress") li.setAttribute("aria-current", "step");
+      labelEl.textContent = name;
+      li.append(numberEl, " ", statusEl, ": ", labelEl);
+      // What Claude says it is doing on the task right now goes beside the
+      // task's name. It used to replace the name, so the name was nowhere on
+      // the page for as long as the task was being worked on.
+      if (status === "in_progress" && todo.activeForm && todo.activeForm !== name) {
+        const activityEl = document.createElement("div");
+        activityEl.className = "task-activity";
+        activityEl.textContent = "Now: " + todo.activeForm;
+        li.appendChild(activityEl);
+      }
+      if (showDescriptions && todo.description) {
+        const descriptionEl = document.createElement("div");
+        descriptionEl.className = "task-description";
+        descriptionEl.textContent = todo.description;
+        li.appendChild(descriptionEl);
+      }
+      if (status === "in_progress") {
+        li.setAttribute("aria-current", "step");
+      }
       todosList.appendChild(li);
-    }
+    });
   }
 
   // ─── Usage modal ────────────────────────────────────────────────────────

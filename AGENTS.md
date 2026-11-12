@@ -21,6 +21,25 @@ We use the Python `claude_agent_sdk` because we need the `can_use_tool` callback
 - `SAFE_TOOLS = {"TodoWrite"}` — auto-approved server-side.
 - `NO_SESSION_ALLOWLIST_TOOLS = {"Bash"}` — UI hides the "Allow this session" button because `(tool, signature)` granularity is too coarse for Bash. **Server-side enforcement too**: even if a tampered client POSTs a session-allow for Bash, the callback refuses it.
 
+### Task list
+
+`task_list.py` rebuilds the chat's task list from the task tool traffic (`TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`), one `TaskLedger` per run. It goes by **results, not calls**: a task exists once the CLI answers with its number, and an update counts once the CLI says it took (`tool_use_result` on the SDK message, `toolUseResult` in the jsonl; the result text is the fallback). A refused update changes nothing, "Task not found" drops the row, a `TaskList` answer replaces the whole list, and a created number that is not above every number held means the CLI is on a fresh list.
+
+**The CLI names a chat's list after its session id, and a branch (`fork_session`) gets a new id and so a new, empty list.** `_prepare_run_task_list` tells the three cases apart:
+
+- A plain resume (idle close, then the next message): same id, same list, nothing to do.
+- A move to another account or personality mid-chat (`swap_respawn`): the same conversation, but a branch underneath. The CLI is started with `CLAUDE_CODE_TASK_LIST_ID` naming the list the chat had, and the new session id is recorded against that list in `session_task_list` so every later start names it again. Without this Claude loses its whole list at each move (`TaskList` answers "No tasks found") while the conversation still shows it.
+- A branch the user asked for (`/fork`): both chats live on, so the branch keeps its own empty list. Its jsonl starts with a copy of the old chat's entries, original timestamps and all; `session_task_list.history_from` marks where the branch's own history starts, and entries before it are not counted.
+
+An operator's own `CLAUDE_CODE_TASK_LIST_ID` in the service environment is left alone (one list for every chat; the panel is then only as good as what each chat happens to see). `_ensure_credential_home` creates `CLAUDE_HOME/tasks` up front so every credential home links to one store; a home that already has a private `tasks/` is not repaired, and a chat moved onto it will not find its list. All of this was checked against the real CLI (2.1.322) driven by a scripted model, through a scratch instance: move, close, resume, branch.
+
+Known edges, left alone on purpose: after a move the old session id and the new one share one list directory, so going back and continuing the old session writes to the same list; a `claude` started by hand from inside a moved chat (through Bash) inherits the variable and shares the list too; and the list a moved chat starts with is read from the saved conversation, so a task result the old CLI had not written when it was cut off mid-turn is missed until the next `TaskList`.
+
+- The same rebuild serves three places: live (`_sdk_message_to_events`), a run that resumes a saved chat (`_seed_run_task_list` replays the jsonl before the CLI starts), and page loads (`"tasks"` in `/api/sessions/{sid}` and `/api/chat/active`). A page attaches to a live run at the tail, so the list has to travel with the load; `run.todos_snapshot` is the last list sent by any provider.
+- **Don't read the CLI's task files** (`$CLAUDE_HOME/tasks/<list id>/`). The list id is not always the session id (an env var or a team renames it) and the CLI has a second storage backend behind a flag. They are fine as a one-off check: on 2026-11-12 the rebuild matched all 79 lists on the homelab, every field.
+- Helper agents' task calls stay out (they have `parent_tool_use_id` live and `isSidechain` in the jsonl).
+- The page draws a loaded list with `drawTodosPanel`, which never touches the status line or the announcer; only a live `todos_update` goes through `updateTodosPanel`.
+
 ### Sessions read from disk
 
 Session jsonl files at `$CLAUDE_HOME/projects/<sanitized-cwd>/*.jsonl` are the source of truth for transcripts. The web UI and any terminal `claude` CLI share state through these files. Sanitisation is the CLI's own rule — every character outside `[A-Za-z0-9]` of the resolved path becomes `-`, with a hash suffix past 200 characters — delegated to `claude_agent_sdk.project_key_for_directory` (`_sanitize_project_key`). Until 2026-10 the app replaced only `/`, `\` and `:`; that agreed with the CLI for `/workspace` but not for a Windows path with spaces, so `_startup_migrate_project_keys` rewrites `project_key` rows written under the old rule and folds any `projects/<old-key>` directory the app itself created into the CLI's directory.
