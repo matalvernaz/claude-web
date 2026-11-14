@@ -66,6 +66,13 @@
   // collapse duplicates that come from the same event reaching the DOM
   // twice (overlapping subscribers, replay-then-tail races, etc.).
   const renderedIdxByRun = new Map();
+  // Per run, the _idx below which events are history to this page: what a
+  // reconnect replays after a long absence plays no sounds (tryResume).
+  const quietBelowByRun = new Map();
+  // A reconnect this soon after the last bytes arrived was a blip, not an
+  // absence, and still sounds what it missed. Shorter than the 35 s of
+  // silence rejoinAfterFreeze waits for, so a frozen tab is always an absence.
+  const CATCH_UP_SOUNDS_GAP_MS = 30_000;
   const RUN_KEY = "claude-web.active-run";
   const MODEL_KEY = "claude-web.model";
   const EFFORT_KEY = "claude-web.effort";
@@ -389,15 +396,65 @@
     return audioCtx;
   }
 
-  // Browser autoplay policy suspends a context created outside a user
-  // gesture. Resume on the first real interaction so the first away-cue
-  // actually sounds.
-  function unlockAudio() {
-    const ctx = ensureAudioCtx();
-    if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+  // A context that isn't running has a stopped clock, so a tone scheduled on
+  // it starts the moment it resumes, on top of every other cue asked for in
+  // the meantime: a phone back from the lock screen, or a freshly opened page
+  // nobody had touched yet, played them all at once on the first tap. So a
+  // cue asked for then is held instead, only the most urgent one, and it
+  // plays only if the sound comes back within CUE_HOLD_MS. Any later and it
+  // is old news, so it is dropped.
+  const CUE_HOLD_MS = 1000;
+  let heldCue = null;
+  // A browser that is blocking sound keeps every resume() pending until the
+  // person does something, so cues ask at most once a second while one is
+  // still pending; an action always asks.
+  let resumePending = false;
+  let resumeAskedAt = -Infinity;
+
+  function resumeAudio(ctx, fromAction) {
+    const askedRecently = cueClock() - resumeAskedAt < CUE_HOLD_MS;
+    if (resumePending && askedRecently && !fromAction) return;
+    resumePending = true;
+    resumeAskedAt = cueClock();
+    ctx.resume().then(() => {
+      const held = heldCue;
+      heldCue = null;
+      if (!held || ctx.state !== "running") return;
+      if (cueClock() - held.at > CUE_HOLD_MS) return;
+      noteCueSounded(held.name);
+      scheduleCue(ctx, held.name);
+    }).catch(() => {}).finally(() => {
+      resumePending = false;
+    });
   }
-  document.addEventListener("pointerdown", unlockAudio, { once: true });
-  document.addEventListener("keydown", unlockAudio, { once: true });
+
+  // Browsers only let a page start its sound from inside something the person
+  // did, and an iPhone stops it again whenever Safari goes to the background.
+  // So every action is a chance to start it, not just the first one, and
+  // click counts too: a screen reader's own activation (NVDA's Enter on a
+  // link, a VoiceOver double tap) can arrive as a click alone.
+  function unlockAudio() {
+    if (!soundsEnabled && !audioCtx) return;
+    const ctx = ensureAudioCtx();
+    if (!ctx || ctx.state === "running") return;
+    resumeAudio(ctx, true);
+    // iOS Safari only counts sound actually started inside the action. A
+    // silent one-sample buffer does that and is harmless everywhere else.
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch { /* the resume above still runs */ }
+  }
+  for (const type of ["pointerdown", "keydown", "click", "touchend"]) {
+    document.addEventListener(type, unlockAudio, { capture: true, passive: true });
+  }
+  // Coming back to the page may be enough to restart it, without an action.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (audioCtx && audioCtx.state !== "running") resumeAudio(audioCtx);
+  });
 
   // One master gain so overall cue loudness lives in a single place and
   // individual notes can sit near full scale without clipping when the tail
@@ -438,6 +495,62 @@
     osc.stop(startAt + dur + 0.02);
   }
 
+  // Several cues landing together (a reconnect, a page thawing after a
+  // freeze, parallel tool calls) play as one: within CUE_BURST_MS of the last
+  // cue, only a more urgent one gets through. This also does what the old
+  // per-tool throttle did for bursts of tool ticks.
+  const CUE_BURST_MS = 250;
+  const CUE_URGENCY = {
+    tool: 1, task_done: 2, task_error: 3, autofire: 4, done: 5,
+    timeout: 6, error: 7, attention: 8, permission: 9,
+  };
+  let lastCueName = null;
+  let lastCueAt = -Infinity;
+
+  function cueClock() {
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+
+  function cueUrgency(name) {
+    return CUE_URGENCY[name] || 0;
+  }
+
+  function noteCueSounded(name) {
+    lastCueName = name;
+    lastCueAt = cueClock();
+  }
+
+  // True while the stream reader handles an event the page is only catching
+  // up on: backlog a reconnect replays after a long absence. That is history,
+  // so it renders without a sound. A question or approval still waiting is
+  // the exception, since it needs an answer now (the server never replays one
+  // that was already answered).
+  let cuesForCatchUp = false;
+  const CATCH_UP_CUES = new Set(["permission"]);
+
+  function playCue(name, force) {
+    if (!soundsEnabled) return;
+    // `force` lets the explicit enable-test cue sound even in background-only
+    // mode while the window is focused.
+    if (soundsAwayOnly && !force && document.hasFocus()) return;
+    if (cuesForCatchUp && !force && !CATCH_UP_CUES.has(name)) return;
+    const ctx = ensureAudioCtx();
+    if (!ctx) return;
+    const now = cueClock();
+    const inBurst = now - lastCueAt < CUE_BURST_MS;
+    if (!force && inBurst && cueUrgency(name) <= cueUrgency(lastCueName)) return;
+    if (ctx.state !== "running") {
+      const heldIsStale = heldCue && now - heldCue.at > CUE_HOLD_MS;
+      if (!heldCue || heldIsStale || cueUrgency(name) >= cueUrgency(heldCue.name)) {
+        heldCue = { name, at: now };
+      }
+      resumeAudio(ctx);
+      return;
+    }
+    noteCueSounded(name);
+    scheduleCue(ctx, name);
+  }
+
   // Each cue is separated on THREE axes at once — timbre (waveform), rhythm
   // (note count + spacing), and pitch contour (up / down / flat / alternating)
   // — not just register, so the category is audible before you've memorised
@@ -447,14 +560,7 @@
   //   triangle climbing = a prompt wants you to approve
   //   sawtooth alternating = harsh alarm, you must act before anything continues
   //   square staccato = the machine is acting on its own
-  function playCue(name, force) {
-    if (!soundsEnabled) return;
-    // `force` lets the explicit enable-test cue sound even in background-only
-    // mode while the window is focused.
-    if (soundsAwayOnly && !force && document.hasFocus()) return;
-    const ctx = ensureAudioCtx();
-    if (!ctx) return;
-    if (ctx.state === "suspended") ctx.resume().catch(() => {});
+  function scheduleCue(ctx, name) {
     const t = ctx.currentTime + 0.01;
     if (name === "done") {
       // Turn finished OK — two rising sine notes.
@@ -510,16 +616,10 @@
     }
   }
 
-  // Per-tool ticks can arrive in bursts — parallel tool calls fire several
-  // within a few ms, and the overflow-recovery path can replay a run's whole
-  // history through this stream. Throttle so a burst collapses to a single
-  // audible tick rather than a machine-gun.
-  const TOOL_CUE_MIN_GAP_MS = 200;
-  let lastToolCueAt = 0;
+  // Per-tool ticks arrive in bursts when parallel tool calls fire several
+  // within a few ms. playCue's burst rule folds those into one tick, and a
+  // reconnect's replayed backlog plays none.
   function playToolCue() {
-    const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
-    if (now - lastToolCueAt < TOOL_CUE_MIN_GAP_MS) return;
-    lastToolCueAt = now;
     playCue("tool");
   }
 
@@ -1406,8 +1506,12 @@
   // down: refreshSessions() reads it during the boot refresh immediately below,
   // which runs before that block is evaluated, and a `let` still in its
   // temporal dead zone throws instead of reading as undefined. That threw away
-  // the boot refresh entirely, silently.
+  // the boot refresh entirely, silently. Same for the two below.
   let searchActive = false;
+  // Which /api/sessions answer may still draw the list (only the newest),
+  // and when the list was last asked for.
+  let sessionsFetchSeq = 0;
+  let sessionsFetchedAt = 0;
 
   // Always refresh the sidebar from /api/sessions on load — the server-rendered
   // list can be stale if the HTML was cached or another tab created sessions.
@@ -1616,11 +1720,13 @@
   toggleBtn.addEventListener("click", () => {
     if (NARROW.matches && sessionsSheet) {
       sessionsSheet.open();
+      refreshSessions();
       return;
     }
     const willCollapse = !document.body.classList.contains("sidebar-collapsed");
     applySidebar(willCollapse);
     safeSet(localStorage, SIDEBAR_KEY, willCollapse ? "1" : "0");
+    if (!willCollapse) refreshSessions();
   });
   if (menuBtn && menuSheet) {
     menuBtn.addEventListener("click", () => menuSheet.open());
@@ -1629,9 +1735,10 @@
   // where the panel lives in a sheet. Open the sheet instead of sending focus
   // nowhere.
   const skipToSessions = document.querySelector('.skip[href="#sessions-heading"]');
-  if (skipToSessions && sessionsSheet) {
+  if (skipToSessions) {
     skipToSessions.addEventListener("click", (e) => {
-      if (!NARROW.matches) return;
+      refreshSessions();
+      if (!NARROW.matches || !sessionsSheet) return;
       e.preventDefault();
       sessionsSheet.open();
     });
@@ -1645,6 +1752,31 @@
     applySidebar(NARROW.matches || saved === "1");
     syncSessionsTrigger();
   });
+
+  // The list used to be fetched only when the page loaded and when a turn in
+  // this tab ended, so a chat started in another tab, on the phone or from a
+  // terminal stayed missing until a reload (Matt, 2026-11-14). Opening the
+  // list fetches it again (above); so does coming back to the tab or the
+  // window, and a check once a minute while the list is on screen.
+  const SESSIONS_POLL_MS = 60_000;
+  const SESSIONS_RECHECK_MIN_MS = 5_000;
+
+  function sessionListOnScreen() {
+    if (NARROW.matches) return !!(sessionsSheet && sessionsSheet.isOpen());
+    return !document.body.classList.contains("sidebar-collapsed");
+  }
+
+  function refreshSessionsOnReturn() {
+    if (document.visibilityState !== "visible" || !sessionListOnScreen()) return;
+    if (Date.now() - sessionsFetchedAt < SESSIONS_RECHECK_MIN_MS) return;
+    refreshSessions({ background: true });
+  }
+  document.addEventListener("visibilitychange", refreshSessionsOnReturn);
+  window.addEventListener("focus", refreshSessionsOnReturn);
+  setInterval(() => {
+    if (document.visibilityState !== "visible" || !sessionListOnScreen()) return;
+    refreshSessions({ background: true });
+  }, SESSIONS_POLL_MS);
 
   // Enter to send, Shift+Enter for newline. A submit while a turn is still
   // streaming is absorbed by the queue path in the form handler (it doesn't
@@ -1840,6 +1972,7 @@
     // Switching sessions: any prior run's dedup state belongs to a different
     // conversation now and shouldn't influence rendering of the new one.
     renderedIdxByRun.clear();
+    quietBelowByRun.clear();
     // The panel tool's "sent to the panel" note is skipped: the panel's
     // answer follows as a panel_result.
     let skipPanelAck = false;
@@ -2512,6 +2645,7 @@
     // a Map entry per chat. Run ids are random UUIDs, so once a chat is
     // closed the entry is just dead weight.
     renderedIdxByRun.clear();
+    quietBelowByRun.clear();
     // Drop every piece of "previous turn" state. Without this the next
     // submit either tries sendInExistingRun against the dead run-id
     // (404 + retry round-trip) or shows the old context-meter fill, and
@@ -3225,13 +3359,16 @@
     }
   }
 
-  async function drainStream(response, gen) {
+  async function drainStream(response, gen, opts) {
     // Mutable holder so handleSSEEvent can lazy-create a new assistant
     // article each time text follows a tool call — keeps DOM order matching
     // chronological order. ctx.runId is set when run_started arrives so
     // dedup keys to the stream's own run rather than the global currentRunId
     // (which can change mid-stream during stall-recovery handovers).
-    const ctx = { currentAssistantBody: null, runId: null, gen };
+    // ctx.quietBelow: events below this _idx are a reconnect's backlog and
+    // render without sounds (see tryResume).
+    const quietBelow = opts && typeof opts.quietBelow === "number" ? opts.quietBelow : null;
+    const ctx = { currentAssistantBody: null, runId: null, gen, quietBelow };
     const reader = response.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -3470,6 +3607,20 @@
       clearPermQueue();
       renderedIdxByRun.delete(savedRunId);
     }
+    // What the run sent before this reconnect is history: it renders without
+    // its sounds, or a phone unlocked mid-turn played every cue it had missed
+    // at once. Read the gap before the new stream refreshes the network
+    // clock. A reconnect after a short blip still sounds what it missed (the
+    // burst rule in playCue keeps that to a cue or two), so a dropped
+    // connection can't swallow the end-of-turn chime. The boundary is kept per run, so
+    // the later rounds of a backlog too big for one stream stay quiet too.
+    const shortGap = incremental
+      && Date.now() - lastNetworkActivityAt < CATCH_UP_SOUNDS_GAP_MS;
+    let quietBelow = quietBelowByRun.get(savedRunId);
+    if (!shortGap && typeof info.next_idx === "number") {
+      quietBelow = Math.max(quietBelow || 0, info.next_idx);
+      quietBelowByRun.set(savedRunId, quietBelow);
+    }
     const gen = ++streamGeneration;
     const myAbort = new AbortController();
     currentRunId = savedRunId;
@@ -3495,7 +3646,7 @@
         + (incremental ? `?start_index=${wm + 1}` : "");
       const r = await fetch(streamUrl, { signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      await drainStream(r, gen);
+      await drainStream(r, gen, { quietBelow });
     } catch (err) {
       if (err.name === "AbortError") {
         if (gen === streamGeneration) {
@@ -3674,6 +3825,22 @@
       }
     }
 
+    cuesForCatchUp = isCatchUpEvent(obj, ctx);
+    try {
+      dispatchSSEEvent(obj, ctx);
+    } finally {
+      cuesForCatchUp = false;
+    }
+  }
+
+  // An event the run sent before this stream's reconnect: part of the backlog
+  // the page is catching up on, not something happening now.
+  function isCatchUpEvent(obj, ctx) {
+    if (!ctx || typeof ctx.quietBelow !== "number") return false;
+    return typeof obj._idx === "number" && obj._idx < ctx.quietBelow;
+  }
+
+  function dispatchSSEEvent(obj, ctx) {
     if (obj.type === "run_started") {
       // Save the run-id so a reload can rejoin via /api/chat/stream/{id}.
       if (obj.run_id) {
@@ -6632,75 +6799,158 @@
     opts = opts || {};
     sessionList.innerHTML = "";
     for (const s of list) {
-      const li = document.createElement("li");
-      li.dataset.project = s.project || "";
-      const a = document.createElement("a");
-      const url = new URL(location.origin + "/");
-      url.searchParams.set("session", s.id);
-      if (s.project) url.searchParams.set("project", s.project);
-      a.href = url.pathname + url.search;
-      a.dataset.session = s.id;
-      a.dataset.project = s.project || "";
-      a.dataset.mtime = s.mtime;
-      const title = document.createElement("span");
-      title.className = "session-title";
-      title.textContent = s.title;
-      a.appendChild(title);
-      if (opts.snippet && s.snippet) {
-        const snip = document.createElement("span");
-        snip.className = "session-snippet";
-        snip.textContent = s.snippet;
-        a.appendChild(snip);
-      }
-      const meta = document.createElement("span");
-      meta.className = "session-meta";
-      const time = document.createElement("time");
-      time.className = "session-time";
-      time.setAttribute("datetime", s.mtime);
-      time.textContent = formatTime(s.mtime);
-      meta.appendChild(time);
-      if (s.provider && s.provider !== "claude") {
-        const prov = document.createElement("span");
-        prov.className = "session-provider";
-        prov.textContent = assistantLabel(s.provider);
-        meta.appendChild(prov);
-      }
-      if (s.project_path || s.project) {
-        const proj = document.createElement("span");
-        proj.className = "session-project";
-        const path = s.project_path || (s.project || "").replace(/-/g, "/");
-        proj.textContent = path.split("/").filter(Boolean).pop() || path;
-        meta.appendChild(proj);
-      }
-      a.appendChild(meta);
-      li.appendChild(a);
-      const exp = document.createElement("button");
-      exp.type = "button";
-      exp.className = "session-export";
-      exp.textContent = "↗";
-      exp.title = "Copy as Markdown";
-      exp.setAttribute("aria-label", `Copy session as Markdown: ${s.title}`);
-      exp.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        exportSession(s.id, s.project || "", s.title);
-      });
-      li.appendChild(exp);
-      const del = document.createElement("button");
-      del.type = "button";
-      del.className = "session-delete";
-      del.textContent = "×";
-      del.setAttribute("aria-label", `Delete session: ${s.title}`);
-      del.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        deleteSession(s.id, s.project || "", s.title, li);
-      });
-      li.appendChild(del);
-      sessionList.appendChild(li);
+      sessionList.appendChild(buildSessionRow(s, opts));
     }
     markActive(sessionId);
     updatePageTitle();
+  }
+
+  // What a row shows apart from its age. A row whose key is unchanged is kept
+  // as it is on a refresh; any other change rebuilds it.
+  function sessionRowKey(s, opts) {
+    const snippet = opts && opts.snippet ? (s.snippet || "") : "";
+    return [s.title, s.project || "", s.project_path || "", s.provider || "", snippet].join("\u0001");
+  }
+
+  function buildSessionRow(s, opts) {
+    opts = opts || {};
+    const li = document.createElement("li");
+    li.dataset.project = s.project || "";
+    li.dataset.session = s.id;
+    li.dataset.rowKey = sessionRowKey(s, opts);
+    const a = document.createElement("a");
+    const url = new URL(location.origin + "/");
+    url.searchParams.set("session", s.id);
+    if (s.project) url.searchParams.set("project", s.project);
+    a.href = url.pathname + url.search;
+    a.dataset.session = s.id;
+    a.dataset.project = s.project || "";
+    a.dataset.mtime = s.mtime;
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = s.title;
+    a.appendChild(title);
+    if (opts.snippet && s.snippet) {
+      const snip = document.createElement("span");
+      snip.className = "session-snippet";
+      snip.textContent = s.snippet;
+      a.appendChild(snip);
+    }
+    const meta = document.createElement("span");
+    meta.className = "session-meta";
+    const time = document.createElement("time");
+    time.className = "session-time";
+    time.setAttribute("datetime", s.mtime);
+    time.textContent = formatTime(s.mtime);
+    meta.appendChild(time);
+    if (s.provider && s.provider !== "claude") {
+      const prov = document.createElement("span");
+      prov.className = "session-provider";
+      prov.textContent = assistantLabel(s.provider);
+      meta.appendChild(prov);
+    }
+    if (s.project_path || s.project) {
+      const proj = document.createElement("span");
+      proj.className = "session-project";
+      const path = s.project_path || (s.project || "").replace(/-/g, "/");
+      proj.textContent = path.split("/").filter(Boolean).pop() || path;
+      meta.appendChild(proj);
+    }
+    a.appendChild(meta);
+    li.appendChild(a);
+    const exp = document.createElement("button");
+    exp.type = "button";
+    exp.className = "session-export";
+    exp.textContent = "↗";
+    exp.title = "Copy as Markdown";
+    exp.setAttribute("aria-label", `Copy session as Markdown: ${s.title}`);
+    exp.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      exportSession(s.id, s.project || "", s.title);
+    });
+    li.appendChild(exp);
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "session-delete";
+    del.textContent = "×";
+    del.setAttribute("aria-label", `Delete session: ${s.title}`);
+    del.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      deleteSession(s.id, s.project || "", s.title, li);
+    });
+    li.appendChild(del);
+    return li;
+  }
+
+  // Bring the list up to date in place. A row whose chat looks the same stays
+  // the same element and only has its age retold, so keyboard focus and a
+  // screen reader's place in the list survive a refresh; the old full rebuild
+  // threw both away every time a turn ended. New chats are added, changed
+  // ones rebuilt, the order follows the server's, and the rest go.
+  function updateSessionList(list) {
+    if (!Array.isArray(list)) return;
+    const focused = focusedSessionControl();
+    const reusable = new Map();
+    for (const li of sessionList.children) {
+      if (li.dataset.session && li.dataset.rowKey) reusable.set(li.dataset.session, li);
+    }
+    let previous = null;
+    for (const s of list) {
+      let li = reusable.get(s.id);
+      if (li && li.dataset.rowKey === sessionRowKey(s)) {
+        reusable.delete(s.id);
+        retellSessionAge(li, s);
+      } else {
+        li = buildSessionRow(s);
+      }
+      // Each wanted row goes straight after the one before it, so everything
+      // left behind after the last one is no longer in the list.
+      const expected = previous ? previous.nextSibling : sessionList.firstChild;
+      if (li !== expected) sessionList.insertBefore(li, expected);
+      previous = li;
+    }
+    let leftover = previous ? previous.nextSibling : sessionList.firstChild;
+    while (leftover) {
+      const next = leftover.nextSibling;
+      leftover.remove();
+      leftover = next;
+    }
+    restoreSessionFocus(focused);
+    markActive(sessionId);
+    updatePageTitle();
+  }
+
+  function retellSessionAge(li, s) {
+    const link = li.querySelector("a");
+    if (link) link.dataset.mtime = s.mtime;
+    const time = li.querySelector("time.session-time");
+    if (!time) return;
+    time.setAttribute("datetime", s.mtime);
+    const label = formatTime(s.mtime);
+    if (time.textContent !== label) time.textContent = label;
+  }
+
+  // The list control that has keyboard focus, so a refresh that has to move
+  // or rebuild its row can put focus back on the same control.
+  function focusedSessionControl() {
+    const active = document.activeElement;
+    if (!active || !sessionList.contains(active)) return null;
+    const li = active.closest("li");
+    if (!li || !li.dataset.session) return null;
+    let part = "a";
+    if (active.classList.contains("session-export")) part = ".session-export";
+    if (active.classList.contains("session-delete")) part = ".session-delete";
+    return { id: li.dataset.session, part, element: active };
+  }
+
+  function restoreSessionFocus(focused) {
+    if (!focused) return;
+    if (focused.element.isConnected && document.activeElement === focused.element) return;
+    const li = [...sessionList.children].find((row) => row.dataset.session === focused.id);
+    const target = li && li.querySelector(focused.part);
+    if (target) target.focus({ preventScroll: true });
   }
 
   async function exportSession(id, project, title) {
@@ -6740,15 +6990,32 @@
     }
   }
 
-  async function refreshSessions() {
+  // Fetch the list again and bring it up to date. The server builds it fresh
+  // from the chat files on every request. `background` marks a refresh
+  // nobody asked for (the timer, coming back to the tab): it leaves the list
+  // alone while keyboard focus is in it, so the row under the focus can't
+  // change while someone is reading it.
+  async function refreshSessions(opts) {
+    const background = !!(opts && opts.background);
     if (searchActive) return;
+    if (background && sessionListInUse()) return;
+    const seq = ++sessionsFetchSeq;
+    sessionsFetchedAt = Date.now();
     try {
       const r = await fetch("/api/sessions");
       if (!r.ok) return;
       const list = await r.json();
-      renderSessionList(list);
+      // A newer fetch, or a search, owns the list now.
+      if (seq !== sessionsFetchSeq || searchActive) return;
+      if (background && sessionListInUse()) return;
+      updateSessionList(list);
       filterSessions();
     } catch { /* ignore */ }
+  }
+
+  function sessionListInUse() {
+    const active = document.activeElement;
+    return !!(active && sessionList.contains(active));
   }
 
   async function deleteSession(id, project, title, li) {
