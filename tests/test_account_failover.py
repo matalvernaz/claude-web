@@ -1181,3 +1181,177 @@ def test_follow_up_does_not_respawn_a_default_run_onto_the_same_refusal(
     assert app_module._denied_families("shared") == {"fable"}
     r = _send(client, run, "shared")
     assert r.status_code == 202, r.text
+
+
+# ─── a used-up model allowance is about one model, not the plan ───────────
+#
+# Hit 2026-11-14: a Fable turn on Office came back "You've hit your Fable limit
+# · resets Nov 19", and the CLI headed its rate-limit reading with that
+# allowance (rejected, rateLimitType seven_day_overage_included, the CLI's own
+# "Fable limit"). Read as a spent plan, it benched Office for every model until
+# Nov 19, and at 11:45 the next Opus pick on Office went to Shared as "plan
+# limit" while Office's own five-hour window stood at 31% and its week at 66%.
+
+
+def _allowance_refusal(*, five_hour: str = "allowed", five_hour_resets_in: float = 4 * 3600,
+                       windows: bool = True) -> dict:
+    """Office's reading after the refusal, as captured on 2026-11-14 07:17."""
+    now = time.time()
+    info = {
+        "status": "rejected",
+        "resetsAt": int(now + 4.5 * 86400),
+        "rateLimitType": "seven_day_overage_included",
+        "overageStatus": "rejected",
+        "overageDisabledReason": "out_of_credits",
+        "isUsingOverage": False,
+    }
+    if windows:
+        info["unifiedWindows"] = {
+            "five_hour": {
+                "utilization": 1.51 if five_hour == "rejected" else 0.31,
+                "resetsAt": int(now + five_hour_resets_in),
+                "status": five_hour,
+            },
+            "seven_day": {
+                "utilization": 0.66, "resetsAt": int(now + 4.5 * 86400),
+                "status": "allowed",
+            },
+            "seven_day_overage_included": {
+                "utilization": 1.03, "resetsAt": int(now + 4.5 * 86400),
+                "status": "rejected", "surpassedThreshold": 1,
+            },
+        }
+    return info
+
+
+# The three wordings in the transcripts (2026-11-13 and 11-14). The last one
+# came while the five-hour window was spent too, so switching models would not
+# have helped and the CLI left the advice out.
+_FABLE_LIMIT_TEXT = (
+    "You've hit your Fable limit · resets Nov 19, 12am (America/Vancouver). "
+    "Switch to another model to continue."
+)
+_FABLE_LIMIT_CREDITS_TEXT = (
+    "You've hit your Fable limit · resets Nov 18, 8am (America/Vancouver). Switch to "
+    "another model, or manage usage credits at "
+    "https://claude.ai/settings/usage?from=cc_cli_limit_message, to continue."
+)
+_FABLE_LIMIT_BARE_TEXT = "You've hit your Fable limit · resets Nov 18, 4pm (America/Vancouver)"
+
+
+def test_model_allowance_refusal_is_not_a_spent_plan_window() -> None:
+    _write_rate_limit("fresh", _allowance_refusal())
+    assert app_module._slot_health_rank("fresh") == app_module._HEALTH_FREE
+    _write_rate_limit("old", _allowance_refusal(), age_seconds=4.5 * 3600)
+    assert app_module._slot_health_rank("old") == app_module._HEALTH_UNKNOWN
+
+
+def test_allowance_refusal_with_a_spent_plan_window_still_benches_the_slot() -> None:
+    """Personal on 2026-11-13: the Fable limit headed the reading, but its
+    five-hour window was spent too. That window benches the slot, and only
+    until its own reset, not the Fable allowance's days later."""
+    _write_rate_limit("a", _allowance_refusal(five_hour="rejected"))
+    assert app_module._slot_health_rank("a") == app_module._HEALTH_SPENT
+    _write_rate_limit("b", _allowance_refusal(five_hour="rejected", five_hour_resets_in=-600),
+                      age_seconds=3600)
+    assert app_module._slot_health_rank("b") == app_module._HEALTH_UNKNOWN
+
+
+def test_allowance_refusal_without_plan_windows_reads_unknown() -> None:
+    """Nothing in the reading says how the plan stands: no evidence either way."""
+    _write_rate_limit("a", _allowance_refusal(windows=False))
+    assert app_module._slot_health_rank("a") == app_module._HEALTH_UNKNOWN
+
+
+def test_opus_pick_stays_on_a_slot_whose_fable_allowance_ran_out(slots) -> None:
+    """The bug as hit at 11:45 on 2026-11-14 (reading four and a half hours old)."""
+    _enable([slots["office"], slots["alex"]])
+    _write_rate_limit(slots["office"], _allowance_refusal(), age_seconds=4.5 * 3600)
+    _write_rate_limit(slots["alex"], _healthy_window())
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["office"], "opus",
+    )
+    assert chosen == slots["office"]
+    assert sub is None
+
+
+def test_allowance_refusal_bars_only_the_family_that_ran(slots, quiet_results) -> None:
+    """Office's turn was a Default pick that resumed Fable, as on 2026-11-14."""
+    _enable([slots["office"], slots["alex"]])
+    rli = _allowance_refusal()
+    _write_rate_limit(slots["office"], rli)
+    _write_rate_limit(slots["alex"], _healthy_window())
+    run = _turn_on(slots["office"], live_model=None, init_model="claude-fable-5-2",
+                   rli=rli, model_key=None)
+    app_module._sdk_message_to_events(_refused_turn(_FABLE_LIMIT_TEXT), run)
+    assert app_module._denied_families(slots["office"]) == {"fable"}
+    # Until the allowance resets, which here is sooner than the denial TTL.
+    expires = app_module._entitlement_cache()["denied"][slots["office"]]["fable"]
+    assert expires == rli["resetsAt"]
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["office"], "fable",
+    )
+    assert chosen == slots["alex"]
+    chosen, sub = app_module._select_account_slot(
+        {"sub": SUB}, slots["office"], "opus",
+    )
+    assert chosen == slots["office"]
+    assert sub is None
+
+
+@pytest.mark.parametrize("text", [_FABLE_LIMIT_CREDITS_TEXT, _FABLE_LIMIT_BARE_TEXT])
+def test_every_measured_fable_limit_wording_bars_the_family(
+    slots, quiet_results, text,
+) -> None:
+    rli = _allowance_refusal()
+    run = _turn_on(slots["personal"], live_model="fable", rli=rli)
+    app_module._sdk_message_to_events(_refused_turn(text), run)
+    assert app_module._denied_families(slots["personal"]) == {"fable"}
+
+
+@pytest.mark.parametrize("text,info,live_model", [
+    # A turn on another model that names the Fable limit (an advisor consult,
+    # say) must not bar the model it ran on.
+    (_FABLE_LIMIT_TEXT, "allowance", "opus"),
+    ("Something nobody has seen before.", "allowance", "fable"),
+    ("", "allowance", "fable"),
+    # The right words with a reading headed by a plan window.
+    (_FABLE_LIMIT_TEXT, "plan", "fable"),
+    (_FABLE_LIMIT_TEXT, None, "fable"),
+    # The model that ran is unknown: never fall back to the picker's.
+    (_FABLE_LIMIT_TEXT, "allowance", None),
+])
+def test_unrecognised_allowance_refusals_record_nothing(
+    slots, quiet_results, text, info, live_model,
+) -> None:
+    rli = {"allowance": _allowance_refusal(), "plan": _spent_window(), None: None}[info]
+    run = _turn_on(slots["personal"], live_model=live_model, rli=rli, model_key="fable")
+    app_module._sdk_message_to_events(_refused_turn(text), run)
+    assert app_module._denied_families(slots["personal"]) == set()
+
+
+def test_follow_up_keeps_an_opus_run_after_a_fable_allowance_refusal(
+    client, alex_slot,
+) -> None:
+    _write_rate_limit("shared", _allowance_refusal())
+    app_module._note_model_denial("shared", "claude-fable-5-1")
+    run = _live_run("shared")
+    run.model = "opus"
+    r = _send(client, run, "shared")
+    assert r.status_code == 202, r.text
+    assert run.accepting_input is True
+
+
+def test_follow_up_moves_a_fable_run_off_after_its_allowance_refusal(
+    client, alex_slot, quiet_results,
+) -> None:
+    """The move the slot-wide "spent" used to make for this case survives."""
+    rli = _allowance_refusal()
+    _write_rate_limit("shared", rli)
+    run = _live_run("shared")
+    run.live_sdk_model = "claude-fable-5-1"
+    run.rate_limit_info = rli
+    app_module._sdk_message_to_events(_refused_turn(_FABLE_LIMIT_TEXT), run)
+    r = _send(client, run, "shared")
+    assert r.status_code == 409
+    assert r.json()["error"] == "account_changed"

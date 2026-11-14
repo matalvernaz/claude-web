@@ -17906,6 +17906,11 @@ def _sdk_message_to_events(msg, run: Optional["ActiveRun"] = None) -> list[dict]
                 # for the model the turn ran on. Bar that family alone, so the
                 # ranker moves Fable off the slot and leaves Opus on it.
                 _note_credits_refusal(run, slot)
+            elif run is not None and _is_model_allowance_refusal(
+                    run.rate_limit_info, _run_model_family(run), msg.result or ""):
+                # The model's own weekly allowance is used up, not the plan.
+                # Same bar, until the allowance resets.
+                _note_credits_refusal(run, slot, "model allowance refusal")
             # Plan window spent mid-turn. The turn is already lost; point at an
             # account that could carry the retry instead of leaving the user to
             # work out which of their slots still has room.
@@ -18345,17 +18350,48 @@ def _is_model_credits_refusal(rli: Optional[dict], text: str) -> bool:
     return _MODEL_CREDITS_REFUSAL_PHRASE in " ".join((text or "").casefold().split())
 
 
-def _note_credits_refusal(run: "ActiveRun", slot: str) -> None:
-    """Bar the model family ``run`` was refused on ``slot``, until its credits reset.
+def _is_model_allowance_refusal(rli: Optional[dict], family: str, text: str) -> bool:
+    """True when a 429 turn was turned away by one model's weekly allowance.
 
-    The family comes from the model the CLI actually ran, never from the
-    picker: a Default pick sends no --model, and on 2026-10-11 a resumed chat
-    on Default was still running Fable when it was refused. An unknown model
-    records nothing. The bar lasts until the refusal's ``resetsAt`` (the
-    credits period), at most the usual denial TTL so a top-up isn't ignored
-    for weeks.
+    Needs the reading the CLI sent with the refusal (rejected, headed by the
+    allowance window) and the result text naming that limit as the family the
+    turn ran on: "You've hit your Fable limit · resets Nov 19, 12am …" (three
+    wordings seen on 2026-11-13 and 11-14, all opening that way; the advice to
+    switch models is left out when another limit is spent too). Tying the text
+    to the model that ran means a turn on another model that names the Fable
+    limit bars nothing. Unfamiliar wording records nothing.
     """
-    family = _normalize_family(run.live_sdk_model or run.init_model or "")
+    if not family or not isinstance(rli, dict):
+        return False
+    if rli.get("status") != "rejected":
+        return False
+    if rli.get("rateLimitType") != _MODEL_ALLOWANCE_RATE_LIMIT_TYPE:
+        return False
+    return f"your {family} limit" in " ".join((text or "").casefold().split())
+
+
+def _run_model_family(run: "ActiveRun") -> str:
+    """Family of the model the CLI actually ran, or ``""`` when unknown.
+
+    Never the picker's: a Default pick sends no --model, and on 2026-10-11 a
+    resumed chat on Default was still running Fable when it was refused.
+    """
+    return _normalize_family(run.live_sdk_model or run.init_model or "")
+
+
+def _note_credits_refusal(
+    run: "ActiveRun", slot: str, what: str = "usage-credits refusal",
+) -> None:
+    """Bar the model family ``run`` was refused on ``slot``, until the refusal resets.
+
+    Serves both refusals of one model: out of usage credits, and a used-up
+    weekly allowance (the CLI's "Fable limit"). The family comes from the model
+    the CLI actually ran (``_run_model_family``); an unknown model records
+    nothing. The bar lasts until the refusal's ``resetsAt`` (the credits period,
+    or the allowance's week), at most the usual denial TTL so a top-up isn't
+    ignored for weeks.
+    """
+    family = _run_model_family(run)
     if not family:
         return
     now = time.time()
@@ -18364,8 +18400,8 @@ def _note_credits_refusal(run: "ActiveRun", slot: str) -> None:
     if isinstance(resets_at, (int, float)) and now < resets_at < expires:
         expires = resets_at
     _record_denials(slot, {family}, int(expires))
-    log.info("recorded usage-credits refusal slot=%s family=%s until=%d",
-             slot, family, int(expires))
+    log.info("recorded %s slot=%s family=%s until=%d",
+             what, slot, family, int(expires))
 
 
 def _denied_families(slot: str) -> set[str]:
@@ -18463,6 +18499,41 @@ def _reset_pending(resets_at) -> bool:
     return False
 
 
+# The CLI's "Fable limit" (its own name for this window): one model's weekly
+# allowance. When that allowance is what turned a request away, the CLI heads
+# the reading with it (rejected, this type, the allowance's reset days away)
+# while the plan's own windows ride along in ``unifiedWindows``.
+_MODEL_ALLOWANCE_RATE_LIMIT_TYPE = "seven_day_overage_included"
+# The ``unifiedWindows`` entries that meter the plan as a whole.
+_PLAN_WINDOW_KEYS = ("five_hour", "seven_day")
+
+
+def _plan_windows_spent(info: dict) -> Optional[bool]:
+    """Whether the plan windows carried in a reading say the plan is spent.
+
+    True when ``five_hour`` or ``seven_day`` is rejected (or, with no status,
+    at or past full) and its reset is still ahead; False when at least one of
+    them is reported and neither is; None when the reading carries neither.
+    """
+    windows = info.get("unifiedWindows")
+    if not isinstance(windows, dict):
+        return None
+    reported = False
+    for key in _PLAN_WINDOW_KEYS:
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            continue
+        reported = True
+        status = window.get("status")
+        utilization = window.get("utilization")
+        full = status == "rejected" or (
+            status is None and isinstance(utilization, (int, float)) and utilization >= 1
+        )
+        if full and _reset_pending(window.get("resetsAt")):
+            return True
+    return False if reported else None
+
+
 def _slot_health_rank(slot: str) -> int:
     """Rank ``slot`` on plan headroom, from its cached rate-limit window.
 
@@ -18487,11 +18558,24 @@ def _slot_health_rank(slot: str) -> int:
             # a Pro account sent every Opus pick elsewhere). The model itself
             # is barred by _note_credits_refusal.
             return _HEALTH_UNKNOWN
-        # Same distinction the overage gate draws: a spent plan window with
-        # credits behind it is payable, not unusable.
-        if info.get("overageStatus") in ("allowed", "allowed_warning"):
-            return _HEALTH_PAYABLE
-        return _HEALTH_SPENT
+        plan_spent = True
+        if info.get("rateLimitType") == _MODEL_ALLOWANCE_RATE_LIMIT_TYPE:
+            # One model's weekly allowance turned the turn away, not the plan.
+            # Read as spent, it benched the slot for every model until that
+            # allowance reset (2026-11-14: one Fable turn on Office sent the
+            # next Opus pick to Shared while Office's five-hour window stood at
+            # 31% and its week at 66%). The plan is judged by its own windows
+            # in the same reading; the model itself is barred by
+            # _note_credits_refusal.
+            plan_spent = _plan_windows_spent(info)
+            if plan_spent is None:
+                return _HEALTH_UNKNOWN
+        if plan_spent:
+            # Same distinction the overage gate draws: a spent plan window
+            # with credits behind it is payable, not unusable.
+            if info.get("overageStatus") in ("allowed", "allowed_warning"):
+                return _HEALTH_PAYABLE
+            return _HEALTH_SPENT
     captured = entry.get("captured_at")
     if not isinstance(captured, (int, float)):
         return _HEALTH_UNKNOWN

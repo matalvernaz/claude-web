@@ -3933,9 +3933,18 @@
             if (opt.value === obj.account_slot) { acctSuffix = " on " + opt.text; break; }
           }
         }
-        announce(obj.status === "rejected"
-          ? "Plan limit reached" + acctSuffix + ". You'll be asked before any usage credits are spent."
-          : "Approaching your Claude plan limit" + acctSuffix + ".");
+        // The Fable allowance is one model's, not the plan's, and the
+        // usage-credits question never comes for it.
+        const fableOnly = obj.rate_limit_type === "seven_day_overage_included";
+        if (fableOnly) {
+          announce(obj.status === "rejected"
+            ? "Fable limit reached" + acctSuffix + "."
+            : "Approaching your Fable limit" + acctSuffix + ".");
+        } else {
+          announce(obj.status === "rejected"
+            ? "Plan limit reached" + acctSuffix + ". You'll be asked before any usage credits are spent."
+            : "Approaching your Claude plan limit" + acctSuffix + ".");
+        }
       }
     } else if (obj.type === "overage_declined") {
       // Plan limit reached and the user declined to continue on usage credits.
@@ -6502,7 +6511,10 @@
     return ({
       five_hour: "5-hour",
       seven_day: "7-day",
-      seven_day_overage_included: "7-day incl. extra usage",
+      // One model's weekly allowance, which the CLI itself calls the "Fable
+      // limit". Labelled as extra usage, a spent one read as the whole week
+      // gone while the plan still had room.
+      seven_day_overage_included: "7-day Fable",
       seven_day_opus: "7-day Opus",
       seven_day_sonnet: "7-day Sonnet",
     })[key] || String(key || "").replace(/_/g, " ");
