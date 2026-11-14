@@ -1158,7 +1158,7 @@ def test_usage_dialog_shows_plan_windows_from_the_last_message_on_a_token_slot(u
     playwright.expect(rows.nth(0)).to_contain_text("40%")
     playwright.expect(rows.nth(1)).to_contain_text("7-day")
     playwright.expect(rows.nth(1)).to_contain_text("36%")
-    playwright.expect(rows.nth(2)).to_contain_text("7-day incl. extra usage")
+    playwright.expect(rows.nth(2)).to_contain_text("7-day Fable")
     playwright.expect(body).to_contain_text("Extra usage: rejected (out of credits)")
     live = page.locator("#usage-live")
     playwright.expect(live).to_contain_text("plan windows below come from the account's most recent message")
