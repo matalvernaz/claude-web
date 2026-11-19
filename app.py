@@ -76,6 +76,7 @@ import auth
 import claude_cli
 import claude_models
 import codex_provider
+import codex_panel
 import deepseek_provider
 import local_provider
 import conversation_replay
@@ -844,6 +845,7 @@ async def _providers_payload(
             "permission_modes": list(codex_provider.CODEX_PERMISSION_MODES),
             "accounts": True,
             "advisor": False,
+            "panel": _panel_available(),
             # The Usage dialog + header cost are Anthropic plan/cost data
             # (today's spend, plan rate limits, 30-day history) — none of it
             # applies to a codex conversation, and the app-server reports no
@@ -8396,7 +8398,7 @@ def _panel_set_enabled(
 
 def _panel_state_for_run(run: "ActiveRun") -> panel.PanelState:
     """The chat's record; a brand-new chat goes by the browser's checkbox."""
-    if run.provider != "claude" or not _panel_available():
+    if run.provider not in ("claude", "codex") or not _panel_available():
         return panel.PanelState()
     state = _panel_load(run.session_id)
     if state is None:
@@ -8451,7 +8453,7 @@ def _panel_prefix(run: "ActiveRun", message: str) -> str:
     where their words end a yes on Claude's card: things may have moved on
     since, so the next send asks again. A slash command isn't their words.
     """
-    if (run.provider == "claude" and message.strip()
+    if (run.provider in ("claude", "codex") and message.strip()
             and not message.lstrip().startswith("/")):
         _panel_end_grants(run.session_id, run.owner_sub)
     if not _panel_state_for_run(run).enabled:
@@ -8462,7 +8464,8 @@ def _panel_prefix(run: "ActiveRun", message: str) -> str:
     if message.strip():
         run.panel_notes.append(message.strip()[:4000])
         del run.panel_notes[:-10]
-    return panel.user_prefix()
+    prefix = panel.user_prefix()
+    return prefix.replace("; load it with ToolSearch if needed", "") if run.provider == "codex" else prefix
 
 
 def _panel_participants() -> list[str]:
@@ -8489,10 +8492,13 @@ def _panel_deny(reason: str) -> dict:
     }}
 
 
-def _panel_exempt(path: str) -> bool:
-    """Claude's own files (memory, plans, settings) and claude-web's state."""
+def _panel_exempt(path: str, provider: str = "claude") -> bool:
+    """Agent-owned memory/settings and claude-web's state, per provider."""
     resolved = Path(path).resolve()
-    for base in (CLAUDE_HOME, PERSONAL_HOMES_DIR, USAGE_DIR):
+    bases = (CLAUDE_HOME, PERSONAL_HOMES_DIR, USAGE_DIR)
+    if provider == "codex":
+        bases += (codex_provider.codex_home(), CODEX_PERSONAL_HOMES_DIR)
+    for base in bases:
         try:
             resolved.relative_to(Path(base).resolve())
             return True
@@ -8511,7 +8517,7 @@ async def _panel_edit_gate(run: "ActiveRun", inp: dict) -> dict:
         return {}
     if not os.path.isabs(path):
         path = os.path.join(inp.get("cwd") or "", path)
-    if _panel_exempt(path):
+    if _panel_exempt(path, run.provider):
         return {}
     root = await asyncio.to_thread(panel.repo_root, path)
     if root is None:
@@ -8596,6 +8602,41 @@ async def _panel_after_commit(run: "ActiveRun", tool_use_id: Optional[str]) -> N
     state.end_cycle()
     _panel_save(run.session_id, run.owner_sub, state)
     run.emit({"type": "panel_cycle_done", "repos": landed})
+
+
+async def _codex_panel_dispatch(run: "ActiveRun", payload: dict) -> dict:
+    """Adapt Codex's command hooks and MCP tool to the existing panel code."""
+    if payload.get("kind") == "review":
+        text, is_error = await _panel_review_call(run, payload["arguments"])
+        return {"text": text, "is_error": is_error}
+    if payload.get("kind") != "hook":
+        raise ValueError("unknown panel bridge request")
+    inp = payload["input"]
+    if inp.get("session_id") != run.session_id:
+        return codex_panel.deny("This review connection belongs to another chat.")
+    event = inp.get("hook_event_name")
+    tool = inp.get("tool_name")
+    tool_id = str(inp.get("tool_use_id") or "")
+    if event == "PostToolUse":
+        if tool == "Bash":
+            await _panel_after_commit(run, tool_id)
+        return {}
+    if event != "PreToolUse":
+        return {}
+    if tool == "Bash":
+        return await _panel_commit_gate(run, inp, tool_id)
+    if tool == "apply_patch":
+        command = str((inp.get("tool_input") or {}).get("command") or "")
+        # Every affected path matters, including a move's destination.
+        paths = re.findall(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$",
+                           command, re.MULTILINE)
+        for path in paths:
+            result = await _panel_edit_gate(run, {
+                **inp, "tool_input": {"file_path": path},
+            })
+            if result:
+                return result
+    return {}
 
 
 def _panel_hooks_for_run(run: "ActiveRun") -> dict:
@@ -9044,11 +9085,47 @@ async def _panel_deliver(sid: str, origin: "ActiveRun", text: str) -> None:
         )
         if reason is None:
             return
+    _panel_park(sid, origin, text)
+
+
+def _panel_park(sid: str, origin: "ActiveRun", text: str) -> None:
     state = _panel_load(sid) or panel.PanelState(enabled=True)
+    if state.pending_message == text:
+        return
     state.pending_message = text
     _panel_save(sid, origin.owner_sub, state)
     _panel_emit(sid, {"type": "panel_parked"})
     log.info("panel answer parked for session %s: no live chat to deliver to", sid)
+
+
+def _panel_delivery_failed(run: "ActiveRun", text: str) -> bool:
+    """A generated answer must be retained, never handed to the user to resend."""
+    if run.provider == "codex" and run.session_id and text.startswith(panel.MESSAGE_MARKER):
+        answer, separator, _ = text.partition(panel.PARKED_SEPARATOR)
+        _panel_park(run.session_id, run, answer)
+        return not separator
+    return False
+
+
+def _panel_codex_input(run: "ActiveRun", text: str) -> str:
+    """Keep a saved verdict until Codex actually accepts the input carrying it."""
+    if text.startswith(panel.MESSAGE_MARKER):
+        return text
+    state = _panel_load(run.session_id)
+    if state is not None and state.pending_message:
+        return state.pending_message + panel.PARKED_SEPARATOR + text
+    return text
+
+
+def _panel_codex_input_accepted(run: "ActiveRun", text: str) -> None:
+    if not text.startswith(panel.MESSAGE_MARKER):
+        return
+    answer = text.partition(panel.PARKED_SEPARATOR)[0]
+    state = _panel_load(run.session_id)
+    # A newer round may have parked another answer during the RPC await.
+    if state is not None and state.pending_message == answer:
+        state.pending_message = None
+        _panel_save(run.session_id, run.owner_sub, state)
 
 
 def _panel_take_pending(session_id: Optional[str], user_sub: Optional[str]) -> str:
@@ -9573,7 +9650,7 @@ class ActiveRun:
             _bind_session_account(sid, self.owner_sub, self.requested_account_slot)
         # And panel review, when the browser said on or off for this chat
         # before it had a session id.
-        if self.panel_requested is not None and self.provider == "claude":
+        if self.panel_requested is not None and self.provider in ("claude", "codex"):
             _panel_set_enabled(sid, self.owner_sub, self.panel_requested)
         # And its task list, for a chat that is not on the list named after
         # itself: every later start of this session has to name the same one.
@@ -11252,6 +11329,12 @@ def _emit_lost_input(
     client match the event to its "(sending…)" chip and clear it — without it
     the chip stays stuck forever (its only other clearers are user_prompt /
     queued_input_cancelled, neither of which fires for a lost message)."""
+    if _panel_delivery_failed(run, text):
+        return
+    if run.provider == "codex":
+        if text.startswith(panel.MESSAGE_MARKER):
+            text = text.partition(panel.PARKED_SEPARATOR)[2]
+        text = panel.strip_user_prefix(text)
     preview = text[:200] + ("…" if len(text) > 200 else "")
     evt = {
         "type": "error",
@@ -11384,7 +11467,14 @@ async def _await_delivery_quietly(
     """
     try:
         await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
-    except Exception:
+    except Exception as exc:
+        if (isinstance(exc, _DeliveryAlreadyReported) and run.provider == "codex"
+                and text.startswith(panel.MESSAGE_MARKER)):
+            # The driver already parked it synchronously. A new user turn
+            # may have consumed it by now; do not put that old answer back.
+            return
+        if _panel_delivery_failed(run, text):
+            return
         log.warning("silent injection not delivered run=%s text=%r",
                     run.run_id, text[:60])
         run.emit({"type": "error",
@@ -11840,6 +11930,9 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         messages = codex_provider.thread_transcript(
             (resp or {}).get("thread") or {}, TOOL_RESULT_PREVIEW * 4,
         )
+        messages = [entry for m in messages for entry in (
+            _user_turn_entries(m["text"]) if m["role"] == "user" else [m]
+        )]
     except Exception as e:
         log.warning("codex thread/read failed for %s: %s", sid, e)
     finally:
@@ -11866,6 +11959,7 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         # are not in what thread/read returns.
         "tasks": await _session_task_list(sid, None),
         "provider": "codex",
+        "panel": _panel_payload(sid),
         "account_slot": account["slot"],
     }
 
@@ -13849,6 +13943,7 @@ async def _codex_driver(
     # thread/compacted fallback note doesn't double up with a
     # contextCompaction item from the same compaction.
     compact_pending = False
+    first_input_delivered = False
     run_server_key = f"{account['server_key']}:run:{run.run_id}"
 
     def _flush_codex_partial() -> None:
@@ -13892,6 +13987,7 @@ async def _codex_driver(
         return {"decision": await _codex_gate_decision(run, tool, tool_input)}
 
     server: Optional[codex_provider.CodexAppServer] = None
+    panel_bridge: Optional[codex_panel.PanelBridge] = None
     thread_id: Optional[str] = None
     notif_q: Optional[asyncio.Queue] = None
     try:
@@ -13909,6 +14005,15 @@ async def _codex_driver(
                 thread_params["model"] = model_id
             if personality_append:
                 thread_params["developerInstructions"] = personality_append
+            if _panel_available():
+                panel_bridge = codex_panel.PanelBridge(
+                    lambda payload: _codex_panel_dispatch(run, payload),
+                )
+                await panel_bridge.start()
+                thread_params["config"] = await panel_bridge.configuration(server, cwd)
+                thread_params["developerInstructions"] = "\n\n".join(filter(None, (
+                    personality_append, panel.SYSTEM_HINT.replace(" (load it with ToolSearch)", ""),
+                )))
             if resume_thread_id and fork:
                 # thread/fork loads the source rollout and branches it into a
                 # brand-new thread id; the source conversation is untouched.
@@ -13933,6 +14038,8 @@ async def _codex_driver(
             run.emit({"type": "error",
                       "message": "Codex did not report a thread id."})
             return
+        if panel_bridge is not None:
+            await panel_bridge.verify_hooks(server, thread_id)
         notif_q = server.subscribe(thread_id)
         server.set_request_handler(thread_id, _approvals)
         run.client = _CodexRunClient(server, run)
@@ -13969,10 +14076,8 @@ async def _codex_driver(
                     run.emit({"type": "error",
                               "message": f"Codex compaction failed: {e}"})
                 return True
-            input_items = _codex_input_items(text, image_blocks, run.run_id)
             params: dict[str, Any] = {
                 "threadId": thread_id,
-                "input": input_items,
                 # Tracks the live permission mode so a mid-chat switch
                 # (POST /api/chat/permission-mode) applies from this turn on.
                 "approvalPolicy": codex_provider.approval_policy_for_mode(
@@ -13985,7 +14090,10 @@ async def _codex_driver(
             run.codex_turn_done.clear()
             try:
                 async with run.client_write_lock:
+                    effective_text = _panel_codex_input(run, text)
+                    params["input"] = _codex_input_items(effective_text, image_blocks, run.run_id)
                     started = await server.request("turn/start", params)
+                    _panel_codex_input_accepted(run, effective_text)
                     started_turn_id = (
                         ((started or {}).get("turn") or {}).get("id")
                     )
@@ -14026,7 +14134,9 @@ async def _codex_driver(
                           + conversation_replay.HANDOFF_MESSAGE_SEPARATOR
                           + initial_text)
         if not await _start_turn(first_text, initial_images):
+            _panel_delivery_failed(run, first_text)
             return
+        first_input_delivered = True
 
         turn_started_mono = time.monotonic()
         while True:
@@ -14056,6 +14166,8 @@ async def _codex_driver(
                     if t is not None and not t.done():
                         t.cancel()
             if not done:
+                if thread_id in _PANEL_ROUNDS or thread_id in _PANEL_ASKS:
+                    continue
                 if run.between_turns:
                     log.info("codex run %s idle timeout", run.run_id)
                 else:
@@ -14220,6 +14332,11 @@ async def _codex_driver(
                             item.get("text") or "", item.get("image_blocks") or [],
                         )
                         turn_started_mono = time.monotonic()
+                        if not delivered_ok:
+                            _emit_lost_input(run, item.get("text") or "",
+                                             "Codex rejected the turn; send it again", queue_id=qid)
+                            if ack is not None and not ack.done():
+                                ack.set_exception(_DeliveryAlreadyReported("turn start rejected"))
                     else:
                         try:
                             async with run.client_write_lock:
@@ -14242,15 +14359,17 @@ async def _codex_driver(
                                     # TurnSteerParams — omitting it makes the
                                     # app-server reject every mid-turn message
                                     # with -32600 missing field.
+                                    effective_text = _panel_codex_input(run, item.get("text") or "")
                                     await server.request("turn/steer", {
                                         "threadId": thread_id,
                                         "expectedTurnId": run.codex_turn_id,
                                         "input": _codex_input_items(
-                                            item.get("text") or "",
+                                            effective_text,
                                             item.get("image_blocks") or [],
                                             run.run_id,
                                         ),
                                     })
+                                    _panel_codex_input_accepted(run, effective_text)
                         except Exception as e:
                             log.warning("codex steer failed: %s", e)
                             delivered_ok = False
@@ -14276,6 +14395,8 @@ async def _codex_driver(
                        "conversation can be resumed with a new message.",
         })
     finally:
+        if not first_input_delivered:
+            _panel_delivery_failed(run, initial_text)
         run.codex_turn_done.set()
         # The run stays in ACTIVE_RUNS (done=True) so reconnecting clients can
         # replay it; _gc_runs reaps it later. Always terminate this run's
@@ -14295,6 +14416,8 @@ async def _codex_driver(
         except Exception as e:
             log.warning("codex run server close failed for %s: %s", run.run_id, e)
         run.client = None
+        if panel_bridge is not None:
+            await panel_bridge.close()
         run.finish()
         _persist_run_meta(run)
 
@@ -14816,7 +14939,7 @@ async def api_chat(
         if existing is not None:
             _require_owner(existing, user)
             file_metas = await _save_uploaded_files(files, existing.run_id)
-            if (panel_field is not None and existing.provider == "claude"
+            if (panel_field is not None and existing.provider in ("claude", "codex")
                     and existing.session_id and _panel_available()):
                 _panel_set_enabled(existing.session_id, user.get("sub"), panel_field)
             shown = _file_attachment_prefix(file_metas) + message
@@ -14920,7 +15043,7 @@ async def api_chat(
         run.effort = effort
         run.project_key = _sanitize_project_key(cwd)
         run.panel_user_label = _panel_user_label(user)
-        if provider == "claude" and panel_field is not None:
+        if provider in ("claude", "codex") and panel_field is not None:
             run.panel_requested = panel_field
         # Canonical conversation linkage (Slice 0, shadow-only — nothing reads
         # these tables yet). Resuming an already-wrapped native session reuses
@@ -14997,7 +15120,7 @@ async def api_chat(
         # A panel answer that found no live chat rides in front, then the
         # panel instruction when the chat has panel review on.
         (_panel_take_pending(run.session_id, user.get("sub")) if provider == "claude" else "")
-        + (_panel_prefix(run, message) if provider == "claude" else "")
+        + (_panel_prefix(run, message) if provider in ("claude", "codex") else "")
         + _file_attachment_prefix(file_metas) + message
     )
     # First two events: run_id (so a reload can reconnect) and the user's
@@ -16397,7 +16520,7 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         # showed the browser's last local value, which is a lie whenever the
         # run was spawned from another tab or the advisor was toggled there.
         "advisor": run.advisor,
-        "panel": _panel_payload(run.session_id) if run.provider == "claude" else None,
+        "panel": _panel_payload(run.session_id) if run.provider in ("claude", "codex") else None,
         "buffered_events": len(run.events),
         # Turn state + tail index, mirroring the live_run payload in
         # /api/sessions/{sid}. tryResume seeds its streaming UI from
@@ -16849,8 +16972,8 @@ async def api_chat_set_panel(
         raise HTTPException(404, "no such session")
     if not _panel_available():
         raise HTTPException(409, "panel review needs the roundtable, which isn't set up here")
-    if _codex_session_row(sid) is not None or _routed_session_row(sid):
-        raise HTTPException(409, "panel review is only available on Claude")
+    if _routed_session_row(sid):
+        raise HTTPException(409, "panel review is available on Claude and Codex")
     state = _panel_set_enabled(sid, user.get("sub"), _form_flag(enabled))
     live = _existing_run_for_session(sid)
     if live is not None:

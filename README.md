@@ -349,13 +349,13 @@ options control the diff base, working-diff capture, and grounded verification.
 
 #### Panel review
 
-Tick **Panel review** in the chat header (Claude chats, with the roundtable set
-up; not on Windows yet) and other AIs check Claude's work in that chat before it
+Tick **Panel review** in the chat header (Claude or Codex chats, with the roundtable set
+up; not on Windows yet) and other AIs check the agent's work in that chat before it
 lands. The panel is
 the roundtable's coding panel, GPT, Gemini and a second Claude by default, and it
-reads the repository read-only; Claude still makes every change.
+reads the repository read-only; the chat's agent still makes every change.
 
-- Before Claude changes files in a git repository, its plan goes to the panel.
+- Before the agent changes files in a git repository, its plan goes to the panel.
 - Before it commits, the panel reviews the actual diff. Nothing is committed
   until they approve, or you decide. A commit has to run as its own command,
   and has to match exactly what the panel saw; any later edit needs another
@@ -368,7 +368,7 @@ reads the repository read-only; Claude still makes every change.
 - If nobody on the panel can answer (provider down, out of credits), the panel
   steps aside and says so rather than stalling the chat.
 
-With the box unticked, Claude can still ask for the panel when it judges a
+With the box unticked, the agent can still ask for the panel when it judges a
 change big or risky enough to want a second opinion. You get a question first:
 send it, send it and keep panel review on for the chat (plans only), or skip
 it. A yes covers that plan's or those changes' back-and-forth with the panel
@@ -377,7 +377,13 @@ again. Nothing is held back in this mode: the panel's answer is advice, your
 word in the chat settles a disagreement, and there's no question card after
 the last round.
 
-The chat shows Claude's message to the panel, each reviewer's reply and the
+Codex uses the same `mcp__panel__review` tool, evidence contract, and saved
+objections as Claude. Its command hooks check patches and commits even in
+bypass mode. The tool and hooks are connected separately for each active chat;
+no user Codex configuration is rewritten. This requires a Codex CLI with
+`config/read`, `hooks/list`, and command-hook support (verified with 0.170.0).
+
+The chat shows the agent's message to the panel, each reviewer's reply and the
 verdict as their own headed sections, and links to the full roundtable thread.
 Each round costs one call per paid participant. Settings:
 `CLAUDE_WEB_PANEL_PARTICIPANTS` (comma-separated roundtable keys, default the

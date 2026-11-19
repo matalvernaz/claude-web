@@ -1141,7 +1141,7 @@
     });
   }
 
-  // Panel review: shown where the provider has it (Claude, with the roundtable
+  // Panel review: shown where the provider has it (Claude or Codex, with the roundtable
   // set up). ``chatState`` is the open chat's own setting when known; a new
   // chat starts from the last choice made.
   function syncPanelControl(chatState) {
@@ -1166,7 +1166,7 @@
       if (!sessionId) {
         announce(on
           ? "Panel review on. It starts with this chat's first message."
-          : "Panel review off. Claude can still ask you before sending something to the panel.");
+          : "Panel review off. The agent can still ask you before sending something to the panel.");
         return;
       }
       const fd = new FormData();
@@ -1177,7 +1177,7 @@
         if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
         announce(on
           ? "Panel review on for this chat."
-          : "Panel review off for this chat. Claude can still ask you before sending something to the panel.");
+          : "Panel review off for this chat. The agent can still ask you before sending something to the panel.");
       } catch (e) {
         panelToggle.checked = !on;
         announce("Could not change panel review. " + e.message);
@@ -2194,7 +2194,7 @@
 
   function renderPanelSubmission(input) {
     const stage = input.stage === "changes" ? "changes" : "plan";
-    const article = panelArticle(`Claude to the panel: ${stage}`, "panel-submission");
+    const article = panelArticle(`Agent to the panel: ${stage}`, "panel-submission");
     panelMarkdown(article, input.message || "");
     maybeAutoScroll();
   }
@@ -2225,11 +2225,11 @@
       case "more_rounds":
         return "You gave them more rounds. Claude is answering their points.";
       case "stop":
-        return "You told Claude to stop. It'll wait for you.";
+        return "You told the agent to stop. It'll wait for you.";
       case "undecided":
-        return "No decision yet. Claude will wait; tell it what you want.";
+        return "No decision yet. The agent will wait; tell it what you want.";
       case "unresolved":
-        return "They still have objections after the last round. Panel review is off, so it's your call: Claude will tell you what's left.";
+        return "They still have objections after the last round. Panel review is off, so it's your call: the agent will tell you what's left.";
       default:
         return String(obj.outcome || "");
     }

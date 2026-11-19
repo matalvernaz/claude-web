@@ -71,7 +71,7 @@ PARTICIPANTS = [
 SERVER_NAME = "panel"
 TOOL_NAME = f"mcp__{SERVER_NAME}__review"
 STAGES = ("plan", "changes")
-AUTHOR = "Claude (author)"
+AUTHOR = "Coding agent (author)"
 # Every message the panel sends Claude starts with this, so a reopened chat
 # can show it as the panel's answer rather than as something the user typed.
 MESSAGE_MARKER = "[Review panel]"
@@ -743,7 +743,7 @@ def ask_card(stage: str, repo_name: str, reason: str, again: bool) -> list[dict]
         })
     options.append({
         "label": ASK_SKIP,
-        "description": "Nothing is sent. Claude carries on without the panel.",
+        "description": "Nothing is sent. The agent carries on without the panel.",
     })
     return [{"question": question, "header": "Panel", "multiSelect": False,
              "options": options}]
@@ -978,7 +978,7 @@ def decision_card(stage: str, rounds: int, max_rounds: int) -> list[dict]:
     what = "plan" if stage == "plan" else "changes"
     return [{
         "question": (
-            f"The panel still has objections to Claude's {what} after {rounds} "
+            f"The panel still has objections to the agent's {what} after {rounds} "
             f"round{'s' if rounds != 1 else ''}. What now?"
         ),
         "header": "Panel",
@@ -986,14 +986,14 @@ def decision_card(stage: str, rounds: int, max_rounds: int) -> list[dict]:
         "options": [
             {"label": "Go ahead anyway",
              "description": (
-                 "Treat it as approved: Claude makes the changes."
+                 "Treat it as approved: the agent makes the changes."
                  if stage == "plan" else
-                 "Treat it as approved: Claude commits these changes."
+                 "Treat it as approved: the agent commits these changes."
              )},
             {"label": "Keep discussing",
              "description": f"Give them up to {max_rounds} more rounds."},
             {"label": "Stop",
-             "description": "Claude stops here and waits for you."},
+             "description": "The agent stops here and waits for you."},
         ],
     }]
 

@@ -158,6 +158,7 @@ REQUIRED_PROTOCOL: dict[str, tuple[str, ...]] = {
         "model/list", "thread/start", "thread/resume", "thread/read",
         "thread/fork", "thread/delete", "thread/compact/start",
         "thread/unsubscribe", "turn/start", "turn/steer", "turn/interrupt",
+        "config/read", "hooks/list",
     ),
     "ServerRequest": (
         "item/commandExecution/requestApproval",
@@ -983,12 +984,14 @@ def item_events(item: dict, *, completed: bool, session_id: Optional[str],
                 "input": item.get("arguments") if isinstance(
                     item.get("arguments"), dict) else {},
             }], session_id)]
-        failed = item.get("status") == "failed"
-        return [_tool_result_event(
-            item_id, json.dumps(item.get("result"))[:preview_cap]
-            if item.get("result") is not None else "done",
-            failed, preview_cap,
-        )]
+        result = item.get("result")
+        failed = item.get("status") == "failed" or bool(
+            isinstance(result, dict) and result.get("isError"))
+        texts = [c["text"] for c in result.get("content", [])
+                 if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str)
+                 ] if isinstance(result, dict) else []
+        output = "\n".join(texts) if texts else json.dumps(result) if result is not None else "done"
+        return [_tool_result_event(item_id, output, failed, preview_cap)]
 
     if itype == "dynamicToolCall":
         # Built-in tools codex resolves at runtime. Same shape family as
@@ -1274,6 +1277,7 @@ def thread_transcript(thread: dict, preview_cap: int) -> list[dict]:
                             "role": "tool_result",
                             "tool_use_id": blk.get("tool_use_id"),
                             "content": blk.get("content"),
+                            "text": blk.get("content"),
                             "is_error": blk.get("is_error"),
                         })
                     elif blk.get("type") == "text" and blk.get("text"):

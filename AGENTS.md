@@ -311,6 +311,30 @@ A per-chat switch that makes the chat's Claude get the roundtable's coding panel
 
 ### Codex provider (OpenAI)
 
+Codex panel review uses `codex_panel.py`: a private, mode-700 temporary
+directory holds a Unix socket for each active run. A stdio MCP server exposes
+the existing `mcp__panel__review` tool, including on resumed/forked threads;
+command hooks adapt Bash and apply_patch into the shared panel gates. Do not
+gate only through approval requests: bypass mode and cached approvals skip
+them. Hook sources accumulate: add only our definitions in session flags,
+never copy user/project definitions there or they run twice. Preserve the
+effective hook trust state from `config/read` when adding trust for our hooks.
+An ephemeral thread discovers the generated hook hashes with `hooks/list`;
+trust only those exact session-flag hooks in the real thread's config overrides,
+and check they are enabled and trusted before starting a turn. Never bypass
+hook trust globally or rewrite an account's config. Close active socket
+handlers before awaiting server shutdown (Python 3.13 waits for connections).
+Panel rounds and off-mode question cards keep the Codex driver alive. Reopen
+splits panel messages and user prefixes with the same parser as Claude.
+Codex pending answers stay in the database until `turn/start` or `turn/steer`
+accepts them. Attach them under the driver's write lock, never when an HTTP
+request queues user input; recalls and full queues must leave them intact.
+Clear only the accepted answer, so a newer round's pending answer survives.
+`CLAUDE_WEB_TEST_CODEX_CLI=1` enables the installed-CLI contracts in
+`tests/test_codex_panel.py`, including scripted loopback model responses with
+no cloud calls. The normal suite exercises IPC/MCP and both providers' shared
+round/gate behavior without requiring a CLI.
+
 Codex also emits nonblocking questions in `agentMessage.questions` (title + string
 options), independently of `item/tool/requestUserInput`. Preserve these as
 `async_question` events and transcript rows. Their answers use ordinary user input

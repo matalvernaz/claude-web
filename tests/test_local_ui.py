@@ -1348,7 +1348,7 @@ def test_panel_review_rides_a_new_chat_and_the_argument_plays_out_in_it(ui):
     chat_post = next(fields for path, fields in state["posts"] if path == "/api/chat")
     assert chat_post["panel"] == "1"
     headings = transcript.get_by_role("heading").all_text_contents()
-    order = ["Claude to the panel: plan", "Panel review: plan, round 1 of 3",
+    order = ["Agent to the panel: plan", "Panel review: plan, round 1 of 3",
              "GPT Sol: approves", "Gemini Pro: wants changes", "Panel verdict"]
     positions = [headings.index(h) for h in order]
     assert positions == sorted(positions)
@@ -1372,10 +1372,12 @@ def test_panel_review_is_hidden_where_the_provider_cannot_do_it(ui):
     playwright.expect(page.locator("#panel-toggle-label")).to_be_hidden()
 
 
-def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui):
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui, provider):
     page, state = ui
     state["providers"]["providers"][0]["capabilities"] = {**CLOUD_CAPS, "panel": True}
-    state["session"] = {"provider": "claude", "model": "claude-test",
+    state["providers"]["providers"][0]["key"] = provider
+    state["session"] = {"provider": provider, "model": "claude-test",
                         "panel": {"enabled": True, "thread_id": 77}, "messages": [
         {"role": "user", "text": "Change the greeting"},
         {"role": "tool_use", "name": "mcp__panel__review", "summary": "",
@@ -1386,7 +1388,7 @@ def test_a_reopened_panel_chat_reads_as_the_argument_it_was(ui):
                                          "### GPT Sol: approves\nGood."},
         {"role": "assistant", "text": "Committing."},
     ]}
-    page.add_init_script("localStorage.setItem('claude-web.provider', 'claude')")
+    page.add_init_script(f"localStorage.setItem('claude-web.provider', '{provider}')")
     page.goto("http://local-ui.test/?session=saved")
     transcript = page.locator("#transcript")
     playwright.expect(transcript).to_contain_text("Committing.")

@@ -155,12 +155,12 @@ async def test_user_requirements_remain_citable_without_a_new_user_message(chat,
     assert state.review_requirements[str(repo)] == ["Preserve the user's saved value."]
 
 
-@pytest.fixture
-def chat(monkeypatch):
-    """A live Claude run with panel review on, its events and deliveries."""
+@pytest.fixture(params=["claude", "codex"])
+def chat(monkeypatch, request):
+    """A live run with panel review on, its events and deliveries."""
     sid = "panel-" + uuid.uuid4().hex[:8]
     run = app_module.ActiveRun("run-" + sid, owner_sub="anonymous")
-    run.provider = "claude"
+    run.provider = request.param
     run.session_id = sid
     run.project_key = "-tmp-project"
     run.panel_user_label = "Matt"

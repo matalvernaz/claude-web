@@ -25,6 +25,14 @@ import conversation_replay
 CAP = 800
 
 
+@pytest.fixture(autouse=True)
+def no_review_transport(monkeypatch):
+    # These scripted app-servers exercise the provider protocol without a
+    # panel. The hook/MCP integration is exercised in test_codex_panel.py.
+    import app as app_module
+    monkeypatch.setattr(app_module, "_panel_available", lambda: False)
+
+
 def test_frontend_sends_permission_mode_for_codex():
     source = (Path(__file__).parents[1] / "static" / "app.js").read_text(
         encoding="utf-8",  # Windows defaults to cp1252 and chokes on the JS
