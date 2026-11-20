@@ -175,9 +175,10 @@ def main() -> None:
         mcp = FastMCP("panel")
 
         @mcp.tool(name="review", description=panel.TOOL_DESCRIPTION)
-        def review(stage: str, repo: str, message: str, reason: str = "") -> str:
+        def review(stage: str, repo: str, message: str, reason: str = "", base: str | None = None) -> str:
             result = request(path, {"kind": "review", "arguments": {
                 "stage": stage, "repo": repo, "message": message, "reason": reason,
+                **({"base": base} if base is not None else {}),
             }})
             if result["is_error"]:
                 raise ValueError(result["text"])

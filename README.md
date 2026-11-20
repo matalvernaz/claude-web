@@ -377,6 +377,18 @@ again. Nothing is held back in this mode: the panel's answer is advice, your
 word in the chat settles a disagreement, and there's no question card after
 the last round.
 
+The review tool accepts an optional `base` for a changes review, for example
+`{ "stage": "changes", "repo": "/path/to/repo", "base": "main", "message": "Review this branch" }`.
+It compares the exact named commit with the current worktree, including committed,
+staged, unstaged and eligible untracked changes. For a PR comparison, pass the desired
+merge-base commit SHA; `main` means its exact tip, not an implicit three-dot diff.
+Each result identifies the pinned base and HEAD. Empty or failed comparisons do not
+count as reviews. Older-base comparisons are review-only: they do not grant commit
+permission or override objections about pending changes. Use the normal HEAD review
+before committing any fixes. Omitting `base`, or naming a commit equal to HEAD, keeps
+the normal commit-approval workflow. At a round-limit decision the card names only
+the earlier comparison that was actually reviewed.
+
 Codex uses the same `mcp__panel__review` tool, evidence contract, and saved
 objections as Claude. Its command hooks check patches and commits even in
 bypass mode. The tool and hooks are connected separately for each active chat;
@@ -463,6 +475,19 @@ access token with a refresh token still counts as configured.
 | `CLAUDE_WEB_SHARED_ACCOUNT_LABEL` | `Shared` | Display name for the shared slot in the UI. Set this per deployment, e.g. `Office`, `Team`, `Workspace`. |
 
 OpenAI has a separate slot set. The shared slot uses `$CODEX_HOME/auth.json` or `OPENAI_API_KEY`; personal slots use Codex's ChatGPT device-code flow and support subscription plans such as Plus and Pro.
+
+Codex models and their effort and speed choices come from the selected account's
+live catalog, including all result pages. **Refresh models** reads that exact account
+through a temporary process without restarting chats or interrupting sign-in. A missing
+saved model stays visibly unavailable until you choose another one. The **Speed** selector
+offers Standard and the faster tiers that model advertises; the description includes
+any increased usage. New chats use Standard. Model, effort and speed are saved per
+conversation and restored when it is reopened, ahead of browser preferences. Messages
+already queued keep their submitted settings; picker changes affect later submissions.
+A different selection waits for the next turn rather than changing an active turn's
+model or billing tier. Default effort and Standard explicitly reset prior overrides.
+A missing sign-in stays selected and blocks sending until you sign in or explicitly
+choose another account; reopening a chat never silently borrows Shared.
 
 Codex questions offer suggested answers and free text. You can answer while Codex
 keeps working or after its response finishes; reopening the conversation restores

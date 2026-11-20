@@ -90,8 +90,15 @@ def ui(browser):
                       for part in message.iter_parts()}
             state["posts"].append((path, fields))
             if path.startswith("/api/chat/send/"):
+                if state.get("hold_send"):
+                    state.setdefault("held_sends", []).append(request_route)
+                    return
+                if state.get("codex_selection_error"):
+                    request_route.fulfill(status=400, json={'ok': False, 'error': 'codex_selection_unavailable',
+                                                          'detail': 'The captured Fast setting is no longer available.'})
+                    return
                 if state.get("send_ok"):
-                    request_route.fulfill(json={"ok": True})
+                    request_route.fulfill(status=202, json={"ok": True})
                     return
                 if state.get("change_settings_during_send"):
                     page.evaluate("""() => {
@@ -1734,3 +1741,702 @@ def test_the_accounts_page_has_no_deepseek_section_where_it_is_off(browser):
         playwright.expect(page.get_by_role("heading", name="DeepSeek accounts")).to_have_count(0)
     finally:
         context.close()
+
+
+def codex_catalog(state):
+    models = [{"key": "gpt-6.2-sol", "label": "GPT-6.2-Sol", "description": "Coding and everyday work.",
+               "efforts": ["low", "ultra"], "default_effort": "low", "is_default": True,
+               "effort_descriptions": {"low": "Quick", "ultra": "Delegates"},
+               "service_tiers": [{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}]},
+              {"key": "gpt-6.1-terra", "label": "GPT-6.1 Terra", "efforts": ["low"], "default_effort": "low"}]
+    entry = {"key": "codex", "label": "Codex", "available": True, "models": models,
+             "capabilities": CLOUD_CAPS, "account_slot": "shared"}
+    state["providers"]["providers"].append(entry)
+    return entry
+
+
+def test_codex_restores_speed_and_default_effort_before_sending(ui):
+    page, state = ui
+    codex_catalog(state)
+    state["session"] = {"provider": "codex", "model": "gpt-6.2-sol", "effort": "ultra",
+                        "service_tier": "priority", "account_slot": "shared", "messages": []}
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.get_by_role("combobox", name="Speed", exact=True)).to_have_value("priority")
+    playwright.expect(page.get_by_label("Effort level", exact=True)).to_have_value("ultra")
+    playwright.expect(page.locator("#codex-speed-help")).to_contain_text("increased usage")
+    page.get_by_role("combobox", name="Speed", exact=True).select_option("default")
+    page.get_by_label("Effort level", exact=True).select_option("")
+    page.locator("#prompt").fill("Use the defaults")
+    page.get_by_role("button", name="Send", exact=True).click()
+    posted = next(fields for path, fields in state["posts"] if path == "/api/chat")
+    assert posted["service_tier"] == "default" and posted["effort"] == ""
+
+
+def test_codex_refresh_preserves_missing_model_and_blocks_send(ui):
+    page, state = ui
+    entry = codex_catalog(state)
+    state["session"] = {"provider": "codex", "model": "gpt-6.2-sol", "effort": "",
+                        "service_tier": "default", "account_slot": "shared", "messages": []}
+    page.route("**/api/codex/models/refresh", lambda route: route.fulfill(json={"account_slot": "shared", "models": entry["models"][1:]}))
+    page.goto("http://local-ui.test/?session=saved")
+    page.get_by_role("button", name="Refresh models", exact=True).click()
+    playwright.expect(page.locator("#codex-model-status")).to_contain_text("Models refreshed")
+    playwright.expect(page.get_by_label("Model", exact=True)).to_have_value("gpt-6.2-sol")
+    playwright.expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+    page.get_by_label("Model", exact=True).select_option("gpt-6.1-terra")
+    playwright.expect(page.get_by_role("button", name="Send", exact=True)).to_be_enabled()
+
+
+def test_codex_refresh_error_keeps_prior_catalog_and_reports_failure(ui):
+    page, state = ui
+    codex_catalog(state)
+    state["session"] = {"provider": "codex", "model": "gpt-6.2-sol", "account_slot": "shared", "messages": []}
+    page.route("**/api/codex/models/refresh", lambda route: route.fulfill(status=502, json={"detail": "Catalog offline"}))
+    page.goto("http://local-ui.test/?session=saved")
+    page.get_by_role("button", name="Refresh models", exact=True).click()
+    playwright.expect(page.locator("#codex-model-status")).to_contain_text("Catalog offline")
+    playwright.expect(page.get_by_label("Model", exact=True)).to_have_value("gpt-6.2-sol")
+    playwright.expect(page.get_by_role("button", name="Send", exact=True)).to_be_enabled()
+
+
+def test_codex_refresh_keeps_a_selection_changed_while_fetching(ui):
+    page, state = ui
+    entry = codex_catalog(state)
+    state["session"] = {"provider": "codex", "model": "gpt-6.2-sol", "account_slot": "shared", "messages": []}
+    pending = []
+    page.route("**/api/codex/models/refresh", lambda route: pending.append(route))
+    page.goto("http://local-ui.test/?session=saved")
+    page.get_by_role("button", name="Refresh models", exact=True).click()
+    page.get_by_label("Model", exact=True).select_option("gpt-6.1-terra")
+    assert len(pending) == 1
+    pending[0].fulfill(json={"account_slot": "shared", "models": entry["models"]})
+    playwright.expect(page.locator("#codex-model-status")).to_contain_text("Models refreshed")
+    playwright.expect(page.get_by_label("Model", exact=True)).to_have_value("gpt-6.1-terra")
+
+
+def test_codex_reopen_does_not_replace_a_signed_out_account_with_shared(ui):
+    page, state = ui
+    entry = codex_catalog(state)
+    entry["accounts"] = {"active": "shared", "shared_configured": True, "shared_label": "Shared",
+                         "credentials": [{"id": 7, "label": "Mine", "configured": False}]}
+    state["session"] = {"provider": "codex", "model": "gpt-6.2-sol", "account_slot": "cred:7",
+                        "history_error": "Sign in to this account", "messages": []}
+    page.goto("http://local-ui.test/?session=saved")
+    playwright.expect(page.get_by_label("Account", exact=True)).to_have_value("cred:7")
+    playwright.expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
+
+
+@pytest.mark.parametrize('leave_codex', [False, True])
+@pytest.mark.parametrize('delayed_stage', ['post', 'catalog'])
+@pytest.mark.parametrize('fails', [False, True])
+def test_stale_codex_account_switch_cannot_reapply_old_ui(ui, leave_codex, delayed_stage, fails):
+    page, state = ui
+    entry = codex_catalog(state)
+    entry['accounts'] = {'active': 'shared', 'shared_label': 'Shared', 'shared_configured': True,
+                         'credentials': [{'id': 1, 'label': 'First', 'configured': True}, {'id': 2, 'label': 'Second', 'configured': True}]}
+    state['session'] = {'provider': 'codex', 'model': 'gpt-6.2-sol', 'account_slot': 'shared', 'messages': []}
+    pending = []
+
+    def activate(route):
+        request = route.request
+        form = BytesParser(policy=default).parsebytes(
+            ('Content-Type: ' + request.headers['content-type'] + '\r\n\r\n').encode() + request.post_data_buffer)
+        fields = {part.get_param('name', header='content-disposition'): part.get_content() for part in form.iter_parts()}
+        if delayed_stage == 'post' and fields['active'] == 'cred:1':
+            pending.append(route)
+        else:
+            route.fulfill(json={**entry['accounts'], 'active': fields['active']})
+
+    page.route('**/api/account/active', activate)
+
+    def catalogs(route):
+        slot = parse_qs(urlparse(route.request.url).query).get('codex_account_slot', ['shared'])[0]
+        if delayed_stage == 'catalog' and slot == 'cred:1':
+            pending.append(route)
+        else:
+            models = [{**model, 'label': 'Second catalog' if slot == 'cred:2' else model['label']} for model in entry['models']]
+            route.fulfill(json={'providers': [{**entry, 'models': models, 'account_slot': slot}], 'provider_switch': True})
+
+    page.route('**/api/providers?**', catalogs)
+    page.goto('http://local-ui.test/?session=saved')
+    page.get_by_label('Account', exact=True).select_option('cred:1')
+    page.get_by_label('Account', exact=True).press('Enter')
+    page.wait_for_timeout(30)
+    assert pending
+    if leave_codex:
+        page.get_by_label('AI provider', exact=True).select_option('claude')
+    else:
+        page.get_by_label('Account', exact=True).select_option('cred:2')
+        page.get_by_label('Account', exact=True).press('Enter')
+        playwright.expect(page.locator('#model-select option:checked')).to_have_text('Second catalog')
+
+    if fails:
+        pending[0].fulfill(status=403, json={'detail': 'Old account failed'})
+    elif delayed_stage == 'post':
+        pending[0].fulfill(json={**entry['accounts'], 'active': 'cred:1'})
+    else:
+        pending[0].fulfill(json={'providers': [{**entry, 'account_slot': 'cred:1'}], 'provider_switch': True})
+    if leave_codex:
+        playwright.expect(page.get_by_label('AI provider', exact=True)).to_have_value('claude')
+        playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_be_hidden()
+    else:
+        playwright.expect(page.get_by_label('Account', exact=True)).to_have_value('cred:2')
+        playwright.expect(page.locator('#model-select option:checked')).to_have_text('Second catalog')
+
+
+@pytest.mark.parametrize('changed', ['speed', 'effort'])
+@pytest.mark.parametrize('turn_ends_before_conflict', [False, True])
+def test_changed_codex_settings_queue_normal_submit_on_the_same_stream(ui, changed, turn_ends_before_conflict):
+    page, state = ui
+    codex_catalog(state)
+    state['session'] = {'provider': 'codex', 'model': 'gpt-6.2-sol', 'effort': '', 'service_tier': 'default',
+                        'account_slot': 'shared', 'messages': [], 'live_run': {'run_id': 'codex-settings', 'active': True, 'between_turns': False}}
+    state['hold_send'] = True
+    page.add_init_script("""(() => {
+      const realFetch = window.fetch;
+      window.streamAborts = 0;
+      window.fetch = (url, options) => {
+        if (!String(url).includes('/api/chat/stream/codex-settings')) return realFetch(url, options);
+        return Promise.resolve(new Response(new ReadableStream({start(controller) {
+          window.emitRunEvent = event => controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(event) + '\\n\\n'));
+          options.signal.addEventListener('abort', () => { window.streamAborts++; controller.error(new DOMException('Aborted', 'AbortError')); });
+        }}), {headers: {'Content-Type': 'text/event-stream'}}));
+      };
+    })();""")
+    page.goto('http://local-ui.test/?session=saved')
+    page.wait_for_function('typeof window.emitRunEvent === "function"')
+    control = page.get_by_role('combobox', name='Speed' if changed == 'speed' else 'Effort level', exact=True)
+    control.select_option('priority' if changed == 'speed' else 'ultra')
+    page.locator('#prompt').fill('Use these settings next')
+    with page.expect_request('**/api/chat/send/codex-settings'):
+        page.locator('#send').click()
+    control.select_option('default' if changed == 'speed' else '')
+    if turn_ends_before_conflict:
+        page.evaluate('window.emitRunEvent({type: "result", is_error: false})')
+        playwright.expect(page.locator('#stop')).to_be_hidden()
+    state['hold_send'] = False
+    state['send_ok'] = True
+    if turn_ends_before_conflict:
+        with page.expect_response(lambda response: '/api/chat/send/codex-settings' in response.url and response.status == 202):
+            state['held_sends'][0].fulfill(status=409, json={'error': 'codex_settings_require_queue'})
+    else:
+        state['held_sends'][0].fulfill(status=409, json={'error': 'codex_settings_require_queue'})
+    playwright.expect(page.locator('#queue-area')).to_contain_text('Use these settings next')
+    if not turn_ends_before_conflict:
+        assert len([path for path, _ in state['posts'] if path.startswith('/api/chat/send/')]) == 1
+        page.evaluate('window.emitRunEvent({type: "partial_text", text: "The original response is still arriving."})')
+        playwright.expect(page.locator('#transcript')).to_contain_text('The original response is still arriving.')
+        with page.expect_response(lambda response: '/api/chat/send/codex-settings' in response.url and response.status == 202):
+            page.evaluate('window.emitRunEvent({type: "result", is_error: false})')
+    sends = [fields for path, fields in state['posts'] if path.startswith('/api/chat/send/')]
+    assert len(sends) == 2 and sends[0]['steer'] == 'true' and 'steer' not in sends[1]
+    for fields in sends:
+        assert fields['service_tier'] == ('priority' if changed == 'speed' else 'default')
+        assert fields['effort'] == ('ultra' if changed == 'effort' else '')
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+    assert page.evaluate('window.streamAborts') == 0
+    assert page.evaluate('sessionStorage.getItem("claude-web.active-run")') == 'codex-settings'
+
+
+def _codex_reconnect(page, info):
+    page.route('**/api/chat/active?**', lambda route: route.fulfill(json=info))
+    page.add_init_script("""(() => {
+      sessionStorage.setItem('claude-web.active-run', 'codex-reconnect');
+      const realFetch = window.fetch;
+      window.fetch = (url, options) => {
+        if (!String(url).includes('/api/chat/stream/codex-reconnect')) return realFetch(url, options);
+        window.resumeStreamURL = String(url);
+        return Promise.resolve(new Response(new ReadableStream({start(controller) {
+          window.emitResumeEvent = event => controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(event) + '\\n\\n'));
+          options.signal.addEventListener('abort', () => controller.error(new DOMException('Aborted', 'AbortError')));
+        }}), {headers: {'Content-Type': 'text/event-stream'}}));
+      };
+    })();""")
+
+
+@pytest.mark.parametrize('catalog_result', ['502', 'discarded'])
+@pytest.mark.parametrize('account_slot', ['shared', 'cred:7'])
+def test_codex_reconnect_reads_live_response_when_catalog_cannot_be_verified(ui, catalog_result, account_slot):
+    page, state = ui
+    entry = codex_catalog(state)
+    entry['accounts'] = {'active': 'shared', 'shared_label': 'Shared', 'shared_configured': True,
+                         'credentials': [{'id': 7, 'label': 'Mine', 'configured': True}]}
+    verified_models = json.loads(json.dumps(entry['models']))
+    # The boot catalog cannot validate the saved run's current options.
+    entry['models'][0].update(efforts=['low'], service_tiers=[])
+    info = {'active': True, 'buffered_events': 10, 'next_idx': 10, 'between_turns': False, 'provider': 'codex',
+            'run_id': 'codex-reconnect', 'session_id': 'saved', 'account_slot': account_slot,
+            'model': 'gpt-6.2-sol', 'effort': 'ultra', 'service_tier': 'priority'}
+    _codex_reconnect(page, info)
+    lookups = []
+
+    def catalog(route):
+        lookups.append(route.request.url)
+        if catalog_result == '502':
+            route.fulfill(status=502, json={'detail': 'Temporary catalog failure'})
+        else:
+            page.get_by_label('AI provider', exact=True).select_option('codex')
+            route.fulfill(json={'providers': [{**entry, 'account_slot': account_slot}], 'provider_switch': True})
+
+    page.route('**/api/providers?**', catalog)
+    page.goto('http://local-ui.test/')
+    page.wait_for_function('typeof window.emitResumeEvent === "function"', timeout=5000)
+    assert len(lookups) == 1 and parse_qs(urlparse(lookups[0]).query)['codex_account_slot'] == [account_slot]
+    page.evaluate('window.emitResumeEvent({type: "partial_text", text: "The healthy run is still responding."})')
+    playwright.expect(page.locator('#transcript')).to_contain_text('The healthy run is still responding.')
+    playwright.expect(page.get_by_label('Account', exact=True)).to_have_value(account_slot)
+    playwright.expect(page.get_by_label('Model', exact=True)).to_have_value(info['model'])
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    playwright.expect(page.locator('#send')).to_be_disabled()
+    assert page.evaluate('sessionStorage.getItem("claude-web.active-run")') == 'codex-reconnect'
+    page.locator('#prompt').fill('Do not send until models are verified')
+    page.locator('#prompt').press('Enter')
+    assert state['posts'] == []
+    page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': account_slot, 'models': verified_models}))
+    page.get_by_role('button', name='Refresh models', exact=True).click()
+    playwright.expect(page.locator('#codex-model-status')).to_contain_text('Models refreshed')
+    playwright.expect(page.locator('#send')).to_be_enabled()
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+
+
+@pytest.mark.parametrize('event_index', [9, 10, 11])
+def test_codex_reconnect_picker_replay_respects_the_settings_snapshot_index(ui, event_index):
+    page, state = ui
+    entry = codex_catalog(state)
+    info = {'active': True, 'buffered_events': 10, 'next_idx': 10, 'between_turns': False, 'provider': 'codex',
+            'run_id': 'codex-reconnect', 'session_id': 'saved', 'account_slot': 'shared',
+            'model': 'gpt-6.1-terra', 'effort': 'low', 'service_tier': 'default'}
+    _codex_reconnect(page, info)
+    state['send_ok'] = True
+    page.goto('http://local-ui.test/')
+    page.wait_for_function('typeof window.emitResumeEvent === "function"', timeout=5000)
+    event = {'type': 'model_changed', '_idx': event_index, 'model': entry['models'][0]['key'], 'effort': 'ultra', 'service_tier': 'priority'}
+    page.evaluate('event => { window.emitResumeEvent(event); window.emitResumeEvent({type: "partial_text", _idx: event._idx + 1, text: "Replay complete"}); }', event)
+    playwright.expect(page.locator('#transcript')).to_contain_text('Replay complete')
+    expected = info if event_index < info['next_idx'] else event
+    playwright.expect(page.get_by_label('Model', exact=True)).to_have_value(expected['model'])
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value(expected['effort'])
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value(expected['service_tier'])
+    page.locator('#prompt').fill('Continue with the restored settings')
+    with page.expect_response('**/api/chat/send/codex-reconnect'):
+        page.locator('#send').click()
+    sent = next(fields for path, fields in state['posts'] if path == '/api/chat/send/codex-reconnect')
+    for key in ['model', 'effort', 'service_tier']:
+        assert sent[key] == expected[key]
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+
+
+@pytest.mark.parametrize('navigation', ['url', 'sidebar'])
+@pytest.mark.parametrize('account_slot', ['shared', 'cred:7'])
+@pytest.mark.parametrize('catalog_result', ['502', 'empty', 'missing', 'effort', 'speed', 'both'])
+def test_saved_codex_open_preserves_unchecked_settings_until_catalog_recovers(ui, navigation, account_slot, catalog_result):
+    page, state = ui
+    entry = codex_catalog(state)
+    entry['account_slot'] = account_slot
+    entry['accounts'] = {'active': account_slot, 'shared_label': 'Shared', 'shared_configured': True,
+                         'credentials': [{'id': 7, 'label': 'Mine', 'configured': True}]}
+    verified_models = json.loads(json.dumps(entry['models']))
+    if catalog_result == '502':
+        entry['models'][0].update(efforts=['low'], service_tiers=[])
+    settings = {'model': 'gpt-6.2-sol', 'effort': 'ultra', 'service_tier': 'priority', 'account_slot': account_slot}
+    state['session'] = {'provider': 'codex', 'messages': [{'role': 'user', 'text': 'Saved conversation'}], **settings}
+
+    def catalog(route):
+        if catalog_result == '502':
+            route.fulfill(status=502, json={'detail': 'Catalog unavailable'})
+        else:
+            models = json.loads(json.dumps(entry['models']))
+            if catalog_result == 'missing':
+                models = models[1:]
+            elif catalog_result == 'empty':
+                models = []
+            else:
+                if catalog_result in ('effort', 'both'):
+                    models[0]['efforts'] = ['low']
+                if catalog_result in ('speed', 'both'):
+                    models[0]['service_tiers'] = []
+            route.fulfill(json={'providers': [{**entry, 'models': models}], 'provider_switch': True})
+
+    page.route('**/api/providers?**', catalog)
+    if navigation == 'url':
+        page.goto('http://local-ui.test/?session=saved')
+    else:
+        page.route('**/api/sessions', lambda route: route.fulfill(json=[
+            {'id': 'saved', 'title': 'Saved Codex conversation', 'provider': 'codex', 'mtime': '2026-11-20T12:00:00Z'}]))
+        page.goto('http://local-ui.test/')
+        page.locator('a[data-session="saved"]').click()
+    playwright.expect(page.locator('#transcript')).to_contain_text('Saved conversation')
+    playwright.expect(page.get_by_label('Account', exact=True)).to_have_value(account_slot)
+    playwright.expect(page.get_by_label('Model', exact=True)).to_have_value(settings['model'])
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.locator('#effort-select option[value="ultra"]')).to_have_count(1)
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    playwright.expect(page.locator('#send')).to_be_disabled()
+    if catalog_result == 'missing':
+        playwright.expect(page.locator('#provider-status')).to_contain_text('This Codex model is unavailable')
+    elif catalog_result in ('effort', 'both'):
+        playwright.expect(page.locator('#provider-status')).to_contain_text('This Codex effort is unavailable')
+        playwright.expect(page.locator('#effort-select option[value="ultra"]')).to_have_js_property('disabled', True)
+    elif catalog_result == 'speed':
+        playwright.expect(page.locator('#provider-status')).to_contain_text('This Codex speed is unavailable')
+    if catalog_result in ('speed', 'both'):
+        playwright.expect(page.locator('#codex-speed option[value="priority"]')).to_have_js_property('disabled', True)
+    page.locator('#prompt').fill('Continue with the saved settings')
+    page.locator('#prompt').press('Enter')
+    assert state['posts'] == []
+    page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': account_slot, 'models': verified_models}))
+    page.get_by_role('button', name='Refresh models', exact=True).click()
+    playwright.expect(page.locator('#send')).to_be_enabled()
+    with page.expect_response('**/api/chat'):
+        page.locator('#send').click()
+    sent = next(fields for path, fields in state['posts'] if path == '/api/chat')
+    for key, value in settings.items():
+        assert sent[key] == value
+
+
+@pytest.mark.parametrize('unavailable', ['effort', 'speed', 'both'])
+def test_codex_unavailable_saved_options_can_be_replaced_explicitly(ui, unavailable):
+    page, state = ui
+    entry = codex_catalog(state)
+    if unavailable in ('effort', 'both'):
+        entry['models'][0]['efforts'] = ['low']
+    if unavailable in ('speed', 'both'):
+        entry['models'][0]['service_tiers'] = []
+    state['session'] = {'provider': 'codex', 'model': 'gpt-6.2-sol', 'effort': 'ultra', 'service_tier': 'priority',
+                        'account_slot': 'shared', 'messages': []}
+    page.goto('http://local-ui.test/?session=saved')
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    playwright.expect(page.locator('#send')).to_be_disabled()
+    page.get_by_role('combobox', name='Effort level', exact=True).select_option('')
+    # Replacing Effort must not silently replace a separately unavailable Speed.
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    if unavailable in ('speed', 'both'):
+        playwright.expect(page.locator('#send')).to_be_disabled()
+    else:
+        playwright.expect(page.locator('#send')).to_be_enabled()
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('default')
+    playwright.expect(page.locator('#send')).to_be_enabled()
+    page.locator('#prompt').fill('Use the replacements I chose')
+    with page.expect_response('**/api/chat'):
+        page.locator('#send').click()
+    sent = next(fields for path, fields in state['posts'] if path == '/api/chat')
+    assert sent['model'] == 'gpt-6.2-sol' and sent['effort'] == '' and sent['service_tier'] == 'default'
+    assert not any(path == '/api/codex/models/refresh' for path, _ in state['posts'])
+
+
+def test_explicit_codex_model_change_uses_valid_options_for_the_new_model(ui):
+    page, state = ui
+    entry = codex_catalog(state)
+    entry['models'][0].update(efforts=['low'], service_tiers=[])
+    state['session'] = {'provider': 'codex', 'model': 'gpt-6.2-sol', 'effort': 'ultra', 'service_tier': 'priority',
+                        'account_slot': 'shared', 'messages': []}
+    page.goto('http://local-ui.test/?session=saved')
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    playwright.expect(page.locator('#send')).to_be_disabled()
+    page.get_by_label('Model', exact=True).select_option('gpt-6.1-terra')
+    playwright.expect(page.locator('#send')).to_be_enabled()
+    page.locator('#prompt').fill('Use this different model instead')
+    with page.expect_response('**/api/chat'):
+        page.locator('#send').click()
+    sent = next(fields for path, fields in state['posts'] if path == '/api/chat')
+    assert sent['model'] == 'gpt-6.1-terra' and sent['effort'] == '' and sent['service_tier'] == 'default'
+
+
+def _codex_selection_rejection_session(page, state, *, between_turns):
+    entry = codex_catalog(state)
+    state['session'] = {'provider': 'codex', 'model': 'gpt-6.2-sol', 'effort': '', 'service_tier': 'default',
+                        'account_slot': 'shared', 'messages': [],
+                        'live_run': {'run_id': 'codex-rejected', 'active': True, 'between_turns': between_turns}}
+    page.add_init_script("""(() => {
+      const realFetch = window.fetch;
+      window.rejectedStreamAborts = 0;
+      window.rejectedRunSends = 0;
+      window.fetch = (url, options) => {
+        if (String(url).includes('/api/chat/send/codex-rejected')) window.rejectedRunSends++;
+        if (!String(url).includes('/api/chat/stream/codex-rejected')) return realFetch(url, options);
+        return Promise.resolve(new Response(new ReadableStream({start(controller) {
+          window.emitRejectedRunEvent = event => controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(event) + '\\n\\n'));
+          options.signal.addEventListener('abort', () => { window.rejectedStreamAborts++; controller.error(new DOMException('Aborted', 'AbortError')); });
+        }}), {headers: {'Content-Type': 'text/event-stream'}}));
+      };
+    })();""")
+    page.goto('http://local-ui.test/?session=saved')
+    page.wait_for_function('typeof window.emitRejectedRunEvent === "function"')
+    return entry
+
+
+@pytest.mark.parametrize('delivery', ['queued', 'idle', 'active'])
+def test_codex_selection_rejection_keeps_the_entry_and_the_original_stream(ui, delivery):
+    page, state = ui
+    entry = _codex_selection_rejection_session(page, state, between_turns=delivery == 'idle')
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+    page.locator('#prompt').fill('Keep this captured Fast message')
+    state['codex_selection_error'] = True
+    if delivery == 'queued':
+        page.get_by_role('button', name='Queue for later', exact=True).click()
+        page.get_by_role('combobox', name='Speed', exact=True).select_option('default')
+        models = json.loads(json.dumps(entry['models']))
+        models[0]['service_tiers'] = []
+        page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': 'shared', 'models': models}))
+        page.get_by_role('button', name='Refresh models', exact=True).click()
+        playwright.expect(page.locator('#codex-model-status')).to_contain_text('Models refreshed')
+        page.evaluate('window.emitRejectedRunEvent({type: "result", is_error: false})')
+    else:
+        page.locator('#send').click()
+    playwright.expect(page.locator('#queue-area')).to_contain_text('Keep this captured Fast message')
+    playwright.expect(page.locator('#queue-area')).to_contain_text('The captured Fast setting is no longer available.')
+    if delivery == 'active':
+        playwright.expect(page.locator('#stop')).to_be_visible()
+    else:
+        playwright.expect(page.locator('#stop')).to_be_hidden()
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    assert page.evaluate('sessionStorage.getItem("claude-web.active-run")') == 'codex-rejected'
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+    sends = [fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected']
+    assert len(sends) == 1 and sends[0]['service_tier'] == 'priority'
+    page.evaluate('window.emitRejectedRunEvent({type: "partial_text", text: "The original stream is still attached."})')
+    playwright.expect(page.locator('#transcript')).to_contain_text('The original stream is still attached.')
+    state['codex_selection_error'] = False
+    state['send_ok'] = True
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('default')
+    page.locator('#prompt').fill('Use Standard on the original run')
+    with page.expect_response(lambda response: '/api/chat/send/codex-rejected' in response.url and response.status == 202):
+        page.locator('#send').click()
+    sends = [fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected']
+    assert len(sends) == 2 and sends[1]['service_tier'] == 'default'
+    assert sends[0]['queue_id'] != sends[1]['queue_id']
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    playwright.expect(page.locator('#queue-area')).to_contain_text('Keep this captured Fast message')
+
+
+def _reject_codex_queue_head(page, state):
+    entry = _codex_selection_rejection_session(page, state, between_turns=False)
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+    page.locator('#prompt').fill('First queued Fast message')
+    page.get_by_role('button', name='Queue for later', exact=True).click()
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('default')
+    page.locator('#prompt').fill('Second queued Standard message')
+    page.get_by_role('button', name='Queue for later', exact=True).click()
+    models = json.loads(json.dumps(entry['models']))
+    models[0]['service_tiers'] = []
+    page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': 'shared', 'models': models}))
+    page.get_by_role('button', name='Refresh models', exact=True).click()
+    playwright.expect(page.locator('#codex-model-status')).to_contain_text('Models refreshed')
+    state['codex_selection_error'] = True
+    page.evaluate('window.emitRejectedRunEvent({type: "result", is_error: false})')
+    playwright.expect(page.locator('#queue-area .queue-error')).to_contain_text('The captured Fast setting is no longer available.')
+    playwright.expect(page.locator('#stop')).to_be_hidden()
+    assert page.evaluate('window.rejectedRunSends') == 1
+    return entry
+
+
+@pytest.mark.parametrize('active_when_cancelled', [False, True])
+def test_cancelling_rejected_codex_queue_head_resumes_the_next_input(ui, active_when_cancelled):
+    page, state = ui
+    _reject_codex_queue_head(page, state)
+    state['codex_selection_error'] = False
+    state['send_ok'] = True
+    if active_when_cancelled:
+        page.evaluate('window.emitRejectedRunEvent({type: "auto_fire", events: []})')
+        playwright.expect(page.locator('#stop')).to_be_visible()
+    cancel = page.get_by_role('button', name='Cancel queued message: First queued Fast message', exact=True)
+    if active_when_cancelled:
+        cancel.click()
+        assert page.evaluate('window.rejectedRunSends') == 1
+        with page.expect_response('**/api/chat/send/codex-rejected'):
+            page.evaluate('window.emitRejectedRunEvent({type: "result", is_error: false})')
+    else:
+        # No new submit or SSE result: cancellation itself must resume the idle queue.
+        with page.expect_response('**/api/chat/send/codex-rejected'):
+            cancel.click()
+    playwright.expect(page.locator('#queue-area')).not_to_contain_text('First queued Fast message')
+    playwright.expect(page.locator('#queue-area')).to_contain_text('Second queued Standard message (sending')
+    sends = [fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected']
+    assert len(sends) == 2
+    assert [(sent['message'], sent['service_tier']) for sent in sends] == [
+        ('First queued Fast message', 'priority'), ('Second queued Standard message', 'default')]
+    assert page.evaluate('window.rejectedRunSends') == 2
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    assert page.evaluate('sessionStorage.getItem("claude-web.active-run")') == 'codex-rejected'
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+
+
+@pytest.mark.parametrize('delivery', ['queued', 'idle', 'active'])
+def test_rejected_codex_queue_head_is_not_retried_by_later_results(ui, delivery):
+    page, state = ui
+    if delivery == 'queued':
+        _reject_codex_queue_head(page, state)
+    else:
+        _codex_selection_rejection_session(page, state, between_turns=delivery == 'idle')
+        state['codex_selection_error'] = True
+        page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+        page.locator('#prompt').fill('Rejected direct Fast message')
+        page.locator('#send').click()
+        playwright.expect(page.locator('#queue-area .queue-error')).to_have_count(1)
+    # Even if the backend would accept a retry, unrelated turn results must
+    # leave both the rejected tuple and its persistent explanation alone.
+    state['codex_selection_error'] = False
+    state['send_ok'] = True
+    for number in range(2):
+        page.evaluate('number => { window.emitRejectedRunEvent({type: "result", is_error: false}); window.emitRejectedRunEvent({type: "partial_text", text: "Later result " + number}); }', number)
+        playwright.expect(page.locator('#transcript')).to_contain_text(f'Later result {number}')
+        assert page.evaluate('window.rejectedRunSends') == 1
+        playwright.expect(page.locator('#queue-area .queue-error')).to_contain_text('The captured Fast setting is no longer available.')
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+
+
+@pytest.mark.parametrize('result_before_ack', [False, True])
+def test_explicit_codex_queue_retry_keeps_the_original_settings_and_fifo(ui, result_before_ack):
+    page, state = ui
+    catalog = _reject_codex_queue_head(page, state)
+    original_send = next(fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected')
+    page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': 'shared', 'models': catalog['models']}))
+    page.get_by_role('button', name='Refresh models', exact=True).click()
+    playwright.expect(page.locator('#codex-model-status')).to_contain_text('Models refreshed')
+    assert page.evaluate('window.rejectedRunSends') == 1
+    state['hold_send'] = True
+    retry = page.get_by_role('button', name='Retry queued message: First queued Fast message', exact=True)
+    with page.expect_request('**/api/chat/send/codex-rejected'):
+        retry.click()
+    playwright.expect(page.locator('#queue-area')).to_contain_text('First queued Fast message (sending')
+    assert len(state['held_sends']) == 1
+    sends = [fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected']
+    for key in ['message', 'queue_id', 'model', 'effort', 'service_tier', 'account_slot']:
+        assert sends[1][key] == original_send[key]
+    assert sends[1]['service_tier'] == 'priority'
+
+    def finish_retried_turn():
+        page.evaluate('qid => { window.emitRejectedRunEvent({type: "user_prompt", text: "First queued Fast message", queue_id: qid}); window.emitRejectedRunEvent({type: "result", is_error: false}); window.emitRejectedRunEvent({type: "partial_text", text: "Retried turn finished"}); }', original_send['queue_id'])
+        playwright.expect(page.locator('#transcript')).to_contain_text('Retried turn finished')
+
+    if result_before_ack:
+        finish_retried_turn()
+        playwright.expect(page.locator('#stop')).to_be_hidden()
+        assert page.evaluate('window.rejectedRunSends') == 2
+    else:
+        state['held_sends'][0].fulfill(status=202, json={'ok': True})
+        playwright.expect(page.locator('#queue-area .queue-error')).to_have_count(0)
+    state['hold_send'] = False
+    state['codex_selection_error'] = False
+    state['send_ok'] = True
+    with page.expect_response(lambda response: response.url.endswith('/api/chat/send/codex-rejected')
+                              and 'Second queued Standard message' in (response.request.post_data or '')):
+        if result_before_ack:
+            # The acknowledgement itself must resume the queue. No new submit
+            # or SSE event is available to wake the waiting Standard message.
+            state['held_sends'][0].fulfill(status=202, json={'ok': True})
+        else:
+            finish_retried_turn()
+    sends = [fields for path, fields in state['posts'] if path == '/api/chat/send/codex-rejected']
+    assert len(sends) == 3 and sends[2]['message'] == 'Second queued Standard message'
+    assert sends[2]['service_tier'] == 'default'
+    assert page.evaluate('window.rejectedRunSends') == 3
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    assert page.evaluate('sessionStorage.getItem("claude-web.active-run")') == 'codex-rejected'
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+
+
+@pytest.mark.parametrize('accepted_first', [False, True])
+def test_overlapping_codex_validation_rejection_does_not_hide_an_accepted_turn(ui, accepted_first):
+    page, state = ui
+    _codex_selection_rejection_session(page, state, between_turns=True)
+    state['hold_send'] = True
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+    page.locator('#prompt').fill('Unavailable Fast attempt')
+    with page.expect_request('**/api/chat/send/codex-rejected'):
+        page.locator('#send').click()
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('default')
+    page.locator('#prompt').fill('Valid Standard attempt')
+    with page.expect_request('**/api/chat/send/codex-rejected'):
+        page.locator('#send').click()
+    page.wait_for_timeout(20)
+    assert len(state['held_sends']) == 2
+    rejected, accepted = state['held_sends']
+
+    def reject():
+        rejected.fulfill(status=400, json={'ok': False, 'error': 'codex_selection_unavailable', 'detail': 'Fast disappeared.'})
+        playwright.expect(page.locator('#queue-area')).to_contain_text('Fast disappeared.')
+
+    if accepted_first:
+        accepted.fulfill(status=202, json={'ok': True})
+        page.wait_for_timeout(20)
+        reject()
+    else:
+        reject()
+        accepted.fulfill(status=202, json={'ok': True})
+    playwright.expect(page.locator('#stop')).to_be_visible()
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+    assert not any(path == '/api/chat' for path, _ in state['posts'])
+
+
+def test_two_rejected_codex_sends_restore_the_idle_run_ui(ui):
+    page, state = ui
+    _codex_selection_rejection_session(page, state, between_turns=True)
+    state['hold_send'] = True
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+    for text in ['First rejected Fast attempt', 'Second rejected Fast attempt']:
+        page.locator('#prompt').fill(text)
+        with page.expect_request('**/api/chat/send/codex-rejected'):
+            page.locator('#send').click()
+    page.wait_for_timeout(20)
+    assert len(state['held_sends']) == 2
+    for route in reversed(state['held_sends']):
+        route.fulfill(status=400, json={'ok': False, 'error': 'codex_selection_unavailable', 'detail': 'Fast disappeared.'})
+    playwright.expect(page.locator('#queue-area .queue-error')).to_have_count(2)
+    playwright.expect(page.locator('#stop')).to_be_hidden()
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+
+
+def test_codex_validation_error_does_not_override_a_new_server_turn(ui):
+    page, state = ui
+    _codex_selection_rejection_session(page, state, between_turns=True)
+    state['hold_send'] = True
+    page.get_by_role('combobox', name='Speed', exact=True).select_option('priority')
+    page.locator('#prompt').fill('Unavailable queued selection')
+    with page.expect_request('**/api/chat/send/codex-rejected'):
+        page.locator('#send').click()
+    page.evaluate('window.emitRejectedRunEvent({type: "auto_fire", events: []})')
+    playwright.expect(page.locator('#transcript')).to_contain_text('Auto-injected')
+    assert len(state['held_sends']) == 1
+    state['held_sends'][0].fulfill(status=400, json={'ok': False, 'error': 'codex_selection_unavailable', 'detail': 'Fast disappeared.'})
+    playwright.expect(page.locator('#queue-area')).to_contain_text('Fast disappeared.')
+    playwright.expect(page.locator('#stop')).to_be_visible()
+    assert page.evaluate('window.rejectedStreamAborts') == 0
+
+
+@pytest.mark.parametrize('event_index', [10, 11])
+def test_unchecked_codex_picker_event_keeps_effort_through_refresh_and_send(ui, event_index):
+    page, state = ui
+    entry = codex_catalog(state)
+    verified_models = json.loads(json.dumps(entry['models']))
+    entry['models'][0].update(efforts=['low'], service_tiers=[])
+    info = {'active': True, 'buffered_events': 10, 'next_idx': 10, 'between_turns': False, 'provider': 'codex',
+            'run_id': 'codex-reconnect', 'session_id': 'saved', 'account_slot': 'shared',
+            'model': 'gpt-6.2-sol', 'effort': 'low', 'service_tier': 'default'}
+    _codex_reconnect(page, info)
+    page.route('**/api/providers?**', lambda route: route.fulfill(status=502, json={'detail': 'Catalog unavailable'}))
+    page.goto('http://local-ui.test/')
+    page.wait_for_function('typeof window.emitResumeEvent === "function"', timeout=5000)
+    event = {'type': 'model_changed', '_idx': event_index, 'model': 'gpt-6.2-sol', 'effort': 'ultra', 'service_tier': 'priority'}
+    page.evaluate('event => { window.emitResumeEvent(event); window.emitResumeEvent({type: "partial_text", _idx: event._idx + 1, text: "New picker event received"}); }', event)
+    playwright.expect(page.locator('#transcript')).to_contain_text('New picker event received')
+    playwright.expect(page.get_by_role('combobox', name='Effort level', exact=True)).to_have_value('ultra')
+    playwright.expect(page.get_by_role('combobox', name='Speed', exact=True)).to_have_value('priority')
+    playwright.expect(page.locator('#send')).to_be_disabled()
+    page.route('**/api/codex/models/refresh', lambda route: route.fulfill(json={'account_slot': 'shared', 'models': verified_models}))
+    page.get_by_role('button', name='Refresh models', exact=True).click()
+    playwright.expect(page.locator('#send')).to_be_enabled()
+    state['send_ok'] = True
+    page.locator('#prompt').fill('Use the newer picker choice')
+    with page.expect_response('**/api/chat/send/codex-reconnect'):
+        page.locator('#send').click()
+    sent = next(fields for path, fields in state['posts'] if path == '/api/chat/send/codex-reconnect')
+    for key in ['model', 'effort', 'service_tier']:
+        assert sent[key] == event[key]
+    assert not any(path == '/api/chat' for path, _ in state['posts'])

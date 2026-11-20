@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import review_contract
+import review_capture
 
 log = logging.getLogger("claude-web")
 
@@ -491,6 +492,11 @@ class PanelState:
     rounds: dict = dataclasses.field(default_factory=lambda: {"plan": 0, "changes": 0})
     # repo root -> {path: digest}: the working state the panel last approved.
     approvals: dict = dataclasses.field(default_factory=dict)
+    # Actual comparison scope, separate from commit-eligible content hashes.
+    comparisons: dict = dataclasses.field(default_factory=dict)
+    # Capture id owns its exact hashes; a pending card points to one immutable association.
+    review_records: dict = dataclasses.field(default_factory=dict)
+    decision_reviews: dict = dataclasses.field(default_factory=dict)
     # repo root -> {path: digest}: what the panel was last shown, approved or
     # not. "Go ahead anyway" approves this, never what's on disk by then.
     last_reviewed: dict = dataclasses.field(default_factory=dict)
@@ -524,6 +530,9 @@ class PanelState:
         state = cls(**{k: v for k, v in data.items() if k in fields})
         state.rounds = {s: int((state.rounds or {}).get(s, 0)) for s in STAGES}
         state.approvals = dict(state.approvals or {})
+        state.comparisons = dict(state.comparisons) if isinstance(state.comparisons, dict) else {}
+        state.review_records = dict(state.review_records) if isinstance(state.review_records, dict) else {}
+        state.decision_reviews = dict(state.decision_reviews) if isinstance(state.decision_reviews, dict) else {}
         state.last_reviewed = dict(state.last_reviewed or {})
         if not isinstance(state.review_ledger, dict):
             state.review_ledger = {}
@@ -533,12 +542,49 @@ class PanelState:
         state.granted = [s for s in STAGES if s in granted]
         return state
 
+    def record_comparison(self, root: str, comparison: dict, reviewed: Optional[dict]) -> None:
+        eligible = comparison["commit_eligible"]
+        if eligible and reviewed is None:
+            raise review_capture.CaptureError("The comparison has no matching snapshot; request a fresh review.")
+        receipt = copy.deepcopy(comparison)
+        snapshot = copy.deepcopy(reviewed) if eligible else None
+        self.review_records.setdefault(root, {})[receipt["capture_id"]] = {"comparison": receipt, "reviewed_state": snapshot}
+        self.comparisons[root] = receipt
+        if eligible:
+            self.last_reviewed[root] = snapshot
+
+    def decision_record(self, root: str) -> Optional[dict]:
+        capture_id = self.decision_reviews.get(root)
+        comparison = self.comparisons.get(root)
+        if capture_id is None and isinstance(comparison, dict):
+            capture_id = comparison.get("capture_id")
+        records = self.review_records.get(root, {})
+        record = records.get(capture_id) if isinstance(records, dict) else None
+        if isinstance(record, dict):
+            receipt = record.get("comparison")
+            snapshot = record.get("reviewed_state")
+            if (isinstance(receipt, dict) and receipt.get("capture_id") == capture_id
+                    and (not receipt.get("commit_eligible") or isinstance(snapshot, dict))):
+                return copy.deepcopy(record)
+        if root in self.decision_reviews:
+            return None  # A missing named target cannot borrow a different comparison's hashes.
+        if isinstance(comparison, dict):
+            if not comparison.get("commit_eligible", True):
+                return {"comparison": copy.deepcopy(comparison), "reviewed_state": None}
+            return None  # A receipt without its association is not a legacy snapshot.
+        if root in self.last_reviewed:
+            # Pre-receipt state has actual reviewed hashes, but no historical OIDs to invent.
+            return {"comparison": None, "reviewed_state": copy.deepcopy(self.last_reviewed[root])}
+        return None
+
     def end_cycle(self) -> None:
         """A task's changes are committed: the next change starts with a plan."""
         self.plan_ok = False
         self.rounds = {s: 0 for s in STAGES}
         self.review_ledger = {}
         self.review_requirements = {}
+        self.review_records = {}
+        self.decision_reviews = {}
 
 
 # ─── What the panel and Claude see ───────────────────────────────────────────
@@ -557,7 +603,7 @@ TOOL_DESCRIPTION = (
     "usually within a few minutes, and the user can talk to you while you wait. "
     "When they want changes, fix what you agree with, push back with reasons on "
     "what you don't (they read your reasons), and send it again. After a few rounds "
-    "without agreement the user decides."
+    "without agreement the user decides. For changes, optional base reviews an exact branch or commit against the worktree. Older-base reviews do not approve pending edits for commit; use a normal HEAD changes review for that."
 )
 
 # Appended to every Claude chat's system prompt where the panel exists. The
@@ -597,6 +643,7 @@ TOOL_SCHEMA = {
                 "to endorse your conclusion."
             ),
         },
+        "base": {"type": "string", "description": "Changes only: exact base branch/commit (default HEAD). Older-base comparisons are review-only; use HEAD to approve pending edits for commit."},
         "reason": {
             "type": "string",
             "description": (
@@ -863,7 +910,7 @@ def reply_heading(label: str, verdict: str) -> str:
 def result_message(
     stage: str, round_no: int, max_rounds: int, outcome: str,
     replies: list[dict], errors: list[dict], user_label: str,
-    advisory: bool = False,
+    advisory: bool = False, commit_eligible: bool = True,
 ) -> str:
     """The panel's answer, delivered to Claude as its next message.
 
@@ -874,6 +921,7 @@ def result_message(
     user's word in the chat is what counts.
     """
     phrase = {
+        "failed": "the intended comparison could not be reviewed; no approval was granted",
         "approved": "approved",
         "changes": "they want changes",
         "unavailable": "nobody on the panel could answer, so the panel stepped "
@@ -919,6 +967,7 @@ def result_message(
             "Next: answer their points, then send it again (stage "
             f"\"{stage}\") and end your turn. Don't {hold} until they approve."
         ),
+        "failed": "Next: fix the capture or delivery failure and submit the review again. No changes were approved.",
         "stop": (
             f"Next: don't change files or commit. Tell {user_label} where things stand "
             "and wait for them."
@@ -961,6 +1010,8 @@ def result_message(
                 f"Next: stop here and wait for {user_label} to tell you what they want."
             ),
         }.get(outcome, nxt)
+    if stage == "changes" and not commit_eligible and outcome in ("approved", "go_ahead", "unavailable"):
+        nxt = "Next: this branch comparison is complete. Use a HEAD changes review before committing pending edits."
     parts.append(nxt)
     return "\n\n".join(parts)
 
@@ -973,14 +1024,23 @@ DECISIONS = {
 }
 
 
-def decision_card(stage: str, rounds: int, max_rounds: int) -> list[dict]:
+def decision_card(
+    stage: str, rounds: int, max_rounds: int, *,
+    repo: Optional[str] = None, comparison: Optional[dict] = None,
+) -> list[dict]:
     """The question card the user gets when a stage deadlocks."""
     what = "plan" if stage == "plan" else "changes"
+    question = (
+        f"The panel still has objections to the agent's {what} after {rounds} "
+        f"round{'s' if rounds != 1 else ''}. What now?"
+    )
+    if stage == "changes" and repo is not None:
+        question += f" This decision concerns only {repo}."
+        question += (" Captured comparison: " + json.dumps(comparison) if comparison is not None
+                     else " It applies to the earlier HEAD snapshot; no new comparison ran.")
+    review_only = comparison is not None and not comparison.get("commit_eligible", True)
     return [{
-        "question": (
-            f"The panel still has objections to the agent's {what} after {rounds} "
-            f"round{'s' if rounds != 1 else ''}. What now?"
-        ),
+        "question": question,
         "header": "Panel",
         "multiSelect": False,
         "options": [
@@ -988,6 +1048,8 @@ def decision_card(stage: str, rounds: int, max_rounds: int) -> list[dict]:
              "description": (
                  "Treat it as approved: the agent makes the changes."
                  if stage == "plan" else
+                 "Accept this comparison only. Pending edits still need a HEAD changes review before commit."
+                 if review_only else
                  "Treat it as approved: the agent commits these changes."
              )},
             {"label": "Keep discussing",
@@ -1010,6 +1072,7 @@ class RoundResult:
     # what an approval covers.
     reviewed_state: Optional[dict] = None
     review_ledger: Optional[dict] = None
+    receipt: Optional[dict] = None
 
 
 def outcome_of(replies: list[dict]) -> str:
@@ -1026,6 +1089,7 @@ async def run_round(
     on_thread: Callable[[int], None] = lambda tid: None,
     effort: str = EFFORT, review_ledger: Optional[dict] = None,
     requirements: Optional[str] = None,
+    capture: Optional[dict] = None,
 ) -> RoundResult:
     """Run one review round through the roundtable library ``core``.
 
@@ -1083,35 +1147,54 @@ async def run_round(
         await asyncio.to_thread(core.roundtable_bind_repo, tid, repo, "readonly")
         repo_bound = True
     except (ValueError, RuntimeError) as exc:
+        if stage == "changes":
+            raise review_capture.CaptureError("Repository binding failed: " + str(exc)) from exc
         # A deployment can fence repositories off (ROUNDTABLE_REPO_ROOTS).
         # Review from what's posted rather than not at all.
         diff_note = (
             f"The repository couldn't be opened for you ({exc}): judge from what's "
             "posted in this thread."
         )
+    receipt = None
+    protected = ""
     if stage == "changes":
-        reviewed_state = await asyncio.to_thread(working_state, repo)
-        try:
-            diff = await asyncio.to_thread(core.roundtable_bind_diff, tid, repo, "HEAD")
-            if diff.get("truncated"):
-                diff_note = (
-                    "The working diff is attached as an artifact, cut short because "
-                    "it's large: read the files for the rest."
-                )
-        except (ValueError, RuntimeError) as exc:
-            diff_note = (diff_note + " " if diff_note else "") + (
-                f"The working diff couldn't be attached ({exc}): read the files "
-                "with your tools if you can."
-            )
+        if capture is None:
+            capture = await asyncio.to_thread(core.capture_review_diff, repo, "HEAD")
+            capture["pending_state"] = await asyncio.to_thread(working_state, repo)
+        await asyncio.to_thread(core.publish_review_diff, tid, capture)
+        receipt = review_capture.receipt(capture)
+        reviewed_state = capture["pending_state"] if receipt["commit_eligible"] else None
+        protected = capture["content"]
+        diff_note = (f"Comparison {receipt['base']!r} = {receipt['base_oid']}; "
+                     f"HEAD {receipt['commit_sha']}; capture {receipt['capture_id']}. ")
+        if not receipt["commit_eligible"]:
+            diff_note += "Review-only branch comparison. This does not approve pending edits for commit. "
+        if capture["truncated"]:
+            diff_note += "The captured diff is abbreviated; read the files for the rest."
     for note in notes:
         await asyncio.to_thread(core.roundtable_post, tid, note, user_label)
     await asyncio.to_thread(core.roundtable_post, tid, message, AUTHOR)
     emit({
         "type": "panel_round", "stage": stage, "round": round_no,
         "max_rounds": max_rounds, "repo": repo, "thread_id": tid,
-        "participants": [labels[p] for p in participants],
+        "participants": [labels[p] for p in participants], "comparison": receipt,
     })
     context = core._effective_tool_context(tid) if repo_bound else None
+    if context is not None and capture is not None and capture.get("dynamic_excluded_paths"):
+        context = copy.copy(context)
+        original_callback = context.permission_callback
+        blocked = {str((Path(repo) / path).resolve()) for path in capture["dynamic_excluded_paths"]}
+
+        def scoped_permission(label, name, arguments):
+            if name in ("Grep", "Glob"):
+                return "deny"  # Native SDK search cannot filter renamed secret destinations.
+            relative = arguments.get("path") or arguments.get("file_path")
+            if relative and str((Path(repo) / relative).resolve()) in blocked:
+                return "deny"
+            return original_callback(label, name, arguments)
+        # Native SDK allowlists can skip can_use_tool. These exclusions must also run as hooks.
+        scoped_permission.enforce_read_hooks = True
+        context.permission_callback = scoped_permission
     if requirements is None:
         requirements = "\n\n".join(notes)
     loop = asyncio.get_running_loop()
@@ -1174,6 +1257,7 @@ async def run_round(
             core.roundtable_ask_parallel, tid, people, prompt=prompt,
             effort=effort, tool_use_context=context, on_result=landed,
             independent=True, house_rules=house_rules(user_label), participant_prompts=prompts,
+            **({"review_context": protected} if protected else {}),
         )
         for p in people:
             if p in (result.get("responses") or {}):
@@ -1194,6 +1278,8 @@ async def run_round(
         ) for p in retry}
         try:
             await ask(retry, prompts, correcting=True)
+        except review_capture.CaptureError:
+            raise
         except Exception as exc:  # A failed correction must keep the rejected report and its objections.
             for p in retry:
                 if p not in shown:
@@ -1220,7 +1306,7 @@ async def run_round(
                                 f"{f['id']}: {f['claim']}" for f in rows if f["status"] == "open")})
     return RoundResult(
         thread_id=tid, outcome="changes" if open_findings else outcome_of(replies), replies=replies,
-        errors=errors, reviewed_state=reviewed_state, review_ledger=ledger,
+        errors=errors, reviewed_state=reviewed_state, review_ledger=ledger, receipt=receipt,
     )
 
 

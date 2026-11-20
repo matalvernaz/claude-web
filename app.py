@@ -76,6 +76,7 @@ import auth
 import claude_cli
 import claude_models
 import codex_provider
+import review_capture
 import codex_panel
 import deepseek_provider
 import local_provider
@@ -833,6 +834,7 @@ async def _providers_payload(
     codex_entry = {
         "key": "codex",
         "label": CODEX_PROVIDER_LABEL,
+        "account_slot": codex_account["slot"],
         "available": bool(codex_avail["available"]),
         "reason": codex_avail["reason"],
         "models": [],
@@ -859,7 +861,7 @@ async def _providers_payload(
             server = await _codex_server_for_account(codex_account)
             models = await server.models()
             codex_entry["models"] = [
-                {"key": m["key"], "label": m["label"], "context": None,
+                {**m, "context": None,
                  "efforts": m["efforts"] or [],
                  "default_effort": m.get("default_effort"),
                  "betas": [], "advisor": "",
@@ -1472,6 +1474,96 @@ def _codex_session_row(thread_id: str) -> Optional[dict]:
         "title": row[3], "model": row[4], "created_at": row[5],
         "updated_at": row[6],
     }
+
+
+def _codex_settings_record(sid: Optional[str]) -> dict:
+    if not sid:
+        return {}
+    row = _state_db().execute("SELECT settings FROM codex_chat_settings WHERE thread_id=?", (sid,)).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def _save_codex_settings(run: "ActiveRun", selection: codex_provider.ModelSelection, kind: str) -> None:
+    if not run.session_id:
+        return
+    record = _codex_settings_record(run.session_id)
+    if kind == "applied":
+        record["applied"] = selection.saved()
+    else:
+        record["pending"] = selection.saved()
+        record["pending_kind"] = kind
+    _state_db().execute("INSERT INTO codex_chat_settings VALUES(?, ?) ON CONFLICT(thread_id) DO UPDATE SET settings=excluded.settings",
+                        (run.session_id, json.dumps(record)))
+
+
+def _record_codex_intent(run: "ActiveRun", selection: codex_provider.ModelSelection, kind: str,
+                         delivery: Optional[codex_provider.InputDelivery] = None, queue_id: Optional[str] = None) -> None:
+    """Keep arrival order: a failed older submission cannot undo a newer explicit choice."""
+    _save_codex_settings(run, selection, kind)
+    run.codex_intents.append({"selection": selection, "kind": kind, "delivery": delivery, "queue_id": queue_id})
+    run.codex_pending = selection
+    _prune_codex_intents(run)
+
+
+def _prune_codex_intents(run: "ActiveRun") -> None:
+    durable = [index for index, intent in enumerate(run.codex_intents)
+               if intent["delivery"] is None or intent["delivery"].state in ("committing", "delivered")]
+    if durable:
+        del run.codex_intents[:durable[-1]]
+
+
+def _discard_codex_intent(run: "ActiveRun", delivery: codex_provider.InputDelivery) -> None:
+    run.codex_intents[:] = [intent for intent in run.codex_intents if intent["delivery"] is not delivery]
+    _prune_codex_intents(run)
+    latest = run.codex_intents[-1] if run.codex_intents else None
+    selection = latest["selection"] if latest else (run.codex_active or run.codex_initial_selection)
+    if selection is not None:
+        _save_codex_settings(run, selection, latest["kind"] if latest else "message")
+        run.codex_pending = selection
+
+
+def _codex_session_settings(sid: str, row: Optional[dict] = None) -> dict:
+    live = _existing_run_for_session(sid)
+    if live is not None and live.codex_pending is not None:
+        return live.codex_pending.saved()
+    record = _codex_settings_record(sid)
+    if record.get("pending_kind") == "picker":
+        return record.get("pending", {})
+    return record.get("applied") or {"model": (row or _codex_session_row(sid) or {}).get("model") or "",
+                                      "effort": "", "service_tier": "default"}
+
+
+async def _codex_catalog(user: dict, account: dict) -> list[dict]:
+    sub = (user or {}).get("sub") or ""
+    credential = _parse_cred_active(account["slot"])
+    async with _codex_credential_lock(sub, credential if credential is not None else -1):
+        _resolve_codex_account_for_run(user, override_slot=account["slot"])
+        server = await _codex_server_for_account(account)
+        return await server.models()
+
+
+@app.post("/api/codex/models/refresh")
+async def api_codex_models_refresh(account_slot: str = Form(...), user: dict = Depends(auth.require_user)):
+    sub = user.get("sub") or ""
+    credential = _parse_cred_active(account_slot)
+    async with _codex_credential_lock(sub, credential if credential is not None else -1):
+        account = _resolve_codex_account_for_run(user, override_slot=account_slot)
+        control = codex_provider.CodexAppServer.get_cached(account["server_key"])
+        if control is not None and time.time() - control._login_started_at < codex_provider.LOGIN_GRACE_S:
+            raise HTTPException(409, "Finish OpenAI sign-in before refreshing models.")
+        reader_key = account["server_key"] + ":read:models:" + str(uuid_mod.uuid4())
+        try:
+            reader = await _codex_server_for_account(account, server_key=reader_key)
+            models = await reader.models()
+            if not models:
+                raise HTTPException(502, "Codex returned no available models.")
+            if control is not None and codex_provider.CodexAppServer.get_cached(account["server_key"]) is control:
+                async with control._models_lock:
+                    control._models_cache = models
+                    control._models_cached_at = time.time()
+            return {"account_slot": account["slot"], "models": models}
+        finally:
+            await codex_provider.CodexAppServer.close_key(reader_key)
 
 
 def _codex_sessions_for_list(user: Optional[dict]) -> list[dict]:
@@ -2464,6 +2556,9 @@ def _state_db() -> sqlite3.Connection:
             model TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS codex_chat_settings (
+            thread_id TEXT PRIMARY KEY, settings TEXT NOT NULL
         )""")
         # One row per chat on a routed provider (ROUTED_PROVIDERS). The table
         # name predates DeepSeek; `provider` says which one a chat is on.
@@ -6600,6 +6695,23 @@ def _resolve_codex_account_for_run(
 ) -> dict:
     """Resolve one OpenAI slot without allowing shared env auth to leak in."""
     sub = (user or {}).get("sub")
+    # A picked/bound account must never silently fall back to another bill or catalog.
+    exact_slot = override_slot if override_slot is not None else _session_account_slot(session_id)
+    if exact_slot is not None:
+        if not _codex_account_slot_visible(sub, exact_slot):
+            raise HTTPException(404, "OpenAI account not found")
+        cred_id = _parse_cred_active(exact_slot)
+        if cred_id is not None:
+            if not _codex_credential_is_configured(sub, cred_id):
+                raise HTTPException(503, "Sign in to this OpenAI account or explicitly choose another account.")
+            cred = _get_codex_credential(sub, cred_id)
+            return {"slot": exact_slot, "label": cred["label"],
+                    "server_key": _codex_server_key(sub, cred_id),
+                    "home": _codex_credential_home_path(sub, cred_id), "isolated_auth": True}
+        if not codex_provider.availability()["available"]:
+            raise HTTPException(503, "The shared OpenAI account is unavailable. Choose another account.")
+        return {"slot": "shared", "label": CODEX_SHARED_ACCOUNT_LABEL,
+                "server_key": "shared", "home": None, "isolated_auth": False}
     candidates: list[str] = []
     if override_slot is not None and _codex_account_slot_visible(sub, override_slot):
         candidates.append(override_slot)
@@ -8347,6 +8459,7 @@ def _shared_mcp_config_file(cwd: Any) -> Optional[Path]:
 # Rounds in flight, by session id. One holds its chat open (the driver's idle
 # close skips a session listed here) and makes a second round wait.
 _PANEL_ROUNDS: dict[str, asyncio.Task] = {}
+_PANEL_PREFLIGHTS: set[str] = set()
 # With panel review off: chats whose user is looking at Claude's "can I send
 # this to the panel?" card, by session id (the run id that asked). A second
 # request while it's up is told to wait rather than raising another card.
@@ -8745,17 +8858,36 @@ async def _panel_review_call(run: "ActiveRun", args: dict) -> tuple[str, bool]:
         return _PANEL_RUNNING, False
     if sid in _PANEL_ASKS:
         return panel.ask_busy(run.panel_user_label), False
+    if sid in _PANEL_PREFLIGHTS:
+        return ("A review is already being prepared. Wait for that call's result.", False)
+    state = _panel_state_for_run(run)
+    base = args.get("base", "HEAD")
+    if "base" in args and stage != "changes":
+        return ("base is only supported for changes reviews.", True)
+    capture = None
+    if stage == "changes" and state.rounds.get(stage, 0) < panel.MAX_ROUNDS:
+        _PANEL_PREFLIGHTS.add(sid)
+        try:
+            capture = await asyncio.to_thread(roundtable_core.capture_review_diff, root, base)
+            capture["pending_state"] = await asyncio.to_thread(panel.working_state, root)
+            await asyncio.to_thread(review_capture.validate, capture)
+        except Exception as exc:
+            return (f"Review did not start: {exc}", True)
+        finally:
+            _PANEL_PREFLIGHTS.discard(sid)
     state = _panel_state_for_run(run)
     if state.enabled or stage in state.granted:
-        return _panel_launch_round(run, sid, stage, root, message)
+        return _panel_launch_round(run, sid, stage, root, message, capture=capture, requested_base=base)
     return await _panel_ask_first(
         run, sid, stage, root, message, str(args.get("reason") or ""), state,
+        capture=capture, requested_base=base,
     )
 
 
 async def _panel_ask_first(
     run: "ActiveRun", sid: str, stage: str, root: str, message: str,
     reason: str, state: panel.PanelState,
+    capture: Optional[dict] = None, requested_base: str = "HEAD",
 ) -> tuple[str, bool]:
     """Panel review is off: ask the user before anything goes to the panel."""
     user_label = run.panel_user_label
@@ -8804,17 +8936,26 @@ async def _panel_ask_first(
             state.rounds[stage] = 0
             _panel_save(sid, run.owner_sub, state)
     log.info("panel ask session=%s stage=%s: %s", sid, stage, answer)
-    return _panel_launch_round(run, sid, stage, root, message)
+    if capture is not None:
+        try:
+            await asyncio.to_thread(review_capture.validate, capture)
+        except Exception as exc:
+            return (f"Review did not start: {exc}", True)
+    return _panel_launch_round(run, sid, stage, root, message, capture=capture, requested_base=requested_base)
 
 
 def _panel_launch_round(
     run: "ActiveRun", sid: str, stage: str, root: str, message: str,
+    capture: Optional[dict] = None, requested_base: str = "HEAD",
 ) -> tuple[str, bool]:
     """Start the round in the background and say so.
 
     No awaits: the record is read and saved here, with nothing in between, so
     a switch flipped meanwhile isn't overwritten with an older copy.
     """
+    running = _PANEL_ROUNDS.get(sid)
+    if running is not None and not running.done():
+        return _PANEL_RUNNING, False
     participants = _panel_participants()
     state = _panel_state_for_run(run)
     advisory = not state.enabled
@@ -8837,11 +8978,20 @@ def _panel_launch_round(
             stage, round_no, panel.MAX_ROUNDS, labels,
             advisory=advisory, user_label=run.panel_user_label,
         )
+    if stage == "changes":
+        if decide_only:
+            saved = state.decision_record(root)
+            previous = saved["comparison"] if saved is not None else "unavailable; a fresh review is required"
+            reply += f" No new comparison ran; requested base {requested_base!r} was NOT reviewed. The decision concerns only the earlier receipt: {previous or 'legacy HEAD snapshot'}."
+        elif capture is not None:
+            reply += f" Comparison: {review_capture.receipt(capture)}."
+            if not capture["commit_eligible"]:
+                reply += " This is a review-only branch comparison; pending edits require a HEAD review before commit."
     notes = run.panel_notes[:]
     run.panel_notes.clear()
     task = asyncio.create_task(_panel_round_task(
         run, sid, stage, root, message, notes, participants, round_no,
-        decide_only=decide_only,
+        decide_only=decide_only, capture=capture,
     ))
     _PANEL_ROUNDS[sid] = task
     task.add_done_callback(_log_task_exception)
@@ -8860,7 +9010,7 @@ def _panel_topic(message: str) -> str:
 async def _panel_round_task(
     run: "ActiveRun", sid: str, stage: str, root: str, message: str,
     notes: list[str], participants: list[str], round_no: int,
-    decide_only: bool = False,
+    decide_only: bool = False, capture: Optional[dict] = None,
 ) -> None:
     """One round, then the answer as the chat's next message.
 
@@ -8873,6 +9023,15 @@ async def _panel_round_task(
     reviewed: Optional[dict] = None
     start = _panel_load(sid) or panel.PanelState(enabled=True)
     thread_id = start.thread_id
+    decision_capture_id = start.decision_reviews.get(root) if stage == "changes" and decide_only else None
+    saved_decision = start.decision_record(root) if decide_only and stage == "changes" else None
+    comparison = None
+    if stage == "changes":
+        if decide_only and saved_decision is not None:
+            comparison = saved_decision["comparison"]
+        elif not decide_only and capture is not None:
+            comparison = review_capture.receipt(capture)
+    eligible = comparison is None or comparison.get("commit_eligible", True)
     if notes:
         requirements = start.review_requirements.setdefault(root, [])
         requirements.extend(notes)
@@ -8880,8 +9039,21 @@ async def _panel_round_task(
         _panel_save(sid, run.owner_sub, start)
     try:
         if decide_only:
+            if stage == "changes":
+                if saved_decision is None:
+                    raise review_capture.CaptureError("The saved comparison has no matching snapshot; request a fresh review.")
+                reviewed = saved_decision["reviewed_state"]
             outcome = "changes"
         elif not participants:
+            if stage == "changes":
+                if capture is None:
+                    raise review_capture.CaptureError("No validated comparison was captured")
+                # With no providers, binding/publication must still succeed before the existing outage policy applies.
+                if thread_id is None:
+                    created = await asyncio.to_thread(roundtable_core.roundtable_create, topic=_panel_topic(message))
+                    thread_id = int(created["thread_id"])
+                await asyncio.to_thread(roundtable_core.publish_review_diff, thread_id, capture)
+                reviewed = capture["pending_state"] if eligible else None
             outcome = "unavailable"
             errors = [{"participant": "", "label": "The panel",
                        "error": "No roundtable participant is configured and available."}]
@@ -8902,15 +9074,20 @@ async def _panel_round_task(
                 emit=lambda event: _panel_emit(sid, event), on_thread=_on_thread,
                 review_ledger=start.review_ledger.get(root, {}).get(stage),
                 requirements="\n\n".join(start.review_requirements.get(root, [])),
+                capture=capture,
             )
             thread_id = result.thread_id
             replies, errors, reviewed = result.replies, result.errors, result.reviewed_state
             outcome = result.outcome
+            comparison = result.receipt or comparison
+            eligible = comparison is None or comparison.get("commit_eligible", True)
             # Persist findings before a decision-card await so cancellation or
             # a restart cannot erase an objection that has already been shown.
             if result.review_ledger is not None:
                 fresh_state = _panel_load(sid) or start
                 fresh_state.review_ledger.setdefault(root, {})[stage] = result.review_ledger
+                if comparison is not None:
+                    fresh_state.record_comparison(root, comparison, reviewed)
                 _panel_save(sid, run.owner_sub, fresh_state)
         if outcome == "changes" and (decide_only or round_no >= panel.MAX_ROUNDS):
             fresh = _panel_load(sid)
@@ -8920,12 +9097,19 @@ async def _panel_round_task(
                 # the chat, where their word counts.
                 outcome = "unresolved"
             else:
-                outcome = await _panel_ask_user(sid, stage, round_no)
+                if comparison is not None:
+                    fresh = _panel_load(sid) or start
+                    fresh.record_comparison(root, comparison, reviewed)
+                    fresh.decision_reviews[root] = comparison["capture_id"]
+                    decision_capture_id = comparison["capture_id"]
+                    _panel_save(sid, run.owner_sub, fresh)
+                    _panel_emit(sid, {"type": "panel_gate", "message": f"Decision concerns captured comparison {comparison}. No new base is being reviewed."})
+                outcome = await _panel_ask_user(sid, stage, round_no, repo=root, comparison=comparison)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — reported to Claude and the user
         log.exception("panel round failed session=%s stage=%s", sid, stage)
-        outcome = "unavailable"
+        outcome = "failed" if stage == "changes" else "unavailable"
         errors = errors + [{"participant": "", "label": "The panel",
                             "error": f"{type(exc).__name__}: {exc}"}]
     if outcome == "unavailable":
@@ -8939,14 +9123,12 @@ async def _panel_round_task(
                                 "\n".join(f"{f['id']}: {f['claim']}" for f in remaining)})
     try:
         approve = outcome in ("approved", "unavailable", "go_ahead")
-        # An approval of changes covers what the panel was shown: this round's
-        # snapshot, or for "go ahead" on a deadlock with no new round, the last
-        # one it saw. Only a panel that stepped aside before seeing anything
-        # approves what's on disk now.
-        on_disk: Optional[dict] = None
-        if (approve and stage == "changes" and reviewed is None
-                and not (decide_only and root in start.last_reviewed)):
-            on_disk = await asyncio.to_thread(panel.working_state, root)
+        # A decision approves only the snapshot paired with its receipt.
+        # Missing state must never be repaired by hashing the current disk.
+        if approve and eligible and stage == "changes" and reviewed is None:
+            outcome, approve = "failed", False
+            errors.append({"participant": "", "label": "The panel",
+                           "error": "No matching reviewed snapshot is available; request a fresh review."})
         # Read the record afresh and save with no await in between: a round
         # plus the user's decision can take minutes, and saving the copy read
         # at the start would undo anything that changed meanwhile, the switch
@@ -8954,26 +9136,30 @@ async def _panel_round_task(
         state = _panel_load(sid) or start
         advisory = not state.enabled
         state.thread_id = thread_id
-        if outcome == "go_ahead":
+        if outcome == "go_ahead" and eligible:
             for findings in state.review_ledger.get(root, {}).get(stage, {}).values():
                 for finding in findings:
                     if finding["status"] == "open":
                         finding["status"] = "overridden_by_user"
-        if stage == "changes" and reviewed is not None:
-            state.last_reviewed[root] = reviewed
-        if approve:
+        if outcome != "failed" and comparison is not None:
+            state.record_comparison(root, {**comparison, "decision": outcome}, reviewed)
+        owns_decision = (stage == "changes" and decision_capture_id is not None
+                         and state.decision_reviews.get(root) == decision_capture_id)
+        if owns_decision and outcome in ("go_ahead", "more_rounds", "stop"):
+            state.decision_reviews.pop(root, None)
+        if approve and (stage == "plan" or eligible):
             if stage == "plan":
                 state.plan_ok = True
             elif reviewed is not None:
                 state.approvals[root] = reviewed
-            elif decide_only and root in state.last_reviewed:
-                state.approvals[root] = state.last_reviewed[root]
-            else:
-                state.approvals[root] = on_disk or {}
             state.rounds[stage] = 0
-        elif outcome in ("more_rounds", "unresolved"):
+        elif outcome in ("more_rounds", "unresolved") or (approve and not eligible):
             state.rounds[stage] = 0
-        if advisory and outcome not in ("changes", "more_rounds"):
+        elif outcome == "failed":
+            state.rounds[stage] = 0 if decide_only else max(0, state.rounds[stage] - 1)
+            if decide_only and owns_decision:
+                state.decision_reviews.pop(root, None)
+        if advisory and eligible and outcome not in ("changes", "more_rounds", "failed"):
             # That stage's review is over (including a decision card answered
             # after the box went off): the next one asks the user again.
             state.granted = [s for s in state.granted if s != stage]
@@ -8989,10 +9175,15 @@ async def _panel_round_task(
             "thread_id": state.thread_id,
             "errors": [e["label"] for e in errors],
         })
-        await _panel_deliver(sid, run, panel.result_message(
-            stage, round_no, panel.MAX_ROUNDS, outcome, replies, errors, user_label,
-            advisory=advisory,
-        ))
+        scope_note = ""
+        if comparison is not None:
+            scope_note = f"\n\nComparison receipt: {comparison}."
+            if not eligible:
+                scope_note += " Review-only: this does not approve pending edits for commit. Use a normal HEAD changes review for those."
+        if outcome == "failed":
+            scope_note += "\n\nThe review failed to start or deliver its intended comparison. No approval was granted; earlier objections remain open. Retry the review."
+        result_text = panel.result_message(stage, round_no, panel.MAX_ROUNDS, outcome, replies, errors, user_label, advisory=advisory, commit_eligible=eligible)
+        await _panel_deliver(sid, run, result_text + scope_note)
     finally:
         if _PANEL_ROUNDS.get(sid) is asyncio.current_task():
             _PANEL_ROUNDS.pop(sid, None)
@@ -9053,15 +9244,19 @@ async def _panel_question(
     return "answered", "", picked[:500]
 
 
-async def _panel_ask_user(sid: str, stage: str, rounds: int) -> str:
+async def _panel_ask_user(
+    sid: str, stage: str, rounds: int, *,
+    repo: Optional[str] = None, comparison: Optional[dict] = None,
+) -> str:
     """The deadlock card: go ahead anyway, more rounds, or stop."""
     # Found by session, not passed in: the round can outlive the run that
     # started it (an account switch replaces it).
     target = ACTIVE_RUNS_BY_SESSION.get(sid)
     if target is None or target.done:
         return "undecided"
+    card = panel.decision_card(stage, rounds, panel.MAX_ROUNDS, repo=repo, comparison=comparison)
     status, picked, _ = await _panel_question(
-        target, panel.decision_card(stage, rounds, panel.MAX_ROUNDS),
+        target, card,
         tool_label="PanelDecision", asker="The review panel",
     )
     if status == "interrupted":
@@ -9617,6 +9812,12 @@ class ActiveRun:
         self.codex_turn_id: Optional[str] = None
         self.codex_model_id: Optional[str] = None
         self.codex_effort: Optional[str] = None
+        self.codex_pending: Optional[codex_provider.ModelSelection] = None
+        self.codex_initial_selection: Optional[codex_provider.ModelSelection] = None
+        self.codex_intents: list[dict] = []
+        self.codex_active: Optional[codex_provider.ModelSelection] = None
+        self.codex_delivery_wake = asyncio.Event()
+        self.codex_delivery_pending: set[asyncio.Future] = set()
         self.codex_token_usage: Optional[dict] = None
         self.codex_turn_done = asyncio.Event()
         self.codex_turn_done.set()
@@ -11395,6 +11596,7 @@ async def _confirm_and_emit_user_prompt(
     file_count: int,
     delivered: asyncio.Future,
     queue_id: Optional[str] = None,
+    delivery: Optional[codex_provider.InputDelivery] = None,
 ) -> None:
     """Wait for the driver to acknowledge delivery of an injected user
     message, then emit the user_prompt event. On timeout, emit an error
@@ -11406,7 +11608,18 @@ async def _confirm_and_emit_user_prompt(
     """
     preview = text[:200] + ("…" if len(text) > 200 else "")
     try:
-        await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+        if delivery is None:
+            await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(delivered), timeout=USER_INPUT_DELIVERY_TIMEOUT)
+            except asyncio.TimeoutError:
+                if delivery.expire():
+                    _discard_codex_intent(run, delivery)
+                    run.codex_delivery_wake.set()
+                    raise
+                # A transmitted RPC can have taken effect. Its bounded result, not a timer, decides delivery.
+                await delivered
     except asyncio.CancelledError:
         # App shutdown cancelled this task. Don't synthesise an error
         # event; just propagate so the loop can tear down cleanly.
@@ -11458,6 +11671,7 @@ async def _confirm_and_emit_user_prompt(
 
 async def _await_delivery_quietly(
     run: ActiveRun, text: str, delivered: asyncio.Future,
+    delivery: Optional[codex_provider.InputDelivery] = None,
 ) -> None:
     """Consume a silent injection's delivery Future.
 
@@ -11466,7 +11680,17 @@ async def _await_delivery_quietly(
     CLI would leave the UI claiming a state the CLI is not in.
     """
     try:
-        await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+        if delivery is None:
+            await asyncio.wait_for(delivered, timeout=USER_INPUT_DELIVERY_TIMEOUT)
+        else:
+            try:
+                await asyncio.wait_for(asyncio.shield(delivered), timeout=USER_INPUT_DELIVERY_TIMEOUT)
+            except asyncio.TimeoutError:
+                if delivery.expire():
+                    _discard_codex_intent(run, delivery)
+                    run.codex_delivery_wake.set()
+                    raise
+                await delivered
     except Exception as exc:
         if (isinstance(exc, _DeliveryAlreadyReported) and run.provider == "codex"
                 and text.startswith(panel.MESSAGE_MARKER)):
@@ -11491,6 +11715,8 @@ async def _inject_user_input(
     announce: bool = True,
     display_text: Optional[str] = None,
     steer: bool = False,
+    codex_selection: Optional[codex_provider.ModelSelection] = None,
+    _codex_locked: bool = False,
 ) -> Optional[str]:
     """Queue user input for the driver to deliver to the CLI.
 
@@ -11514,23 +11740,47 @@ async def _inject_user_input(
       cap; the caller should tell the client to retry, NOT tear down a
       healthy run. Previously both conditions returned a bare False and the
       browser's run_finished fallback aborted a live mid-turn stream.
+    - ``"codex_settings_require_queue"`` — changed Codex settings cannot steer
+      the active turn; keep the stream and resubmit at the next turn boundary.
 
     Ordinary input waits for a turn boundary on Claude. Explicit steering uses
     its own queue, consumed by the same driver and serialized write lock while
     the current turn continues. Codex consumes user input through turn/steer.
     """
+    if run.provider == "codex" and codex_selection is not None and not _codex_locked:
+        credential = _parse_cred_active(run.account_slot)
+        async with _codex_credential_lock(run.owner_sub or "", credential if credential is not None else -1):
+            _resolve_codex_account_for_run({"sub": run.owner_sub}, override_slot=run.account_slot)
+            return await _inject_user_input(run, text, blocks, image_count, file_count,
+                queue_id=queue_id, announce=announce, display_text=display_text, steer=steer,
+                codex_selection=codex_selection, _codex_locked=True)
     if run.done or not run.accepting_input:
         return "run_finished"
+    if (run.provider == "codex" and steer and not run.between_turns
+            and codex_selection is not None and codex_selection != run.codex_active):
+        return "codex_settings_require_queue"
     # Bound the per-run input backlog. The browser caps at MAX_QUEUE_LENGTH
     # client-side, but a direct API caller could otherwise enqueue without
     # limit — each item spawns a delivery task + Future.
-    if run.user_input_queue.qsize() + run.steering_input_queue.qsize() >= MAX_USER_INPUT_QUEUE:
+    held = int(run._deferred_user_item is not None) if run.provider == "codex" else 0
+    backlog = run.user_input_queue.qsize() + run.steering_input_queue.qsize() + held
+    if run.provider == "codex":
+        # Include an item already popped by the get task but not yet adopted by the driver.
+        backlog = max(backlog, sum(not future.done() for future in run.codex_delivery_pending))
+    if backlog >= MAX_USER_INPUT_QUEUE:
         return "queue_full"
     loop = asyncio.get_running_loop()
     delivered: asyncio.Future = loop.create_future()
     target_queue = (run.steering_input_queue if steer and run.provider != "codex"
                     else run.user_input_queue)
-    await target_queue.put({
+    delivery = codex_provider.InputDelivery() if run.provider == "codex" else None
+    if codex_selection is not None:
+        _record_codex_intent(run, codex_selection, "message", delivery, queue_id)
+    if delivery is not None:
+        run.codex_delivery_pending.add(delivered)
+        delivered.add_done_callback(run.codex_delivery_pending.discard)
+    target_queue.put_nowait({
+        "delivery": delivery, "selection": codex_selection,
         "text": text,
         "steer": steer,
         "image_blocks": blocks,
@@ -11541,8 +11791,8 @@ async def _inject_user_input(
         _confirm_and_emit_user_prompt(
             run, text if display_text is None else display_text,
             image_count, file_count, delivered,
-            queue_id=queue_id,
-        ) if announce else _await_delivery_quietly(run, text, delivered)
+            queue_id=queue_id, delivery=delivery,
+        ) if announce else _await_delivery_quietly(run, text, delivered, delivery=delivery)
     )
     # Log unexpected exceptions instead of letting them surface as the
     # generic "Task exception was never retrieved" warning at GC time.
@@ -11912,11 +12162,12 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
     an empty history rather than a 500 — the live_run attach still lets an
     in-flight conversation reconnect."""
     messages: list[dict] = []
-    account = _resolve_codex_account_for_run(user, session_id=sid)
-    read_server_key = (
-        f"{account['server_key']}:read:{uuid_mod.uuid4().hex}"
-    )
+    account = {"slot": _session_account_slot(sid) or "shared"}
+    read_server_key = None
+    history_error = None
     try:
+        account = _resolve_codex_account_for_run(user, session_id=sid)
+        read_server_key = f"{account['server_key']}:read:{uuid_mod.uuid4().hex}"
         # thread/unsubscribe keeps a thread resident in app-server memory for
         # up to 30 minutes. A disposable reader is therefore required after
         # another account extends the same rollout; the account-control
@@ -11934,10 +12185,12 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
             _user_turn_entries(m["text"]) if m["role"] == "user" else [m]
         )]
     except Exception as e:
+        history_error = str(e.detail) if isinstance(e, HTTPException) else "History could not be loaded. Refresh or choose an account to try again."
         log.warning("codex thread/read failed for %s: %s", sid, e)
     finally:
         try:
-            await codex_provider.CodexAppServer.close_key(read_server_key)
+            if read_server_key is not None:
+                await codex_provider.CodexAppServer.close_key(read_server_key)
         except Exception as e:
             log.warning("codex thread reader close failed for %s: %s", sid, e)
     live = _existing_run_for_session(sid)
@@ -11959,8 +12212,9 @@ async def _codex_session_payload(sid: str, row: dict, user: dict) -> dict:
         # are not in what thread/read returns.
         "tasks": await _session_task_list(sid, None),
         "provider": "codex",
+        **_codex_session_settings(sid, row),
         "panel": _panel_payload(sid),
-        "account_slot": account["slot"],
+        "account_slot": account["slot"], "history_error": history_error,
     }
 
 
@@ -12086,6 +12340,7 @@ async def api_delete_session(
         try:
             _state_db().execute(
                 "DELETE FROM codex_session WHERE thread_id = ?", (sid,))
+            _state_db().execute("DELETE FROM codex_chat_settings WHERE thread_id=?", (sid,))
             _state_db().execute(
                 "DELETE FROM session_owners WHERE session_id = ?", (sid,))
         except sqlite3.Error:
@@ -13919,6 +14174,7 @@ async def _codex_driver(
     fork: bool = False,
     handoff_text: str = "",
     handoff_items: Optional[list[dict]] = None,
+    selection: Optional[codex_provider.ModelSelection] = None,
 ) -> None:
     """Own one Codex thread for the life of this run.
 
@@ -13933,8 +14189,11 @@ async def _codex_driver(
     run.client for stop, emits the v1 SSE event shapes, and calls
     run.finish() on the way out.
     """
+    selection = selection or codex_provider.ModelSelection(model_id, model_id, effort, effort)
+    run.codex_initial_selection = run.codex_initial_selection or selection
+    run.codex_pending = run.codex_pending or selection
     run.codex_model_id = model_id or None
-    run.codex_effort = effort or None
+    run.codex_effort = selection.effective_effort or None
     # fileChange approval params don't repeat the file list; remember each
     # item's tool input from item/started so the approval card can show it.
     item_inputs: dict[str, dict] = {}
@@ -14034,7 +14293,7 @@ async def _codex_driver(
         # A fork must never fall back to the source id — two runs would then
         # append to the same thread, the exact split the fork asked to avoid.
         thread_id = thread.get("id") or (None if fork else resume_thread_id)
-        if not thread_id:
+        if not thread_id or (fork and thread_id == resume_thread_id):
             run.emit({"type": "error",
                       "message": "Codex did not report a thread id."})
             return
@@ -14058,24 +14317,17 @@ async def _codex_driver(
             first_prompt_title, model_id or None,
         )
 
-        async def _start_turn(text: str, image_blocks: list[dict]) -> bool:
-            """turn/start with the run's current model/effort. Returns
-            False when the request itself failed (turn never opened)."""
+        async def _start_turn(text: str, image_blocks: list[dict],
+                              picked: codex_provider.ModelSelection = selection,
+                              item: Optional[dict] = None) -> bool:
+            """Claim queued input before sending a turn or compaction RPC.
+
+            False means that accepted delivery was not confirmed.
+            """
             nonlocal compact_pending
-            if text.strip() == "/compact" and not image_blocks:
-                # The composer's builtin /compact maps to codex's native
-                # compaction instead of reaching the model as literal text.
-                # No turn bookkeeping: if codex runs it as a turn, the
-                # normal turn/started..turn/completed events handle it.
-                try:
-                    await server.request(
-                        "thread/compact/start", {"threadId": thread_id},
-                    )
-                    compact_pending = True
-                except Exception as e:
-                    run.emit({"type": "error",
-                              "message": f"Codex compaction failed: {e}"})
-                return True
+            if not run.accepting_input:
+                return False
+            compact = text.strip() == "/compact" and not image_blocks
             params: dict[str, Any] = {
                 "threadId": thread_id,
                 # Tracks the live permission mode so a mid-chat switch
@@ -14083,17 +14335,38 @@ async def _codex_driver(
                 "approvalPolicy": codex_provider.approval_policy_for_mode(
                     run.permission_mode),
             }
-            if run.codex_model_id:
-                params["model"] = run.codex_model_id
-            if run.codex_effort:
-                params["effort"] = run.codex_effort
-            run.codex_turn_done.clear()
+            params.update(picked.turn_params())
+            if not picked.model:
+                params.pop("model", None)
             try:
                 async with run.client_write_lock:
+                    if not run.accepting_input:
+                        return False
+                    if item is not None:
+                        delivery = item.get("delivery")
+                        qid = item.get("queue_id")
+                        if ((qid and qid in run.canceled_input_ids)
+                                or (delivery is not None and not delivery.claim())):
+                            return False
+                        if qid:
+                            run.committed_input_ids.add(qid)
+                    if compact:
+                        # Native compaction has the same delivery boundary as
+                        # a turn. Its notifications own any turn bookkeeping.
+                        await server.request("thread/compact/start", {"threadId": thread_id})
+                        compact_pending = True
+                        return True
+                    run.codex_turn_done.clear()
                     effective_text = _panel_codex_input(run, text)
                     params["input"] = _codex_input_items(effective_text, image_blocks, run.run_id)
                     started = await server.request("turn/start", params)
                     _panel_codex_input_accepted(run, effective_text)
+                    run.codex_active = picked
+                    run.codex_model_id = picked.model
+                    run.codex_effort = picked.effective_effort
+                    _save_codex_settings(run, picked, "applied")
+                    log.info("codex turn settings run=%s model=%s effort=%s speed=%s",
+                             run.run_id, picked.model, picked.effective_effort, picked.tier)
                     started_turn_id = (
                         ((started or {}).get("turn") or {}).get("id")
                     )
@@ -14103,9 +14376,11 @@ async def _codex_driver(
                     run.interrupting = False
                     item_inputs.clear()
             except Exception as e:
-                run.codex_turn_done.set()
+                if not compact:
+                    run.codex_turn_done.set()
+                failure = "compaction failed" if compact else "turn failed to start"
                 run.emit({"type": "error",
-                          "message": f"Codex turn failed to start: {e}"})
+                          "message": f"Codex {failure}: {e}"})
                 return False
             return True
 
@@ -14149,9 +14424,10 @@ async def _codex_driver(
             notif_get = asyncio.create_task(notif_q.get())
             user_get = (
                 asyncio.create_task(run.user_input_queue.get())
-                if run.accepting_input else None
+                if run.accepting_input and run._deferred_user_item is None else None
             )
-            waiters = {notif_get}
+            wake = asyncio.create_task(run.codex_delivery_wake.wait())
+            waiters = {notif_get, wake}
             if user_get is not None:
                 waiters.add(user_get)
             timeout = (SESSION_IDLE_TIMEOUT_MS if run.between_turns
@@ -14162,9 +14438,10 @@ async def _codex_driver(
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             finally:
-                for t in (notif_get, user_get):
+                for t in (notif_get, user_get, wake):
                     if t is not None and not t.done():
                         t.cancel()
+            run.codex_delivery_wake.clear()
             if not done:
                 if thread_id in _PANEL_ROUNDS or thread_id in _PANEL_ASKS:
                     continue
@@ -14323,18 +14600,27 @@ async def _codex_driver(
                     run.canceled_input_ids.discard(qid)
                     if ack is not None and not ack.done():
                         ack.set_exception(_DeliveryAlreadyReported("recalled"))
+                elif item.get("delivery") is not None and item["delivery"].state == "expired":
+                    if ack is not None and not ack.done():
+                        ack.set_exception(_DeliveryAlreadyReported("expired"))
                 else:
-                    if qid:
-                        run.committed_input_ids.add(qid)
+                    picked = item.get("selection") or (run.codex_active if item.get("steer") else run.codex_pending) or selection
+                    if not run.between_turns and picked != run.codex_active:
+                        run._deferred_user_item = item
+                        continue
                     delivered_ok = True
                     if run.between_turns:
                         delivered_ok = await _start_turn(
-                            item.get("text") or "", item.get("image_blocks") or [],
+                            item.get("text") or "", item.get("image_blocks") or [], picked, item,
                         )
                         turn_started_mono = time.monotonic()
                         if not delivered_ok:
-                            _emit_lost_input(run, item.get("text") or "",
-                                             "Codex rejected the turn; send it again", queue_id=qid)
+                            _panel_delivery_failed(run, item.get("text") or "")
+                            delivery = item.get("delivery")
+                            if delivery is None or delivery.state == "queued":
+                                _emit_lost_input(run, item.get("text") or "", "Codex did not accept the message", queue_id=qid)
+                            elif delivery.state == "committing":
+                                run.emit({"type": "error", "message": "Codex did not confirm delivery. The message may have been received; check before retrying."})
                             if ack is not None and not ack.done():
                                 ack.set_exception(_DeliveryAlreadyReported("turn start rejected"))
                     else:
@@ -14359,6 +14645,14 @@ async def _codex_driver(
                                     # TurnSteerParams — omitting it makes the
                                     # app-server reject every mid-turn message
                                     # with -32600 missing field.
+                                    delivery = item.get("delivery")
+                                    if ((qid and qid in run.canceled_input_ids)
+                                            or (delivery is not None and not delivery.claim())):
+                                        if ack is not None and not ack.done():
+                                            ack.set_exception(_DeliveryAlreadyReported("expired or recalled"))
+                                        continue
+                                    if qid:
+                                        run.committed_input_ids.add(qid)
                                     effective_text = _panel_codex_input(run, item.get("text") or "")
                                     await server.request("turn/steer", {
                                         "threadId": thread_id,
@@ -14372,18 +14666,16 @@ async def _codex_driver(
                                     _panel_codex_input_accepted(run, effective_text)
                         except Exception as e:
                             log.warning("codex steer failed: %s", e)
+                            _panel_delivery_failed(run, item.get("text") or "")
                             delivered_ok = False
-                            _emit_lost_input(
-                                run, item.get("text") or "",
-                                f"Codex rejected the mid-turn message ({e}); "
-                                "send it again",
-                                queue_id=qid,
-                            )
+                            run.emit({"type": "error", "message": "Codex did not confirm the mid-turn message. It may have been received; check before retrying."})
                             if ack is not None and not ack.done():
                                 ack.set_exception(_DeliveryAlreadyReported(
                                     "steer failed; lost_input already emitted"
                                 ))
                     if delivered_ok and ack is not None and not ack.done():
+                        if item.get("delivery") is not None:
+                            item["delivery"].state = "delivered"
                         ack.set_result(True)
     except asyncio.CancelledError:
         raise
@@ -14567,6 +14859,7 @@ async def api_chat(
     model: str = Form(default=""),
     advisor: str = Form(default=""),
     effort: str = Form(default=""),
+    service_tier: str = Form(default="default"),
     permission_mode: str = Form(default="default"),
     fork: bool = Form(default=False),
     personality_id: Optional[int] = Form(default=None),
@@ -14649,7 +14942,7 @@ async def api_chat(
     # credential slot; rides out to the client on run_started so the account
     # the turn actually runs on is never silently different from the picked one.
     substitution: Optional[dict] = None
-    codex_models: dict[str, dict] = {}
+    codex_selection = None
     if provider == "codex":
         account = _resolve_codex_account_for_run(
             user,
@@ -14724,21 +15017,22 @@ async def api_chat(
         if fork and not session_id:
             raise HTTPException(400, "fork requires a session to fork from")
         try:
-            codex_server = await _codex_server_for_account(account)
-            codex_models = {
-                item["key"]: item for item in await codex_server.models()
-            }
-        except Exception as e:
-            return JSONResponse(
-                {"error": "codex_not_configured", "detail": str(e)},
-                status_code=503,
-            )
-        if model and codex_models and model not in codex_models:
-            raise HTTPException(400, "unknown model")
-        selected_model = codex_models.get(model, {}) if model else {}
-        if (effort and selected_model
-                and effort not in (selected_model.get("efforts") or [])):
-            raise HTTPException(400, "model does not support this effort level")
+            catalog = await _codex_catalog(user, account)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            return JSONResponse({"error": "codex_not_configured", "detail": str(exc)}, status_code=503)
+        saved = _codex_session_settings(session_id, _codex_sess) if session_id else {}
+        submitted = await request.form()
+        model = model if "model" in submitted else saved.get("model", model)
+        effort = effort if "effort" in submitted else saved.get("effort", effort)
+        service_tier = service_tier if "service_tier" in submitted else saved.get("service_tier", "default")
+        try:
+            codex_selection = codex_provider.model_selection(catalog, model, effort, service_tier)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        model = codex_selection.key
+        selected_model = next(item for item in catalog if item["key"] == model)
     elif provider in ROUTED_PROVIDERS:
         selected_model = await _routed_model_for_run(
             provider, model, effort, (account or {}).get("api_key"))
@@ -14774,6 +15068,8 @@ async def api_chat(
     )
 
     image_blocks, _image_meta = await _read_uploaded_images(images)
+    if provider == "codex" and image_blocks and "image" not in selected_model.get("input_modalities", ["text", "image"]):
+        raise HTTPException(400, "This model does not accept images. Choose a model with image input.")
 
     # Reuse an existing long-lived run for this session if we can. The lock
     # ensures two near-simultaneous POSTs with the same session_id can't both
@@ -14803,6 +15099,8 @@ async def api_chat(
         except BaseException:
             switch_lock.release()
             raise
+    codex_admission_lock = None
+    codex_admission_acquired = False
     sess_lock = _session_lock(session_id) if session_id else None
     if sess_lock:
         await sess_lock.acquire()
@@ -14861,7 +15159,7 @@ async def api_chat(
         # binding here closes the gap between the client's POST landing
         # and the SDK confirming session_id back to us.
         if (
-            session_id and personality_id is not None
+            session_id and provider != "codex" and personality_id is not None
             and active_personality_id is not None
         ):
             _bind_session_personality(
@@ -14875,7 +15173,7 @@ async def api_chat(
         # substitution is re-decided every turn from live plan state; persisting
         # it would quietly rewrite the user's standing choice the first time
         # their account hit a limit, and they'd never drift back once it reset.
-        if session_id and account_slot and provider in ACCOUNT_PROVIDERS:
+        if session_id and provider != "codex" and account_slot and provider in ACCOUNT_PROVIDERS:
             _bind_session_account(
                 session_id, user.get("sub"),
                 substitution["from_slot"] if substitution else account["slot"],
@@ -14970,6 +15268,7 @@ async def api_chat(
                 file_count=len(file_metas),
                 queue_id=queue_id or None,
                 display_text=shown,
+                codex_selection=codex_selection,
             )
             if inject_failure == "queue_full":
                 # The run is alive but its input backlog is at the cap.
@@ -15041,6 +15340,8 @@ async def api_chat(
         run.model = model or None
         run.advisor = bool(advisor_on) if provider == "claude" else False
         run.effort = effort
+        run.codex_pending = codex_selection
+        run.codex_initial_selection = codex_selection
         run.project_key = _sanitize_project_key(cwd)
         run.panel_user_label = _panel_user_label(user)
         if provider in ("claude", "codex") and panel_field is not None:
@@ -15094,8 +15395,18 @@ async def api_chat(
         # into its (driver-less) queue, and report success while the message
         # silently disappears when the original request raises.
         file_metas = await _save_uploaded_files(files, run_id)
+        if provider == "codex":
+            credential = _parse_cred_active(account["slot"])
+            codex_admission_lock = _codex_credential_lock(user.get("sub") or "", credential if credential is not None else -1)
+            await codex_admission_lock.acquire()
+            codex_admission_acquired = True
+            _resolve_codex_account_for_run(user, override_slot=account["slot"])
+            if session_id and not fork:
+                _bind_session_account(session_id, user.get("sub"), account["slot"])
+                if personality_id is not None and active_personality_id is not None:
+                    _bind_session_personality(session_id, user.get("sub"), active_personality_id)
         ACTIVE_RUNS[run_id] = run
-        if session_id and not forking_live_run:
+        if session_id and not forking_live_run and not (fork and provider == "codex"):
             # Eager-claim the session id so a concurrent POST sees this run
             # and reuses it instead of spawning a parallel one. The driver
             # may overwrite this with whatever the SDK reports in init —
@@ -15112,6 +15423,8 @@ async def api_chat(
             if not fork:
                 _record_routed_session(run)
     finally:
+        if codex_admission_acquired:
+            codex_admission_lock.release()
         if sess_lock:
             sess_lock.release()
         if switch_lock:
@@ -15176,6 +15489,7 @@ async def api_chat(
             first_prompt_title=message.strip().splitlines()[0][:80] if message.strip() else "",
             account=account,
             fork=fork,
+            selection=codex_selection,
         ))
         run.task.add_done_callback(_log_task_exception)
         return _stream_run_response(run)
@@ -16455,9 +16769,23 @@ async def api_chat_send(
     # user changed the picker and the ranker landed on this run anyway.
     run.requested_account_slot = account["slot"]
     form = await request.form()
+    picked = None
+    if run.provider == "codex":
+        catalog = await _codex_catalog(user, account)
+        saved = run.codex_pending.saved() if run.codex_pending else _codex_session_settings(run.session_id)
+        try:
+            picked = codex_provider.model_selection(catalog, form.get("model", saved.get("model", "")),
+                form.get("effort", saved.get("effort", "")), form.get("service_tier", saved.get("service_tier", "default")))
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": "codex_selection_unavailable", "detail": str(exc)}, status_code=400)
     images = _form_uploads(form, "images")
     files = _form_uploads(form, "files")
     image_blocks, _meta = await _read_uploaded_images(images)
+    if picked is not None and image_blocks:
+        entry = next(item for item in catalog if item["key"] == picked.key)
+        if "image" not in entry.get("input_modalities", ["text", "image"]):
+            return JSONResponse({"ok": False, "error": "codex_selection_unavailable",
+                                 "detail": "This model does not accept images. Choose a model with image input."}, status_code=400)
     file_metas = await _save_uploaded_files(files, run_id)
     shown = _file_attachment_prefix(file_metas) + message
     effective = _panel_prefix(run, message) + shown
@@ -16475,8 +16803,10 @@ async def api_chat_send(
         image_count=len(image_blocks),
         file_count=len(file_metas),
         queue_id=queue_id or None,
-        display_text=shown, steer=steer is True,
+        display_text=shown, steer=steer is True, codex_selection=picked,
     )
+    if inject_failure == "codex_settings_require_queue":
+        return JSONResponse({"ok": False, "error": inject_failure}, status_code=409)
     if inject_failure == "queue_full":
         # The run is alive — 429 tells the browser to hold the message
         # locally and retry, instead of the run_finished fallback (which
@@ -16513,6 +16843,8 @@ async def api_chat_active(run_id: str = "", user: dict = Depends(auth.require_us
         return {"active": False}
     return {
         "active": not run.done,
+        "provider": run.provider, "account_slot": run.account_slot,
+        **(run.codex_pending.saved() if run.provider == "codex" and run.codex_pending else {}),
         "run_id": run.run_id,
         "session_id": run.session_id,
         "project": run.project_key,
@@ -16710,6 +17042,13 @@ async def api_chat_cancel_queued(
     if len(run.canceled_input_ids) >= MAX_USER_INPUT_QUEUE * 4:
         raise HTTPException(429, "too many pending cancellations")
     run.canceled_input_ids.add(queue_id)
+    if run.provider == "codex":
+        for intent in list(run.codex_intents):
+            delivery = intent["delivery"]
+            if intent["queue_id"] == queue_id and delivery is not None and delivery.state == "queued":
+                delivery.state = "canceled"
+                _discard_codex_intent(run, delivery)
+        run.codex_delivery_wake.set()
     return {"ok": True, "cancelled": True}
 
 
@@ -16844,6 +17183,8 @@ async def api_chat_permission_mode(
 async def api_chat_set_model(
     session_id: str = Form(...),
     model: str = Form(default=""),
+    effort: Optional[str] = Form(default=None),
+    service_tier: Optional[str] = Form(default=None),
     user: dict = Depends(auth.require_user),
 ):
     """Switch the live CLI's model mid-conversation via
@@ -16868,16 +17209,31 @@ async def api_chat_set_model(
         codex_account = _resolve_codex_account_for_run(
             user, session_id=run.session_id, override_slot=run.account_slot,
         )
-        codex_models = _codex_models_by_key(codex_account)
-        if model and codex_models and model not in codex_models:
-            raise HTTPException(400, f"unknown model {model!r}")
-        entry = codex_models.get(model, {}) if model else {}
-        run.codex_model_id = entry.get("model") or model or None
-        run.model = model
-        label = entry.get("label") or model or "Default"
-        run.emit({"type": "model_changed", "model": model, "label": label})
-        log.info("codex model set run=%s model=%s", run.run_id, model or "(default)")
-        return {"ok": True, "model": model, "label": label}
+        catalog = await _codex_catalog(user, codex_account)
+        previous = run.codex_pending
+        entry = next((item for item in catalog if item["key"] == model), {})
+        wanted_effort = effort if effort is not None else (previous.effort if previous else "")
+        wanted_tier = service_tier if service_tier is not None else (previous.tier if previous else "default")
+        if effort is None and wanted_effort not in entry.get("efforts", []):
+            wanted_effort = ""
+        if service_tier is None and wanted_tier not in {tier["id"] for tier in entry.get("service_tiers", [])}:
+            wanted_tier = "default"
+        try:
+            selection = codex_provider.model_selection(catalog, model, wanted_effort, wanted_tier)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        credential = _parse_cred_active(codex_account["slot"])
+        async with _codex_credential_lock(user.get("sub") or "", credential if credential is not None else -1):
+            _resolve_codex_account_for_run(user, override_slot=codex_account["slot"])
+            if run.done or not run.accepting_input or _existing_run_for_session(session_id) is not run:
+                raise HTTPException(409, "This run changed while saving settings. Reload the conversation and try again.")
+            _record_codex_intent(run, selection, "picker")
+            run.model = selection.key
+            run.effort = selection.effort
+        label = entry.get("label") or selection.key
+        run.emit({"type": "model_changed", "model": selection.key, "label": label,
+                  **selection.saved(), "message": "Settings apply to the next submitted message."})
+        return {"ok": True, "label": label, **selection.saved()}
     # A retired combo key can still arrive from an old browser; take the
     # executor it named and leave the advisor alone (this route does not
     # change it — /api/chat/advisor does).

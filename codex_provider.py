@@ -38,6 +38,7 @@ Design notes:
 import asyncio
 import collections
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -737,25 +738,36 @@ class CodexAppServer:
             if (self._models_cache is not None
                     and time.time() - self._models_cached_at < MODELS_CACHE_TTL_S):
                 return self._models_cache
-            resp = await self.request("model/list", {})
             models = []
-            for m in (resp or {}).get("data", []):
-                if m.get("hidden"):
-                    continue
-                efforts = [
-                    e.get("reasoningEffort")
-                    for e in (m.get("supportedReasoningEfforts") or [])
-                    if e.get("reasoningEffort")
-                ]
-                models.append({
-                    "key": m.get("id") or m.get("model"),
-                    "model": m.get("model") or m.get("id"),
-                    "label": m.get("displayName") or m.get("id"),
-                    "description": m.get("description") or "",
-                    "efforts": efforts,
-                    "default_effort": m.get("defaultReasoningEffort"),
-                    "is_default": bool(m.get("isDefault")),
-                })
+            cursor = None
+            seen = set()
+            while True:
+                params = {"cursor": cursor} if cursor else {}
+                resp = await self.request("model/list", params)
+                for model in (resp or {}).get("data", []):
+                    if model.get("hidden"):
+                        continue
+                    efforts = model.get("supportedReasoningEfforts") or []
+                    models.append({
+                        "key": model.get("id") or model.get("model"),
+                        "model": model.get("model") or model.get("id"),
+                        "label": model.get("displayName") or model.get("id"),
+                        "description": model.get("description") or "",
+                        "efforts": [entry["reasoningEffort"] for entry in efforts if entry.get("reasoningEffort")],
+                        "effort_descriptions": {entry["reasoningEffort"]: entry.get("description", "")
+                                                for entry in efforts if entry.get("reasoningEffort")},
+                        "default_effort": model.get("defaultReasoningEffort"),
+                        "service_tiers": model.get("serviceTiers") or [],
+                        "default_service_tier": model.get("defaultServiceTier"),
+                        "input_modalities": model.get("inputModalities", ["text", "image"]),
+                        "is_default": bool(model.get("isDefault")),
+                    })
+                cursor = (resp or {}).get("nextCursor")
+                if not cursor:
+                    break
+                if not isinstance(cursor, str) or cursor in seen:
+                    raise CodexError("model/list returned a repeated or invalid cursor")
+                seen.add(cursor)
             self._models_cache = models
             self._models_cached_at = time.time()
             return models
@@ -799,6 +811,62 @@ class CodexAppServer:
             # explains it, so don't overwrite it.
             pass
         return out
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelSelection:
+    """One accepted input's settings, independent of subsequent picker changes."""
+
+    key: str
+    model: str
+    effort: str
+    effective_effort: str
+    tier: str = "default"
+
+    def saved(self) -> dict:
+        return {"model": self.key, "effort": self.effort, "service_tier": self.tier}
+
+    def turn_params(self) -> dict:
+        params = {"model": self.model, "serviceTier": self.tier}
+        if self.effective_effort:
+            params["effort"] = self.effective_effort
+        return params
+
+
+def model_selection(models: list[dict], key: str, effort: str = "", tier: str = "default") -> ModelSelection:
+    """Validate against the destination account; Standard never inherits paid speed."""
+    entry = next((model for model in models if model["key"] == key), None) if key else next(
+        (model for model in models if model.get("is_default")), models[0] if models else None)
+    if entry is None:
+        raise ValueError("Model is unavailable. Refresh models and choose an available model.")
+    supported = entry.get("efforts") or []
+    if effort and effort not in supported:
+        raise ValueError("Model does not support this effort level.")
+    effective = effort or entry.get("default_effort") or ""
+    if supported and not effective:
+        raise ValueError("Codex did not report a default effort. Choose an explicit effort level.")
+    if tier != "default" and tier not in {item["id"] for item in entry.get("service_tiers", [])}:
+        raise ValueError("Model does not support this speed. Choose Standard or an advertised speed.")
+    return ModelSelection(entry["key"], entry.get("model") or entry["key"], effort, effective, tier)
+
+
+@dataclasses.dataclass
+class InputDelivery:
+    """Only queued input can expire; an already transmitted RPC may have taken effect."""
+
+    state: str = "queued"
+
+    def expire(self) -> bool:
+        if self.state != "queued":
+            return False
+        self.state = "expired"
+        return True
+
+    def claim(self) -> bool:
+        if self.state != "queued":
+            return False
+        self.state = "committing"
+        return True
 
 
 # ─── Notification → SSE-event translation ─────────────────────────────────────

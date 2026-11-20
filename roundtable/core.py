@@ -55,6 +55,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
+import review_capture
+
 import anthropic
 import jsonschema
 from google import genai
@@ -2308,6 +2310,21 @@ def _call_anthropic_sdk_with_tools(
             {"type": "adaptive"} if effort in {"medium", "high"} else None
         ),
     }
+    if getattr(perm_cb, "enforce_read_hooks", False):
+        async def _gate_comparison_read(payload, tool_use_id, context):
+            try:
+                decision = await asyncio.to_thread(perm_cb, participant_label,
+                    payload.get("tool_name", ""), payload.get("tool_input") or {})
+            except Exception:
+                decision = "deny"
+            if str(decision).strip().lower() in ("allow", "allow_session"):
+                return {}
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                    "permissionDecisionReason": "This tool or path is excluded from the current review comparison."}}
+
+        # Hooks still run when a native Read or an inherited tool allowlist skips the permission callback.
+        options_kwargs["hooks"] = {"PreToolUse": [sdk.HookMatcher(matcher=".*", hooks=[_gate_comparison_read])]}
+
     # If the caller explicitly opted into a narrower toolset via
     # ``tool_use_context.allowed_tools``, honour it. The default
     # (``allowed_tools=None`` → ``effective_allowed_tools()`` returns
@@ -2968,126 +2985,32 @@ _BIND_DIFF_MAX_CHARS = int(
 _BIND_DIFF_MAX_UNTRACKED = 50
 
 
-def roundtable_bind_diff(
-    thread_id: int, working_directory: str, base: str = "HEAD",
-) -> dict:
-    """Capture the repo's working diff as a versioned artifact and bind the
-    repo read-only — one call to put "review my uncommitted change" in
-    front of the panel.
+def capture_review_diff(working_directory: str, base: str = "HEAD") -> dict:
+    """Prepare a comparison without publishing or consuming a review round."""
+    resolved = _validate_bindable_dir(working_directory)
+    return review_capture.capture(str(resolved), base, _is_excluded_repo_path,
+        limit=min(_BIND_DIFF_MAX_CHARS, max(1000, PROMPT_CHAR_CAP // 2)),
+        untracked_limit=_BIND_DIFF_MAX_UNTRACKED)
 
-    Runs ``git diff <base>`` in ``working_directory`` (``HEAD`` covers
-    staged + unstaged; any commit-ish works, e.g. ``main`` to review a
-    whole branch), appends each untracked file as a ``/dev/null``
-    pseudo-diff, and stores the result via ``roundtable_set_artifact`` as
-    ``'working-diff'`` — so re-capturing after edits announces what changed
-    since the last capture. Also registers a ``readonly`` repo binding
-    (replacing any existing one, like ``roundtable_bind_github``) so
-    participants can open the full files behind the hunks.
 
-    Files matching the secret/VCS exclusion patterns (``.env``, key
-    material, ``.git``) are dropped from both the tracked diff and the
-    untracked list — same rule as every other panel-facing read.
+def publish_review_diff(thread_id: int, capture: dict) -> dict:
+    """Publish exactly the validated capture, never a fresh read of the worktree."""
+    review_capture.validate(capture)
+    roundtable_bind_repo(thread_id, capture["root"], permission_policy="readonly")
+    artifact = roundtable_set_artifact(thread_id, _DIFF_ARTIFACT_NAME, capture["content"])
+    return {"thread_id": thread_id, **review_capture.receipt(capture),
+            **{key: capture[key] for key in ("files_changed", "files_excluded", "untracked_included", "untracked_skipped")},
+            "artifact_version": artifact["version"], "chars": len(capture["content"])}
 
-    Raises ``ValueError`` when the tree is clean against ``base`` — a
-    silent empty artifact would read as "reviewed, no changes".
 
-    Returns ``{"thread_id", "base", "commit_sha", "files_changed",
-    "files_excluded", "untracked_included", "untracked_skipped",
-    "artifact_version", "chars", "truncated"}``.
-    """
+def roundtable_bind_diff(thread_id: int, working_directory: str, base: str = "HEAD") -> dict:
+    """Capture and publish an exact commit-to-worktree comparison, with secret paths excluded."""
     thread = _thread_row(thread_id)
     if thread is None:
         raise ValueError(f"No such thread: {thread_id}")
     if thread.get("closed_at"):
         raise RuntimeError(f"Thread {thread_id} is closed — cannot bind a diff.")
-    if base.startswith("-"):
-        raise ValueError(f"invalid base ref {base!r}")
-    resolved = _validate_bindable_dir(working_directory)
-
-    def _g(*args: str) -> str:
-        return _git(["git", "-C", str(resolved), *args])
-
-    try:
-        _g("rev-parse", "--is-inside-work-tree")
-        commit_sha = _g("rev-parse", "HEAD").strip()
-    except RuntimeError as exc:
-        raise ValueError(
-            f"{resolved} is not a git work tree with at least one commit: {exc}"
-        ) from exc
-
-    changed = [f for f in _g("diff", "--name-only", base, "--").splitlines() if f]
-    excluded = [f for f in changed if _is_excluded_repo_path(Path(f))]
-    if excluded:
-        # Pathspec-exclude the secret files rather than diffing then
-        # scrubbing text — the diff never contains their contents at all.
-        diff_text = _g(
-            "diff", base, "--", ".",
-            *[f":(exclude){f}" for f in excluded],
-        )
-    else:
-        diff_text = _g("diff", base)
-
-    untracked = [
-        f for f in _g("ls-files", "--others", "--exclude-standard").splitlines()
-        if f and not _is_excluded_repo_path(Path(f))
-    ]
-    untracked_shown = untracked[:_BIND_DIFF_MAX_UNTRACKED]
-    untracked_blocks: list[str] = []
-    for f in untracked_shown:
-        # --no-index exits 1 when the files differ (always true against
-        # /dev/null), so this can't go through _git's zero-exit check.
-        proc = subprocess.run(
-            ["git", "-C", str(resolved), "diff", "--no-index", "--",
-             "/dev/null", f],
-            capture_output=True, text=True, timeout=_GIT_CLONE_TIMEOUT_SEC,
-        )
-        if proc.returncode in (0, 1) and proc.stdout:
-            untracked_blocks.append(proc.stdout)
-
-    if not diff_text.strip() and not untracked_blocks:
-        raise ValueError(
-            f"working tree at {resolved} is clean against {base!r} — "
-            f"nothing to bind. Use roundtable_bind_repo for a plain binding."
-        )
-
-    parts = [
-        f"# Working diff of {resolved.name} vs {base} "
-        f"(HEAD = {commit_sha[:12]})",
-    ]
-    if excluded:
-        parts.append(
-            f"# {len(excluded)} changed file(s) excluded as secret/VCS "
-            f"paths: {', '.join(excluded)}"
-        )
-    if len(untracked) > len(untracked_shown):
-        parts.append(
-            f"# {len(untracked) - len(untracked_shown)} untracked file(s) "
-            f"beyond the {_BIND_DIFF_MAX_UNTRACKED}-file cap omitted"
-        )
-    if diff_text.strip():
-        parts.append(diff_text.rstrip())
-    if untracked_blocks:
-        parts.append("# Untracked files (shown as additions):")
-        parts.extend(b.rstrip() for b in untracked_blocks)
-    content = "\n\n".join(parts)
-    capped = _truncate_message_body(
-        {"content": content}, _BIND_DIFF_MAX_CHARS,
-    )["content"]
-
-    roundtable_bind_repo(thread_id, str(resolved), permission_policy="readonly")
-    art = roundtable_set_artifact(thread_id, _DIFF_ARTIFACT_NAME, capped)
-    return {
-        "thread_id": thread_id,
-        "base": base,
-        "commit_sha": commit_sha,
-        "files_changed": len(changed) - len(excluded),
-        "files_excluded": len(excluded),
-        "untracked_included": len(untracked_shown),
-        "untracked_skipped": len(untracked) - len(untracked_shown),
-        "artifact_version": art["version"],
-        "chars": len(capped),
-        "truncated": capped != content,
-    }
+    return publish_review_diff(thread_id, capture_review_diff(working_directory, base))
 
 
 def roundtable_repo_pack(
@@ -3783,6 +3706,7 @@ def _run_turn(
     effort: Optional[str] = None, web_search: bool = False,
     tool_use_context: Optional[ToolUseContext] = None,
     on_delta: "Optional[StreamDelta]" = None,
+    review_context: str = "",
 ) -> ProviderResult:
     """Render the transcript for one participant and call its provider.
 
@@ -3802,9 +3726,17 @@ def _run_turn(
     # of the cap once the pack is accounted for — floored so a huge pack can't
     # zero out the conversation.
     context_pack = thread.get("context_pack") or ""
+    if review_context:
+        available = PROMPT_CHAR_CAP - len(context_pack) - len(instruction) - len(review_context) - 4000
+        if available < 1000:
+            raise review_capture.CaptureError("Current review context cannot fit the prompt budget")
+        messages = [message for message in messages if review_context not in message.get("content", "")]
+        instruction = instruction + "\n\nCurrent captured comparison (source data):\n" + review_context
+    else:
+        available = max(PROMPT_CHAR_CAP - len(context_pack), MIN_TRANSCRIPT_CAP)
     trimmed = _trim_messages_to_cap(
         messages,
-        max(PROMPT_CHAR_CAP - len(context_pack), MIN_TRANSCRIPT_CAP),
+        available,
         for_participant_label=info["label"],
     )
     transcript = _format_transcript(trimmed, for_participant_label=info["label"])
@@ -3973,6 +3905,7 @@ def roundtable_ask_parallel(
     independent: bool = False,
     house_rules: Optional[str] = None,
     participant_prompts: Optional[dict[str, str]] = None,
+    review_context: str = "",
 ) -> dict:
     """Ask multiple participants the SAME question in parallel — each sees
     the transcript only up to the prompt, never each other's answers.
@@ -4068,10 +4001,19 @@ def roundtable_ask_parallel(
                 thread, info, messages, instruction=instruction, effort=effort,
                 web_search=web_search,
                 tool_use_context=tool_use_context,
+                **({"review_context": review_context} if review_context else {}),
             )
             return name, resp, None
         except Exception as exc:
             return name, None, exc
+
+    # Budget failures are grounding failures, not provider outages that could grant approval.
+    if review_context:
+        for name in infos:
+            instruction = (participant_prompts or {}).get(name, "")
+            available = PROMPT_CHAR_CAP - len(thread.get("context_pack") or "") - len(instruction) - len(review_context) - 4000
+            if available < 1000:
+                raise review_capture.CaptureError("Current review context cannot fit the prompt budget")
 
     results: dict[str, tuple[Optional[ProviderResult], Optional[Exception]]] = {}
     with concurrent.futures.ThreadPoolExecutor(

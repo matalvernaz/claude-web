@@ -38,7 +38,7 @@ def repo(tmp_path):
     return r
 
 
-class FakeCore:
+class FakeCore(panel_support.CaptureSupport):
     """The slice of roundtable.core panel review uses, scripted per test."""
 
     _RepoTools = panel_support.SourceTools
@@ -446,7 +446,8 @@ async def test_one_yes_covers_that_stages_rounds_until_it_resolves(chat, repo, m
     assert "approved" in delivered[-1] and "your call" in delivered[-1]
     state = app_module._panel_load(run.session_id)
     assert state.granted == [] and state.plan_ok is True and state.rounds["plan"] == 0
-    # It resolved, so the next review asks again, without the keep-on choice.
+    # A real pending change asks again; empty comparisons are rejected before consent.
+    (repo / "a.py").write_text("a = 2\n")
     call = _ask(run, stage="changes", repo=str(repo), message="Changed a.")
     card = await _card(events, 2)
     assert [o["label"] for o in card["questions"][0]["options"]] == [panel.ASK_SEND, panel.ASK_SKIP]

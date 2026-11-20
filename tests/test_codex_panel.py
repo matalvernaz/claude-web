@@ -154,7 +154,9 @@ async def test_rejected_codex_panel_answers_are_parked_instead_of_lost(client, m
     await asyncio.sleep(0)
     assert app_module._panel_load(run.session_id).pending_message == answer
     lost = [e for e in run.events if e.get("lost_input")]
-    assert len(lost) == int(with_user_message and failure not in ("initial", "startup"))
+    assert len(lost) == int(with_user_message and failure == "exit")
+    if with_user_message and failure in ("start", "steer"):
+        assert any("may have been received" in event.get("message", "") for event in run.events)
     if lost:
         assert lost[0]["lost_input"] == "My follow-up"
     assert sum(e["type"] == "panel_parked" for e in run.events) == int(not with_user_message)
@@ -192,7 +194,7 @@ async def test_full_input_queue_preserves_the_parked_answer_for_one_retry(tmp_pa
 
     class Server:
         async def models(self):
-            return []
+            return [{"key": "test", "model": "test", "efforts": []}]
 
     async def server_for_account(*args, **kwargs):
         return Server()
@@ -553,6 +555,14 @@ async def test_installed_codex_enforces_hooks_and_calls_review_without_a_cloud_m
         run.emit({"type": "system", "subtype": "init", "session_id": sid})
         queue = server.subscribe(sid)
         await bridge.verify_hooks(server, sid)
+        # Thread creation can return while MCP inventory is still starting. A scripted model cannot wait/discover it itself.
+        async with asyncio.timeout(15):
+            while True:
+                inventory = await server.request("mcpServerStatus/list", {"threadId": sid, "serverName": "panel"})
+                registered = [tool for row in inventory.get("data", []) for tool in (row.get("tools") or {}).values()]
+                if any(tool.get("name") == "review" for tool in registered):
+                    break
+                await asyncio.sleep(0.02)
         await server.request("turn/start", {"threadId": sid, "input": [{"type": "text", "text": "Run the contract"}]})
         while True:
             event = await asyncio.wait_for(queue.get(), 30)

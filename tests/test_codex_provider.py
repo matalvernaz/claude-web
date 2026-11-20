@@ -39,7 +39,7 @@ def test_frontend_sends_permission_mode_for_codex():
     )
     send_one = source.index("async function sendOne")
     start = source.index("const provider = ", send_one)
-    end = source.index("if (effortSelect", start)
+    end = source.index("if (entry.fork)", start)
     form_block = source[start:end]
 
     assert 'provider === "claude"' not in form_block

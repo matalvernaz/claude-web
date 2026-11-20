@@ -38,3 +38,17 @@ def report(text, root, prompt=""):
                          "reason": "The current assignment establishes the value", "evidence": refs} for f in old],
         "limitations": [], "verdict": "changes" if change else "approve",
     })
+
+
+class CaptureSupport:
+    """Use real Git capture while keeping review publication and inference scripted."""
+
+    @staticmethod
+    def capture_review_diff(root, base='HEAD'):
+        from roundtable.core import capture_review_diff
+        return capture_review_diff(root, base)
+
+    def publish_review_diff(self, thread_id, capture):
+        import review_capture
+        review_capture.validate(capture)
+        return self.roundtable_bind_diff(thread_id, capture['root'], capture['base'])

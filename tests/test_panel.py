@@ -227,7 +227,7 @@ def test_result_message_carries_the_marker_every_reply_and_the_next_step():
     assert "Don't change files until they approve" in msg
 
 
-class FakeCore:
+class FakeCore(panel_support.CaptureSupport):
     """Just enough of roundtable.core for one round, recording every call."""
 
     _RepoTools = panel_support.SourceTools

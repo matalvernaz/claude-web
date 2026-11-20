@@ -22,6 +22,12 @@
   const providerStatus = document.getElementById("provider-status");
   const accountSelect = document.getElementById("account-select");
   const permModeSelect = document.getElementById("permission-mode-select");
+  const codexSpeed = document.getElementById("codex-speed");
+  const codexModelStatus = document.getElementById("codex-model-status");
+  const codexRefresh = document.getElementById("codex-refresh-models");
+  let codexCatalogGeneration = 0;
+  let codexCatalogLoading = false;
+  const codexCatalogUncheckedSlots = new Set();
   const effortSelect = document.getElementById("effort-select");
   const effortSelectLabel = document.getElementById("effort-select-label");
   const localEffortControl = document.getElementById("local-effort-control");
@@ -91,7 +97,7 @@
   // Each routed provider remembers its own effort pick, so Claude's level
   // isn't carried onto a model that names its levels differently.
   function effortKeyFor(provider) {
-    return isRoutedProvider(provider) ? EFFORT_KEY + "." + provider : EFFORT_KEY;
+    return provider !== "claude" ? EFFORT_KEY + "." + provider : EFFORT_KEY;
   }
   // Per-provider model memory: each provider's model list is disjoint, so
   // remembering one pick per provider means toggling back and forth doesn't
@@ -198,6 +204,8 @@
   const messageQueue = [];
   const MAX_QUEUE_LENGTH = 10;
   let isStreaming = false;
+  let confirmedStreaming = false;
+  let confirmedStreamingVersion = 0;
   // Guards drainQueueIfPossible against re-entry while its fallback awaits a
   // full sendOne (see drainQueueIfPossible).
   let queueDraining = false;
@@ -787,6 +795,7 @@
       lastSeenModel = newModel || lastSeenModel;
       renderContextMeter();
       rebuildEffortOptions();
+      syncCodexOptions(undefined, false);
       syncAdvisorControl();
       // With a live conversation, switch the running CLI's model in place via
       // set_model so it takes effect from the next turn. Without one, the pick
@@ -811,8 +820,17 @@
       const fd = new FormData();
       fd.append("session_id", sessionId);
       fd.append("model", modelKey || "");
+      if (currentProvider() === "codex") {
+        fd.append("effort", effortSelect.value);
+        fd.append("service_tier", codexSpeed.value);
+      }
       const r = await fetch("/api/chat/model", { method: "POST", body: fd });
-      if (!r.ok) console.warn("live model switch failed", r.status, await r.text());
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (currentProvider() === "codex" && codexModelStatus) {
+          codexModelStatus.textContent = body.detail || "Could not save these settings. They will be checked when you send.";
+        } else console.warn("live model switch failed", r.status);
+      }
     } catch (e) {
       console.warn("live model switch error", e);
     }
@@ -875,6 +893,8 @@
     effortSelect.addEventListener("change", () => {
       if (currentProvider() === "local") syncLocalEffort();
       safeSet(localStorage, effortKeyFor(currentProvider()), effortSelect.value);
+      syncCodexOptions();
+      if (currentProvider() === "codex") pushModelChange(modelSelect.value);
     });
     syncEffortVisibility();
   }
@@ -914,6 +934,7 @@
   let sessionLoadGeneration = 0;
   let sessionLoadAbort = null;
   let sessionLoading = false;
+  let accountSwitchGeneration = 0;
   let lastAccount = accountSelect ? accountSelect.value : "shared";
   function currentProvider() {
     return (providerSelect && providerSelect.value) || "claude";
@@ -937,6 +958,20 @@
     if (sessionId && !sessionProvider) return "Loading conversation. Start a new chat if it cannot be loaded.";
     const provider = currentProvider();
     const details = PROVIDERS[provider];
+    if (provider === "codex") {
+      if (codexCatalogLoading) return "Refreshing Codex models…";
+      if (accountSelect?.selectedOptions[0]?.disabled) return "Sign in to the selected OpenAI account or choose another account.";
+      if (codexCatalogUncheckedSlots.has(accountSelect?.value)) return "Refresh models for the selected OpenAI account before sending.";
+      if (details && details.account_slot && accountSelect.value !== details.account_slot) return "Refresh models for the selected OpenAI account before sending.";
+      if (!(details?.models || []).some((model) => model.key === modelSelect.value)) return "This Codex model is unavailable. Choose an available model.";
+      const model = codexModel();
+      if (effortSelect?.value && !(model?.efforts || []).includes(effortSelect.value)) {
+        return "This Codex effort is unavailable. Refresh models or choose another effort.";
+      }
+      if (codexSpeed?.value && codexSpeed.value !== "default" && !(model?.service_tiers || []).some((tier) => tier.id === codexSpeed.value)) {
+        return "This Codex speed is unavailable. Refresh models or choose another speed.";
+      }
+    }
     if ((details && details.available === false) || (!details && provider !== "claude")) {
       // The server's reason is a finished sentence naming the fix (link a key,
       // turn the provider on); "Reload to retry" over it hides that.
@@ -1023,23 +1058,119 @@
       (option) => option.value === desired && !option.disabled,
     );
     const fallback = [...accountSelect.options].find((option) => !option.disabled);
-    if (desiredOption) accountSelect.value = desiredOption.value;
+    if (provider === "codex" && preferredSlot) {
+      if (![...accountSelect.options].some((option) => option.value === preferredSlot)) {
+        const unavailable = new Option("Unavailable OpenAI account", preferredSlot);
+        unavailable.disabled = true;
+        accountSelect.add(unavailable);
+      }
+      accountSelect.value = preferredSlot;
+    } else if (desiredOption) accountSelect.value = desiredOption.value;
     else if (fallback) accountSelect.value = fallback.value;
     lastAccount = accountSelect.value;
   }
 
-  async function refreshCodexProvider(accountSlot) {
-    const query = accountSlot
-      ? "?codex_account_slot=" + encodeURIComponent(accountSlot)
-      : "";
-    const response = await fetch("/api/providers" + query);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
-    const codex = (payload.providers || []).find((provider) => provider.key === "codex");
-    if (!codex) throw new Error("Codex provider missing from response");
-    ingestProvider(codex);
-    return codex;
+  function codexModel() {
+    return (PROVIDERS.codex?.models || []).find((model) => model.key === modelSelect.value);
   }
+
+  function syncCodexOptions(preferredTier, keepUnavailable = true) {
+    const visible = currentProvider() === "codex";
+    const model = codexModel();
+    if (codexRefresh) codexRefresh.hidden = !visible;
+    if (codexModelStatus) codexModelStatus.hidden = !visible;
+    const label = document.getElementById("codex-speed-label");
+    if (label) label.hidden = !visible;
+    if (codexSpeed) {
+      const saved = preferredTier ?? codexSpeed.value ?? "default";
+      const restoring = visible && keepUnavailable &&
+        (preferredTier !== undefined || codexSpeed.selectedOptions[0]?.dataset.unavailable === "true");
+      codexSpeed.replaceChildren(new Option("Standard", "default"));
+      for (const tier of model?.service_tiers || []) codexSpeed.add(new Option(tier.name, tier.id));
+      const preserveSpeed = restoring || codexCatalogUncheckedSlots.has(accountSelect?.value) || (visible && modelSelect.value && !model);
+      if (saved && preserveSpeed && ![...codexSpeed.options].some((option) => option.value === saved)) {
+        const option = new Option(saved + " (unavailable)", saved);
+        option.dataset.unavailable = "true";
+        option.disabled = true;
+        codexSpeed.add(option);
+      }
+      codexSpeed.value = [...codexSpeed.options].some((option) => option.value === saved) ? saved : "default";
+    }
+    const tier = (model?.service_tiers || []).find((item) => item.id === codexSpeed?.value);
+    const help = {
+      "codex-model-help": model?.description || "",
+      "codex-speed-help": tier?.description || (codexSpeed?.value !== "default" ? "Refresh models to check this speed." : "Standard speed."),
+      "codex-effort-help": (model?.effort_descriptions || {})[effortSelect?.value || model?.default_effort] || "",
+    };
+    for (const [id, text] of Object.entries(help)) {
+      const element = document.getElementById(id);
+      if (element) { element.textContent = text; element.hidden = !visible || !text; }
+    }
+    syncProviderAvailability();
+  }
+
+  if (codexSpeed) codexSpeed.addEventListener("change", () => {
+    syncCodexOptions();
+    pushModelChange(modelSelect.value);
+  });
+
+  async function refreshCodexProvider(accountSlot, force = false, stillCurrent = () => true) {
+    const generation = ++codexCatalogGeneration;
+    const providerAtStart = currentProvider();
+    const slotAtStart = accountSelect?.value;
+    codexCatalogLoading = true;
+    syncProviderAvailability();
+    try {
+      const query = accountSlot ? "?codex_account_slot=" + encodeURIComponent(accountSlot) : "";
+      const response = force
+        ? await fetch("/api/codex/models/refresh", { method: "POST", body: new URLSearchParams({ account_slot: accountSlot }) })
+        : await fetch("/api/providers" + query);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      if (!stillCurrent() || generation !== codexCatalogGeneration || currentProvider() !== providerAtStart || accountSelect?.value !== slotAtStart) return null;
+      const codex = force
+        ? { ...PROVIDERS.codex, available: true, reason: null, models: payload.models, account_slot: payload.account_slot }
+        : (payload.providers || []).find((provider) => provider.key === "codex");
+      if (!codex || (codex.account_slot && accountSlot && codex.account_slot !== accountSlot)) throw new Error("Codex returned a different account's catalog.");
+      const latestSelection = { model: modelSelect.value, effort: effortSelect.value, service_tier: codexSpeed?.value };
+      ingestProvider(codex);
+      if (codex.available !== false && codex.account_slot && codex.models?.length) codexCatalogUncheckedSlots.delete(codex.account_slot);
+      if (!force && codexModelStatus) codexModelStatus.textContent = "";
+      if (force) {
+        rebuildModelOptions("codex");
+        restoreCodexSelection(latestSelection);
+        codexModelStatus.textContent = "Models refreshed.";
+      }
+      return codex;
+    } finally {
+      if (generation === codexCatalogGeneration) { codexCatalogLoading = false; syncProviderAvailability(); }
+    }
+  }
+
+  function restoreCodexSelection(settings) {
+    if (settings.model && ![...modelSelect.options].some((option) => option.value === settings.model)) {
+      modelSelect.add(new Option(settings.model + " (unavailable)", settings.model));
+    }
+    if (settings.model) modelSelect.value = settings.model;
+    lastSeenModel = modelSelect.value;
+    rebuildEffortOptions();
+    if (settings.effort && ![...effortSelect.options].some((option) => option.value === settings.effort)) {
+      const option = new Option(settings.effort + " (unavailable)", settings.effort);
+      option.disabled = true;
+      effortSelect.add(option);
+    }
+    effortSelect.value = settings.effort || "";
+    if (settings.effort && effortSelectLabel) effortSelectLabel.hidden = false;
+    syncCodexOptions(settings.service_tier || "default");
+  }
+
+  if (codexRefresh) codexRefresh.addEventListener("click", async () => {
+    codexRefresh.disabled = true;
+    codexModelStatus.textContent = "Refreshing models…";
+    try { await refreshCodexProvider(accountSelect.value, true); }
+    catch (error) { codexModelStatus.textContent = "Could not refresh models: " + error.message; }
+    finally { codexRefresh.disabled = false; }
+  });
 
   function rebuildModelOptions(provider) {
     if (!modelSelect) return;
@@ -1066,6 +1197,9 @@
         saved = mapped;
         safeSet(localStorage, modelKeyFor(provider), saved);
       }
+    }
+    if (provider === "codex" && saved && !models.some((model) => model.key === saved)) {
+      modelSelect.add(new Option(saved + " (unavailable)", saved));
     }
     if (saved !== null && [...modelSelect.options].some((o) => o.value === saved)) {
       modelSelect.value = saved;
@@ -1210,6 +1344,7 @@
 
   // Show/hide the Claude-only header controls and swap the model list.
   function applyProviderUI(provider, preferredAccount) {
+    accountSwitchGeneration++;
     const caps = providerCapabilities(provider);
     // permission_modes: true = every mode, array = that subset, falsy = none.
     const permModes = caps.permission_modes;
@@ -1248,6 +1383,7 @@
     if (promptEl) promptEl.placeholder = "Ask " + assistantLabel(provider) + "…";
     rebuildModelOptions(provider);
     rebuildEffortOptions();
+    syncCodexOptions(sessionId ? undefined : "default");
     syncAdvisorControl();
     syncPanelControl();
     renderContextMeter();
@@ -1377,8 +1513,10 @@
 
   if (accountSelect) {
     onCommittedChange(accountSelect, async (target) => {
-      if (target === lastAccount) return;
       const provider = currentProvider();
+      const generation = ++accountSwitchGeneration;
+      if (target === lastAccount && provider !== "codex") return;
+      const isCurrent = () => generation === accountSwitchGeneration && currentProvider() === provider && accountSelect.value === target;
       try {
         const fd = new FormData();
         fd.append("active", target);
@@ -1393,22 +1531,28 @@
           throw new Error(detail);
         }
         const accounts = await r.json();
+        if (!isCurrent()) return;
         if (PROVIDERS[provider]) PROVIDERS[provider].accounts = accounts;
         lastAccount = target;
         if (provider === "claude") syncDefaultModelLabel();
         if (provider === "codex") {
           try {
-            await refreshCodexProvider(target);
+            const catalog = await refreshCodexProvider(target, false, isCurrent);
+            if (!isCurrent() || !catalog) return;
             applyProviderUI(provider, target);
+            return announce(`Account switched to ${accountSelect.options[accountSelect.selectedIndex]?.text || target}. Takes effect on your next message.`);
           } catch (_) {
+            if (!isCurrent()) return;
             // The account switch is already persisted. Keep the selected slot;
             // the send endpoint validates the model if model-list refresh failed.
             rebuildAccountOptions(provider, target);
           }
         }
+        if (!isCurrent()) return;
         const label = accountSelect.options[accountSelect.selectedIndex]?.text || target;
         announce(`Account switched to ${label}. Takes effect on your next message.`);
       } catch (err) {
+        if (!isCurrent()) return;
         accountSelect.value = lastAccount;
         announce(`Could not switch account: ${err.message}`);
       }
@@ -1897,6 +2041,7 @@
     if (loadGeneration !== sessionLoadGeneration) return;
     const sessProvider = data.provider in PROVIDERS ? data.provider : "claude";
     if (sessProvider === "codex" && data.account_slot) {
+      codexCatalogUncheckedSlots.add(data.account_slot);
       try { await refreshCodexProvider(data.account_slot); } catch (_) {}
       if (loadGeneration !== sessionLoadGeneration) return;
     }
@@ -1928,6 +2073,10 @@
       providerSelect.value = sessProvider;
       safeSet(localStorage, PROVIDER_KEY, sessProvider);
       applyProviderUI(sessProvider, data.account_slot || undefined);
+      if (sessProvider === "codex") {
+        restoreCodexSelection(data);
+        if (data.history_error && codexModelStatus) codexModelStatus.textContent = data.history_error;
+      }
       if (isRoutedProvider(sessProvider) && modelSelect && data.model) {
         const modelAvailable = [...modelSelect.options].some((o) => o.value === data.model);
         if (!modelAvailable) {
@@ -2628,6 +2777,7 @@
     cancelSessionLoad();
     sessionId = "";
     sessionProvider = null;
+    syncCodexOptions("default");
     // Clear the URL-pinned project so the picker takes over again. Without
     // this, a chat opened from a session URL stayed glued to that project
     // even after the user picked a different one and clicked New chat.
@@ -2691,11 +2841,15 @@
     wakeLock = null;
   }
 
-  function setStreaming(on) {
+  function setStreaming(on, { optimistic = false } = {}) {
     // "on" means: a turn is currently in progress (between submit/auto-fire
     // and the next ResultMessage). The SSE may stay open across multiple
     // turns; this state toggles back and forth as result/auto_fire events
     // arrive.
+    if (!optimistic) {
+      confirmedStreaming = on;
+      confirmedStreamingVersion++;
+    }
     isStreaming = on;
     if (on) {
       streamStartedAt = Date.now();
@@ -2785,9 +2939,9 @@
     return true;
   }
 
-  // Cancel a queued message. Three states:
-  //   - not yet POSTed (status undefined): drop the local copy; the server
-  //     never saw it.
+  // Cancel a queued message:
+  //   - local (status undefined or "blocked"): drop the local copy; the
+  //     server has not admitted it.
   //   - POSTed into the run (status "sending"): ask the server to recall it.
   //     If it hadn't reached the CLI the server drops it; if it already
   //     committed to delivery we fall back to interrupting the turn it's now
@@ -2795,7 +2949,12 @@
   async function cancelQueuedEntry(entry) {
     if (messageQueue.indexOf(entry) === -1) return;
     if (entry.status !== "sending" || !entry.queue_id || !currentRunId) {
+      const unblocksQueue = entry.error && entry === nextQueuedEntry();
       removeQueueEntry(entry);
+      if (unblocksQueue) {
+        await drainQueueIfPossible("Queued message cancelled.");
+        return;
+      }
       announce("Queued message cancelled.");
       return;
     }
@@ -2836,6 +2995,17 @@
     return (e.originRunId || null) === (currentRunId || null);
   }
 
+  function nextQueuedEntry() {
+    return messageQueue.find((e) => e.status !== "sending" && entryForCurrentRun(e));
+  }
+
+  async function retryQueuedEntry(entry) {
+    if (entry.status !== "blocked" || entry !== nextQueuedEntry()) return;
+    entry.status = undefined;
+    renderQueue();
+    await drainQueueIfPossible("Queued message will retry.");
+  }
+
   function renderQueue() {
     if (!queueArea) return;
     queueArea.innerHTML = "";
@@ -2870,6 +3040,20 @@
       // ends mid-render) doesn't make us act on the wrong index.
       del.addEventListener("click", () => { cancelQueuedEntry(entry); });
       chip.appendChild(label);
+      if (entry.error) {
+        const error = document.createElement("span");
+        error.className = "queue-error";
+        error.textContent = " " + entry.error;
+        chip.appendChild(error);
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "queue-retry";
+        retry.textContent = "Retry";
+        retry.setAttribute("aria-label", `Retry queued message: ${previewText}`);
+        retry.disabled = entry.status !== "blocked" || entry !== nextQueuedEntry();
+        retry.addEventListener("click", () => { retryQueuedEntry(entry); });
+        chip.appendChild(retry);
+      }
       chip.appendChild(del);
       queueArea.appendChild(chip);
     });
@@ -2933,6 +3117,7 @@
       return;
     }
     const entry = { text, images: pendingImages.slice(), files: pendingFiles.slice(), queue_id: newQueueId(), originRunId: currentRunId, steer: isStreaming && !queueOnly };
+    if (currentProvider() === "codex") entry.codexSelection = { model: modelSelect.value, effort: effortSelect.value, service_tier: codexSpeed.value };
     promptEl.value = "";
     clearAttachments();
     if (forkNextSend) {
@@ -2973,10 +3158,17 @@
       if (!queueOnly) {
         const res = await sendInExistingRun(entry);
         if (res && !res.ok && messageQueue.indexOf(entry) === -1) {
-          entry.originRunId = currentRunId;
+          if (res.mode !== "codex_selection_unavailable") entry.originRunId = currentRunId;
           messageQueue.push(entry);
           renderQueue();
-          announce("Message could not be sent now. Kept in the queue for retry.");
+          if (res.mode === "next_turn") {
+            announce("Settings changed. Message queued for the next turn.");
+            // A result may have arrived while the POST was pending. Its
+            // drain ran before this entry existed, so retry now if idle.
+            await drainQueueIfPossible();
+          } else if (res.mode !== "codex_selection_unavailable") {
+            announce("Message could not be sent now. Kept in the queue for retry.");
+          }
         }
         promptEl.focus();
         return;
@@ -2995,8 +3187,8 @@
       // Server-side input queue full: this entry was never queued locally
       // (direct-send path), so park it in the local queue for the drain to
       // retry — otherwise the text is silently gone.
-      if (res && res.mode === "queue_full" && messageQueue.indexOf(entry) === -1) {
-        entry.originRunId = currentRunId;
+      if (res && ["queue_full", "codex_selection_unavailable"].includes(res.mode) && messageQueue.indexOf(entry) === -1) {
+        if (res.mode !== "codex_selection_unavailable") entry.originRunId = currentRunId;
         messageQueue.push(entry);
         renderQueue();
       }
@@ -3019,6 +3211,7 @@
     // currentRunId has been nulled, and the queue re-bind needs the id of
     // the run the entries were typed into.
     const rid = currentRunId;
+    delete entry.error;
     // A provider is fixed to its live native process. Route the first message
     // after a picker change through /api/chat, where the cross-provider
     // handoff is prepared, instead of injecting it into the old provider's
@@ -3034,7 +3227,11 @@
       const sent = await sendOne(entry);
       return { ok: sent, mode: sent ? "fresh" : "failed" };
     }
-    setStreaming(true);
+    const codexSend = currentProvider() === "codex";
+    const confirmedVersionAtSend = confirmedStreamingVersion;
+    // Rejection rolls back only this provisional spinner. Other requests
+    // and incoming turn events can confirm a newer state while it waits.
+    setStreaming(true, { optimistic: codexSend });
     startGerunds();
     announce("Sent. " + assistantLabel() + " is responding.");
     // The POST itself isn't bound to currentAbort (which owns the SSE
@@ -3064,6 +3261,10 @@
         fd.append("account_slot", accountSelect.value);
       }
       fd.append("provider", currentProvider());
+      if (currentProvider() === "codex") {
+        const settings = entry.codexSelection || { model: modelSelect.value, effort: effortSelect.value, service_tier: codexSpeed.value };
+        for (const [key, value] of Object.entries(settings)) fd.append(key, value);
+      }
       if (isRoutedProvider(currentProvider())) {
         if (modelSelect && modelSelect.value) fd.append("model", modelSelect.value);
         if (effortSelect && effortSupported()) fd.append("effort", effortSelect.value);
@@ -3096,7 +3297,26 @@
         return { ok: false, mode: "queue_full" };
       }
       if (!r.ok) {
-        // Any other non-2xx — 404 (run gone), 409 (run superseded by a
+        if (r.status === 400 && fd.get("provider") === "codex") {
+          const body = await r.clone().json().catch(() => null);
+          if (body?.error === "codex_selection_unavailable") {
+            entry.status = "blocked";
+            entry.error = body.detail || "These Codex settings are unavailable.";
+            if (currentRunId === rid) {
+              if (!confirmedStreaming) stopGerunds();
+              setStreaming(confirmedStreaming, { optimistic: true });
+              const action = entry.onAccepted
+                ? "Refresh models or choose available settings and try again."
+                : "Message kept in the queue. Refresh models, then use Retry, or cancel and resubmit with available settings.";
+              const message = `${entry.error} ${action}`;
+              setStatus(message);
+              announce(message);
+            }
+            return { ok: false, mode: "codex_selection_unavailable" };
+          }
+        }
+        // A Codex settings mismatch needs next-turn delivery on this run.
+        // Other non-2xx — 404 (run gone), 409 (run superseded by a
         // personality/account swap or a provider handoff), 5xx (driver
         // crashed), network blip through the proxy — means the existing
         // stream can't carry this message. Abort the old SSE reader so
@@ -3110,6 +3330,12 @@
             const body = await r.clone().json();
             supersededReason = body && body.error;
           } catch (_) {}
+        }
+        if (supersededReason === "codex_settings_require_queue") {
+          // The active turn is healthy. Keep its reader and the settings
+          // captured on this entry, then retry without steering at its end.
+          entry.steer = false;
+          return { ok: false, mode: "next_turn" };
         }
         if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
         currentAbort = null;
@@ -3139,8 +3365,11 @@
         // discarding the user's text.
         return { ok: sent, mode: sent ? "fresh" : "failed" };
       }
-      // The existing SSE stream will deliver the new turn's events; nothing
-      // else to do here. setStreaming(false) happens on the next result.
+      // Confirm the provisional UI only if no newer turn state arrived on
+      // the stream. A completed turn must not restart its spinner on a late ACK.
+      if (codexSend && currentRunId === rid && confirmedStreamingVersion === confirmedVersionAtSend) {
+        setStreaming(true);
+      }
       if (entry.onAccepted) entry.onAccepted();
       return { ok: true, mode: "injected" };
     } catch (err) {
@@ -3185,8 +3414,11 @@
     // is in the server's queue (or running) and clears itself on its
     // user_prompt / queued_input_cancelled event — re-sending it here would
     // double it up.
-    const entry = messageQueue.find((e) => e.status !== "sending" && entryForCurrentRun(e));
-    if (!entry) { speakResult(); return; }
+    const entry = nextQueuedEntry();
+    // Rejected settings need an explicit Retry or Cancel. Keep FIFO and the
+    // explanation intact instead of retrying on unrelated turn results.
+    if (!entry || entry.status === "blocked") { speakResult(); return; }
+    const drainRunId = currentRunId;
     queueDraining = true;
     entry.status = "sending";
     renderQueue();
@@ -3208,13 +3440,16 @@
       // In the server queue now; keep the "sending" chip (its × recalls it)
       // until the user_prompt / queued_input_cancelled event resolves it.
       renderQueue();
+      // A result can arrive before the POST response, while its drain is
+      // still guarded. Continue once admission completes if this run is idle.
+      if (currentRunId === drainRunId && !isStreaming) {
+        await drainQueueIfPossible();
+      }
     } else if (messageQueue.indexOf(entry) !== -1) {
-      // Failed (network/auth, or server restarting) — return it to plain queued
-      // so the user can retry. Re-bind to the current context (the fresh
-      // fallback may have dropped the live run), or H6's per-run filter would
-      // hide the chip and the text would be silently unreachable.
-      entry.status = undefined;
-      entry.originRunId = currentRunId;
+      // Unavailable selections stay blocked, owned by the original run.
+      // Other failures can retry after recovery, which may need a new run.
+      entry.status = res.mode === "codex_selection_unavailable" ? "blocked" : undefined;
+      if (res.mode !== "codex_selection_unavailable") entry.originRunId = currentRunId;
       renderQueue();
     }
   }
@@ -3241,7 +3476,12 @@
       if (project) fd.append("project", project);
       const provider = retrySelection ? retrySelection.provider : currentProvider();
       fd.append("provider", provider);
-      const model = retrySelection ? retrySelection.model : modelSelect && modelSelect.value;
+      const codexSettings = provider === "codex" ? (entry.codexSelection || { model: modelSelect.value, effort: effortSelect.value, service_tier: codexSpeed.value }) : null;
+      const model = codexSettings ? codexSettings.model : (retrySelection ? retrySelection.model : modelSelect && modelSelect.value);
+      if (codexSettings) {
+        fd.append("effort", codexSettings.effort);
+        fd.append("service_tier", codexSettings.service_tier);
+      }
       if (model) fd.append("model", model);
       // Spawn-time advisor. A retry reuses whatever that turn ran with rather
       // than whatever the header says now.
@@ -3263,9 +3503,9 @@
           providerCapabilities(provider).permission_modes) {
         fd.append("permission_mode", permModeSelect.value);
       }
-      if (retrySelection) {
+      if (!codexSettings && retrySelection) {
         if (retrySelection.effort !== null) fd.append("effort", retrySelection.effort);
-      } else if (effortSelect && effortSelect.value && effortSupported()) {
+      } else if (!codexSettings && effortSelect && effortSelect.value && effortSupported()) {
         fd.append("effort", effortSelect.value);
       }
       if (entry.fork) fd.append("fork", "true");
@@ -3341,7 +3581,7 @@
     while (true) {
       if (queueDraining) return;
       const idx = messageQueue.findIndex((e) => e.status !== "sending" && entryForCurrentRun(e));
-      if (idx === -1) return;
+      if (idx === -1 || messageQueue[idx].status === "blocked") return;
       const [next] = messageQueue.splice(idx, 1);
       renderQueue();
       announce("Sending next queued message.");
@@ -3368,7 +3608,7 @@
     // ctx.quietBelow: events below this _idx are a reconnect's backlog and
     // render without sounds (see tryResume).
     const quietBelow = opts && typeof opts.quietBelow === "number" ? opts.quietBelow : null;
-    const ctx = { currentAssistantBody: null, runId: null, gen, quietBelow };
+    const ctx = { currentAssistantBody: null, runId: null, gen, quietBelow, codexSettingsSnapshotIdx: opts?.codexSettingsSnapshotIdx };
     const reader = response.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -3576,6 +3816,21 @@
     if (sessionId && info.session_id && info.session_id !== sessionId) {
       return false;
     }
+    if (info.provider === "codex") {
+      const loadGeneration = sessionLoadGeneration;
+      await providersReady;
+      const accountSlot = info.account_slot || "shared";
+      codexCatalogUncheckedSlots.add(accountSlot);
+      // Discovery may block new input, but never reading a healthy run.
+      // Mark before the await so a newer successful refresh can clear it.
+      try { await refreshCodexProvider(accountSlot); } catch (_) { /* Keep the saved selection until discovery recovers. */ }
+      if (loadGeneration !== sessionLoadGeneration || safeGet(sessionStorage, RUN_KEY) !== savedRunId) return false;
+      sessionId = info.session_id || sessionId;
+      sessionProvider = "codex";
+      selectProvider("codex");
+      applyProviderUI("codex", accountSlot);
+      restoreCodexSelection(info);
+    }
     if (info.project) sessionProject = info.project;
     // The run is the authority on the advisor, not this tab's localStorage:
     // the run may have been spawned elsewhere, or toggled from another tab.
@@ -3646,7 +3901,7 @@
         + (incremental ? `?start_index=${wm + 1}` : "");
       const r = await fetch(streamUrl, { signal: myAbort.signal });
       if (!r.ok) throw new Error("HTTP " + r.status);
-      await drainStream(r, gen, { quietBelow });
+      await drainStream(r, gen, { quietBelow, codexSettingsSnapshotIdx: info.provider === "codex" ? info.next_idx : undefined });
     } catch (err) {
       if (err.name === "AbortError") {
         if (gen === streamGeneration) {
@@ -4211,6 +4466,9 @@
       announce(`Permission mode is now ${permModeLabel(obj.mode)}.`);
       markVisibleActivity();
     } else if (obj.type === "model_changed") {
+      // The reconnect snapshot already includes these earlier picker changes.
+      if (typeof ctx?.codexSettingsSnapshotIdx === "number" &&
+          typeof obj._idx === "number" && obj._idx < ctx.codexSettingsSnapshotIdx) return;
       // Server confirmed a live model switch. Align the picker + context meter
       // and announce; the switch applies from the next turn.
       if (modelSelect && typeof obj.model === "string" &&
@@ -4220,7 +4478,8 @@
         renderContextMeter();
         syncEffortVisibility();
       }
-      announce(`Model switched to ${obj.label || "default"} for the rest of this conversation.`);
+      if (currentProvider() === "codex" && obj.service_tier) restoreCodexSelection(obj);
+      announce(obj.message || `Model switched to ${obj.label || "default"} for the rest of this conversation.`);
       markVisibleActivity();
     } else if (obj.type === "advisor_changed") {
       // Server queued the CLI's own /advisor command. Align the checkbox and

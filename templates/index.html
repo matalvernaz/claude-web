@@ -53,12 +53,21 @@
         </label>
         <label class="header-select" for="model-select">
           <span class="sr-only">Model</span>
-          <select id="model-select" aria-label="Model">
+          <select id="model-select" aria-label="Model" aria-describedby="codex-model-help">
             {% for m in models %}
               <option value="{{ m.key }}">{{ m.label }}</option>
             {% endfor %}
           </select>
         </label>
+        <span id="codex-model-help" hidden></span>
+        <label class="header-select" for="codex-speed" id="codex-speed-label" hidden>
+          <span>Speed</span>
+          <select id="codex-speed" aria-describedby="codex-speed-help"><option value="default">Standard</option></select>
+        </label>
+        <span id="codex-speed-help" hidden></span>
+        <span id="codex-effort-help" hidden></span>
+        <button type="button" id="codex-refresh-models" hidden>Refresh models</button>
+        <span id="codex-model-status" role="status" aria-live="polite"></span>
         <label class="header-check" for="advisor-toggle" id="advisor-toggle-label" hidden>
           <input type="checkbox" id="advisor-toggle"
                  title="Let Claude consult a stronger model at key moments. Only those consults bill at the advisor's rate.">
@@ -82,7 +91,7 @@
         </label>
         <label class="header-select" for="effort-select" id="effort-select-label">
           <span class="sr-only">Effort</span>
-          <select id="effort-select" aria-label="Effort level">
+          <select id="effort-select" aria-label="Effort level" aria-describedby="codex-effort-help">
             <option value="">Default effort</option>
             {% for e in effort_levels %}
               <option value="{{ e }}">{{ e }}</option>
