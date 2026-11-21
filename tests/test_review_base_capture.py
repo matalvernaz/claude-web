@@ -6,18 +6,20 @@ import pytest
 from roundtable import core
 
 
-def git(repo, *arguments):
-    return subprocess.run(['git', '-C', str(repo), *arguments], check=True,
-                          capture_output=True).stdout.decode().strip()
+def git(repo, *arguments, stdin=None, raw=False):
+    output = subprocess.run(['git', '-C', str(repo), *arguments], check=True,
+                            capture_output=True, input=stdin).stdout
+    return output if raw else output.decode('utf-8').strip()
 
 
-def repository(tmp_path):
+def repository(tmp_path, *, include_secret=True):
     git(tmp_path, 'init', '-q')
     git(tmp_path, 'config', 'user.name', 'Test')
     git(tmp_path, 'config', 'user.email', 'test@example.com')
     git(tmp_path, 'config', 'core.hooksPath', '/dev/null')
     (tmp_path / 'code.py').write_text('value = 1\n')
-    (tmp_path / 'café.key').write_text('SECRET_SENTINEL\n')
+    if include_secret:
+        (tmp_path / 'café.key').write_text('SECRET_SENTINEL\n')
     git(tmp_path, 'add', '.')
     git(tmp_path, 'commit', '-qm', 'base')
     return git(tmp_path, 'rev-parse', 'HEAD')
@@ -61,16 +63,29 @@ def test_receipts_do_not_alias_different_snapshots_with_identical_visible_diff(t
 
 @pytest.mark.parametrize('filename', ['café.key', 'line\nbreak.key', 'bracket[one].key', 'quoted".key'])
 def test_raw_deleted_secret_paths_do_not_leak(tmp_path, filename):
-    base = repository(tmp_path)
-    (tmp_path / filename).write_text('HISTORICAL_SECRET\n')
-    git(tmp_path, 'add', '.')
-    git(tmp_path, 'commit', '-qm', 'secret')
-    base = git(tmp_path, 'rev-parse', 'HEAD')
-    (tmp_path / filename).unlink()
+    parent = repository(tmp_path, include_secret=False)
+    code_entry = git(tmp_path, 'ls-tree', '-z', parent, '--', 'code.py', raw=True)
+    baseline_index = git(tmp_path, 'ls-files', '--stage', '-z', raw=True)
+    assert git(tmp_path, 'ls-files', '-z', raw=True) == b'code.py\0'
+    # Some historical Git names cannot exist on Windows. Store those names
+    # in a tree without checking them out or adding them to the index.
+    secret = git(tmp_path, 'hash-object', '-w', '--stdin', stdin=b'HISTORICAL_SECRET\n')
+    name = filename.encode('utf-8')
+    tree = git(tmp_path, 'mktree', '-z', stdin=(
+        code_entry + b'100644 blob ' + secret.encode('ascii') + b'\t' + name + b'\0'
+    ))
+    base = git(tmp_path, 'commit-tree', tree, '-p', parent, stdin=b'secret\n')
+    git(tmp_path, 'update-ref', 'HEAD', base)
+    assert git(tmp_path, 'ls-files', '--stage', '-z', raw=True) == baseline_index
+    assert git(tmp_path, 'diff', '--cached', '--name-status', '-z', raw=True) == b'D\0' + name + b'\0'
     (tmp_path / 'code.py').write_text('value = 4\n')
+    fields = git(tmp_path, 'diff', '--name-status', '-z', base, '--', raw=True).removesuffix(b'\0').split(b'\0')
+    assert set(zip(fields[::2], fields[1::2], strict=True)) == {(b'D', name), (b'M', b'code.py')}
     tid = core.roundtable_create('raw deletion')['thread_id']
     core.roundtable_bind_diff(tid, str(tmp_path), base)
-    assert 'HISTORICAL_SECRET' not in core.roundtable_get_artifact(tid, 'working-diff')['content']
+    content = core.roundtable_get_artifact(tid, 'working-diff')['content']
+    assert 'HISTORICAL_SECRET' not in content
+    assert '+value = 4' in content
 
 
 def test_literal_pathspec_preserves_metacharacter_source_name(tmp_path):
