@@ -67,6 +67,87 @@ async def driver(monkeypatch, tmp_path):
             app_module._STATE_DB.close()
 
 
+async def test_declining_first_turn_credits_keeps_the_prompt_and_closes_the_driver(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "_STATE_DB", None)
+    monkeypatch.setattr(app_module, "STATE_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(app_module, "ACTIVE_RUNS", {})
+    monkeypatch.setattr(app_module, "ACTIVE_RUNS_BY_SESSION", {})
+    monkeypatch.setattr(app_module, "PENDING", {})
+    monkeypatch.setattr(app_module, "_notify_turn_complete", lambda run: None)
+    monkeypatch.setattr(app_module.setup_flow, "is_configured", lambda *a, **k: True)
+    monkeypatch.setattr(app_module, "_load_rate_limit", lambda slot: {
+        "status": "rejected", "rateLimitType": "five_hour", "overageStatus": "allowed",
+    })
+    # The refusal preview must contain the user's text, not internal context
+    # prepended to the message intended for the CLI.
+    monkeypatch.setattr(app_module, "_panel_prefix", lambda run, message: "Internal review context.\n\n")
+    question = asyncio.get_running_loop().create_future()
+    context_closed = asyncio.Event()
+    queries = []
+    messages = asyncio.Queue()
+    run = None
+
+    @contextlib.asynccontextmanager
+    async def sdk_client(options, active_run, stderr):
+        original_emit = active_run.emit
+
+        def emit(event):
+            original_emit(event)
+            if event.get("type") == "question_request" and not question.done():
+                question.set_result(event)
+
+        monkeypatch.setattr(active_run, "emit", emit)
+
+        class Client:
+            async def query(self, prompt, **kwargs):
+                queries.append(prompt)
+
+            async def receive_messages(self):
+                while True:
+                    yield await messages.get()
+
+        try:
+            yield Client()
+        finally:
+            context_closed.set()
+
+    monkeypatch.setattr(app_module, "_sdk_client", sdk_client)
+    request = Request({"type": "http", "method": "POST", "path": "/api/chat",
+                       "headers": [], "scheme": "http", "server": ("testserver", 80)})
+    request._form = FormData()
+    prompt = "Please check my library"
+    try:
+        await app_module.api_chat(
+            request=request, message=prompt, session_id="", project="", model="opus",
+            effort="low", permission_mode="default", fork=False, personality_id=None,
+            account_slot="", queue_id="", provider="claude", advisor="", panel_review="", user={"sub": "anonymous"},
+        )
+        run = next(iter(app_module.ACTIVE_RUNS.values()))
+        card = await asyncio.wait_for(question, timeout=3)
+        assert queries == []
+        app_module.PENDING[card["id"]]["future"].set_result({
+            "decision": "answer",
+            "payload": {"answers": {app_module._OVERAGE_GATE_QUESTION: app_module._OVERAGE_GATE_STOP}},
+        })
+        await asyncio.wait_for(asyncio.shield(run.task), timeout=3)
+        declined = [event for event in run.events if event.get("type") == "overage_declined"]
+        assert len(declined) == 1
+        assert declined[0]["text_preview"] == prompt
+        assert declined[0]["queue_id"] is None
+        assert not any(event.get("type") == "error" for event in run.events)
+        assert queries == []
+        assert not run.overage_consent
+        assert context_closed.is_set() and run.done and run.client is None
+        assert card["id"] not in app_module.PENDING
+    finally:
+        if run is not None and run.task is not None and not run.task.done():
+            run.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run.task
+        if app_module._STATE_DB is not None:
+            app_module._STATE_DB.close()
+
+
 async def wait_queries(state, count):
     async with asyncio.timeout(3):
         while len(state["queries"]) < count:

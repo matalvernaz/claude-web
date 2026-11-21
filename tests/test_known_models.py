@@ -226,7 +226,7 @@ def test_frontend_gates_the_advisor_on_a_capability_not_a_provider_name() -> Non
     )
     send_one = source.index("async function sendOne")
     start = source.index("const provider = ", send_one)
-    end = source.index("if (effortSelect", start)
+    end = source.index('const r = await fetch("/api/chat"', start)
     form_block = source[start:end]
 
     assert "providerCapabilities(provider).advisor" in form_block

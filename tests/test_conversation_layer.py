@@ -611,7 +611,11 @@ def test_refused_switch_leaves_the_source_run_alone(client, monkeypatch) -> None
 
     class _Server:
         async def models(self):
-            return []
+            return [{
+                "key": "test-codex", "model": "test-codex", "label": "Test Codex",
+                "efforts": ["low"], "default_effort": "low", "is_default": True,
+                "input_modalities": ["text"], "service_tiers": [],
+            }]
 
     async def _server_for_account(account, server_key=None):
         return _Server()
